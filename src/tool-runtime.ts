@@ -1,12 +1,3 @@
-/**
- * Tool handlers and MCP resources — the stateful tool layer of this server.
- *
- * Owns the persistent monitoring state (`~/.zulip_mcp_state/<session>.json`):
- * which streams are monitored and the last-read message id per stream. The
- * MCPL layer (channels/context) is independent of this; tools and resources
- * are the plain-MCP surface every client gets.
- */
-
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -34,7 +25,6 @@ import {
   type Uploader,
 } from "./uploads.js";
 
-/** What registering the streams `listen` joined achieved (MCPL mode only). */
 export interface SubscriptionRegistration {
   announced: string[];
   local: string[];
@@ -42,14 +32,12 @@ export interface SubscriptionRegistration {
   reason?: string;
 }
 
-/** A message this server sent through a tool — recorded for rollback. */
 export interface SentRecord {
   messageId: string;
   channelId: string;
   content: string;
 }
 
-/** What of a message's reactions the model may see. */
 export interface ReactionPolicy {
   /** `code`/`type` are Zulip's `emoji_code`/`reaction_type` when known. */
   suppressed(emojiName: string, emojiCode?: string, reactionType?: string): boolean;
@@ -57,16 +45,10 @@ export interface ReactionPolicy {
 
 const SHOW_ALL: ReactionPolicy = { suppressed: () => false };
 
-/** Project reactions through the policy. */
 export function projectReactions(reactions: ReactionSummary[], policy: ReactionPolicy): ReactionSummary[] {
   return reactions.filter((r) => !policy.suppressed(r.name, r.code, r.type));
 }
 
-/**
- * Withhold suppressed reactions from raw Zulip message payloads before any
- * model-visible serialization (the legacy `raw` format hands the payload to
- * the model as is).
- */
 export function stripSuppressedReactions<T extends { reactions?: unknown }>(messages: T[], policy: ReactionPolicy): T[] {
   return messages.map((m) => {
     if (!Array.isArray(m.reactions)) return m;
@@ -113,7 +95,6 @@ export interface ToolCallResult {
 
 const STATE_DIR = join(homedir(), ".zulip_mcp_state");
 
-// Helper function to parse date strings
 export function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
   if (!dateStr) return defaultDate;
 
@@ -136,7 +117,6 @@ export function parseDate(dateStr: string | undefined, defaultDate: Date): Date 
   return new Date(dateStr);
 }
 
-// Helper function to format messages
 export function formatMessages(messages: any[], format: string): string {
   if (format === 'raw') {
     return JSON.stringify(messages, null, 2);
@@ -151,7 +131,6 @@ export function formatMessages(messages: any[], format: string): string {
     return `📊 ${messages.length} messages\n\n${summary}`;
   }
 
-  // Detailed format
   const formatted = messages.map(msg => {
     const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     const date = new Date(msg.timestamp * 1000).toLocaleDateString('en-US');
@@ -174,17 +153,10 @@ function numberOrUndefined(value: unknown): number | undefined {
   return undefined;
 }
 
-/** UTC ISO seconds -- the line time when no agent formatter is supplied. */
 export function utcLineTime(d: Date): string {
   return Number.isNaN(d.getTime()) ? "" : d.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-/**
- * One line per message in the shared line shape (message-line.ts), id first
- * so the agent can fetch_around(id). The anchor of a fetch_around window is
- * marked so it stands out. The runtime passes the agent line-time formatter,
- * so these lines read the same as live delivery and the `<missed>` block.
- */
 export function formatHistoryLines(
   messages: ZulipMessage[],
   anchorId?: number,
@@ -209,10 +181,6 @@ export function formatHistoryLines(
   }).join("\n");
 }
 
-/**
- * Shape a handler's return value into an MCP `tools/call` result. Handlers
- * that need to return image/non-text content set `_content` directly.
- */
 export function toToolCallResult(result: unknown): ToolCallResult {
   if (result && typeof result === "object" && Array.isArray((result as any)._content)) {
     return { content: (result as any)._content };
@@ -227,14 +195,10 @@ export class ZulipToolRuntime {
 
   private reactionPolicy: ReactionPolicy = SHOW_ALL;
 
-  /** Set by the MCPL server: every message sent by a tool is reported here
-   *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
-  /** Called when that delete_message failed: the message still exists, and
-   *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
   /** Streams `listen` just subscribed the bot to, so they can be registered
@@ -243,7 +207,6 @@ export class ZulipToolRuntime {
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
-  /** Line time for fetch_history / fetch_around, shared with live delivery. */
   private readonly formatTime: (d: Date) => string;
 
   constructor(
@@ -264,7 +227,6 @@ export class ZulipToolRuntime {
     return this.uploader;
   }
 
-  /** Validate and upload every `attachments` entry of a send call; throws before anything is sent. */
   private async uploadFor(args: Record<string, any>) {
     if (args.attachments === undefined || args.attachments === null) return [];
     if (Array.isArray(args.attachments) && args.attachments.length === 0) return [];
@@ -272,7 +234,6 @@ export class ZulipToolRuntime {
     return uploadPrepared(uploader, await prepareAttachments(args.attachments, this.uploadPolicy), this.uploadPolicy);
   }
 
-  /** Reaction suppression for history rendering (the filters plane). */
   setReactionPolicy(policy: ReactionPolicy): void {
     this.reactionPolicy = policy;
   }
@@ -308,8 +269,6 @@ export class ZulipToolRuntime {
     const ids = recipients.map((r) => r.id);
     return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
   }
-
-  // ── Persistent monitoring state ──
 
   private stateFile(): string {
     return join(this.stateDir, `${this.sessionId}.json`);
@@ -354,9 +313,6 @@ export class ZulipToolRuntime {
     }
   }
 
-  // ── Tools ──
-
-  /** Execute a tool. Returns the raw handler result; see toToolCallResult. */
   async handleToolCall(name: string, args: any): Promise<any> {
     const zulipClient = this.zulipClient;
     const monitoredChannels = this.monitoredChannels;
@@ -369,7 +325,6 @@ export class ZulipToolRuntime {
 
         for (const channelName of channels) {
           try {
-            // Get latest message to establish baseline
             const messages = await zulipClient.messages.retrieve({
               anchor: "newest",
               num_before: 1,
@@ -414,7 +369,6 @@ export class ZulipToolRuntime {
         const channels: string[] = args.channels;
 
         if (!channels || channels.length === 0) {
-          // Stop all monitoring
           const stopped = Array.from(monitoredChannels.keys());
           monitoredChannels.clear();
           this.saveState();
@@ -518,7 +472,6 @@ export class ZulipToolRuntime {
       }
 
       case "get_channel_history": {
-        // Parse dates
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const now = new Date();
@@ -528,13 +481,11 @@ export class ZulipToolRuntime {
         const startTimestamp = Math.floor(startDate.getTime() / 1000);
         const endTimestamp = Math.floor(endDate.getTime() / 1000);
 
-        // Build narrow filters
         const narrow: any[] = [["stream", args.channel]];
         if (args.topic) {
           narrow.push(["topic", args.topic]);
         }
 
-        // Retrieve messages
         const maxMessages = args.max_messages || 500;
         const result = await zulipClient.messages.retrieve({
           anchor: "newest",
@@ -543,12 +494,10 @@ export class ZulipToolRuntime {
           narrow: narrow,
         });
 
-        // Filter by date range
         const filteredMessages = result.messages.filter((msg: any) => {
           return msg.timestamp >= startTimestamp && msg.timestamp <= endTimestamp;
         });
 
-        // Auto-monitor: Start monitoring this channel if requested (default: true)
         const autoMonitor = args.auto_monitor !== false;
         let monitoringStatus = "not_monitored";
 
@@ -564,7 +513,6 @@ export class ZulipToolRuntime {
             monitoringStatus = "started_monitoring";
             this.saveState();
           } else {
-            // Update last read
             const state = monitoredChannels.get(args.channel)!;
             state.lastReadMessageId = latestMessageId;
             monitoringStatus = "updated_read_position";
@@ -574,7 +522,6 @@ export class ZulipToolRuntime {
           monitoringStatus = "already_monitored";
         }
 
-        // Format output — suppressed reaction markers never reach the model, raw format included.
         const format = args.format || "detailed";
         const formattedOutput = formatMessages(stripSuppressedReactions(filteredMessages, this.reactionPolicy), format);
 
@@ -616,7 +563,6 @@ export class ZulipToolRuntime {
           }
 
           try {
-            // Get messages since last read
             const result = await zulipClient.messages.retrieve({
               anchor: "newest",
               num_before: 200,
@@ -633,7 +579,6 @@ export class ZulipToolRuntime {
               channel: channelName,
             })));
 
-            // Update last read if mark_as_read is true
             if (args.mark_as_read !== false && unreadMessages.length > 0) {
               state.lastReadMessageId = Math.max(...unreadMessages.map((m: any) => m.id));
             }
@@ -653,15 +598,12 @@ export class ZulipToolRuntime {
           }
         }
 
-        // Sort by timestamp
         allUnreadMessages.sort((a, b) => a.timestamp - b.timestamp);
 
-        // Save state if we marked messages as read
         if (args.mark_as_read !== false && allUnreadMessages.length > 0) {
           this.saveState();
         }
 
-        // Format output — suppressed reaction markers never reach the model, raw format included.
         const format = args.format || "detailed";
         const formattedOutput = formatMessages(stripSuppressedReactions(allUnreadMessages, this.reactionPolicy), format);
 
@@ -771,7 +713,6 @@ export class ZulipToolRuntime {
         });
         assertApiSuccess(result, "listing streams");
 
-        // Format streams nicely
         const streams = result.streams || [];
         const formatted = streams
           .sort((a: any, b: any) => b.stream_weekly_traffic - a.stream_weekly_traffic)
@@ -902,9 +843,6 @@ export class ZulipToolRuntime {
       case "fetch_history": {
         const channel = String(args.channel ?? "").trim().replace(/^#/, "");
         if (!channel) throw new Error("channel is required");
-        // A DM conversation reads by its channel id (`zulip:dm:<ids>`, the
-        // form every catch-up note and history line quotes); anything else
-        // is a stream name or stream channel id.
         const dmIds = parseDmChannelId(channel.startsWith("zulip:") ? channel : `zulip:${channel}`);
         const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
         const limit = clampInt(args.limit, 50, 1, 1000);
@@ -946,8 +884,6 @@ export class ZulipToolRuntime {
       }
 
       case "fetch_attachment": {
-        // Validation (realm host + /user_uploads/ prefix, with the URL
-        // dot-segment normalization invariant) lives in parseZulipAttachmentUrl.
         const url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm);
 
         const headers: Record<string, string> = {};
@@ -961,23 +897,18 @@ export class ZulipToolRuntime {
     }
   }
 
-  // ── Emoji resolution ──
-
   private emojiCache: { at: number; emoji: Record<string, { id: string; name: string; deactivated?: boolean }> } | null = null;
 
   private async realmEmoji(): Promise<Record<string, { id: string; name: string; deactivated?: boolean }>> {
     const now = Date.now();
     if (this.emojiCache && now - this.emojiCache.at < 300_000) return this.emojiCache.emoji;
     const result = await this.zulipClient.emojis.retrieve();
-    // An API error is an error, not an empty realm — and never cached as one.
     assertApiSuccess(result, "listing realm emoji");
     const emoji = (result?.emoji ?? {}) as Record<string, { id: string; name: string; deactivated?: boolean }>;
     this.emojiCache = { at: now, emoji };
     return emoji;
   }
 
-  /** `:name:` or `name` → the reaction params Zulip wants: a realm emoji
-   *  needs its code and type; anything else is tried as unicode by name. */
   private async resolveEmoji(raw: string): Promise<{ emoji_name: string; emoji_code?: string; reaction_type: string }> {
     const name = raw.trim().replace(/^:|:$/g, "");
     if (!name) throw new Error("emoji_name is required");
@@ -985,12 +916,9 @@ export class ZulipToolRuntime {
       const realm = Object.values(await this.realmEmoji()).find((e) => e.name === name && !e.deactivated);
       if (realm) return { emoji_name: name, emoji_code: realm.id, reaction_type: "realm_emoji" };
     } catch {
-      // Realm emoji lookup is best-effort; fall through to unicode.
     }
     return { emoji_name: name, reaction_type: "unicode_emoji" };
   }
-
-  // ── User resolution ──
 
   private userCache: { at: number; members: any[] } | null = null;
 
@@ -1004,11 +932,6 @@ export class ZulipToolRuntime {
     return members;
   }
 
-  /**
-   * A user id from a name, email, or id. Exact, case-insensitive matches
-   * only — a near-miss fails loudly rather than messaging the wrong person,
-   * and an ambiguous name lists the candidates with their ids.
-   */
   async resolveUserId(query: string): Promise<number> {
     const q = query.trim();
     if (/^\d+$/.test(q)) return Number(q);
@@ -1024,8 +947,6 @@ export class ZulipToolRuntime {
     }
     throw new Error(`No user matches "${q}" (by full name, email, or id). Use find_user to search.`);
   }
-
-  // ── Resources ──
 
   listResources(): ResourceDescriptor[] {
     const resources: ResourceDescriptor[] = [
@@ -1043,7 +964,6 @@ export class ZulipToolRuntime {
       },
     ];
 
-    // Add a resource for each monitored Zulip channel
     for (const channel of this.monitoredChannels.keys()) {
       resources.push({
         uri: `zulip://channel/${channel}/unread`,
@@ -1060,7 +980,6 @@ export class ZulipToolRuntime {
     const zulipClient = this.zulipClient;
     const monitoredChannels = this.monitoredChannels;
 
-    // Handle unread summary
     if (uri === "zulip://unread/summary") {
       let totalUnread = 0;
       const channelSummaries: string[] = [];
@@ -1081,7 +1000,6 @@ export class ZulipToolRuntime {
             channelSummaries.push(`📬 #${channelName}: ${unread.length} unread`);
           }
         } catch (error) {
-          // Skip channels with errors
         }
       }
 
@@ -1092,7 +1010,6 @@ export class ZulipToolRuntime {
       return { contents: [{ uri, mimeType: "text/plain", text: summary }] };
     }
 
-    // Handle monitoring status
     if (uri === "zulip://monitoring/status") {
       const status = {
         session_id: this.sessionId,
@@ -1106,7 +1023,6 @@ export class ZulipToolRuntime {
       return { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(status, null, 2) }] };
     }
 
-    // Handle individual channel unread count
     const channelMatch = uri.match(/^zulip:\/\/channel\/([^/]+)\/unread$/);
     if (channelMatch) {
       const channelName = channelMatch[1];

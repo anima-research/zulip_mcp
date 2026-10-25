@@ -51,34 +51,26 @@ export class CapabilityGrant {
     this.readyWaiters = [];
   }
 
-  /** True once a grant-bearing `featureSets/update` Request has been accepted. */
   isReady(): boolean {
     return this.state.ready;
   }
 
-  /** Resolves the first time a policy is accepted. */
   whenReady(): Promise<void> {
     if (this.isReady()) return Promise.resolve();
     return new Promise<void>((resolve) => this.readyWaiters.push(resolve));
   }
 
-  /**
-   * Is `path` in the effective grant? False before the initial policy
-   * exchange, and false for any path the host did not name.
-   */
   has(path: string): boolean {
     if (!this.state.ready) return false;
     return capabilityGranted(this.state.effectiveCapabilities, path);
   }
 
-  /** Is a declared feature set currently active? */
   isFeatureSetActive(name: string): boolean {
     if (!this.state.ready) return false;
     if (!featureSetSelected(this.state, name)) return false;
     return this.missingFor(name).length === 0;
   }
 
-  /** Capability paths a declared feature set needs but has not been granted. */
   missingFor(name: string): string[] {
     const decl = this.declarations[name];
     if (!decl) return [];

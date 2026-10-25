@@ -1,13 +1,3 @@
-/**
- * The server manifest — SPEC 0.5 §17.1, §17.3, §17.4, §17.10.
- *
- * Canonicalization, the content digest, and the change-domain diff are
- * @animalabs/mcpl-core's (conformance-tested there against the RFC-003
- * vectors). These cases pin how this server's manifest rides on them: the
- * digest is content-derived and stable, a change is announced once with the
- * domains it touched, and `mcpl/manifest` answers with a snapshot.
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -67,7 +57,6 @@ test('a real change announces exactly one notification, with domains and nothing
   const { announcements, notifier } = collector();
   tracker.attach(notifier);
 
-  // Typing off touches the channel advertisement AND the messaging `uses`.
   const change = tracker.setManifest(buildServerCapabilities({ typing: false }));
 
   assert.equal(change.changed, true);

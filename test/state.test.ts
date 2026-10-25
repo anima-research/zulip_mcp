@@ -19,9 +19,7 @@ test('rollback hands back what was sent after the checkpoint and truncates the r
   assert.equal(t.rollback('chk_nope'), null);
   assert.deepEqual(t.rollback(c1)!.map((m) => m.messageId), ['2', '3', '4']);
   assert.equal(t.current, c1);
-  // A second rollback to the same checkpoint has nothing left to undo.
   assert.deepEqual(t.rollback(c1), []);
-  // Old checkpoints survive: c2 is still addressable (now empty).
   assert.deepEqual(t.rollback(c2), []);
 });
 
@@ -34,7 +32,6 @@ test('chunkMessage splits long text at paragraph, then line, then hard boundarie
   assert.deepEqual(chunkMessage(lines, 110).map((c) => c.length), [101, 50]);
   const wall = 'w'.repeat(250);
   assert.deepEqual(chunkMessage(wall, 100).map((c) => c.length), [100, 100, 50]);
-  // Every chunk respects the limit and the concatenation loses no characters.
   const mixed = `${'p'.repeat(9000)}\n\n${'q'.repeat(9000)}\n${'r'.repeat(3000)}`;
   const chunks = chunkMessage(mixed);
   assert.ok(chunks.every((c) => c.length <= ZULIP_MAX_MESSAGE_LENGTH));

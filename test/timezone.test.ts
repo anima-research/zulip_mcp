@@ -72,6 +72,5 @@ test('the message-line time drops the zone name from full (the offset stays), ke
   assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC', AGENT_TIMESTAMP_STYLE: 'compact' })(d), '2026-09-14 08:42');
   assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC', AGENT_TIMESTAMP_STYLE: 'none' })(d), '');
   assert.equal(agentLineTimeFormatter({ AGENT_TIMEZONE: 'UTC' })(new Date('not a date')), '');
-  // formatAgentDateTime's own default is unchanged.
   assert.equal(formatAgentDateTime(d, 'UTC'), '2026-09-14T08:42:52+00:00 [UTC]');
 });

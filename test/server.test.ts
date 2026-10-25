@@ -1,13 +1,3 @@
-/**
- * ZulipMcplServer — the wire. A host talks to the server over an in-memory
- * stream pair through the same `McplConnection` both ends use in
- * production, so these cases exercise the actual JSON-RPC framing, the
- * initialize handshake, the §5.3 policy exchange, channel registration,
- * incoming delivery with tags, publish routing, and the tool surface in both
- * plain-MCP and MCPL modes.
- *
- * Run: node --import tsx --test test/server.test.ts
- */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -49,17 +39,14 @@ interface FakeAdapter extends PlatformAdapter {
   systemEvent: OnSystemEvent | null;
   react: OnReaction | null;
   change: OnMessageChange | null;
-  /** The stream's messages, oldest first; fetchHistory pages over them by id. */
   history: IncomingChannelMessage[];
   historyCalls: { channelId: string; query: ChannelHistoryQuery }[];
   subscribed: string[];
   acked: string[];
   deleted: string[];
-  /** Streams whose subscription fails, with the reason. */
   subscribeError: Map<string, string>;
   /** The platform's page ceiling (Zulip: 5000); smaller than the ask forces paging. */
   pageCap: number;
-  /** What discoverChannels answers now — a stream the bot joins later is pushed here. */
   visible: ChannelDescriptor[];
 }
 
@@ -85,7 +72,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     async fetchHistory(channelId, query): Promise<ChannelHistoryPage> {
       adapter.historyCalls.push({ channelId, query });
       let rows = adapter.history.filter((m) => m.channelId === channelId);
-      // As history.ts does: the after-cursor wins when both are given.
       if (query.afterMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) > Number(query.afterMessageId));
       else if (query.beforeMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) < Number(query.beforeMessageId));
       const limit = Math.min(query.limit, adapter.pageCap);
@@ -128,16 +114,13 @@ function fakeAdapter(withTyping = true): FakeAdapter {
 
 const fakeTools = {
   calls: [] as { name: string; args: Record<string, unknown> }[],
-  /** Set by the server; the real runtime reports every message a tool sends. */
   onSent: null as null | ((sent: { messageId: string; channelId: string; content: string }) => void),
-  /** Set by the server; the real runtime reports streams `listen` subscribed to. */
   onSubscribed: null as null | ((streams: string[]) => unknown),
   async handleToolCall(name: string, args: Record<string, unknown>) {
     fakeTools.calls.push({ name, args });
     if (name === 'explode') throw new Error('boom');
     if (name === 'send_message') fakeTools.onSent?.({ messageId: '99', channelId: 'zulip:general', content: String(args.content ?? '') });
     if (name === 'listen') {
-      // The real runtime subscribes, then awaits onSubscribed and reports it.
       const registration = await fakeTools.onSubscribed?.(args.channels as string[]);
       return { result: 'success', subscribed: args.channels, ...(registration ? { registration } : {}) };
     }
@@ -156,13 +139,10 @@ interface Harness {
   server: ZulipMcplServer;
   adapter: FakeAdapter;
   host: McplConnection;
-  /** Server→host requests the host reactor answered, in order. */
   hostSaw: JsonRpcRequest[];
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   served: Promise<void>;
-  /** How the host answers channels/incoming: per-message rejections (for
-   *  good, or once), and whole batches that error out (counted down per batch). */
   policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string> };
   close(): Promise<void>;
 }
@@ -178,7 +158,6 @@ interface HarnessOptions {
   batchWindowMs?: number;
   attributeDelivery?: boolean;
   announceTimeoutMs?: number;
-  /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
 }
 
@@ -254,11 +233,9 @@ function harness(opts: HarnessOptions = {}): Harness {
               policy.reconcileOpens.push({ channelId: c.id, ok: false, detail: (err as Error).message });
             }
           }
-          // The test may have torn the connection down while this host was
-          // still reconciling; that write is the harness's, not the server's.
           try {
             host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) });
-          } catch { /* connection closed */ }
+          } catch { }
         })();
       }
       else host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: policy.changedAnswer === 'accept' })) });
@@ -311,7 +288,6 @@ const FULL_GRANT = [
   'contextHooks.beforeInference.inject.beforeUser',
 ];
 
-/** Wait until `predicate` holds, polling — the server's async work is real. */
 async function until(predicate: () => boolean, what: string, ms = 2000): Promise<void> {
   const deadline = Date.now() + ms;
   while (!predicate()) {
@@ -320,9 +296,6 @@ async function until(predicate: () => boolean, what: string, ms = 2000): Promise
   }
 }
 
-/** Registration completes only once the host's answer reaches the server;
- *  channels/list is the observable that it did. Live delivery follows the
- *  catch-up sweep, which is what most cases go on to exercise. */
 async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
   await until(() => h.adapter.emit !== null, 'event delivery to start');
   const deadline = Date.now() + 2000;
@@ -334,8 +307,6 @@ async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
   }
   if (andLive) await until(() => h.server.isLive, 'live delivery');
 }
-
-// --- plain MCP ---------------------------------------------------------------
 
 test('a plain-MCP client gets tools and resources, and no MCPL manifest', async () => {
   const h = harness();
@@ -370,11 +341,9 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   };
   assert.equal(read.contents[0].text, '{}');
 
-  // MCPL methods are not on offer to a client that did not negotiate MCPL.
   await assert.rejects(h.host.sendRequest(method.CHANNELS_LIST), /-32601/);
   await assert.rejects(h.host.sendRequest('no/such/method'), /-32601/);
 
-  // Events are never started for a plain-MCP client.
   assert.equal(h.adapter.emit, null);
   await h.close();
 });
@@ -408,8 +377,6 @@ test('an unknown MCP protocol revision is answered with the fallback', async () 
   await h.close();
 });
 
-// --- MCPL --------------------------------------------------------------------
-
 test('initialize carries the 0.5 manifest, and mcpl/manifest answers with the same snapshot (§5.1, §17.4)', async () => {
   const h = harness();
   const init = await initialize(h, true);
@@ -430,13 +397,11 @@ test('nothing is available before the policy exchange; the Request form settles 
   const h = harness();
   await initialize(h, true);
 
-  // Absence is denial: channel methods are refused with the capability named.
   await assert.rejects(h.host.sendRequest(method.CHANNELS_LIST), (err: Error & { code?: number; data?: unknown }) => {
     assert.equal(err.code, -32002);
     assert.deepEqual(err.data, { capability: 'channels.register' });
     return true;
   });
-  // ...and so is the tool surface.
   await assert.rejects(
     h.host.sendRequest('tools/call', { name: 'list_streams', arguments: {} }),
     (err: Error & { code?: number }) => err.code === -32002,
@@ -472,7 +437,6 @@ test('a degraded grant is reported as such and disables the tools of the feature
   assert.equal(receipt.mode, 'degraded');
   assert.ok(receipt.unavailableFeatures.some((f) => f.featureSet === 'zulip.messaging'));
 
-  // A messaging tool is unavailable with its feature set; a plain lookup is not.
   const send = (await h.host.sendRequest('tools/call', { name: 'send_message', arguments: {} })) as { isError?: boolean };
   assert.equal(send.isError, true);
   const upload = (await h.host.sendRequest('tools/call', { name: 'upload_file', arguments: { data: 'aGk=', name: 'a.txt' } })) as { isError?: boolean; content: { text: string }[] };
@@ -507,7 +471,6 @@ test('open → incoming with tags → publish routes to the topic of the convers
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await awaitRegistered(h);
 
-  // Not open yet: an incoming message on the channel goes nowhere.
   h.adapter.emit!({
     channelId: 'zulip:general',
     messageId: '1',
@@ -537,7 +500,6 @@ test('open → incoming with tags → publish routes to the topic of the convers
   await until(() => h.incoming.length === 1, 'channels/incoming');
   assert.equal(h.incoming[0].messageId, '2');
   assert.deepEqual(h.incoming[0].tags, ['chat:mention', 'chat:from-human']);
-  // The body the model reads says who, where and when; the fields stay.
   assert.equal((h.incoming[0].content[0] as { text: string }).text, '[T id=2] [#general > deploys] Ann (mention): ship it?');
   assert.deepEqual(h.incoming[0].author, { id: '9', name: 'Ann' });
   assert.equal(h.incoming[0].threadId, 'deploys');
@@ -552,13 +514,11 @@ test('open → incoming with tags → publish routes to the topic of the convers
   assert.equal(h.adapter.published[0].hints?.threadId, 'deploys');
   assert.equal((h.adapter.published[0].hints?.metadata as { topic: string }).topic, 'deploys');
 
-  // Typing, both carriers.
   await h.host.sendRequest(method.CHANNELS_TYPING, { channelId: 'zulip:general', op: 'start' });
   h.host.sendNotification(method.CHANNELS_TYPING, { channelId: 'zulip:general', op: 'stop' });
   await until(() => h.adapter.typing.length === 2, 'typing');
   assert.deepEqual(h.adapter.typing.map((t) => t.op), ['start', 'stop']);
 
-  // A platform system event reaches the open channel as a system message.
   h.adapter.systemEvent!({ kind: 'gap', text: 'queue expired', metadata: { platform: 'zulip' } });
   await until(() => h.incoming.length === 2, 'system event');
   assert.equal((h.incoming[1].metadata as { system: boolean; kind: string }).system, true);
@@ -591,7 +551,6 @@ test('context/beforeInference injects history for open channels under zulip.cont
   assert.equal(result.contextInjections.length, 1);
   assert.equal(result.contextInjections[0].position, 'beforeUser');
 
-  // Disabling the feature set by Notification is a reduction, honoured at once.
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.context'] });
   await new Promise((r) => setTimeout(r, 10));
   const reduced = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, params)) as { contextInjections: unknown[] };
@@ -614,8 +573,6 @@ test('the manifest omits channels.typing when the adapter cannot type', async ()
   assert.equal(manifest.channels.typing, false);
   await h.close();
 });
-
-// --- delivery model ---------------------------------------------------------
 
 function streamMsg(id: number, over: Partial<IncomingChannelMessage> & { mentioned?: boolean; text?: string } = {}): IncomingChannelMessage {
   const { mentioned = false, text = `msg ${id}`, ...rest } = over;
@@ -642,7 +599,6 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
   await initialize(h, true);
   await settled(h);
 
-  // Open then close: closing is what starts the tally.
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
   h.adapter.emit!(streamMsg(1));
   await until(() => h.incoming.length === 1, 'open-channel delivery');
@@ -668,8 +624,6 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
   assert.equal(origin.isMention, true);
   assert.equal(origin.missedMessages, 2);
   assert.equal(origin.missedCharacters, 'chatter'.length + 'more chatter'.length);
-  // The watermark moves once the host has acknowledged the push, not when
-  // the request leaves — an unacknowledged forward is not a forward.
   await until(() => h.server.delivery.watermark('zulip:general') === 4, 'watermark after acknowledged push');
 
   const missed = (await h.host.sendRequest('tools/call', { name: 'channel_missed', arguments: { channel: '#general' } })) as {
@@ -680,7 +634,6 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
   assert.equal(report.missedMessages, 2);
   assert.equal(report.sinceMessageId, 1);
 
-  // Reopening ends the tally.
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
   const cleared = JSON.parse(
     ((await h.host.sendRequest('tools/call', { name: 'channel_missed', arguments: { channel: 'general' } })) as { content: { text: string }[] }).content[0].text,
@@ -699,7 +652,6 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   const mention = (id: number, topic: string) =>
     streamMsg(id, { mentioned: true, text: `@bot a question in ${topic}`, threadId: topic, metadata: { topic, mentioned: true, isDM: false } });
 
-  // A stream the agent had open, its last message in "deploys", then closed.
   const h = harness();
   await initialize(h, true);
   await settled(h);
@@ -708,11 +660,8 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   await until(() => h.incoming.length === 1, 'open-channel delivery');
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
 
-  // Each push is answered once the host has accepted it, as an agent answers
-  // what it was given: the watermark moves on that acceptance.
   h.adapter.emit!(mention(2, 'billing'));
   await until(() => h.server.delivery.watermark('zulip:general') === 2, 'the mention in billing accepted');
-  // Typing with no topic from the host follows the same hint.
   await h.host.sendRequest(method.CHANNELS_TYPING, { channelId: 'zulip:general', op: 'start' });
   await until(() => h.adapter.typing.length === 1, 'typing start');
   assert.equal(h.adapter.typing[0].metadata?.topic, 'billing');
@@ -721,13 +670,11 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   await until(() => h.server.delivery.watermark('zulip:general') === 3, 'the mention in support accepted');
   assert.deepEqual(await answer(h, 'about support'), { threadId: 'support', topic: 'support' });
 
-  // A message that doesn't address the agent isn't pushed, and moves nothing.
   h.adapter.emit!(streamMsg(4, { text: 'chatter', threadId: 'chatter', metadata: { topic: 'chatter', mentioned: false, isDM: false } }));
   await until(() => h.server.delivery.tally('zulip:general')?.talliedThrough === 4, 'the ambient message tallied');
   assert.equal(h.pushed.length, 2, 'not pushed');
   assert.deepEqual(await answer(h, 'still about support'), { threadId: 'support', topic: 'support' });
 
-  // A mention the host refuses never reached the agent, so it moves nothing.
   h.policy.rejectPushes.add('5');
   h.adapter.emit!(mention(5, 'random'));
   await until(() => h.server.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'the refusal handled: held as failed');
@@ -735,7 +682,6 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   assert.deepEqual(await answer(h, 'and still about support'), { threadId: 'support', topic: 'support' });
   await h.close();
 
-  // A stream never open: the first answer goes to the mention's topic too.
   const g = harness();
   await initialize(g, true);
   await settled(g);
@@ -753,8 +699,6 @@ test('an answer after channels/open with history goes to the topic of its newest
   const inTopic = (id: number, topic: string) => streamMsg(id, { threadId: topic, metadata: { topic, mentioned: false, isDM: false } });
   const history = [inTopic(1, 'deploys'), inTopic(2, 'printer')];
 
-  // A stream never open in this process: the agent opens it, reads its
-  // backscroll and answers, and typing with no topic from the host follows.
   const h = harness({ history });
   await initialize(h, true);
   await settled(h);
@@ -765,10 +709,6 @@ test('an answer after channels/open with history goes to the topic of its newest
   assert.equal(await answerTopic(h), 'printer');
   await h.close();
 
-  // History fetched before a given message is older history, read for
-  // context, so it moves nothing, and the answer has no topic from it. With
-  // no watermark yet, sinceLastSeen has nothing to read forward from, so the
-  // page is fetched before the message.
   const g = harness({ history });
   await initialize(g, true);
   await settled(g);
@@ -781,9 +721,6 @@ test('an answer after channels/open with history goes to the topic of its newest
   assert.equal(await answerTopic(g), undefined);
   await g.close();
 
-  // A mention pushed while the stream is closed keeps its topic through an
-  // open without history, as a host opens a stream to deliver an answer,
-  // and through an open whose history is older than the mention.
   const k = harness({ history });
   await initialize(k, true);
   await settled(k);
@@ -808,13 +745,11 @@ test('ZULIP_ATTRIBUTE_DELIVERY=false delivers bare bodies on every attributed su
   assert.equal((h.incoming[0].content[0] as { text: string }).text, '@bot ping');
   assert.equal((h.incoming[0].metadata as { attributed?: boolean }).attributed, undefined);
 
-  // A gap recovers 2 and 3 onto the open channel through the replay path.
   h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
   await until(() => h.incoming.length === 4, 'recovered + marker');
   assert.equal((h.incoming[1].metadata as { recovered: boolean }).recovered, true);
   assert.equal((h.incoming[1].content[0] as { text: string }).text, 'msg 2');
 
-  // A mention on a closed channel goes out as push/event, bare, with no stamp in origin.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.emit!(streamMsg(4, { mentioned: true, text: '@bot closed' }));
   await until(() => h.pushed.length === 1, 'push');
@@ -841,13 +776,11 @@ test('channels/open returns capped history before the lifecycle commits, and sub
   assert.deepEqual(h.adapter.subscribed, ['zulip:general']);
   assert.equal(h.server.delivery.watermark('zulip:general'), 12, 'returned history counts as forwarded');
 
-  // A request past the descriptor's cap is truncated and says so.
   const capped = (await h.host.sendRequest(method.CHANNELS_OPEN, {
     channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 9999 },
   })) as { historyTruncated?: boolean; history?: unknown[] };
   assert.equal(capped.historyTruncated, true);
 
-  // sinceLastSeen pages from the watermark.
   h.adapter.history.push(streamMsg(13), streamMsg(14));
   const since = (await h.host.sendRequest(method.CHANNELS_OPEN, {
     channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 50, sinceLastSeen: true },
@@ -856,8 +789,6 @@ test('channels/open returns capped history before the lifecycle commits, and sub
   const lastCall = h.adapter.historyCalls[h.adapter.historyCalls.length - 1];
   assert.equal(lastCall.query.afterMessageId, '12');
 
-  // sinceLastSeen wins over a message to page back from, so the page is new
-  // history, and its newest message gives the answer's topic.
   h.adapter.history.push(streamMsg(15, { threadId: 'printer', metadata: { topic: 'printer', mentioned: false, isDM: false } }));
   const both = (await h.host.sendRequest(method.CHANNELS_OPEN, {
     channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 50, sinceLastSeen: true, beforeMessageId: '13' },
@@ -874,7 +805,6 @@ test('channels/open returns capped history before the lifecycle commits, and sub
 test('the reconnect sweep delivers what arrived while offline, by what the host had open', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-sweep-'));
   try {
-    // Session 1: general open, watermark at 3; dev only watermarked (closed).
     const first = harness({ stateDir: dir, sessionId: 'sw' });
     await initialize(first, true);
     await settled(first);
@@ -885,8 +815,6 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     first.server.delivery.save();
     await first.close();
 
-    // Session 2: new messages exist beyond both watermarks.
-    // dev's one mention is in "triage", and the talk after it in "chatter".
     const devTopic = (id: number) => (id === 60 ? 'triage' : id > 60 ? 'chatter' : 'deploys');
     const later = [
       streamMsg(4, { text: 'while you were away' }),
@@ -901,7 +829,6 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
       }),
     ];
     const second = harness({ stateDir: dir, sessionId: 'sw', history: later });
-    // dev must be a registered channel for the sweep to consider it.
     second.adapter.discoverChannels = async () => [DESCRIPTOR, { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } }];
     await initialize(second, true);
     await settled(second);
@@ -923,9 +850,6 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
 
     assert.equal(second.server.delivery.watermark('zulip:general'), 6);
     assert.equal(second.server.delivery.watermark('zulip:dev'), 70, 'advanced past everything scanned');
-    // The agent answers the blocks through channels/publish: a backscroll's
-    // answer goes to its newest message's topic, a mention block's to its
-    // newest mention's, not the talk after it.
     const topicOfAnswer = async (channelId: string) => {
       await second.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId, content: [{ type: 'text', text: 'back now' }] });
       return (second.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic;
@@ -934,7 +858,6 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     assert.equal(await topicOfAnswer('zulip:dev'), 'triage');
     await second.close();
 
-    // Session 3: nothing new → nothing pushed, and the sweep runs once.
     const third = harness({ stateDir: dir, sessionId: 'sw', history: later });
     await initialize(third, true);
     await settled(third);
@@ -1007,14 +930,11 @@ test('a DM from a new conversation registers its channel, is pushed with a reply
   assert.match(first, /^<system>Direct message from Bo \(user id 42\)\. To reply, use send_dm\(\["42"\]\) or publish to channel zulip:dm:42/);
   assert.equal((push.payload.content[1] as { text: string }).text, '[T id=500] [DM] Bo: hey, got a minute?');
 
-  // The second message from the same conversation carries no affordance.
   await until(() => h.server.delivery.watermark('zulip:dm:42') === 500, 'watermark');
   h.adapter.emit!({ ...dm, messageId: '501', content: [{ type: 'text', text: 'still there?' }] });
   await until(() => h.pushed.length === 2, 'second push');
   assert.equal((h.pushed[1].payload.content[0] as { text: string }).text, '[T id=501] [DM] Bo: still there?');
 
-  // Opening the DM channel routes the conversation through channels/incoming,
-  // and a publish reaches the adapter with the DM channel id.
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:dm:42', type: 'zulip', address: {} });
   h.adapter.emit!({ ...dm, messageId: '502', content: [{ type: 'text', text: 'ok' }] });
   await until(() => h.incoming.length === 1, 'incoming on the open DM');
@@ -1062,16 +982,11 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
     assert.equal(got.plane.status, 'live');
     assert.equal(got.reactionSuppression.status, 'not-configured');
 
-    // Removing the only allowed stream would empty the list — and an empty
-    // allowlist is unrestricted, so the edit is refused rather than
-    // silently re-opening everything.
     const emptied = await call('filters_update', { removeStreams: ['general'] });
     assert.equal(emptied.isError, true);
     assert.match(emptied.content[0].text, /last allowed stream/);
     assert.equal(plane.current().streams, undefined, 'nothing was written');
 
-    // Removing from an unrestricted allowlist materializes it first; adding
-    // a stream re-discovers and announces channels the host lacks.
     h.adapter.discoverChannels = async () => [DESCRIPTOR, { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } }];
     const upd = json(await call('filters_update', { addStreams: ['dev'], removeStreams: ['general'], setDmUsers: ['42'] }));
     assert.deepEqual(upd.streams, ['dev']);
@@ -1084,12 +999,10 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
     assert.equal(plane.dmAllowed({ id: 42, email: 'x' }), true);
     assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), false);
 
-    // Clearing the DM allowlist is allowed, and says what it means.
     const anyone = json(await call('filters_update', { setDmUsers: [] }));
     assert.equal(anyone.dmUsers, null);
     assert.match(anyone.note, /UNRESTRICTED/);
 
-    // A DM cannot be muted; the error names the right lever.
     const bad = await call('mute_channel', { channel: 'zulip:dm:42' });
     assert.equal(bad.isError, true);
     assert.match(bad.content[0].text, /dmUsers/);
@@ -1109,7 +1022,6 @@ test('attachments on live delivery are inlined from the configured source', asyn
         async fetch(path) {
           fetched.push(path);
           if (path.endsWith('.png')) {
-            // A 1x1 PNG.
             const buf = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
             return { buf, mimeType: 'image/png', overflow: false };
           }
@@ -1151,7 +1063,6 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
   const original = console.error;
   console.error = () => {};
   try {
-    // One name-shaped entry and one glyph, as the host's baseline carries them.
     const plane = new FiltersPlane(join(dir, 'filters.json'), { ZULIP_SUPPRESSED_REACTIONS_BASELINE: 'biohazard,🛑' }, { pollMs: 60_000 });
     plane.start();
     const h = harness({ filters: plane });
@@ -1165,7 +1076,6 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
       ...over,
     });
 
-    // Default off: nothing surfaces.
     reaction();
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(h.incoming.length, 0);
@@ -1187,14 +1097,11 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
     assert.deepEqual(h.incoming[1].tags, ['chat:reaction-remove']);
     assert.equal((h.incoming[1].content[0] as { text: string }).text, '[reaction] Ann removed a reaction :thumbs_up: on message 77');
 
-    // Suppressed emoji: no glyph, no event, nowhere — by name, or by the
-    // codepoints a glyph-shaped baseline entry is matched on.
     reaction({ emoji: 'biohazard' });
     reaction({ emoji: 'octagonal_sign', emojiCode: '1f6d1', emojiType: 'unicode_emoji' });
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(h.incoming.length, 2);
 
-    // Closed channel with visibility on → push/event.
     await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
     reaction({ emoji: 'eyes' });
     await until(() => h.pushed.length === 1, 'reaction push on a closed channel');
@@ -1226,7 +1133,6 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
   assert.match(sent.state!.checkpoint, /^chk_/);
   assert.equal(sent.state!.parent, null);
   const afterOne = sent.state!.checkpoint;
-  // A read-only tool carries no checkpoint; a later messaging tool chains.
   assert.equal((await call('list_streams', {})).state, undefined);
   const next = await call('add_reaction', { message_id: 1, emoji_name: 'eyes' });
   assert.equal(next.state!.parent, afterOne);
@@ -1244,7 +1150,6 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
   assert.equal(rolled.reason, undefined);
   assert.deepEqual(h.adapter.deleted, ['42', '43'], 'everything sent after the checkpoint (publish 41 and tool send 99 came before)');
 
-  // Rolling back to the later checkpoint now undoes the tool's own send.
   const rolledFurther = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint: afterOne })) as { success: boolean };
   assert.equal(rolledFurther.success, true);
   assert.deepEqual(h.adapter.deleted, ['42', '43'], 'nothing left to undo after the checkpoint');
@@ -1253,15 +1158,12 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
   assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
   assert.deepEqual(h.adapter.acked, ['7:eyes']);
 
-  // Streaming notifications are accepted and deliver nothing.
   h.host.sendNotification(method.CHANNELS_OUTGOING_CHUNK, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', index: 0, delta: 'never sent' });
   h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'never sent' }] });
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(h.adapter.published.length, 3);
   await h.close();
 });
-
-// --- review fix round ---------------------------------------------------------
 
 test('the watermark never passes an undelivered message: a refusal or a lost batch holds it, the next answer replays them, shutdown flushes', async () => {
   const original = console.error;
@@ -1272,8 +1174,6 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     await settled(h);
     await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
 
-    // The host itemizes: 2 is refused (once). The watermark stops short of
-    // it although 3, in the same batch, was accepted.
     h.policy.rejectOnce.add('2');
     h.adapter.emit!(streamMsg(1));
     h.adapter.emit!(streamMsg(2));
@@ -1281,8 +1181,6 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     await until(() => h.incoming.length === 2, 'the accepted pair');
     assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '3']);
     assert.equal(h.server.delivery.watermark('zulip:general'), 1, 'held below the refused id');
-    // The host is answering, so the refused message is fetched back from
-    // history and offered again; accepted now, the watermark catches up.
     await until(() => h.incoming.length === 3, 'the replay');
     assert.equal(h.incoming[2].messageId, '2');
     assert.ok(h.incoming[2].tags!.includes('zulip:missed'));
@@ -1291,9 +1189,6 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     h.adapter.emit!(streamMsg(4));
     await until(() => h.server.delivery.watermark('zulip:general') === 4, 'watermark 4');
 
-    // Two transport failures in a row — the attempt and its retry — then
-    // the host recovers and accepts the next message: the lost one is not
-    // buried under that acceptance.
     h.policy.failIncomingBatches = 2;
     h.adapter.emit!(streamMsg(5));
     await until(() => h.policy.failIncomingBatches === 0 && h.server.channelManager.pendingCount() === 0, 'given up after the retry');
@@ -1306,8 +1201,6 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     await until(() => h.server.delivery.watermark('zulip:general') === 6, 'watermark 6 once 5 is in');
     assert.equal(h.server.delivery.floor('zulip:general'), undefined);
 
-    // Shutdown on a live connection pushes the last window out instead of
-    // cancelling it.
     h.adapter.emit!(streamMsg(7));
     assert.equal(h.server.channelManager.pendingCount(), 1);
     await h.server.shutdown();
@@ -1352,7 +1245,6 @@ test('a muted stream is silent on every surface: open-history, context injection
     assert.equal(h.adapter.historyCalls.length, 0);
     await h.close();
 
-    // The reconnect sweep: a watermarked muted stream with new mentions pushes nothing.
     const first = harness({ stateDir: dir, sessionId: 'mute' });
     await initialize(first, true);
     await settled(first);
@@ -1390,13 +1282,11 @@ test('channels/open fails — and commits nothing — when the bot cannot subscr
   assert.equal(h.adapter.historyCalls.length, 0, 'history is not fetched for an open that failed');
   assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
   assert.equal(h.server.delivery.wasOpen('zulip:general'), false);
-  // Still closed: ambient goes nowhere, and a mention is pushed as usual.
   h.adapter.emit!(streamMsg(2));
   h.adapter.emit!(streamMsg(3, { mentioned: true }));
   await until(() => h.pushed.length === 1, 'mention on the still-closed channel');
   assert.equal(h.incoming.length, 0);
 
-  // Once the subscription can succeed, the open goes through.
   h.adapter.subscribeError.clear();
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:general');
@@ -1420,7 +1310,6 @@ test('channels/open re-discovers once when the channel was created after startup
   assert.deepEqual(h.adapter.subscribed, ['zulip:late-stream']);
   assert.equal(h.server.channelManager.isOpen('zulip:late-stream'), true);
 
-  // A channel that still is not there fails as before, and says what to do.
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:nope', type: 'zulip', address: {} }),
     (err: Error & { code?: number }) => {
@@ -1438,8 +1327,6 @@ test('a mention in a stream created after startup registers it, so the invitatio
   await initialize(h, true);
   await settled(h);
   const fresh: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
-  // Discovery would not find it (the stub still lists only #general): the
-  // descriptor the adapter attaches to the message is the only source.
   h.adapter.emit!(streamMsg(20, { channelId: 'zulip:late-stream', mentioned: true, text: '@bot join us?' }), fresh);
   await until(() => h.pushed.length === 1, 'the mention is pushed');
   assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED), 'the new stream was announced first');
@@ -1461,8 +1348,6 @@ test('live events received before the catch-up sweep are held, so a live deliver
     await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
     await first.close();
 
-    // Session 2: the sweep's history fetch is slow; a live mention (6) and a
-    // duplicate of something the sweep will deliver (5) arrive meanwhile.
     const second = harness({ stateDir: dir, sessionId: 'pl', history: [streamMsg(4), streamMsg(5, { mentioned: true })] });
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
@@ -1493,8 +1378,6 @@ test('live events received before the catch-up sweep are held, so a live deliver
 });
 
 test('gap recovery also catches up closed channels, paging through history up to the ceiling', async () => {
-  // Two mentions, an older one in "billing" and the newest in "triage",
-  // among talk in "deploys".
   const mention = (id: number, topic: string) =>
     streamMsg(id, { mentioned: true, threadId: topic, metadata: { topic, mentioned: true, isDM: false } });
   const h = harness({ history: Array.from({ length: 250 }, (_, i) =>
@@ -1515,7 +1398,6 @@ test('gap recovery also catches up closed channels, paging through history up to
   await until(() => h.server.delivery.watermark('zulip:general') === 101, 'the block accepted');
   assert.equal(h.server.delivery.watermark('zulip:general'), 101, 'advanced through everything scanned');
   assert.equal((h.pushed[0].origin as { truncated?: boolean }).truncated, true);
-  // The agent answers the block in the topic of its newest mention.
   await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
   assert.equal((h.adapter.published.at(-1)?.hints?.metadata as { topic?: string } | undefined)?.topic, 'triage');
   await h.close();
@@ -1527,17 +1409,13 @@ test('a catch-up block the host refuses moves no topic', async () => {
     : streamMsg(i + 2)) });
   await initialize(h, true);
   await settled(h);
-  // The last mention the agent was given is in "support", and older than the
-  // block's, so a refused block that took or cleared the hint would show.
   h.adapter.emit!(streamMsg(1, { mentioned: true, threadId: 'support', metadata: { topic: 'support', mentioned: true, isDM: false } }));
   await until(() => h.server.delivery.watermark('zulip:general') === 1, 'the mention in support accepted');
-  // The block goes out under the newest id it scanned, 21.
   h.policy.rejectPushes.add('21');
 
   h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
   await until(() => h.pushed.length === 2, 'catch-up push for the closed channel');
   assert.equal((h.pushed[1].origin as { messageId?: string }).messageId, '21');
-  // A round trip after the refusal: the server has handled it by the answer.
   await h.host.sendRequest(method.CHANNELS_LIST);
   assert.equal(h.server.delivery.watermark('zulip:general'), 1, 'refused: the watermark stays');
   await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'on it' }] });
@@ -1576,8 +1454,6 @@ test('a live message landing mid-drain queues behind the held ones instead of bu
     await until(() => first.incoming.length === 1, 'delivery');
     await first.close();
 
-    // Session 2: the sweep is slow, and the first held message carries an
-    // attachment whose fetch stalls once the drain reaches it.
     let releaseSweep!: () => void;
     const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
     let releaseFetch!: () => void;
@@ -1603,7 +1479,6 @@ test('a live message landing mid-drain queues behind the held ones instead of bu
     second.adapter.emit!(streamMsg(21));
     assert.equal(second.server.isLive, false);
     releaseSweep();
-    // The drain is now stalled on 20's attachment fetch when a live message lands.
     await new Promise((r) => setTimeout(r, 25));
     assert.equal(second.server.isLive, false, 'delivery stays gated until the buffer is empty');
     second.adapter.emit!(streamMsg(22));
@@ -1639,12 +1514,10 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     const call = async (name: string, args: Record<string, unknown>) =>
       JSON.parse(((await h.host.sendRequest('tools/call', { name, arguments: args })) as { content: { text: string }[] }).content[0].text);
 
-    // Narrow to #dev. The host still has #general registered and open.
     await call('filters_update', { addStreams: ['dev'], removeStreams: ['general'] });
     assert.equal(plane.streamAllowed('general'), false);
     h.adapter.history = [streamMsg(1), streamMsg(2, { mentioned: true }), streamMsg(3)];
 
-    // Live: dropped; a mention: not pushed; nothing tallied or watermarked.
     h.adapter.emit!(streamMsg(2, { mentioned: true }));
     h.adapter.emit!(streamMsg(3));
     await new Promise((r) => setTimeout(r, 25));
@@ -1652,7 +1525,6 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     assert.equal(h.pushed.length, 0);
     assert.equal(h.server.delivery.watermark('zulip:general'), 1);
 
-    // Backscroll on open and context injection: nothing, and no fetch either.
     const reopened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
       channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 10 },
     })) as { history?: unknown[] };
@@ -1662,8 +1534,6 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
       model: { id: 'm', vendor: 'v', contextWindow: 1, capabilities: [] },
     })) as { contextInjections: unknown[] };
     assert.deepEqual(ctx.contextInjections, []);
-    // Gap recovery: no replay from the stream. The marker itself is about the
-    // connection, not the stream, and still rides the open channel.
     h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
     await until(() => h.incoming.length === 2, 'the gap marker');
     assert.equal((h.incoming[1].metadata as { kind: string; recoveredMessages: number }).kind, 'gap');
@@ -1673,9 +1543,6 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     h.server.delivery.save();
     await h.close();
 
-    // The reconnect sweep: #general is watermarked with new mentions beyond
-    // the watermark, but outside the allowlist — not fetched, not pushed.
-    // #dev, inside it, is caught up.
     const second = harness({
       filters: plane, stateDir: dir, sessionId: 'al',
       history: [streamMsg(2, { mentioned: true }), streamMsg(3), streamMsg(60, { channelId: 'zulip:dev', mentioned: true, text: 'dev mention' })],
@@ -1687,7 +1554,6 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     assert.equal((second.pushed[0].origin as { mcplChannelId: string }).mcplChannelId, 'zulip:dev');
     assert.ok(second.adapter.historyCalls.every((c) => c.channelId !== 'zulip:general'), 'the excluded stream is never fetched');
 
-    // DMs are judged by sender: only user 42 may DM the bot now.
     const call2 = async (name: string, args: Record<string, unknown>) =>
       JSON.parse(((await second.host.sendRequest('tools/call', { name, arguments: args })) as { content: { text: string }[] }).content[0].text);
     await call2('filters_update', { setDmUsers: ['42'] });
@@ -1755,8 +1621,6 @@ test('a channel_open with backscroll during the sweep window does not hide the o
     await until(() => first.incoming.length === 1, 'delivery');
     await first.close();
 
-    // Session 2: the sweep's fetch (the first one) is slow; meanwhile the
-    // agent opens the channel asking for the two newest messages.
     const second = harness({ stateDir: dir, sessionId: 'sa', history: [4, 5, 6, 7, 8].map((id) => streamMsg(id)) });
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
@@ -1795,7 +1659,6 @@ test('a second connection to the same server starts from a fresh grant, registra
 
   const two = harness({ reuse: { server: one.server, adapter: one.adapter } });
   await initialize(two, true);
-  // Nothing of the first peer's grant carries over: absence is denial again.
   await assert.rejects(two.host.sendRequest(method.CHANNELS_LIST), (err: Error & { code?: number }) => err.code === -32002);
   assert.equal(two.server.channelManager.isOpen('zulip:general'), false, 'nor what it had open');
   await settled(two);
@@ -1837,8 +1700,6 @@ test('shutdown waits for a delivery still fetching its attachment, then flushes 
 
 test('catch-up pages past a page holding nothing but the bot\'s own messages', async () => {
   const h = harness({ history: [streamMsg(101), streamMsg(102), streamMsg(103, { mentioned: true })] });
-  // The adapter withholds the bot's own messages after fetching; 101 and
-  // 102 are its own, and the page size is two.
   const lastWithheldId = 102;
   const realFetch = h.adapter.fetchHistory!.bind(h.adapter);
   h.adapter.fetchHistory = async (channelId, query) => {
@@ -1858,8 +1719,6 @@ test('catch-up pages past a page holding nothing but the bot\'s own messages', a
   await h.close();
 });
 
-// ── Streams joined after startup (#20) ──
-
 const LATE_STREAM: ChannelDescriptor = {
   id: 'zulip:ops',
   type: 'zulip',
@@ -1875,13 +1734,11 @@ test('refresh_channels announces a newly visible stream and the host can then op
   const registered = h.hostSaw.find((r) => r.method === method.CHANNELS_REGISTER)!.params as ChannelsRegisterParams;
   assert.deepEqual(registered.channels.map((c) => c.id), ['zulip:general'], 'only what was visible at startup');
 
-  // Unknown until it is announced: the host cannot open what was never registered.
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }),
     (err: { code?: number; message?: string }) => err.code === -32023 && /Unknown channel: zulip:ops/.test(err.message ?? ''),
   );
 
-  // The bot joins #ops; the adapter can now see it.
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
 
   const refreshed = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] };
@@ -1901,14 +1758,11 @@ test('a message that carries a descriptor for an unregistered channel registers 
   await initialize(h, true);
   await settled(h);
 
-  // Not registered at startup: the bot was not in #ops then.
   await assert.rejects(
     h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }),
     (err: { code?: number }) => err.code === -32023,
   );
 
-  // A mention arrives from #ops. The adapter describes the stream with it,
-  // exactly as it does for a DM from a new conversation.
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
   h.adapter.emit!({
     channelId: 'zulip:ops',
@@ -1927,7 +1781,6 @@ test('a message that carries a descriptor for an unregistered channel registers 
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops', 'the channel the agent was mentioned in is openable, with no restart');
 
-  // A second message on the same stream does not re-announce it.
   const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
   h.adapter.emit!(streamMsg(901, { channelId: 'zulip:ops', metadata: { topic: 'incidents', mentioned: false, isDM: false } }));
   await until(() => h.incoming.length === 1, 'delivery on the now-open channel');
@@ -1950,14 +1803,12 @@ test('a channel the host never answered for stays usable here and is re-announce
   assert.deepEqual(first.pendingAnnouncement, ['zulip:ops']);
   assert.match(first.note, /could not be announced/);
 
-  // The host answers again: the next refresh re-announces what was pending.
   h.policy.changedAnswer = 'accept';
   const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; note: string };
   assert.deepEqual(second.added, ['zulip:ops']);
   assert.match(second.note, /Registered 1 newly visible channel/);
 
-  // And a third refresh has nothing left to say.
   const third = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; pendingAnnouncement?: string[] };
   assert.deepEqual(third.added, []);
@@ -1981,7 +1832,6 @@ test('a host that opens or closes a pending channel has confirmed it; the backlo
   assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'the answer could not arrive in time');
   await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
 
-  // Second call: nothing pending, no second announcement, no stall.
   const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
   const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; pendingAnnouncement?: string[]; note: string };
@@ -2023,7 +1873,6 @@ test('listen registers what it subscribed the bot to and reports how the host an
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
 
-  // A host that cannot answer in time: the tool says so rather than logging it.
   h.policy.changedAnswer = 'reconcile';
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM, { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } }];
   const stalled = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['infra'] } })) as { content: { text: string }[] }).content[0].text) as
@@ -2048,13 +1897,9 @@ test('a host that reconciles before it answers does not cost the channel — the
   assert.deepEqual(report.added, [], 'the answer never arrived in time');
   assert.deepEqual(report.pendingAnnouncement, ['zulip:ops'], 'and the agent is told exactly that');
 
-  // The channel is usable anyway: the agent can open what it was told about.
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
 
-  // And the host's own reconcile-time open is answered once the tool call
-  // returns, because the descriptor was recorded before the announcement went
-  // out rather than after the answer came back.
   await until(() => h.policy.reconcileOpens.length > 0, "the host's own channels/open is served");
   assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
   await h.close();
@@ -2074,7 +1919,6 @@ test('channels/open re-discovery settles against a host that reconciles before i
   await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
   assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
 
-  // Several timeouts' worth of quiet: announced once, not once per cycle.
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 1);
   assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
@@ -2089,7 +1933,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
   await settled(h);
 
-  // Ann's message is delivered and accepted: the watermark now covers id 10.
   h.adapter.emit!({
     channelId: 'zulip:general', messageId: '10', author: { id: '9', name: 'Ann' }, timestamp: new Date(1_700_000_000_000).toISOString(),
     content: [{ type: 'text', text: 'ship it' }], tags: ['chat:ambient'], metadata: { topic: 'deploys', mentioned: false, isDM: false },
@@ -2104,8 +1947,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
     ...over,
   });
 
-  // An edit of the accepted message surfaces on the open channel, with the
-  // message's own id in the line and a synthetic id that moves no watermark.
   h.adapter.change!(change());
   await until(() => h.incoming.length === 2, 'edit on the open channel');
   const edited = h.incoming[1];
@@ -2120,12 +1961,10 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal(meta.attributed, true);
   assert.equal(h.server.delivery.watermark('zulip:general'), 10, 'a change never advances the watermark');
 
-  // A message the host never accepted: its edit is noise.
   h.adapter.change!(change({ messageId: '11', messageIds: ['11'] }));
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(h.incoming.length, 2);
 
-  // ...unless the edit now mentions the bot, or the message is the bot's own.
   h.adapter.change!(change({ messageId: '11', messageIds: ['11'], mentioned: true, content: 'ship it @Bot?' }));
   await until(() => h.incoming.length === 3, 'a newly addressing edit');
   assert.equal((h.incoming[2].content[0] as { text: string }).text, '[edited] [T id=11] [#general > deploys] Ann (mention): ship it @Bot?');
@@ -2135,8 +1974,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal((h.incoming[3].content[0] as { text: string }).text, '[deleted] [T id=12] [#general > deploys] Ann: message deleted — was: "my own line"');
   assert.deepEqual(h.incoming[3].tags, ['chat:deleted', 'chat:ambient']);
 
-  // A message offered but not yet accepted (held) counts as seen: "post,
-  // then fix the typo" lands before the host's acceptance round trip.
   h.policy.rejectIds.add('13');
   h.adapter.emit!({
     channelId: 'zulip:general', messageId: '13', author: { id: '9', name: 'Ann' }, timestamp: new Date(1_700_000_070_000).toISOString(),
@@ -2147,8 +1984,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   await until(() => h.incoming.length === 5, 'an edit of a held message');
   assert.equal((h.incoming[4].content[0] as { text: string }).text, '[edited] [T id=13] [#general > deploys] Ann: ship it');
 
-  // A moderator's topic move of three messages reads as one line and does
-  // not retarget the agent's reply: the conversation is still in `deploys`.
   h.adapter.change!(change({ kind: 'move', messageIds: ['10', '8', '9'], content: null, previousContent: null, previousTopic: 'deploys', topic: 'deploys-2', actorId: '12' }));
   await until(() => h.incoming.length === 6, 'a topic move');
   assert.equal((h.incoming[5].content[0] as { text: string }).text, '[moved] [T id=10] [#general > deploys-2] Ann: topic changed from "deploys" (3 messages) [by user 12]');
@@ -2157,7 +1992,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal(h.adapter.published.length, 1);
   assert.equal((h.adapter.published[0].hints?.metadata as { topic: string }).topic, 'deploys', 'a move marker must not hijack reply routing');
 
-  // Closed channel: an ambient edit is dropped, an addressed one is pushed.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.change!(change());
   await new Promise((r) => setTimeout(r, 30));
@@ -2168,16 +2002,12 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.match(h.pushed[0].eventId, /^zulip_edit_10_1700000060000\.\d+$/);
   assert.equal((h.pushed[0].origin as { change: string; isMention: boolean }).change, 'edit');
   assert.equal((h.pushed[0].origin as { change: string; isMention: boolean }).isMention, true);
-  // Two edits within the same second are two pushes, not a host-side duplicate.
   h.adapter.change!(change({ mentioned: true, content: 'ship it @Bot now' }));
   await until(() => h.pushed.length === 2, 'a second edit within the same second');
   assert.notEqual(h.pushed[1].eventId, h.pushed[0].eventId);
-  // A deleted mention on a closed channel is pushed: the message the agent
-  // was about to answer is gone.
   h.adapter.change!(change({ kind: 'delete', content: null, mentioned: true, previouslyMentioned: true, actorId: null }));
   await until(() => h.pushed.length === 3, 'a deleted mention on a closed channel');
   assert.deepEqual(h.pushed[2].tags, ['chat:deleted', 'chat:mention']);
-  // A move into a stream the bot cannot see reads as a vanishing, not a deletion.
   h.adapter.change!(change({ kind: 'delete', content: null, mentioned: true, previouslyMentioned: true, actorId: null, vanished: true }));
   await until(() => h.pushed.length === 4, 'a vanished mention');
   assert.equal((h.pushed[3].payload as { content: { text: string }[] }).content[0].text, '[deleted] [T id=10] [#general > deploys] Ann (mention): no longer visible to the bot (moved to a stream it cannot see) — was: "ship it"');
@@ -2186,9 +2016,6 @@ test('an edit, move or deletion is as visible as its message: open channels see 
 });
 
 test('an edit from a stream the bot joined after startup registers the channel too (#20)', async () => {
-  // The first thing a newly joined stream sends can be an edit — a message
-  // edited into a mention. That marker must not name a channel the agent
-  // cannot then open.
   const h = harness();
   await initialize(h, true);
   await settled(h);

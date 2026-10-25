@@ -1,12 +1,7 @@
-/**
- * MCP tool definitions for the Zulip server. Handlers live in tool-runtime.ts.
- */
-
 export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  /** MCP `_meta`. `tools/list` adds `mcpl/class` from src/tool-classes.ts. */
   _meta?: Record<string, unknown>;
 }
 

@@ -1,10 +1,3 @@
-/**
- * Attachment inlining — image normalization against real encoders, the
- * capped fetch against a local HTTP server, and block building.
- *
- * Run: node --import tsx --test test/attachments.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
@@ -67,7 +60,6 @@ test('resolveInlineOptions clamps the text cap and reads the knobs', () => {
   assert.equal(resolveInlineOptions({ ZULIP_ATTACHMENT_INLINE_MAX_BYTES: 'junk' }).inlineTextMaxBytes, 5120);
 });
 
-/** A local upload host that checks the Authorization header. */
 async function uploadHost(files: Record<string, { body: Buffer; type: string; chunked?: boolean }>): Promise<{ server: Server; origin: string; hits: string[] }> {
   const hits: string[] = [];
   const server = createServer((req, res) => {
@@ -111,7 +103,6 @@ test('fetchCapped sends the credentials, honours the ceiling, and reports overfl
     assert.equal(over.overflow, true);
     assert.equal(over.buf.length, 0);
 
-    // No Content-Length: the streamed read stops at the cap.
     const nolength = await fetchCapped(`${origin}/user_uploads/1/a/nolength.txt`, headers, 1000);
     assert.equal(nolength.overflow, true);
     assert.equal(nolength.buf.length, 0);
@@ -149,14 +140,12 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
       ref('/user_uploads/1/a/second.png', 'image/png', true),
     ];
     const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 });
-    // A failed fetch does not spend the image budget.
     assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(HTTP 404\)/);
     assert.equal(blocks[1].type, 'image');
     assert.equal((blocks[1] as { mimeType: string }).mimeType, 'image/jpeg');
     assert.equal((blocks[2] as { text: string }).text, '[image attachment: shot.png]');
     assert.equal((blocks[3] as { text: string }).text, '[attachment: notes.md (10B)]\n# notes\nhi');
     assert.match((blocks[4] as { text: string }).text, /^\[attachment: huge\.log over the 5KB inline cap — not inlined: fetch_attachment \/user_uploads\/1\/a\/huge\.log\]$/);
-    // The pdf produces no block: its reference note is already on the message.
     assert.match((blocks[5] as { text: string }).text, /second\.png" not inlined \(per-message image limit reached\)/);
     assert.equal(blocks.length, 6);
 

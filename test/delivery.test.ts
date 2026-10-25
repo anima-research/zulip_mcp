@@ -1,10 +1,3 @@
-/**
- * Delivery bookkeeping — watermarks, the open mirror, missed tallies, and
- * the pure catch-up helpers (mention vicinity, <missed> rendering).
- *
- * Run: node --import tsx --test test/delivery.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -31,7 +24,6 @@ test('watermarks only advance, and survive a restart', () => {
     assert.equal(b.watermark('zulip:general'), 12);
     assert.deepEqual(b.watermarkedChannels(), ['zulip:general']);
 
-    // Sessions are isolated.
     const other = new DeliveryState(dir, 's2');
     assert.equal(other.watermark('zulip:general'), undefined);
   } finally {
@@ -41,7 +33,6 @@ test('watermarks only advance, and survive a restart', () => {
 
 test('the undelivered floor: the watermark never passes an offered-but-unaccepted id, and lifts when it is delivered', () => {
   const state = new DeliveryState(null, 'mem');
-  // 1, 2, 3 offered; 1 and 3 accepted, 2 rejected.
   for (const id of [1, 2, 3]) state.hold('zulip:general', id);
   assert.equal(state.floor('zulip:general'), 1);
   state.release('zulip:general', 1);
@@ -50,7 +41,6 @@ test('the undelivered floor: the watermark never passes an offered-but-unaccepte
   assert.equal(state.advance('zulip:general', 3), true);
   assert.equal(state.watermark('zulip:general'), 1, 'stops below the rejected id');
 
-  // A later batch is accepted in full: still capped by the floor.
   state.hold('zulip:general', 4);
   state.release('zulip:general', 4);
   assert.equal(state.advance('zulip:general', 4), false);
@@ -60,12 +50,10 @@ test('the undelivered floor: the watermark never passes an offered-but-unaccepte
   state.markReplayed('zulip:general', [2]);
   assert.deepEqual(state.heldIds('zulip:general', { replayable: true }), [], 'and only once');
 
-  // The replay is accepted: the floor lifts and the watermark catches up to everything accepted.
   assert.equal(state.release('zulip:general', 2), true);
   assert.equal(state.watermark('zulip:general'), 4);
   assert.equal(state.floor('zulip:general'), undefined);
 
-  // A batch given up on holds too; a catch-up block that scanned past it releases it.
   state.hold('zulip:general', 5, 'failed');
   state.hold('zulip:general', 6);
   state.release('zulip:general', 6);
@@ -75,7 +63,6 @@ test('the undelivered floor: the watermark never passes an offered-but-unaccepte
   assert.equal(state.watermark('zulip:general'), 6);
   assert.deepEqual(state.heldChannels(), []);
 
-  // Already forwarded ids are never held; releasing everything drops a channel's floor.
   state.hold('zulip:general', 3);
   assert.equal(state.floor('zulip:general'), undefined);
   state.hold('zulip:general', 9, 'failed');
@@ -98,7 +85,6 @@ test('closing a channel starts a tally anchored at the watermark; reopening clea
   assert.equal(state.countMissed('zulip:dev', { id: 103, text: 'world!' }), true);
   assert.deepEqual(state.tally('zulip:dev'), { anchorId: 100, talliedThrough: 103, messages: 2, characters: 11 });
 
-  // Closing a channel that was never open changes nothing.
   state.markClosed('zulip:never');
   assert.equal(state.tally('zulip:never'), undefined);
 
@@ -138,7 +124,6 @@ test('the state file is round-tripped, sorted, and tolerant of garbage', () => {
     assert.equal(b.wasOpen('zulip:a'), false);
     assert.deepEqual(b.tally('zulip:a'), { anchorId: 1, talliedThrough: 3, messages: 1, characters: 3 });
 
-    // A corrupt file is reported and ignored, not fatal.
     const dirty = tmp();
     try {
       const path = join(dirty, 'x.delivery.json');
@@ -174,7 +159,6 @@ test('viewOf reads the sweep fields off an incoming message', () => {
   assert.equal(v.authorName, 'Ann');
   assert.equal(v.text, 'hi there', 'the attachment note is not part of the text');
   assert.deepEqual(v.attachmentNames, ['shot.png']);
-  // A DM is addressed even without a mention flag.
   assert.equal(viewOf({ ...msg(5, false), metadata: { isDM: true } }).mentioned, true);
 });
 
@@ -185,7 +169,6 @@ test('selectMissed keeps every message for a channel the host had open, else men
   const kept = selectMissed(views, { keepAll: false, vicinity: 2 });
   assert.deepEqual(kept.map((v) => v.id), [8, 9, 10, 11, 12, 23, 24, 25, 26, 27]);
 
-  // Windows overlap and clamp at the edges without duplicating.
   const edge = selectMissed(views.slice(0, 3).map((v) => ({ ...v, mentioned: v.id === 1 })), { keepAll: false, vicinity: 5 });
   assert.deepEqual(edge.map((v) => v.id), [1, 2, 3]);
 
@@ -235,7 +218,6 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   assert.ok(block.includes('[id=50]'), 'the newest line survives');
   assert.ok(!block.includes('[id=1]'), 'the oldest is gone');
 
-  // Under budget: untouched, no annotations.
   const small = renderMissedBlock(views.slice(0, 2), {
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 2, formatTime: () => '', maxChars: 40_000,
   });
@@ -243,7 +225,6 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
 });
 
 test('renderMissedBlock: the budget is a hard cap on the whole block, one long line included', () => {
-  // Header, elision note and ceiling note all count; the block never exceeds the budget.
   const views = Array.from({ length: 30 }, (_, i) => viewOf(msg(i + 1, false, 'y'.repeat(120))));
   const tight = renderMissedBlock(views, {
     streamName: 'general', channelId: 'zulip:dm:42', reason: 'backscroll', count: 30, formatTime: () => '',
@@ -255,15 +236,12 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   assert.match(tight, /fetch_history\(channel="zulip:dm:42", after=30\)/);
   assert.ok(tight.includes('[id=30]'), 'the newest line survives');
 
-  // A single 5 000-character message under a 1 000-character budget: cut, and said so.
   const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
   });
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });
-
-// ── attributeMessage ──
 
 function incoming(over: Partial<IncomingChannelMessage> = {}): IncomingChannelMessage {
   return {
@@ -289,7 +267,6 @@ test('attributeMessage renders who/where/when into the body in the fetch_history
   assert.equal((out.metadata as { attributionHeader: string }).attributionHeader, '[2026-09-14T08:42:52Z id=17206924] [#qa > router] Mykhailo Buialo (mention): ', 'the exact prefix, so a host can strip it');
   assert.equal((out.content[0] as { text: string }).text.startsWith((out.metadata as { attributionHeader: string }).attributionHeader), true);
 
-  // Ambient (no mention) has no marker; a DM says so instead of stream > topic.
   assert.equal((attributeMessage(incoming({ metadata: { topic: 'router', mentioned: false } }), () => 'T').content[0] as { text: string }).text.startsWith('[T id=17206924] [#qa > router] Mykhailo Buialo: @'), true);
   const dm = attributeMessage(incoming({ channelId: 'zulip:dm:760', threadId: undefined, metadata: { isDM: true, mentioned: false }, content: [{ type: 'text', text: 'hi' }] }), () => 'T');
   assert.equal((dm.content[0] as { text: string }).text, '[T id=17206924] [DM] Mykhailo Buialo: hi');

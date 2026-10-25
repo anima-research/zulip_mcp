@@ -1,11 +1,3 @@
-/**
- * History — the one message shape every reader shares, the RFC-001 tags it
- * carries, and the cursor semantics of the fetch helpers against a fake
- * zulip-js client.
- *
- * Run: node --import tsx --test test/history.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -99,13 +91,10 @@ test('toIncoming renders the incoming shape, with the attachment note as a secon
   assert.equal(meta.backscroll, true);
   assert.equal(attachmentNote([]), null);
 
-  // Without a known self id the session id stands in, so a consumer can
-  // still express "not from me".
   const anon = toIncoming('zulip:general', m, { selfUserId: null, sessionId: 'sess' });
   assert.equal((anon.metadata as Record<string, unknown>).botUserId, 'sess');
 });
 
-/** A zulip-js stand-in that records the query and answers with a fixed page. */
 function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}) {
   const calls: Record<string, unknown>[] = [];
   const byId: Record<string, unknown>[] = [];
@@ -153,7 +142,6 @@ test('fetchHistory: newest page by default, exclusive cursors, raw markdown, old
     anchor: 100, num_before: 10, num_after: 0, narrow: [['stream', 'general']], apply_markdown: false, include_anchor: false,
   });
 
-  // limit 0 never hits the API; oversize limits are clamped to Zulip's page cap.
   const empty = await fetchHistory(client, { streamName: 'general', limit: 0 });
   assert.deepEqual(empty.messages, []);
   assert.equal(client.calls.length, 3);
@@ -170,12 +158,10 @@ test('fetchAround centres a window on the anchor within its own conversation', a
     anchor: 42, num_before: 25, num_after: 25, narrow: [['stream', 'general'], ['topic', 'deploys']], apply_markdown: false, include_anchor: true,
   });
 
-  // A DM anchor narrows on its conversation.
   const dm = fakeClient([raw({ id: 5, type: 'private', display_recipient: [{ id: 790, full_name: 'Bot', email: 'b' }, { id: 42, full_name: 'Bo', email: 'bo' }] })]);
   await fetchAround(dm, 5, 10);
   assert.deepEqual(dm.calls[0].narrow, [{ operator: 'dm', operand: [790, 42] }]);
 
-  // An unreadable anchor fails loudly instead of widening to the realm timeline.
   await assert.rejects(fetchAround(client, 999, 10), /Invalid message/);
 });
 
@@ -193,7 +179,6 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
   assert.equal(parseDmChannelId('zulip:dm:x'), null);
   assert.equal(isDmChannelId('zulip:dm:42'), true);
 
-  // A self-DM is its own conversation rather than an empty one.
   assert.deepEqual(dmCounterparts([recipients[0]], 790).map((r) => r.id), [790]);
 
   const m = normalizeMessage(raw({ type: 'private', display_recipient: recipients, flags: [] }));

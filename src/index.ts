@@ -1,43 +1,4 @@
 #!/usr/bin/env node
-/**
- * Zulip MCP/MCPL server — CLI entry point.
- *
- * Usage:
- *   zulip-mcp-server                 # stdio transport (default; MCP-compatible)
- *   zulip-mcp-server --stdio
- *   zulip-mcp-server --tcp <port>    # TCP transport for MCPL hosts
- *
- * Environment:
- *   ZULIP_REALM / ZULIP_EMAIL / ZULIP_API_KEY   - bot credentials
- *   ZULIP_RC_PATH                               - alternative: a zuliprc file
- *   ZULIP_SESSION_ID                            - persistent monitoring state id
- *   ZULIP_SUBSCRIBE                             - comma-separated streams to join on startup
- *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
- *                                                 (default ~/.zulip_mcp_state)
- *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
- *                                                 catch-up sweep and gap recovery (3000)
- *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
- *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
- *   ZULIP_FILTERS_FILE                          - the filters plane file (default
- *                                                 <state dir>/<session>.filters.json); hot-reloaded
- *   ZULIP_STREAMS / ZULIP_DM_USERS /            - env seed for the filters file on first
- *   ZULIP_MUTED_STREAMS                           materialization (then the file is authoritative)
- *   ZULIP_SUPPRESSED_REACTIONS_BASELINE         - host-injected reaction-suppression seed
- *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
- *   ZULIP_ATTRIBUTE_DELIVERY                    - "false" delivers bare bodies; default renders
- *                                                 "[time id=N] [#stream > topic] Author: " into each
- *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split (10000)
- *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
- *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
- *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
- *   ZULIP_UPLOAD_ROOTS                          - named directories local-file attachments may come from,
- *                                                 "notes=./notes,out=/srv/out"; unset = local files refused
- *   ZULIP_UPLOAD_MAX_BYTES                      - per-file ceiling for outbound uploads (the realm's
- *                                                 advertised cap, else 25MiB); 10 files / 4x that per message
- *   MCPL_ENABLED                                - "false" forces plain-MCP mode
- *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
- *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
- */
 
 import * as net from 'node:net';
 import { homedir } from 'node:os';
@@ -71,7 +32,6 @@ function intEnv(name: string, fallback: number): number {
   return n;
 }
 
-/** "general:50,dev:200" → Map { general → 50, dev → 200 }. Bad entries are reported and skipped. */
 export function parseBackscrollLimits(raw: string | undefined): Map<string, number> {
   const out = new Map<string, number>();
   if (!raw) return out;
@@ -103,14 +63,12 @@ async function main(): Promise<void> {
   const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
   const filters = new FiltersPlane(process.env.ZULIP_FILTERS_FILE || join(stateDir, `${session.sessionId}.filters.json`));
   filters.start();
-  // Outbound uploads: a bad ZULIP_UPLOAD_ROOTS is a startup failure.
   const uploadPolicy = resolveUploadPolicy(process.env, session.maxUploadBytes);
   const uploader = session.realm ? createZulipUploader(session) : undefined;
   if (uploadPolicy.roots.size > 0) {
     console.error(`[zulip-mcp] upload roots: ${[...uploadPolicy.roots].map(([n, d]) => `${n}=${d}`).join(', ')}`);
     if (!LOCAL_FILES_SUPPORTED) console.error(`[zulip-mcp] ZULIP_UPLOAD_ROOTS is set but local-file attachments are Linux-only on this platform (${process.platform}); base64 data still works`);
   }
-  // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
     formatTime,
@@ -138,8 +96,6 @@ async function main(): Promise<void> {
     formatTime,
     filters,
     attachments: {
-      // Same validation as fetch_attachment: only /user_uploads/ on the realm
-      // host may ever see the bot's credentials.
       source: {
         fetch: (path, maxBytes) => {
           const url = parseZulipAttachmentUrl(path, session.realm);
@@ -157,7 +113,6 @@ async function main(): Promise<void> {
     tcpServer.listen(tcpPort, '127.0.0.1');
     await new Promise<void>((resolve) => tcpServer.once('listening', resolve));
 
-    // One connection at a time.
     while (true) {
       const conn = await McplConnection.acceptTcp(tcpServer);
       console.error('[zulip-mcp] Client connected');
@@ -187,10 +142,6 @@ async function main(): Promise<void> {
   await stop('stdin closed');
 }
 
-// Only auto-start when run as a CLI. Importing this module (e.g. from tests)
-// should not boot the server or require Zulip credentials. isMainModule
-// realpaths argv[1] so the guard also passes when launched through an npm
-// bin symlink (npx zulip-mcp-server).
 if (isMainModule(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     console.error('Failed to start server:', error);

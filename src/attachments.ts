@@ -1,20 +1,6 @@
-/**
- * Attachment inlining on live delivery — images downsampled to model-max,
- * small text files as text — so the agent sees what was shared instead of
- * a path it would have to fetch. Everything else stays a reference the
- * agent can pull with fetch_attachment.
- *
- * Applies to live delivery only (channels/incoming and push/event). History
- * on channels/open, the reconnect sweep, and the fetch tools keep the
- * reference form: replaying a backlog is not the moment to pull every
- * image that was ever posted.
- */
-
 import sharp from 'sharp';
 import type { ContentBlock, TextContent } from '@animalabs/mcpl-core';
 import type { AttachmentRef } from './content.js';
-
-// ── Image normalization (downsample-on-ingest) ──
 
 /** Anthropic downscales an image whose long edge is over 1568 px or whose cost
  *  would be over 1568 visual tokens (2576 px and 4784 tokens on Claude 4.7 and
@@ -26,11 +12,7 @@ const IMAGE_JPEG_QUALITY = 85;
  *  managed); base64 adds a third, so 3.5 MB of image bytes stays under the
  *  smaller limit. */
 export const IMAGE_OUTPUT_RAW_CAP = 3.5 * 1024 * 1024;
-/** Refuse to even download sources larger than this (OOM guard). sharp's own
- *  pixel limit guards the decoded bitmap against decompression bombs. */
 export const IMAGE_FETCH_CEILING = 25 * 1024 * 1024;
-/** Absolute ceiling on inlined text-attachment bytes: however high the knob
- *  is set, a text attachment can never put more than this into context. */
 export const MAX_TEXT_BYTES = 256 * 1024;
 export const DEFAULT_ATTACHMENT_INLINE_MAX_BYTES = 5120;
 export const DEFAULT_MAX_INLINE_IMAGES = 4;
@@ -39,13 +21,9 @@ export const DEFAULT_MAX_INLINE_IMAGES = 4;
  *  passed through would be a block the API rejects on every request. */
 const API_SAFE_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
 
-/** Decoded-bitmap ceiling handed to sharp (default is 268 Mpx, ~1 GiB RGBA).
- *  Message attachments over 40 Mpx are not something a model will see at
- *  1568 px anyway; refusing them bounds memory per decode. */
 const IMAGE_MAX_INPUT_PIXELS = 40_000_000;
 const sharpOpts = { limitInputPixels: IMAGE_MAX_INPUT_PIXELS };
 
-/** At most this many image decodes run at once across all messages. */
 const IMAGE_DECODE_CONCURRENCY = 2;
 let decodesInFlight = 0;
 const decodeWaiters: (() => void)[] = [];
@@ -63,17 +41,10 @@ async function withDecodeSlot<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export interface NormalizedImage {
-  data: string; // base64
+  data: string;
   mimeType: string;
 }
 
-/** Downsample an image to model-max on ingest: resize so the longest edge is
- *  <= IMAGE_LONG_EDGE_MAX (never upscales), re-encoding to stay under the inline
- *  byte cap. Opaque images become JPEG; images with alpha stay PNG (flattened to
- *  JPEG only as a last resort to fit the cap). Already-small images pass through
- *  untouched. Animated GIFs are left as-is (frame resizing is out of scope) and
- *  inlined only when already under cap. Returns null when nothing inlinable can
- *  be produced, letting the caller degrade to a text note. */
 export function normalizeImageForInference(buf: Buffer): Promise<NormalizedImage | null> {
   return withDecodeSlot(() => normalizeImageUnbounded(buf));
 }
@@ -85,14 +56,12 @@ async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | n
     const isAnimated = (meta.pages ?? 1) > 1;
     const apiSafe = API_SAFE_FORMATS.has(meta.format ?? '');
 
-    // Animated: don't resize frames here. Inline as-is if small enough.
     if (isAnimated) {
       return apiSafe && buf.length <= IMAGE_OUTPUT_RAW_CAP
         ? { data: buf.toString('base64'), mimeType: `image/${meta.format}` }
         : null;
     }
 
-    // Already within bounds and under cap → inline original bytes unchanged.
     if (apiSafe && longest > 0 && longest <= IMAGE_LONG_EDGE_MAX && buf.length <= IMAGE_OUTPUT_RAW_CAP) {
       return { data: buf.toString('base64'), mimeType: `image/${meta.format}` };
     }
@@ -112,7 +81,6 @@ async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | n
       mimeType = 'image/jpeg';
     }
 
-    // Still over cap (large PNG / high-detail photo) → flatten + shrink harder.
     if (out.length > IMAGE_OUTPUT_RAW_CAP) {
       out = await sharp(buf, sharpOpts)
         .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
@@ -129,18 +97,12 @@ async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | n
   }
 }
 
-// ── Fetching ──
-
 export interface FetchedBytes {
   buf: Buffer;
   mimeType: string | null;
-  /** The body exceeded `maxBytes`; `buf` is then partial and unused. */
   overflow: boolean;
 }
 
-/** GET with an enforced byte ceiling: the read is cancelled the moment the
- *  body passes `maxBytes`, so a lying or absent Content-Length cannot OOM
- *  the process. */
 export async function fetchCapped(
   url: string,
   headers: Record<string, string>,
@@ -177,8 +139,6 @@ export async function fetchCapped(
   }
 }
 
-// ── Blocks ──
-
 const TEXT_EXT =
   /\.(txt|md|markdown|json|jsonl|csv|tsv|log|ya?ml|xml|html?|css|js|mjs|cjs|ts|tsx|jsx|py|rb|go|rs|java|kt|c|h|cpp|hpp|sh|bash|zsh|toml|ini|cfg|conf|sql|diff|patch|env)$/i;
 
@@ -187,15 +147,12 @@ export function isTextAttachment(ref: AttachmentRef): boolean {
 }
 
 export interface AttachmentSource {
-  /** Fetch an upload by its `/user_uploads/...` path with the bot's credentials. */
   fetch(path: string, maxBytes: number): Promise<FetchedBytes>;
 }
 
 export interface InlineOptions {
   inlineImages: boolean;
-  /** Text attachments at or under this many bytes are inlined (clamped to MAX_TEXT_BYTES). */
   inlineTextMaxBytes: number;
-  /** Images inlined per message; the rest stay references. */
   maxImages: number;
 }
 
@@ -220,12 +177,6 @@ function text(t: string): TextContent {
   return { type: 'text', text: t };
 }
 
-/**
- * Content blocks for a message's attachments: inlined images (after
- * normalization) and small text files, notes for the rest. Never throws —
- * a failed fetch becomes a note naming the path so the agent can still
- * fetch_attachment it.
- */
 export async function buildAttachmentBlocks(
   refs: AttachmentRef[],
   source: AttachmentSource,
@@ -261,7 +212,6 @@ export async function buildAttachmentBlocks(
         }
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
-      // Other binaries stay as the reference note already on the message.
     } catch (err) {
       blocks.push(text(`[attachment: ${ref.name} — could not fetch (${(err as Error).message}); fetch_attachment ${ref.path}]`));
     }

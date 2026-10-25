@@ -18,11 +18,6 @@ import assert from 'node:assert/strict';
 import { ZulipEventLoop, type ZulipMessageChange } from '../src/platforms/zulip-events.ts';
 import type { PlatformSystemEvent } from '../src/platforms/adapter.ts';
 
-/**
- * Build the exact error node-fetch@2.7.0 rejects with. It is a `FetchError`
- * (a plain Error subclass with `.name = 'FetchError'` and a `.type`), never a
- * SyntaxError, and its message embeds the request URL — including `queue_id`.
- */
 function fetchError(message: string, type: 'invalid-json' | 'system'): Error {
   const err = new Error(message);
   err.name = 'FetchError';
@@ -32,7 +27,6 @@ function fetchError(message: string, type: 'invalid-json' | 'system'): Error {
 
 const POLL_URL = 'https://zulip.example.com/api/v1/events?queue_id=q1&last_event_id=-1';
 
-/** node-fetch's message for an HTML/proxy 502 body that fails JSON.parse. */
 function html502Error(): Error {
   return fetchError(
     `invalid json response body at ${POLL_URL} reason: Unexpected token '<', "<html><hea"... is not valid JSON`,
@@ -40,12 +34,10 @@ function html502Error(): Error {
   );
 }
 
-/** node-fetch's message for a dropped connection — note it embeds queue_id. */
 function econnresetError(): Error {
   return fetchError(`request to ${POLL_URL} failed, reason: read ECONNRESET`, 'system');
 }
 
-/** Sleep recorder that resolves instantly and can stop the loop after N sleeps. */
 function makeSleepRecorder(loop: () => ZulipEventLoop, stopAfter: number) {
   const delays: number[] = [];
   const sleep = async (ms: number) => {
@@ -67,36 +59,25 @@ test('HTML/proxy 502 (real FetchError, not SyntaxError) backs off exponentially'
       register: async () => ({ queue_id: 'q1', last_event_id: -1 }),
     },
     events: {
-      // What zulip-js actually surfaces when a reverse proxy answers a
-      // long-poll with an HTML 502 page: node-fetch rejects response.json()
-      // with a FetchError('invalid json response body ...'), NOT a SyntaxError.
       retrieve: async () => { throw html502Error(); },
     },
   };
 
   await loop.start(zulipClient, () => {}, (e) => systemEvents.push(e));
 
-  // Six failures → six growing delays: 2s, 4s, 8s, 16s, 32s, 60s (capped).
   assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000]);
   for (let i = 1; i < delays.length - 1; i++) {
     assert.ok(delays[i] > delays[i - 1], `delay ${i} should grow`);
   }
 
-  // Degraded condition surfaced exactly once (at the threshold), naming the
-  // non-JSON cause — proving isNonJsonError matched the real FetchError shape.
   const degraded = systemEvents.filter(e => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
   assert.match(degraded[0].text, /non-JSON/);
 
-  // And it must NOT have been misread as queue expiry despite the URL in the
-  // message containing `queue_id`.
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
 });
 
 test('a dropped-connection FetchError (URL contains queue_id) is NOT treated as expiry', async () => {
-  // Regression for the deleted `errMsg.includes("queue_id")` clause: every
-  // node-fetch FetchError embeds the request URL, so a substring match would
-  // abandon a healthy queue and spam a false gap marker on every blip.
   let loop: ZulipEventLoop;
   const { delays, sleep } = makeSleepRecorder(() => loop, 4);
   const systemEvents: PlatformSystemEvent[] = [];
@@ -115,11 +96,8 @@ test('a dropped-connection FetchError (URL contains queue_id) is NOT treated as 
 
   await loop.start(zulipClient, () => {}, (e) => systemEvents.push(e));
 
-  // Healthy queue never abandoned: registered exactly once, no re-register.
   assert.equal(registerCalls, 1, 'must not re-register the live queue on a transient error');
-  // No false gap markers.
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
-  // Backoff engaged (the expiry path used to bypass it entirely).
   assert.deepEqual(delays, [2000, 4000, 8000, 16000]);
 });
 
@@ -156,8 +134,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
       retrieve: async () => {
         retrieveCalls++;
         if (retrieveCalls === 1) {
-          // Deliver a real message so the gap anchor (message id + timestamp)
-          // is populated.
           return {
             events: [{
               id: 42,
@@ -181,7 +157,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
           // Queue died server-side — zulip-js RETURNS this, it does not throw.
           return { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'Bad event queue ID: q1' };
         }
-        // First poll on the fresh queue — end the test.
         loop.stop();
         return { events: [] };
       },
@@ -201,7 +176,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
   assert.equal(gaps[0].metadata?.lastMessageId, 9001);
   assert.equal(gaps[0].metadata?.lastMessageTimestamp, 1_710_000_000);
   assert.equal(gaps[0].metadata?.newQueueId, 'q2');
-  // The gap text carries the usable since-anchor (message id), not event id 42.
   assert.match(gaps[0].text, /message id 9001/);
 });
 
@@ -217,15 +191,13 @@ test('malformed non-throwing response (no events, no error code) sleeps instead 
     events: {
       retrieve: async () => {
         retrieveCalls++;
-        return {}; // no `events` array, not an error object — previously hot-spun
+        return {};
       },
     },
   };
 
   await loop.start(zulipClient, () => {});
 
-  // Every malformed poll must be followed by a sleep — poll count tracks
-  // sleep count instead of running away.
   assert.equal(retrieveCalls, 3);
   assert.deepEqual(delays, [2000, 4000, 8000]);
 });
@@ -242,7 +214,6 @@ test('well-formed response resets the backoff counter', async () => {
     events: {
       retrieve: async () => {
         retrieveCalls++;
-        // fail, fail, succeed, then fail again — backoff must restart at base.
         if (retrieveCalls === 3) return { events: [] };
         throw econnresetError();
       },
@@ -268,8 +239,6 @@ test('degraded is followed by a recovered event once polling succeeds again', as
     events: {
       retrieve: async () => {
         retrieveCalls++;
-        // Three failures cross the degraded threshold; the fourth poll succeeds
-        // and must emit 'recovered', then we stop.
         if (retrieveCalls <= 3) throw econnresetError();
         loop.stop();
         return { events: [] };
@@ -318,7 +287,6 @@ test('a throwing onMessage does not abort the batch or inflate the failure count
       retrieve: async () => {
         retrieveCalls++;
         if (retrieveCalls === 1) {
-          // Batch of two: the first handler throws, the second must still run.
           return { events: [makeMessageEvent(1, 100), makeMessageEvent(2, 101)] };
         }
         loop.stop();
@@ -334,9 +302,7 @@ test('a throwing onMessage does not abort the batch or inflate the failure count
 
   await loop.start(zulipClient, onMessage, (e) => systemEvents.push(e));
 
-  // The second event was still delivered despite the first handler throwing.
   assert.deepEqual(delivered, [101], 'rest of the batch survives a throwing handler');
-  // A handler bug is not a poll failure — no spurious degraded marker.
   assert.equal(systemEvents.filter(e => e.kind === 'degraded').length, 0);
 });
 
@@ -399,16 +365,12 @@ test('edits, topic moves and deletions reach onChange; re-renders and unchanged 
         if (polls > 1) { loop.stop(); return { events: [] }; }
         return {
           events: [
-            // A content edit by the author, mentioning the bot as it now reads.
             { id: 1, type: 'update_message', message_id: 77, message_ids: [77], user_id: 9, edit_timestamp: 1_710_000_100, rendering_only: false, orig_content: 'old', content: 'new @**bot**', flags: ['mentioned'], stream_id: 7 },
-            // A link preview arriving: nothing the author wrote changed.
             { id: 2, type: 'update_message', message_id: 78, message_ids: [78], user_id: null, edit_timestamp: 1_710_000_101, rendering_only: true, content: 'with preview', stream_id: 7 },
-            // A topic move of three messages, by a moderator.
             { id: 3, type: 'update_message', message_id: 79, message_ids: [79, 80, 81], user_id: 12, edit_timestamp: 1_710_000_102, orig_subject: 'old topic', subject: 'new topic', propagate_mode: 'change_all', stream_id: 7 },
             // A move to another stream under the same topic name: Zulip sends
             // orig_subject for every move but subject only for a rename.
             { id: 4, type: 'update_message', message_id: 82, message_ids: [82], user_id: 12, edit_timestamp: 1_710_000_103, stream_id: 7, new_stream_id: 8, orig_subject: 'same' },
-            // An update that names no change at all.
             { id: 5, type: 'update_message', message_id: 83, message_ids: [83], user_id: 9, edit_timestamp: 1_710_000_104, stream_id: 7 },
             { id: 6, type: 'delete_message', message_ids: [84, 85], message_type: 'stream', stream_id: 7, topic: 'deploys' },
             { id: 7, type: 'delete_message', message_id: 86, message_type: 'private' },

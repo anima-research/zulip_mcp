@@ -1,11 +1,3 @@
-/**
- * The tool runtime against a fake zulip-js client — DM conversations in
- * fetch_history, reaction suppression on the legacy raw format, and API
- * errors that surface as errors.
- *
- * Run: node --import tsx --test test/toolRuntime.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -103,8 +95,6 @@ test('find_user and list_emojis report a Zulip API error as an error, never as a
     rmSync(dir, { recursive: true, force: true });
   }
 });
-
-// ── Outbound attachments ──
 
 function fakeUploader() {
   const uploaded: { name: string; bytes: string; mimeType?: string }[] = [];
@@ -225,8 +215,6 @@ test('without a realm there is no uploader: attachments error clearly and plain 
   }
 });
 
-// ── listen registers what it joined (#20) ──
-
 test('listen reports subscriptions to the server and carries the registration outcome back to the agent (#20)', async () => {
   const calls: unknown[] = [];
   const client = {
@@ -247,7 +235,6 @@ test('listen reports subscriptions to the server and carries the registration ou
     assert.deepEqual(out.registration, { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' });
     assert.match(out.note, /did not confirm zulip:ops \(timed out\)/, 'the agent is told, instead of it going to stderr');
 
-    // The hook is awaited: `listen` answers after registration, not before.
     let settled = false;
     tools.onSubscribed = async () => {
       await new Promise((r) => setTimeout(r, 20));
@@ -275,7 +262,6 @@ test('listen does not register anything when Zulip refused the subscription (#20
     assert.equal(out.registration, undefined);
     assert.deepEqual(out.unauthorized, ['secret']);
 
-    // An error from Zulip is reported as such, and registers nothing.
     const failing = runtime({ users: { me: { subscriptions: { add: async () => { throw new Error('nope'); } } } } });
     failing.tools.onSubscribed = () => { called++; };
     assert.match((await failing.tools.handleToolCall('listen', { channels: ['ops'] })).error, /nope/);

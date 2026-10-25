@@ -1,18 +1,3 @@
-/**
- * ZulipAdapter — Zulip implementation of PlatformAdapter.
- *
- * Channel ids:
- *   zulip:{stream_name}      a stream; threads map to topics (incoming carries
- *                            the topic as threadId; publishes route to the
- *                            topic of the newest message
- *                            ChannelManager.noteConversation took there,
- *                            else 'mcpl')
- *   zulip:dm:{ids}           a direct-message conversation, keyed by the
- *                            other parties' sorted user ids (see history.ts)
- *
- * DM conversations are discovered from recent DM history at startup and
- * described on the fly when a message from a new conversation arrives.
- */
 
 import type {
   ChannelDescriptor,
@@ -53,7 +38,6 @@ import {
   type ZulipRawMessage,
 } from '../history.js';
 
-/** The address every stream descriptor carries. */
 export interface ZulipChannelAddress {
   stream_name: string;
   /** Sends address a stream by name; only typing needs its id. */
@@ -64,14 +48,12 @@ export function zulipChannelId(streamName: string): string {
   return `zulip:${streamName}`;
 }
 
-/** The stream behind a `zulip:{stream_name}` channel id. */
 export function streamNameOf(channelId: string): string {
   return channelId.slice('zulip:'.length);
 }
 
 const SNIPPET_MAX = 80;
 
-/** One line of a message body, whitespace collapsed, capped; null when empty. */
 export function snippetOf(text: string): string | null {
   const one = text.replace(/\s+/g, ' ').trim();
   if (!one) return null;
@@ -87,7 +69,6 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
-/** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
   authorId: number;
@@ -96,19 +77,13 @@ interface SeenMessage {
   isDm: boolean;
   topic: string;
   snippet: string | null;
-  /** Zulip's mention verdict as the message last read. */
   mentioned: boolean;
 }
 
-/** How long a GET placing a change may take before the change is dropped
- *  rather than wedging every change behind it. */
 const LOCATE_TIMEOUT_MS = 15_000;
-/** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
-/** How long a stream id that the list did not resolve is not asked about again. */
 const STREAM_REFRESH_HOLDOFF_MS = 60_000;
-/** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
@@ -119,7 +94,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
-/** The live filters the adapter consults — the plane, or a stand-in. */
 export interface FilterView {
   streamAllowed(streamName: string): boolean;
   dmAllowed(sender: { id: number; email: string }): boolean;
@@ -128,21 +102,13 @@ export interface FilterView {
 const ALLOW_ALL: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
 
 export interface ZulipAdapterOptions {
-  /** Backscroll cap advertised per channel and enforced on channels/open. */
   backscrollDefault?: number;
-  /** Per-stream overrides of the backscroll cap. */
   backscrollLimits?: ReadonlyMap<string, number>;
-  /** Stream allowlist + DM allowlist, read live on every event. */
   filters?: FilterView;
-  /** How many recent DMs to scan for conversations at startup. */
   dmDiscoveryLimit?: number;
-  /** The realm's max message length; longer publishes are split. */
   maxMessageLength?: number;
-  /** Uploads for the media blocks of a publish (image/audio with inline data). Unset: such blocks are dropped. */
   uploader?: Uploader;
-  /** Size and count limits for those uploads. Required with `uploader`. */
   uploadPolicy?: UploadPolicy;
-  /** Line time for the recent history injected before inference (default: the agent line time from env). */
   formatTime?: (d: Date) => string;
 }
 
@@ -162,21 +128,13 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
   private readonly formatTime: (d: Date) => string;
-  /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
-  /** Recently seen messages, so a reaction or an edit can be placed without
-   *  a round trip: id → channel, author, topic, snippet. Bounded; oldest
-   *  evicted. A deletion can only be placed from here — the message is gone. */
   private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
-  /** Stream names by id, from discovery (refreshed on a miss): how a
-   *  deletion or a cross-stream move names a stream the cache does not know. */
   private streamNamesById = new Map<number, string>();
   /** Zulip's delete event names no actor, so the echo of the bot's own
    *  deletion is recognised here and dropped. */
   private selfDeleted = new Map<number, number>();
-  /** When the stream list was last refreshed for an unknown id: a stream
-   *  the bot cannot see never resolves, and must not cost a refresh per event. */
   private streamsRefreshedAt = 0;
   /** Zulip reports a move to a stream the bot cannot see as a delete event. */
   private movedAway = new Map<number, number>();
@@ -199,7 +157,6 @@ export class ZulipAdapter implements PlatformAdapter {
     if (this.uploader && !this.uploadPolicy) throw new Error('ZulipAdapter: uploader needs an uploadPolicy');
   }
 
-  /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
   backscrollLimitFor(streamName: string): number {
     return this.backscrollLimits.get(streamName) ?? this.backscrollDefault;
   }
@@ -233,11 +190,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return channels;
   }
 
-  /**
-   * The descriptor for a stream. Built from discovery and, for a stream the
-   * bot joined after startup, from the first message that arrives on it —
-   * both must describe the same channel, so they share this (#20).
-   */
   private streamDescriptor(name: string, streamId: number | undefined, metadata: Record<string, unknown> = {}): ChannelDescriptor {
     const address: ZulipChannelAddress = { stream_name: name, stream_id: streamId };
     const descriptor: ChannelDescriptor = {
@@ -258,12 +210,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return descriptor;
   }
 
-  /**
-   * Descriptors for the named stream channels, without enumerating the realm.
-   * The stream id comes from `get_stream_id` so the descriptor is the same
-   * shape discovery builds; a name Zulip does not resolve is omitted, and one
-   * outside the allowlist is never described.
-   */
   async describeChannels(channelIds: string[]): Promise<ChannelDescriptor[]> {
     const out: ChannelDescriptor[] = [];
     for (const channelId of channelIds) {
@@ -282,10 +228,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return out;
   }
 
-  /**
-   * DM conversations the bot has been part of recently. Zulip has no
-   * "list my DM conversations" call; the recent DM history is the source.
-   */
   private async discoverDmChannels(): Promise<ChannelDescriptor[]> {
     if (this.dmDiscoveryLimit <= 0) return [];
     try {
@@ -327,7 +269,6 @@ export class ZulipAdapter implements PlatformAdapter {
     });
   }
 
-  /** Where a message lives — from the recent-messages cache, else one GET. */
   private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
@@ -351,15 +292,9 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  /**
-   * The allowlists as the live event path applies them to a placed message.
-   * A DM is judged by its sender; the bot's own DM message has no sender to
-   * judge and is left to the server's per-conversation check.
-   */
   private changeAllowed(where: SeenMessage): boolean {
     if (where.isDm) {
       if (this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId) {
-        // The bot's own DM message: judged by whom it was sent to.
         const counterparts = parseDmChannelId(where.channelId) ?? [];
         return counterparts.some((id) => this.filters.dmAllowed({ id, email: '' }));
       }
@@ -398,13 +333,7 @@ export class ZulipAdapter implements PlatformAdapter {
       const topic = change.topic ?? where.topic;
       const movedToStream = crossStream ? await this.streamNameById(Number(change.newStreamId)) : null;
       const movedToChannelId = movedToStream !== null ? zulipChannelId(movedToStream) : null;
-      // Zulip's verdict on the new content replaces the cached one only when
-      // the content changed; a move keeps the mention it had (the event's
-      // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
-      // Keep the cache current: a later reaction or deletion reads the message
-      // as it now is. A move re-seats every co-moved message, not only the one
-      // acted on.
       this.seen.set(change.messageId, {
         ...where,
         topic,
@@ -453,8 +382,6 @@ export class ZulipAdapter implements PlatformAdapter {
     // an actor: drop what this adapter deleted itself.
     const ids = change.messageIds.filter((id) => !this.wasSelfDeleted(id));
     if (ids.length === 0) return;
-    // A bulk deletion is reported under an id the cache can vouch for, so the
-    // line never shows one message's id with another's author and quote.
     const placedId = ids.find((id) => this.seen.has(id)) ?? ids[0];
     const cached = this.seen.get(placedId) ?? null;
     const now = Date.now();
@@ -480,7 +407,6 @@ export class ZulipAdapter implements PlatformAdapter {
         movedToChannelId: null,
         content: null,
         previousContent: cached.snippet,
-        // A deleted mention is the one the agent was about to answer.
         mentioned: cached.mentioned,
         previouslyMentioned: cached.mentioned,
         vanished,
@@ -516,7 +442,6 @@ export class ZulipAdapter implements PlatformAdapter {
     if (event) emit(event);
   }
 
-  /** The descriptor for a DM's conversation, remembered once described. */
   private describeDm(m: ZulipMessage): { descriptor: ChannelDescriptor; isNew: boolean } {
     const counterparts = dmCounterparts(m.recipients, this.identity.selfUserId);
     const descriptor = dmDescriptor(counterparts, this.backscrollDefault);
@@ -552,9 +477,6 @@ export class ZulipAdapter implements PlatformAdapter {
       what = `direct message to ${channelId}`;
     } else {
       const streamName = streamNameOf(channelId);
-      // Route to the topic of the newest message noteConversation took on
-      // this channel (in-thread answers); fall back to the 'mcpl' topic when
-      // the agent initiates the conversation.
       const topic =
         (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
         hints?.threadId ??
@@ -574,7 +496,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
   }
 
-  /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */
   async acknowledge(_channelId: string, messageId: string, value?: string): Promise<string> {
     const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
     const result = await this.zulipClient.reactions.add({ message_id: Number(messageId), emoji_name: name, reaction_type: 'unicode_emoji' });
@@ -594,8 +515,6 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  /** A message the bot deleted through another path (the delete tool): its
-   *  delete event is the bot's own doing and must not surface. */
   noteSelfDeleted(messageId: number): void {
     if (!Number.isFinite(messageId)) return;
     const now = Date.now();
@@ -620,8 +539,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return Date.now() - at <= SELF_DELETE_TTL_MS;
   }
 
-  /** A stream's name by id — from discovery, else one refresh of the list
-   *  (a stream created after startup). */
   private async streamNameById(streamId: number): Promise<string | null> {
     const known = this.streamNamesById.get(streamId);
     if (known !== undefined) return known;
@@ -679,19 +596,10 @@ export class ZulipAdapter implements PlatformAdapter {
         console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
       }
     } catch (err) {
-      // Best-effort — swallow errors so typing never breaks the agent.
       console.error(`[zulip-mcp] typing.send(${op}) failed:`, (err as Error).message);
     }
   }
 
-  /**
-   * The allowlists, applied to what a history read may hand on: a message
-   * from a stream outside `streams`, or a DM from a sender outside `dmUsers`,
-   * is withheld here the same way the live event path withholds it — so a
-   * narrowed allowlist is enforced on catch-up, gap recovery, backscroll and
-   * context injection, not only on live delivery. The bot's own messages
-   * pass (they are its own doing); callers decide whether to show them.
-   */
   private allowed(m: ZulipMessage): boolean {
     if (this.identity.selfUserId !== null && m.authorId === this.identity.selfUserId) return true;
     if (m.isDm) return this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail });
@@ -711,8 +619,6 @@ export class ZulipAdapter implements PlatformAdapter {
     const messages = page.messages.filter((m) => this.allowed(m));
     if (messages.length === 0) return null;
 
-    // The shared line shape, so injected history reads like live delivery
-    // and every line carries an id the agent can fetch_around.
     const formatted = messages.map((m) => messageLineHead({
       id: m.id,
       time: Number.isNaN(m.timestamp.getTime()) ? '' : this.formatTime(m.timestamp),
@@ -730,14 +636,6 @@ export class ZulipAdapter implements PlatformAdapter {
     };
   }
 
-  /**
-   * History as incoming-shaped messages, oldest first, the bot's own
-   * messages excluded (they are already in the agent's own record as its
-   * turns) and disallowed senders withheld. Marked `backscroll: true` so
-   * consumers can tell replayed history from live delivery. The page's
-   * `scannedThrough` covers the excluded rows too, so a pager never mistakes
-   * a page of nothing but the bot's own messages for the end of history.
-   */
   async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
     const dmIds = parseDmChannelId(channelId);
     if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) {
@@ -791,10 +689,6 @@ export class ZulipAdapter implements PlatformAdapter {
     onMessageChange?: OnMessageChange,
   ): void {
     this.eventLoop = new ZulipEventLoop();
-    // Changes are placed asynchronously (a cache miss costs one GET) but must
-    // reach the server in queue order: an edit followed by a deletion of the
-    // same message reads backwards otherwise. Every await in the chain is
-    // bounded (LOCATE_TIMEOUT_MS), so one hung GET delays, never wedges.
     let changeChain: Promise<void> = Promise.resolve();
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {
@@ -807,7 +701,6 @@ export class ZulipAdapter implements PlatformAdapter {
       : undefined;
     const reactionHandler = onReaction
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
-          // The bot's own reactions are its own doing; only others' are news.
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
           void this.locate(ev.message_id).then((where) => {
             if (!where) return;
@@ -830,8 +723,6 @@ export class ZulipAdapter implements PlatformAdapter {
       : undefined;
     this.eventLoop.start(this.zulipClient, (_streamName, msg, flags) => {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
-      // Remember our own messages too: reactions to them are the ones that
-      // matter most ("someone reacted to your message").
       this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
       if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       if (m.isDm) {
@@ -848,7 +739,6 @@ export class ZulipAdapter implements PlatformAdapter {
       // messages carry their descriptor (#20).
       const channelId = channelIdOf(m, this.identity.selfUserId);
       const streamId = typeof msg.stream_id === 'number' ? msg.stream_id : undefined;
-      // Remembered so a later reaction or edit on this stream can be placed.
       if (m.streamName !== null && streamId !== undefined) this.streamNamesById.set(streamId, m.streamName);
       const descriptor = m.streamName !== null ? this.streamDescriptor(m.streamName, streamId) : undefined;
       onMessage(toIncoming(channelId, m, this.identity), descriptor);

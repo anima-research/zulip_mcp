@@ -1,11 +1,3 @@
-/**
- * Content helpers — Zulip message formatting and attachment handling.
- *
- * Pure functions shared by the MCP tool layer (index.ts) and the Zulip
- * adapter (src/platforms/zulip.ts). Kept free of client/SDK dependencies so both
- * sides can import without cycles.
- */
-
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -29,8 +21,6 @@ export function isMainModule(importMetaUrl: string, argv1: string | undefined): 
 // so an over-eager fetch can't poison the agent's next turn.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
-// MIME types we decode and return as `content_text` instead of base64,
-// so the agent can read them directly (CSVs, JSON, plain text, etc).
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
 
 export interface FetchedAttachment {
@@ -39,11 +29,6 @@ export interface FetchedAttachment {
   name: string;
 }
 
-/**
- * Authenticated GET with an enforced size cap. Checks Content-Length when the
- * server provides one, and streams with a running byte budget as defense in
- * depth so a missing or lying header can't OOM the process.
- */
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
@@ -52,7 +37,6 @@ export async function fetchAttachmentBytes(
   const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: "follow" });
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
-  // Pre-check Content-Length so an oversized declared body never starts buffering.
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
     const n = Number(declared);
@@ -64,7 +48,6 @@ export async function fetchAttachmentBytes(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    // No streaming body: fall back to arrayBuffer with a post-read check.
     buf = Buffer.from(await resp.arrayBuffer());
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
@@ -92,11 +75,6 @@ export async function fetchAttachmentBytes(
   return { buf, mimeType, name: fallbackName };
 }
 
-/**
- * Shape a successful fetch into the tool's response. Images return as native
- * MCP content blocks (via `_content`), text-ish MIME types return decoded
- * `content_text`, other binary returns `base64`.
- */
 export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Record<string, unknown> {
   if (mimeType.startsWith("image/")) {
     return {
@@ -156,9 +134,9 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
 }
 
 export interface AttachmentRef {
-  path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
-  name: string;       // basename for human display
-  mimeType: string;   // best-effort from extension
+  path: string;
+  name: string;
+  mimeType: string;
   isImage: boolean;
 }
 
@@ -209,13 +187,11 @@ export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
 export function cleanContent(html: string): string {
   let content = html;
 
-  // Extract Zulip mentions first
   content = content.replace(
     /<span class="user-mention"[^>]*data-user-id="(\d+)"[^>]*>@([^<]+)<\/span>/g,
     '@$2 (uid:$1)'
   );
 
-  // Handle silent mentions
   content = content.replace(
     /<span class="user-mention silent"[^>]*data-user-id="(\d+)"[^>]*>([^<]+)<\/span>/g,
     '$2 (uid:$1)'
@@ -232,9 +208,6 @@ export function cleanContent(html: string): string {
         if (hasImg) return `[image: ${href}]`;
         return text ? `[attachment: ${text} — ${href}]` : `[attachment: ${href}]`;
       }
-      // External anchors with an inline image preview: keep `[image: ...]` so
-      // the agent can choose to fetch. Plain external links keep the prior
-      // text-only behaviour (no scope creep on non-attachment links).
       if (hasImg) return `[image: ${href}]`;
       return text || href;
     }
@@ -246,7 +219,6 @@ export function cleanContent(html: string): string {
     '[image: $1]'
   );
 
-  // Clean up HTML
   content = content
     .replace(/<p>/gi, '\n')
     .replace(/<br\s*\/?>/gi, '\n')
@@ -272,11 +244,6 @@ export function cleanMarkdown(raw: string): string {
 /** Zulip's default `max_message_length` realm setting. */
 export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
 
-/**
- * Split text into messages of at most `limit` characters, preferring
- * paragraph boundaries, then line boundaries, then a hard cut. Boundary
- * whitespace at the split is dropped; nothing else is.
- */
 export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
   const out: string[] = [];
   let rest = text;
