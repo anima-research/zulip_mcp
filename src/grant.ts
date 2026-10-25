@@ -1,24 +1,12 @@
 /**
  * Capability grant state (SPEC 0.5 §5.3, §5.4, §6.4, §6.7).
  *
- * The grant is the security boundary. This class holds what the *host* told
- * this connection it may do, and nothing else. The message-to-grant step, the
- * wildcard matching, and the §6.4 derivation all come from @animalabs/mcpl-core
- * (`grantFromUpdate`, `capabilityGranted`, `deriveFeatureSets`); this wrapper
- * adds the connection-lifetime state around them and the degradation receipt.
- *
- * - `effectiveCapabilities` is the sole normative allowlist. Every path not
- *   present is denied; absence is the denial, there is no unspecified state
- *   (§5.4).
- * - `deniedCapabilities` is derived diagnostic data. It is read only to detect
- *   a malformed policy message and never participates in an authorization
- *   decision (§5.4).
+ * - `effectiveCapabilities` is the sole normative allowlist: every path not
+ *   present is denied (§5.4).
+ * - `deniedCapabilities` is diagnostic and never decides authorization (§5.4).
  * - Until the initial policy exchange completes, every capability-dependent
- *   behavior is unavailable (§5.3). `has()` therefore returns false before the
- *   first grant-bearing `featureSets/update` Request.
- *
- * Nothing here widens anything. The degradation receipt this produces is
- * testimony about consequences, never an assertion of entitlement (§6.7).
+ *   behavior is unavailable (§5.3), so `has()` returns false before the first
+ *   grant-bearing `featureSets/update` Request.
  */
 
 import {
@@ -50,20 +38,14 @@ export class CapabilityGrant {
   constructor(private declarations: Record<string, FeatureSetDeclaration> = {}) {}
 
   /**
-   * Point the grant at the feature-set declarations of a newly installed
-   * manifest (§17.5). Declarations are what degradation is derived from
-   * (§6.4); they are not authority, so this widens nothing — the effective
-   * grant is untouched and stays whatever the host last sent.
+   * Declarations are what degradation is derived from (§6.4); they are not
+   * authority, so the effective grant is untouched.
    */
   setDeclarations(declarations: Record<string, FeatureSetDeclaration>): void {
     this.declarations = declarations;
   }
 
-  /**
-   * Forget the grant: a new connection starts from nothing (§5.3) — the
-   * previous peer's policy is not this peer's. Waiters from the old
-   * connection are dropped; their callers guard on the connection anyway.
-   */
+  /** A new connection starts from nothing (§5.3): the previous peer's policy is not this peer's. */
   reset(): void {
     this.state = emptyGrantState();
     this.readyWaiters = [];
@@ -104,22 +86,13 @@ export class CapabilityGrant {
   }
 
   /**
-   * Apply a `featureSets/update` and return the degradation receipt (§6.7).
+   * §5.4 requires the receiving side to fail closed and reject a policy that
+   * names a path in both `effectiveCapabilities` and `deniedCapabilities`.
    *
-   * Throws {@link McplRpcError} when the message is malformed — §5.4 requires
-   * the receiving side to fail closed and reject a policy naming a path in
-   * both `effectiveCapabilities` and `deniedCapabilities`. Fail-closed means
-   * exactly that: the grant that results holds nothing and is not ready, so a
-   * malformed message cannot leave a previous, wider grant standing.
-   *
-   * `form` is how the message arrived. §6.7 requires the **Request** form for
-   * any change to the effective grant and says a Notification "cannot
-   * establish a ready state". A Notification therefore never alters the grant
-   * except to apply `disabled` reductions — reductions are respected whatever
-   * the carrier — and any other grant-bearing field it carries is discarded
-   * with a note, because honouring a widening from an unacknowledgeable
-   * message would have this server acting on a path the host cannot know it
-   * accepted.
+   * §6.7 requires the Request form for any change to the effective grant and
+   * says a Notification "cannot establish a ready state", so a Notification
+   * applies only `disabled` reductions and any other grant-bearing field it
+   * carries is discarded.
    */
   apply(
     params: FeatureSetsUpdateParams,

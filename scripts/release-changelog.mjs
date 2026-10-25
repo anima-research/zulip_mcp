@@ -37,11 +37,10 @@ const fail = (msg) => {
   throw new ReleaseError(msg);
 };
 
-// Fragment grammar: every non-blank line starts a bullet or continues one
-// (indented two or more spaces; nested bullets included). Headings and
-// thematic breaks are refused wherever they appear — at top level a '## '
-// line would splice a fake section boundary into the released changelog,
-// and as item content ('- ## x', '  ## x') they still render as headings.
+// Headings and thematic breaks are refused wherever they appear: as item
+// content ('- ## x', '  ## x') a heading still renders as one, and at top
+// level a '## ' line would splice a fake section boundary into the released
+// changelog.
 const isBulletStart = (l) => /^[-*] /.test(l);
 const isContinuation = (l) => /^ {2,}\S/.test(l);
 const itemContent = (l) => l.replace(/^\s*(?:[-*]\s+)?/, "");

@@ -16,13 +16,15 @@ import type { AttachmentRef } from './content.js';
 
 // ── Image normalization (downsample-on-ingest) ──
 
-/** Longest edge (px) kept for inlined images. Matches the ~1568px ceiling
- *  every major vision model downscales to server-side, so resizing to this is
- *  perceptually lossless — the model discards anything finer regardless. */
+/** Anthropic downscales an image whose long edge is over 1568 px or whose cost
+ *  would be over 1568 visual tokens (2576 px and 4784 tokens on Claude 4.7 and
+ *  later models). */
 export const IMAGE_LONG_EDGE_MAX = 1568;
 const IMAGE_JPEG_QUALITY = 85;
-/** Cap on the *encoded* bytes inlined (raw, pre-base64). Anthropic accepts
- *  ~5MB/image of base64; staying under ~3.5MB raw keeps us inside. */
+/** Anthropic accepts up to 5 MB of base64 per image on Amazon Bedrock, and
+ *  10 MB on the Claude API and on Claude models on Google Cloud (Google
+ *  managed); base64 adds a third, so 3.5 MB of image bytes stays under the
+ *  smaller limit. */
 export const IMAGE_OUTPUT_RAW_CAP = 3.5 * 1024 * 1024;
 /** Refuse to even download sources larger than this (OOM guard). sharp's own
  *  pixel limit guards the decoded bitmap against decompression bombs. */
@@ -33,11 +35,8 @@ export const MAX_TEXT_BYTES = 256 * 1024;
 export const DEFAULT_ATTACHMENT_INLINE_MAX_BYTES = 5120;
 export const DEFAULT_MAX_INLINE_IMAGES = 4;
 
-/** The pass-through fast paths may ONLY emit formats the model API accepts.
- *  sharp happily reads svg/tiff/avif/heif too — an SVG small enough to skip
- *  re-encoding would otherwise sail through as `image/svg` and poison the
- *  agent's history with a permanently-rejected block. Non-API formats fall
- *  through to the re-encode pipeline, which rasterizes them to PNG/JPEG. */
+/** Formats the model API accepts. sharp also reads svg/tiff/avif/heif; an SVG
+ *  passed through would be a block the API rejects on every request. */
 const API_SAFE_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
 
 /** Decoded-bitmap ceiling handed to sharp (default is 268 Mpx, ~1 GiB RGBA).
@@ -98,9 +97,8 @@ async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | n
       return { data: buf.toString('base64'), mimeType: `image/${meta.format}` };
     }
 
-    // Fresh pipeline per encode (sharp instances aren't safely reusable across
-    // multiple toBuffer() calls). resize() with withoutEnlargement is a no-op
-    // when the image is already within bounds but over the byte cap.
+    // resize() with withoutEnlargement is a no-op when the image is already
+    // within bounds.
     const resizeOpts = { width: IMAGE_LONG_EDGE_MAX, height: IMAGE_LONG_EDGE_MAX, fit: 'inside' as const, withoutEnlargement: true };
     const base = () => sharp(buf, sharpOpts).resize(resizeOpts);
 

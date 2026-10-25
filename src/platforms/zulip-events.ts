@@ -1,38 +1,20 @@
 /**
- * Zulip Event Loop — Real-time message delivery via long-polling.
+ * Failure shapes of the client stack (`zulip-js@2.1.0` → `isomorphic-fetch` →
+ * `node-fetch@2.7.0`):
  *
- * Registers an event queue for message, reaction, edit and delete events,
- * polls for them (stream messages and direct messages alike), and routes
- * each kind through its callback. Handles queue expiry recovery and
- * graceful shutdown.
- *
- * Failure semantics — grounded in what the vendored client stack
- * (`zulip-js@2.1.0` → `isomorphic-fetch` → `node-fetch@2.7.0`) actually does:
- *
- *   - Queue expiry (BAD_EVENT_QUEUE_ID) is an HTTP 400 with a *valid* JSON
- *     body `{ result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: ... }`.
- *     node-fetch does NOT throw on 4xx and the body parses fine, so zulip-js
- *     `retrieve` RETURNS this object — it never throws. (zulip-js's own
- *     `events_wrapper.js` checks `res.result === 'error'` for exactly this.)
- *     We classify on the returned `code` field and re-register a fresh queue.
- *     Zulip offers no gap recovery for a dead queue, so any events between the
- *     last delivered message and re-registration are lost — we surface that as
- *     a 'gap' system event anchored on the last delivered *message* id/time
- *     (not the queue-local event id, which is meaningless to the new queue or
- *     the messages API) so the host/agent can consult history from there.
- *   - Transport failures (ECONNRESET, timeouts, and non-JSON proxy/HTML error
- *     bodies) DO throw — as a node-fetch `FetchError`. A 502 HTML page rejects
+ *   - Queue expiry (BAD_EVENT_QUEUE_ID) is an HTTP 400 with a valid JSON body
+ *     `{ result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: ... }`. node-fetch
+ *     does not throw on 4xx and the body parses, so zulip-js `retrieve`
+ *     returns this object rather than throwing. Zulip offers no gap recovery
+ *     for a dead queue: events between the last delivered message and
+ *     re-registration are lost.
+ *   - Transport failures (ECONNRESET, timeouts, non-JSON proxy/HTML error
+ *     bodies) throw a node-fetch `FetchError`. A 502 HTML page rejects
  *     `response.json()` with `FetchError('invalid json response body at <url>
  *     reason: ...', 'invalid-json')`; a dropped connection rejects with
  *     `FetchError('request to <url> failed, reason: ...', 'system')`. Both
- *     embed the full request URL (including `?queue_id=...`) in the message,
- *     which is precisely why we must NOT sniff the message for 'queue_id' —
- *     doing so misclassifies every transient blip as expiry. These back off
- *     exponentially (base 2s, cap 60s); after several consecutive failures a
- *     'degraded' system event fires, and a 'recovered' event fires when
- *     polling succeeds again.
- *   - A malformed but non-throwing response (missing `events` array and not an
- *     error object) also backs off rather than hot-spinning the poll.
+ *     embed the request URL, `?queue_id=...` included, so sniffing the message
+ *     for 'queue_id' would misclassify a transient failure as expiry.
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
@@ -52,8 +34,7 @@ export interface ZulipEventMessage {
 }
 
 /** `flags` are the receiving user's message flags from the event envelope
- * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
- * `streamName` is null for direct messages. */
+ * (e.g. 'mentioned', 'wildcard_mentioned'), computed server-side by Zulip. */
 export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
 
 /** A `reaction` event as the queue delivers it. */
@@ -70,12 +51,11 @@ export interface ZulipReactionEvent {
 export type OnZulipReaction = (event: ZulipReactionEvent) => void;
 
 /**
- * An `update_message` event as the queue delivers it — the fields this loop
- * reads. Zulip sends `orig_content`/`content` only when the content changed,
- * `orig_subject`/`subject` only when the topic changed, and `new_stream_id`
- * only when the message moved to another stream. `rendering_only` marks a
- * re-render (a link preview arriving, an inline image resolving) that
- * changed nothing the author wrote.
+ * Zulip sends `orig_content` only when the content changed, and `content`
+ * then and on a re-render that changed nothing the author wrote, such as a
+ * link preview arriving (`rendering_only`). It sends `subject` only when the
+ * topic changed, `orig_subject` with every move, and `new_stream_id` only
+ * when the message moved to another stream.
  */
 export interface ZulipUpdateMessageEvent {
   message_id: number;
@@ -108,6 +88,8 @@ export interface ZulipDeleteMessageEvent {
   topic?: string;
 }
 
+type UnixSeconds = number;
+
 /** A change to an existing message, as the loop forwards it. */
 export type ZulipMessageChange =
   | {
@@ -116,12 +98,11 @@ export type ZulipMessageChange =
       messageIds: number[];
       actorId: number | null;
       /** Unix seconds. */
-      editedAt: number;
+      editedAt: UnixSeconds;
       /** New raw content; null when only the topic or stream changed. */
       content: string | null;
       origContent: string | null;
-          /** New topic; null when the topic name did not change (Zulip omits
-       *  `subject` for a stream-only move but still sends `orig_subject`). */
+      /** Zulip omits `subject` for a stream-only move but still sends `orig_subject`. */
       topic: string | null;
       /** The topic before any move (topic or stream); null for a content edit. */
       origTopic: string | null;
@@ -271,7 +252,6 @@ export class ZulipEventLoop {
     onReaction?: OnZulipReaction,
     onChange?: OnZulipMessageChange,
   ): Promise<void> {
-    // Register event queue.
     // Two zulip-js quirks to work around:
     //   - Booleans crash FormData serialization; pass "true"/"false" as strings.
     //   - Arrays must be raw JS arrays (the library JSON.stringifies them);
@@ -280,7 +260,7 @@ export class ZulipEventLoop {
     // and 'delete_message' an edit to a message the agent was mentioned in
     // never arrived at all (#22).
     // `client_capabilities` must be pre-stringified: zulip-js JSON-encodes
-    // arrays only, and a raw object goes over the wire as "[object Object]".
+    // arrays only.
     // Without bulk_message_deletion a topic deletion is one event per
     // message. `notification_settings_null` is spelled out at its documented
     // default (false): Zulip 12 validates client_capabilities as a whole
@@ -293,11 +273,7 @@ export class ZulipEventLoop {
       client_capabilities: JSON.stringify({ notification_settings_null: false, bulk_message_deletion: true }),
     });
 
-    // A refused registration comes back as a value, not a throw. Without
-    // this check the loop went on polling queue "undefined" and logged only
-    // "returned no events array" — every event lost, the cause invisible.
-    // Throwing hands it to the outer loop: logged with Zulip's reason and
-    // retried after its pause.
+    // A refused registration comes back as a value, not a throw.
     if (registration?.result === 'error' || typeof registration?.queue_id !== 'string') {
       throw new Error(
         `Zulip event queue registration failed: ${registration?.msg ?? 'no queue_id in the response'}` +
@@ -466,11 +442,8 @@ export class ZulipEventLoop {
             const isStream = msg.type === 'stream' && streamName !== null;
             const isDm = msg.type === 'private';
             if (isStream || isDm) {
-              // A throwing onMessage is a handler bug, not a poll failure —
-              // isolate it so it neither aborts the rest of the batch nor
-              // inflates consecutiveFailures toward a bogus 'degraded' marker.
-              // The event is already acked (lastEventId advanced); Zulip won't
-              // redeliver it, so we log and move on (at-most-once).
+              // Zulip won't redeliver an event once the next poll acknowledges
+              // it, so a handler failure is logged, not retried (at-most-once).
               try {
                 onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {
@@ -515,14 +488,8 @@ export class ZulipEventLoop {
     return Math.min(this.baseBackoffMs * 2 ** exp, this.maxBackoffMs);
   }
 
-  /**
-   * Heuristic: did this error come from parsing a non-JSON (HTML/proxy) body?
-   * node-fetch@2 rejects `response.json()` with a `FetchError` (name
-   * 'FetchError', type 'invalid-json') whose message is
-   * `invalid json response body at <url> reason: ...` — NOT a `SyntaxError`
-   * (node-fetch wraps the parse error before it ever escapes). Match that
-   * real shape.
-   */
+  /** node-fetch@2 rejects `response.json()` with a `FetchError` (type
+   *  'invalid-json'), not a `SyntaxError`. */
   private isNonJsonError(error: unknown, errMsg: string): boolean {
     const name = (error as { name?: string })?.name;
     const type = (error as { type?: string })?.type;

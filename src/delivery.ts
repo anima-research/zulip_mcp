@@ -342,17 +342,11 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
 }
 
 /**
- * Render the who/where/when of a message into its body in the shared line
- * shape (see message-line.ts), so the model sees
- * `[<time> id=N] [#stream > topic] Author (mention): text` and not a bare
- * body. The structured fields (author, threadId, metadata) travel too;
- * agent-framework's context strategies render the content blocks only, and
- * an agent that reads "ship it?" with no author cannot tell who asked.
- *
- * Stamps `metadata.attributed: true` and `metadata.attributionHeader` (the
- * exact prefix added), so a host strategy that renders its own provenance
+ * A host that renders only the content blocks shows the model only the body,
+ * so the who/where/when goes into it. `metadata.attributionHeader` is the
+ * exact prefix added, so a host strategy that renders its own provenance
  * header can skip it, and one that scans message text can strip the prefix
- * first. Idempotent on the flag, so a replay cannot double the header.
+ * first.
  */
 export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date) => string): IncomingChannelMessage {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;

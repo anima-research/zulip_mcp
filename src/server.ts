@@ -73,12 +73,9 @@ import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
-/** How long an announcement waits for the host. Short on purpose: this
- *  server answers one request at a time, so a host that reconciles before it
- *  answers `channels/changed` (agent-framework does) cannot be served while
- *  this is outstanding. Timing out fast keeps the channel usable, lets the
- *  host's own `channels/open` be answered, and leaves the re-announcement to
- *  the next refresh. */
+/** A host that reconciles before it answers `channels/changed` cannot be
+ *  served while an announcement is outstanding, since this server answers
+ *  one request at a time. */
 const ANNOUNCE_TIMEOUT_MS = 5_000;
 
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
@@ -194,8 +191,7 @@ export class ZulipMcplServer {
     const manifest = buildServerCapabilities({ typing: typeof adapter.sendTyping === 'function' });
 
     // The manifest is what `initialize` presents (§5.1) and what `mcpl/manifest`
-    // returns (§17.4). Building it through the tracker stamps the canonical
-    // content digest (§17.2) onto the same snapshot both paths serve.
+    // returns (§17.4).
     this.manifestTracker = new ManifestTracker(manifest);
 
     // The effective capability grant for this connection (§5.4). It starts
@@ -445,8 +441,7 @@ export class ZulipMcplServer {
     conn.sendResponse(msg.request.id, result);
 
     // The client's `notifications/initialized` (or, from a lax client, its
-    // first request) follows. Anything that is not the initialized
-    // notification is handed to the main loop untouched.
+    // first request) follows.
     const next = await conn.nextMessage();
     if (next.type === 'notification' && next.notification.method === 'notifications/initialized') {
       console.error(`[zulip-mcp] Client initialized (${this.mcplActive ? 'MCPL' : 'MCP'} mode)`);
@@ -554,9 +549,9 @@ export class ZulipMcplServer {
           const publish = params as unknown as ChannelsPublishParams;
           const result = await this.channelManager.publish(publish);
           if (result.delivered) {
-            // Part of the rollback record. No checkpoint is minted here: the
-            // publish result has no field to carry one (§14.6), so a host can
-            // only learn checkpoints from tool results — see callTool.
+            // No checkpoint is minted here: the
+            // publish result has no field to carry one (§14.3), so a host can
+            // only learn checkpoints from tool results.
             const text = publish.content
               .filter((b): b is TextContent => b.type === 'text')
               .map((b) => b.text)
@@ -626,7 +621,7 @@ export class ZulipMcplServer {
           break;
 
         case method.FEATURE_SETS_UPDATE:
-          // §6.7 Notification form: descriptive metadata only. Grant-bearing
+          // §6.7 Notification form: only `disabled` reductions apply. Grant-bearing
           // updates (including the §5.3 initial policy) arrive as a Request.
           if (this.mcplActive) this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'notification');
           break;
@@ -749,8 +744,7 @@ export class ZulipMcplServer {
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
-    // As with open: the host named a channel, so it has it. agent-framework
-    // reconciles a channel it does not want with `channels/close`.
+    // agent-framework reconciles a channel it does not want with `channels/close`.
     this.channelManager.confirmAnnounced(params.channelId);
     const result = this.channelManager.closeChannel(params);
     this.delivery.markClosed(params.channelId);
@@ -900,15 +894,12 @@ export class ZulipMcplServer {
     // routing. Rechecked here (not only at the event) for what was held.
     if (this.isMuted(channelId) || !this.isAllowed(channelId, message)) return;
 
-    // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
-    // and push alike. Not watermarked: the host asked not to hear it now,
-    // which is not the same as having heard it.
+    // §6.7: a disabled zulip.messaging stops its traffic at once, incoming
+    // and push alike.
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
 
-    // A channel the host has never seen — a DM from someone new, or a stream
-    // the bot was added to after startup (#20): make it a registered channel
-    // first, so the host can open it and route a reply back to it. The
-    // message that arrived is itself the proof that the channel is reachable.
+    // A channel the host has never seen (#20) is registered first, so the host
+    // can open it and route a reply back to it.
     if (newChannel && !this.channelManager.getChannel(channelId)) {
       await this.channelManager.registerAdditional([newChannel]);
     }
@@ -922,10 +913,8 @@ export class ZulipMcplServer {
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
-    // Who said it, where and when, in the body the model reads. The
-    // structured fields stay; this is what a host that renders only the
-    // content blocks shows the model (the Discord surface does the same).
-    // The missed tally below counts the body as written, not the header.
+    // A host that renders only the content blocks shows the model only the
+    // body, so who said it, where and when go into it.
     const bodyText = viewOf(message).text;
     message = this.attributed(message);
 
@@ -1041,11 +1030,9 @@ export class ZulipMcplServer {
   }
 
   /**
-   * Addressed message on a closed channel → push/event. Requires the
-   * `pushEvents` capability and an active zulip.messaging. The origin carries
-   * the MCPL channel id (what the host registers and routes replies to) and
-   * the missed-ambient tally, so the host's closed-channel invitation can
-   * show what staying out has cost.
+   * Requires the `pushEvents` capability and an active zulip.messaging. The
+   * origin carries the MCPL channel id, which the host registers and routes
+   * replies to.
    */
   private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}): Promise<boolean> {
     const conn = this.conn;
@@ -1264,12 +1251,8 @@ export class ZulipMcplServer {
   }
 
   /**
-   * A Zulip event queue died and its replacement starts from "now". Heal
-   * the gap from history (watermark → now) before the gap marker itself is
-   * delivered, so the agent gets the messages, not advice to go looking for
-   * them: open channels are replayed through channels/incoming; every other
-   * watermarked channel gets its mentions as a `<missed>` push, exactly as
-   * after a restart.
+   * A Zulip event queue's replacement starts from "now", so the gap is healed
+   * from history before the gap marker is delivered.
    */
   private async onSystemEvent(event: PlatformSystemEvent): Promise<void> {
     let recovered = 0;
@@ -1353,10 +1336,9 @@ export class ZulipMcplServer {
   }
 
   /**
-   * Execute a tool for `tools/call`. In MCPL mode the tool surface is gated:
-   * `tools` must be in the effective grant (§14.1 / §6.2), and a tool owned
-   * by a feature set the host disabled is unavailable with it (§6.7). Plain
-   * MCP clients are not subject to a grant — there is none to consult.
+   * In MCPL mode `tools` must be in the effective grant (§14.1 / §6.2), and a
+   * tool owned by a feature set the host disabled is unavailable with it
+   * (§6.7). Plain MCP clients have no grant to consult.
    */
   private async callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
     if (this.mcplActive) {
@@ -1373,10 +1355,7 @@ export class ZulipMcplServer {
       const own = await this.serverTool(name, args);
       const result = toToolCallResult(own !== undefined ? own : await this.tools.handleToolCall(name, args));
       // §8: a tool of the rollback-capable feature set mints a checkpoint and
-      // hands it back in `state`, which is the only way a host ever learns
-      // one. A rollback to this checkpoint undoes every send made after it
-      // (this tool's own send is before it, on the record). Error results
-      // carry none: nothing was sent, there is nothing new to return to.
+      // hands it back in `state`, the only way a host ever learns one.
       if (this.mcplActive && featureSetForTool(name) === MESSAGING_FEATURE_SET) {
         const checkpoint = this.stateTracker.createCheckpoint();
         const parent = this.stateTracker.getCheckpointState()?.parent ?? null;
@@ -1405,9 +1384,8 @@ export class ZulipMcplServer {
   }
 
   /**
-   * Make sure a channel this server is about to deliver from is registered.
-   * Runs off the request loop (the event path), so the announcement cannot
-   * deadlock against a host that reconciles before it answers.
+   * Runs off the request loop, so the announcement cannot deadlock against a
+   * host that reconciles before it answers.
    */
   private async ensureChannelKnown(channelId: string): Promise<void> {
     if (this.channelManager.getChannel(channelId)) return;

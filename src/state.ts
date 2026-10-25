@@ -1,11 +1,6 @@
 /**
- * Checkpoint tracking for zulip.messaging rollback (SPEC §8, out of scope
- * for 0.5.0 but still handled, as discord-mcpl does).
- *
- * Every message this server sends — channels/publish and the send tools —
- * is recorded. A checkpoint marks a point in that record; `state/rollback`
- * to a checkpoint hands back the messages sent after it so the caller can
- * delete them (best-effort: Zulip lets a bot delete its own messages).
+ * Rollback (SPEC §8) is best-effort: Zulip lets a bot delete its own messages
+ * only as far as the realm's deletion policy and time limit allow.
  */
 
 import { randomUUID } from 'node:crypto';

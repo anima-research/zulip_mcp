@@ -1,23 +1,16 @@
 /**
- * Tests for ZulipEventLoop failure handling.
+ * The client stack (`zulip-js@2.1.0` → `isomorphic-fetch` → `node-fetch@2.7.0`):
  *
- * These mocks reproduce the ACTUAL error shapes the vendored client stack
- * (`zulip-js@2.1.0` → `isomorphic-fetch` → `node-fetch@2.7.0`) produces —
- * verified by reading node_modules/zulip-js/lib/{api,events_wrapper}.js and
- * node_modules/node-fetch/lib/index.js:
- *
- *   - Queue expiry (BAD_EVENT_QUEUE_ID) is a *returned value*, not a throw:
+ *   - Queue expiry (BAD_EVENT_QUEUE_ID) is a returned value, not a throw:
  *     node-fetch doesn't throw on 4xx and the JSON error body parses cleanly,
- *     so `retrieve` RESOLVES to `{ result:'error', code:'BAD_EVENT_QUEUE_ID' }`.
+ *     so `retrieve` resolves to `{ result:'error', code:'BAD_EVENT_QUEUE_ID' }`.
  *   - Transport failures (dropped connection, HTML/proxy 502 bodies) throw a
- *     node-fetch `FetchError` — name 'FetchError', a `type`, and a message
- *     that embeds the full request URL (including `?queue_id=...`). A 502 HTML
- *     page yields type 'invalid-json' / message `invalid json response body
- *     at <url> reason: ...`; a dropped socket yields type 'system' / message
+ *     node-fetch `FetchError`: name 'FetchError', a `type`, and a message that
+ *     embeds the full request URL (including `?queue_id=...`). A 502 HTML page
+ *     yields type 'invalid-json' / message `invalid json response body at
+ *     <url> reason: ...`; a dropped socket yields type 'system' / message
  *     `request to <url> failed, reason: read ECONNRESET`. Neither is a
  *     `SyntaxError`, and both contain the substring `queue_id`.
- *
- * Run: node --import tsx --test test/zulipEventLoop.test.ts
  */
 
 import test from 'node:test';

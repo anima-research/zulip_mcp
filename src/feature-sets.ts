@@ -1,42 +1,7 @@
 /**
- * Feature Set Declarations — MCPL 0.5 (SPEC §5.1, §6.1, §6.2).
- *
- * Declares this server's feature sets and builds the manifest
- * (`experimental.mcpl`) presented at `initialize` and returned by
- * `mcpl/manifest`.
- *
- *   zulip.messaging — real-time delivery + channel management
- *   zulip.history   — reading back through streams (tools)
- *   zulip.context   — history injection before inference
- *
- * `uses` is a closed vocabulary in 0.5 (§6.2) and derivation is fail-closed
- * (§6.4): an inaccurate declaration disables the feature set. Every path below
- * is justified by a call site, not by aspiration:
- *
- *   channels.register  — ChannelManager.registerChannels sends channels/register
- *   channels.lifecycle — server.ts handles channels/open and channels/close
- *   channels.publish   — server.ts handles channels/publish
- *   channels.incoming  — ChannelManager.flushBatch sends channels/incoming
- *   channels.typing    — server.ts handles channels/typing (adapter implements it)
- *   channels.acknowledge — server.ts handles channels/acknowledge (a reaction)
- *   channels.streaming — server.ts handles the channels/outgoing/chunk and
- *                        /complete terminators (finalize-only: delivery is
- *                        never a side effect of a lifecycle event, §14.5)
- *   pushEvents         — server.ts sends push/event for addressed messages on
- *                        channels the host has not opened, and for the
- *                        reconnect catch-up sweep
- *   tools              — the MCP tool surface of this server
- *   contextHooks.beforeInference.inject.beforeUser
- *                      — ContextProvider returns injections, all at
- *                        position 'beforeUser' (platforms/zulip.ts fetchContext)
- *
- * Deliberately NOT declared:
- *   contextHooks.beforeInference.observe
- *               — ContextProvider.handleBeforeInference ignores its params
- *                 entirely, so it never reads `userMessage` (§10.1).
- *   inferenceLifecycle — this server has no use for turn boundaries; absence
- *                 of a capability is denial, and advertising one we do not
- *                 consume would invite a grant we cannot justify.
+ * MCPL 0.5 feature sets (SPEC §5.1, §6.1, §6.2). `uses` is a closed
+ * vocabulary (§6.2), and a feature set whose `uses` is absent, empty or
+ * unrecognized is disabled (§6.4).
  */
 
 import type {

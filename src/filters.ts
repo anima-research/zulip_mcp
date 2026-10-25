@@ -1,41 +1,6 @@
 /**
- * The filters plane — which streams and people can reach the agent, which
- * streams are muted, and (for the reactions surface) which channels show
- * live reactions and which reaction emojis are withheld from the model.
- *
- * One JSON file is the desired state. It always exists once the server has
- * started: `ZULIP_FILTERS_FILE` when set, else `<state dir>/<session>.filters.json`,
- * seeded from the environment on first materialization. From then on edits
- * — by hand, by ops tooling, or by the agent through `filters_update` /
- * `mute_channel` — are hot-applied within seconds; nothing here needs a
- * restart, so an allowlist change can never require one (discord-mcpl #26).
- *
- * Semantics:
- *   streams unset/empty      → every stream the bot can see
- *   dmUsers unset/empty      → anyone may DM the bot
- *   mutedStreams             → nothing from these streams reaches the agent,
- *                              mentions included, and nothing is tallied
- *   reactionChannels         → channels opted into live reaction visibility
- *   suppressedReactionEmojis → reaction markers withheld from every
- *                              model-visible surface (operator-owned; the
- *                              agent's tools cannot carry this key)
- *
- * File schema:
- *   {
- *     "streams": ["general", "dev"],
- *     "dmUsers": ["42", "ann@example.com"],
- *     "mutedStreams": ["random"],
- *     "reactionChannels": ["zulip:general"],
- *     "suppressedReactionEmojis": ["biohazard"]
- *   }
- *
- * Failure posture: an unparseable or vanished file keeps the last-known-good
- * filters in force (never fail-open) and marks the plane stale. At startup
- * there is no last-known-good, so a file that exists but cannot be parsed
- * is a startup failure — the alternative would be running every
- * authorization list on the env seed, which for a deployment that never set
- * one means unrestricted. `filters_get` reports the plane's
- * desired-vs-effective state so disk ≠ process is always witnessed.
+ * Edits to the filters file are hot-applied: an allowlist change must never
+ * require a restart (discord-mcpl #26).
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
@@ -68,11 +33,10 @@ function stripHash(s: string): string {
 }
 
 /**
- * The matching key of a reaction marker. A name (`biohazard`, `:eyes:`) is
- * lower-cased without colons. A glyph (☣️, as the host's baseline carries
- * them) becomes its codepoints in hex joined by '-', VS-16 stripped — the
- * form Zulip reports as `emoji_code` for unicode emoji — so a glyph-shaped
- * entry and a name-shaped event meet on the code.
+ * A glyph (☣️, as the host's baseline carries them) becomes its codepoints in
+ * hex joined by '-', VS-16 stripped: the form Zulip reports as `emoji_code`
+ * for unicode emoji, so a glyph-shaped entry and a name-shaped event meet on
+ * the code.
  */
 export function normalizeReactionEmoji(emoji: string): string {
   const s = emoji.replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '');
@@ -169,11 +133,9 @@ export function filtersFileMtime(path: string): number | null {
   }
 }
 
-/** Poll-cycle interpreter for the file's presence/mtime, so the poller can
- *  tell an atomic-rename blink from a real deletion and force a reload when
- *  a vanished file reappears with a preserved mtime. One missing observation
- *  is grace (a non-atomic editor mid-replace); persistent absence is a real
- *  state the plane must witness. */
+/** One missing observation is grace: a non-atomic editor removes the file mid-replace. */
+const MISSING_POLLS_TOLERATED = 1;
+
 export class FiltersFilePollTracker {
   private lastMtime: number | null;
   private missedPolls = 0;
@@ -185,7 +147,7 @@ export class FiltersFilePollTracker {
   observe(mtime: number | null): 'none' | 'missing' | 'reload' {
     if (mtime === null) {
       this.missedPolls++;
-      return this.missedPolls >= 2 ? 'missing' : 'none';
+      return this.missedPolls > MISSING_POLLS_TOLERATED ? 'missing' : 'none';
     }
     const reappeared = this.missedPolls > 0;
     this.missedPolls = 0;
@@ -388,12 +350,7 @@ export class FiltersPlane {
     return [...new Set([...(this.effective.suppressedReactionEmojis ?? []), ...this.baseline])];
   }
 
-  /**
-   * Is a reaction withheld? Matched on the emoji name and, for unicode
-   * emoji, on its codepoints — so the host's glyph-shaped baseline (☣️)
-   * meets Zulip's name-shaped event (`biohazard`, code `2623`). A realm
-   * emoji's code is its realm id and is never compared against a glyph.
-   */
+  /** A custom emoji's code is its id, never compared against a glyph. */
   reactionSuppressed(emojiName: string, emojiCode?: string, reactionType?: string): boolean {
     const list = this.effectiveSuppressed();
     if (list.length === 0) return false;

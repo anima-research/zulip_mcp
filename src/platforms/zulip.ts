@@ -56,8 +56,7 @@ import {
 /** The address every stream descriptor carries. */
 export interface ZulipChannelAddress {
   stream_name: string;
-  /** Absent only when a stream was described from an event that carried no
-   *  id; the name addresses every send, and typing degrades to a no-op. */
+  /** Sends address a stream by name; only typing needs its id. */
   stream_id?: number;
 }
 
@@ -173,16 +172,13 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Stream names by id, from discovery (refreshed on a miss): how a
    *  deletion or a cross-stream move names a stream the cache does not know. */
   private streamNamesById = new Map<number, string>();
-  /** Messages this adapter deleted itself (rollback, the delete tool), by
-   *  id → when: Zulip's delete event names no actor, so the echo of the
-   *  bot's own deletion is recognised here and dropped. Bounded and expiring
-   *  — a failed delete never echoes. */
+  /** Zulip's delete event names no actor, so the echo of the bot's own
+   *  deletion is recognised here and dropped. */
   private selfDeleted = new Map<number, number>();
   /** When the stream list was last refreshed for an unknown id: a stream
    *  the bot cannot see never resolves, and must not cost a refresh per event. */
   private streamsRefreshedAt = 0;
-  /** Messages just moved to a stream the bot cannot see, by id → when: the
-   *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
+  /** Zulip reports a move to a stream the bot cannot see as a delete event. */
   private movedAway = new Map<number, number>();
 
   constructor(
@@ -373,21 +369,17 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * An edit, move or deletion from the event queue, placed and cleaned for
-   * the server. The bot's own edits are its own doing; a change someone
-   * else made to the bot's message is news. A deletion is placed from the
-   * cache alone (the message is gone), falling back to the stream the event
-   * names — a deleted DM the cache never saw cannot be placed and is dropped.
+   * A deleted message can't be fetched, so a deletion is placed from the
+   * cache, falling back to the stream the event names; a deleted DM the cache
+   * never saw cannot be placed.
    */
   private async onZulipChange(change: ZulipMessageChange, emit: OnMessageChange): Promise<void> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
       if (self !== null && change.actorId === self) return;
       const cached = this.seen.get(change.messageId) ?? null;
-      // A cache miss GETs the message as it reads NOW. For a content edit
-      // that is the right place; for a cross-stream move it is the stream
-      // the message went to, and the agent only ever saw it in the one it
-      // came from — which the event names.
+      // A GET reads the message as it is now: after a cross-stream move, the
+      // stream it went to, while the event names the one it came from.
       const where = cached ?? await this.locate(change.messageId, 'an edit');
       if (!where) return;
       const crossStream = change.newStreamId !== null && !where.isDm;
@@ -544,9 +536,8 @@ export class ZulipAdapter implements PlatformAdapter {
       .map(c => c.text)
       .join('\n');
     // Image and audio blocks ride along as uploads, linked after the text
-    // (Zulip's own attachment form). Uploads happen before the send, so a
-    // failed upload fails the publish whole; a send that fails after them
-    // leaves unreferenced uploads, which Zulip garbage-collects.
+    // (Zulip's own attachment form). A send that fails after them leaves
+    // unreferenced uploads, which Zulip garbage-collects.
     if (this.uploader && this.uploadPolicy) {
       const uploaded = await uploadBlocks(this.uploader, content, this.uploadPolicy);
       textContent = withAttachmentLinks(textContent, uploaded);
@@ -655,21 +646,13 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Best-effort typing indicator.
+   * Zulip clients stop showing a typing start that is never stopped once the
+   * server's expiry period passes, so a missed stop lingers but does not stick.
    *
-   * Stream typing goes to `metadata.topic`. ChannelManager.sendTyping fills
-   * it in when the host names none (the topic of the newest message
-   * noteConversation took) and stops a run in the topic it started in;
-   * falls back to 'mcpl' only when there is still no topic.
-   *
-   * `op` is passed through: 'start' while the host refreshes (every ~7s
-   * during inference), 'stop' when the turn ends. Zulip expires a start that
-   * is never stopped on its own, so a missed stop lingers but does not stick.
-   *
-   * Note: zulip-js's `typing.send` unconditionally dereferences `params.to.length`,
-   * so we must pass `to: []` even for the stream form — otherwise the library
-   * throws a TypeError before the HTTP request is made. The Zulip server ignores
-   * `to` when `type:'stream'` is set.
+   * zulip-js's `typing.send` dereferences `params.to.length` unconditionally,
+   * so the stream form must pass `to: []` or the library throws a TypeError
+   * before the request is made; since Zulip 8.0 the server ignores `to` for
+   * `type:'stream'`.
    */
   async sendTyping(
     channelId: string,
@@ -779,20 +762,12 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Zulip delivers stream events only to subscribers — even with
-   * `all_public_streams` on the queue — so opening a channel must also
-   * subscribe the bot, or the host would be listening to silence.
-   * Idempotent; subscription persists server-side. DMs need nothing.
-   *
-   * Asks Zulip every time rather than remembering: the `unlisten` tool
-   * removes subscriptions behind this adapter's back, and a remembered
-   * "subscribed" would let a later open succeed onto silence. The add call
-   * is cheap and answers `already_subscribed` when there is nothing to do.
-   *
-   * Throws when the subscription did not happen: an API error, a transport
-   * failure, or — Zulip's way of refusing a private stream — a `success`
-   * result that lists the stream under `unauthorized`. The caller (the open
-   * lifecycle) turns that into a failed open rather than a silent one.
+   * Zulip sends a private stream's messages only to its subscribers. A public
+   * stream's reach an unsubscribed bot's `all_public_streams` queue without
+   * their flags, so without `mentioned`, and a guest bot's not at all unless
+   * the stream is web-public. A message's edits and reactions go only to those
+   * who received it. So opening a channel subscribes the bot. The call answers
+   * `already_subscribed` when there is nothing to do.
    */
   async ensureSubscribed(channelId: string): Promise<void> {
     if (parseDmChannelId(channelId)) return;
@@ -869,13 +844,8 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      // A stream the bot joined after startup is unknown to the host; the
-      // message proves it is reachable, so it travels with its descriptor
-      // (#20). Sent with EVERY message, never suppressed as "already
-      // described": the registry that decides what is new is the server's,
-      // it is cleared on reconnect, and a descriptor the host refused or
-      // never confirmed must be offered again rather than held back by
-      // adapter-side memory.
+      // A stream the bot joined after startup is unknown to the host, so its
+      // messages carry their descriptor (#20).
       const channelId = channelIdOf(m, this.identity.selfUserId);
       const streamId = typeof msg.stream_id === 'number' ? msg.stream_id : undefined;
       // Remembered so a later reaction or edit on this stream can be placed.

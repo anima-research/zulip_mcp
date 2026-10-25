@@ -123,8 +123,8 @@ test('the plane seeds from env, hot-reloads edits, and refuses updates while bro
     assert.equal(changes.length, 1);
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')).mutedStreams, ['random']);
 
-    // A hand edit is picked up by the poll; touch the mtime forward so the
-    // change is observable regardless of filesystem timestamp granularity.
+    // Touch the mtime forward so the change is observable regardless of
+    // filesystem timestamp granularity.
     writeFileSync(path, JSON.stringify({ streams: ['dev'], suppressedReactionEmojis: ['biohazard'] }));
     utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
     quiet(() => plane.tick());

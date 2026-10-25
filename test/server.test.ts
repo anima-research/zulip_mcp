@@ -242,9 +242,9 @@ function harness(opts: HarnessOptions = {}): Harness {
       // a transport drop, a timeout, or one that treats it as a Notification.
       if (policy.changedAnswer === 'error') host.sendError(req.id, -32601, 'channels/changed unsupported');
       else if (policy.changedAnswer === 'reconcile') {
-        // agent-framework's handleChanged: reconcile (a blocking channels/open
-        // per descriptor) BEFORE answering. This server answers one request at
-        // a time, so while it waits for this answer it cannot serve that open.
+        // This stands for a host that reconciles (a blocking channels/open per
+        // descriptor) before it answers. This server answers one request at a
+        // time, so while it waits for this answer it cannot serve that open.
         void (async () => {
           for (const c of p.added ?? []) {
             try {
@@ -1220,8 +1220,7 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
     (await h.host.sendRequest('tools/call', { name, arguments: args })) as { isError?: boolean; state?: { featureSet: string; checkpoint: string; parent: string | null } };
 
   await publish('one');
-  // The only way a host learns a checkpoint is a tool result's `state` (§8):
-  // a messaging tool mints one after its own send is on the record.
+  // The only way a host learns a checkpoint is a tool result's `state` (§8).
   const sent = await call('send_message', { content: 'via tool' });
   assert.equal(sent.state?.featureSet, 'zulip.messaging');
   assert.match(sent.state!.checkpoint, /^chk_/);
@@ -1840,10 +1839,11 @@ test('catch-up pages past a page holding nothing but the bot\'s own messages', a
   const h = harness({ history: [streamMsg(101), streamMsg(102), streamMsg(103, { mentioned: true })] });
   // The adapter withholds the bot's own messages after fetching; 101 and
   // 102 are its own, and the page size is two.
+  const lastWithheldId = 102;
   const realFetch = h.adapter.fetchHistory!.bind(h.adapter);
   h.adapter.fetchHistory = async (channelId, query) => {
     const page = await realFetch(channelId, query);
-    return { ...page, messages: page.messages.filter((m) => Number(m.messageId) > 102) };
+    return { ...page, messages: page.messages.filter((m) => Number(m.messageId) > lastWithheldId) };
   };
   h.adapter.pageCap = 2;
   await initialize(h, true);
@@ -1966,10 +1966,10 @@ test('a channel the host never answered for stays usable here and is re-announce
 });
 
 test('a host that opens or closes a pending channel has confirmed it; the backlog does not grow forever (#20)', async () => {
-  // Against agent-framework the answer to an announcement made inside a tool
-  // call can never arrive (it reconciles first, and this server serves one
-  // request at a time). The host acting on the channel is the only
-  // confirmation available, so it has to count as one.
+  // Against a host that reconciles before it answers, the answer to an
+  // announcement made inside a tool call cannot arrive until the call returns,
+  // because this server serves one request at a time. So the host acting on
+  // the channel is the only confirmation in time.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);
@@ -2034,12 +2034,9 @@ test('listen registers what it subscribed the bot to and reports how the host an
 });
 
 test('a host that reconciles before it answers does not cost the channel — the reported failure (#20)', async () => {
-  // agent-framework answers channels/register BEFORE reconciling and
-  // channels/changed AFTER, and this server serves one request at a time. So
-  // an announcement made inside a tool call cannot be answered until the tool
-  // returns: the host waits for a channels/open this server cannot reach, and
-  // the announcement times out. That is why restarting fixed the reported
-  // streams and refresh_channels never did.
+  // A host that answers channels/changed only after reconciling can't answer
+  // an announcement made inside a tool call until the tool returns, since this
+  // server serves one request at a time.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);
@@ -2065,10 +2062,7 @@ test('a host that reconciles before it answers does not cost the channel — the
 
 test('channels/open re-discovery settles against a host that reconciles before it answers (#20)', async () => {
   // The re-discovery runs inside the open, so such a host cannot answer its
-  // announcement until the open returns. With the descriptor recorded before
-  // the announcement goes out, the open succeeds after the timeout, and the
-  // host's queued reconcile-time open then finds the channel instead of
-  // re-discovering it and starting the same cycle over.
+  // announcement until the open returns.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);

@@ -10,12 +10,11 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /**
- * Run-as-main detection that survives npm bin symlinks. Node resolves the
- * entry module to its realpath while process.argv[1] keeps the symlink path,
- * so a naive `import.meta.url === pathToFileURL(argv[1]).href` is false when
- * launched via `npx`/a bin shim. Both sides are canonicalised: argv[1] for
- * the bin shim, and the entry path because it can itself sit behind a
- * symlinked directory (macOS's /var → /private/var, --preserve-symlinks).
+ * Node resolves the entry module to its realpath while process.argv[1] keeps
+ * the symlink path, so a naive `import.meta.url === pathToFileURL(argv[1]).href`
+ * is false when launched via `npx`/a bin shim. Both sides are canonicalised:
+ * argv[1] for the bin shim, and the entry path because it can itself sit
+ * behind a symlinked directory (macOS's /var → /private/var, --preserve-symlinks).
  */
 export function isMainModule(importMetaUrl: string, argv1: string | undefined): boolean {
   if (!argv1) return false;
@@ -125,16 +124,11 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
 }
 
 /**
- * Validate a Zulip attachment path or URL against the configured realm before
- * the bot's credentials are attached. Tool input is influenced by message
- * content from untrusted senders, so only `/user_uploads/` on the realm host
- * may be reachable.
- *
- * SAFETY INVARIANT: the prefix check relies on `new URL()` normalizing dot
- * segments BEFORE `pathname` is read — '/user_uploads/../api/v1/users/me'
- * (and its percent-encoded variants; the WHATWG parser treats '%2e%2e' as
- * '..') normalizes to '/api/v1/users/me' and is rejected. Never replace this
- * with a check on the raw input string.
+ * The prefix check relies on `new URL()` normalizing dot segments before
+ * `pathname` is read: '/user_uploads/../api/v1/users/me' (and its
+ * percent-encoded variants; the WHATWG parser treats '%2e%2e' as '..')
+ * normalizes to '/api/v1/users/me' and is rejected. Never replace this with a
+ * check on the raw input string.
  */
 export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): URL {
   if (!rawPath) throw new Error("path is required");
@@ -192,8 +186,7 @@ export function classifyExtension(name: string): { mimeType: string; isImage: bo
 }
 
 // Zulip uploads appear in markdown as `[name](/user_uploads/X/Yy/Zz/name.ext)`
-// or inline-image syntax `![name](/user_uploads/...)`. We pull paths out so the
-// agent can request the bytes on demand via fetch_attachment.
+// or inline-image syntax `![name](/user_uploads/...)`.
 export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
   const refs: AttachmentRef[] = [];
   const seen = new Set<string>();
@@ -210,14 +203,9 @@ export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
   return refs;
 }
 
-// Helper function to strip HTML and format content with mention handling.
-// Only for paths where Zulip returns rendered HTML: today that is
-// `formatMessages` in tool-runtime.ts, fed by `messages.retrieve` without
-// `apply_markdown:false`. Everything that goes through `normalizeMessage`
-// (history, fetch_around, DM discovery, the live event queue) is raw markdown
-// and uses `cleanMarkdown` instead; running this strip on raw markdown deletes
-// author-typed XML/HTML (#24). Attachment refs on the raw path are extracted
-// by extractZulipAttachments.
+// Only for paths where Zulip returns rendered HTML (fetched without
+// `apply_markdown:false`): on raw markdown this strip deletes author-typed
+// XML/HTML (#24).
 export function cleanContent(html: string): string {
   let content = html;
 
@@ -233,10 +221,8 @@ export function cleanContent(html: string): string {
     '$2 (uid:$1)'
   );
 
-  // Preserve attachment / inline-image URLs before the generic tag strip below
-  // eats them. Zulip renders uploads as `<a href="/user_uploads/...">name</a>`
-  // and inline images as the same anchor wrapping an `<img>`. Without this,
-  // history fetches lose the URL and the agent can't call fetch_attachment.
+  // Zulip renders uploads as `<a href="/user_uploads/...">name</a>` and inline
+  // images as the same anchor wrapping an `<img>`.
   content = content.replace(
     /<a [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
     (_match, href: string, inner: string) => {
@@ -275,13 +261,9 @@ export function cleanContent(html: string): string {
 }
 
 /**
- * Normalise raw markdown as returned by Zulip with `apply_markdown: false`.
- * Deliberately NOT an HTML stripper: raw markdown contains no HTML of Zulip's
- * making, so any `<...>` in it is the author's own text (XML in a fenced
- * block, generics such as `Map<string, T>`, comparisons). Running
- * `cleanContent()` on this path deleted all of it (#24). Mentions are already
- * textual (`@**Name**`) and uploads are `[name](/user_uploads/...)`, so the
- * only work left is line-ending and whitespace normalisation.
+ * Not an HTML stripper: raw markdown (`apply_markdown: false`) contains no
+ * HTML of Zulip's making, so any `<...>` in it is the author's own text (XML
+ * in a fenced block, generics such as `Map<string, T>`, comparisons) (#24).
  */
 export function cleanMarkdown(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').trim();

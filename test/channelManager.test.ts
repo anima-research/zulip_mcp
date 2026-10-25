@@ -33,11 +33,7 @@ const fakeMcplClient = {
   sendIncoming: async () => {},
 } as any;
 
-/**
- * A grant with the channel capabilities these tests exercise. There is no
- * ungated ChannelManager: SPEC 0.5 §5.4 makes absence the denial, so a test
- * has to say what the host granted.
- */
+/** SPEC 0.5 §5.4 makes absence the denial, so a test has to say what the host granted. */
 function grantedChannels(): CapabilityGrant {
   const grant = new CapabilityGrant();
   grant.apply({

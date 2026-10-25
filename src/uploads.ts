@@ -1,22 +1,8 @@
 /**
- * Outbound attachments — uploading files to Zulip so a message can carry
- * them. zulip-js has no upload surface, so this goes straight at
- * `POST /api/v1/user_uploads` with the bot's credentials, the same realm +
- * Basic-auth pair the fetch side uses.
- *
- * Zulip attaches a file to a message by markdown link: the upload returns a
- * `/user_uploads/...` path and the message body links to it. Images so
- * linked get a preview in the web client automatically.
- *
- * Trust boundary. Tool input is influenced by message content from
- * untrusted senders, and this server runs as a child of the host with the
- * host's filesystem and environment. So a local-file attachment is never an
- * arbitrary path: it is `<root>/<relative>`, where `<root>` names a
- * directory an operator exported in `ZULIP_UPLOAD_ROOTS`. With no roots
- * configured, local files are refused outright (fail closed); inline base64
- * bytes still work. Every read is bounded by a per-file ceiling that is
- * enforced on the bytes actually read, not only on `stat`, and a message
- * carries at most `maxCount` files within `maxTotalBytes`.
+ * zulip-js has no upload surface, so this goes straight at
+ * `POST /api/v1/user_uploads` with the bot's credentials. Zulip attaches a
+ * file to a message by link: the upload returns a `/user_uploads/...` path
+ * and the message body links to it.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -130,11 +116,9 @@ export function isValidMimeType(value: string): boolean {
 }
 
 /**
- * A multipart/form-data body, built by hand. zulip-js drags in
- * isomorphic-form-data, which replaces the global `FormData` with a
- * stream-based one that cannot take a Blob — so neither the WHATWG form
+ * zulip-js drags in isomorphic-form-data, which replaces the global `FormData`
+ * with a stream-based one that cannot take a Blob, so neither the WHATWG form
  * nor that one is safe to rely on. A Buffer body works under every fetch.
- * The header fields are re-sanitised here so no caller can inject a line.
  */
 export function multipartBody(input: UploadInput, boundary: string): Buffer {
   const name = input.name.replace(/["\r\n]/g, '_');
@@ -320,18 +304,13 @@ async function resolveUnderRoot(file: string, policy: UploadPolicy): Promise<{ c
 export const LOCAL_FILES_SUPPORTED = process.platform === 'linux';
 
 /**
- * Bind the containment check to the object actually opened, not to the
- * pathname it was opened by: a parent directory swapped for a symlink
- * between `realpath` and `open` would otherwise open a file outside the
- * root (O_NOFOLLOW guards only the final component). `/proc/self/fd/N`
- * says what the descriptor refers to. The opened object must be a strict
- * descendant of the root: an opened regular file can never be the root
- * itself, and a file unlinked after open reads back as `<root>/x (deleted)`,
- * which still starts with `<root>/`. Nothing is stripped from the link —
- * a sibling literally named `<root> (deleted)` must not pass as the root.
- * Without procfs there is no descriptor-relative resolution in Node, and a
- * pathname re-check is the race this guards against; callers refuse local
- * files there instead (LOCAL_FILES_SUPPORTED).
+ * O_NOFOLLOW guards only the final component, so a parent directory swapped
+ * for a symlink between `realpath` and `open` would open a file outside the
+ * root; `/proc/self/fd/N` says what the descriptor actually refers to. A file
+ * unlinked after open reads back as `<root>/x (deleted)`, which still starts
+ * with `<root>/`, and a sibling literally named `<root> (deleted)` must not
+ * pass as the root. Without procfs, Node has no descriptor-relative
+ * resolution.
  */
 export async function verifyOpenedInsideRoot(handle: FileHandle, rootDir: string): Promise<boolean> {
   if (!LOCAL_FILES_SUPPORTED) return false;
@@ -482,10 +461,8 @@ export async function closeAll(prepared: PreparedUpload[]): Promise<void> {
 }
 
 /**
- * Read and upload one at a time, so one file's bytes are in memory at once.
- * Every source is released whatever happens. The aggregate budget is
- * re-applied to the bytes actually read: declared sizes are what `fstat`
- * said at preparation, and a file may have grown (or, on procfs, been 0).
+ * The aggregate budget is re-applied to the bytes actually read: a file may
+ * have grown since its `fstat`, and most procfs files report a size of 0.
  */
 export async function uploadPrepared(uploader: Uploader, prepared: PreparedUpload[], policy: UploadPolicy): Promise<UploadedFile[]> {
   const out: UploadedFile[] = [];
@@ -503,9 +480,9 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
   return out;
 }
 
-/** Validate all, then upload. Uploads happen before the send; a send that
- *  then fails leaves them unreferenced, and Zulip garbage-collects unclaimed
- *  uploads after a week. */
+/** Uploads happen before the send; a send that then fails leaves them
+ *  unreferenced, and by default Zulip deletes unclaimed uploads after five
+ *  weeks. */
 export async function uploadAttachmentArgs(uploader: Uploader, args: unknown, policy: UploadPolicy): Promise<UploadedFile[]> {
   return uploadPrepared(uploader, await prepareAttachments(args, policy), policy);
 }
@@ -526,11 +503,8 @@ export function withAttachmentLinks(content: string, files: UploadedFile[]): str
 // ── MCPL content blocks ──
 
 /**
- * The media blocks of a publish, validated as uploads: `image`/`audio`
- * blocks carrying inline data. URI-bearing blocks are left alone — Zulip
- * can only attach bytes this server holds, and a host→server `file://`
- * reference has no meaning in the spec (and would be a path the host chose
- * for the server's filesystem). Count and byte budgets apply as for tools.
+ * URI-bearing blocks are left alone: Zulip can only attach bytes this server
+ * holds, and a host→server `file://` reference has no meaning in the spec.
  */
 export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy): Promise<PreparedUpload[]> {
   const prepared: PreparedUpload[] = [];

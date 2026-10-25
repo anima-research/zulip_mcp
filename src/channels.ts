@@ -35,10 +35,9 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
  */
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
-  /** `channels/changed`, Request form (§14.5) — itemized like register.
-   *  `timeoutMs` bounds the wait: a host that reconciles before answering
-   *  cannot be served while this server is inside a request of its own, so
-   *  waiting out the default 30s would stall the whole loop. */
+  /** A host that reconciles before answering cannot be served while this
+   *  server is inside a request of its own, so the wait is bounded by
+   *  `timeoutMs`. */
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
@@ -111,9 +110,8 @@ export class ChannelManager {
   private typingTopic = new Map<string, string | undefined>();
 
   /**
-   * @param grant the effective capability grant for this connection (§5.4).
-   *   Required: there is no ungated construction, because a default would be a
-   *   default-allow and absence of a capability is denial.
+   * There is no ungated construction: absence of a capability is denial
+   * (§5.4), so a default would be a default-allow.
    */
   constructor(
     private host: HostClient,
@@ -126,13 +124,9 @@ export class ChannelManager {
   }
 
   /**
-   * Discover all available channels across adapters and register them with the
-   * host (`channels/register`, §14.3).
-   *
-   * Descriptors are recorded locally only once the host has accepted them.
    * §14.5 authorizes each descriptor independently and the Request form
-   * answers itemwise, so a rejected descriptor must not sit in `allChannels`
-   * pretending to exist.
+   * answers itemwise, so a descriptor is recorded only once the host has
+   * accepted it.
    */
   async registerChannels(): Promise<void> {
     if (!this.grant.has('channels.register')) {
@@ -175,18 +169,11 @@ export class ChannelManager {
   }
 
   /**
-   * Register channels that appeared after startup (a DM from a new
-   * conversation, a stream the bot was just added to) via `channels/changed`
-   * (§14.5). Descriptors already known are refreshed locally and NOT
-   * re-announced, so repeat calls do not spam the host.
-   *
    * An announcement that never landed (transport error, timeout, a host that
    * treats `channels/changed` as a Notification and answers nothing) is not a
-   * refusal: the channel exists and the host may already know it from the
-   * message that arrived from it. Dropping it locally is what left a stream
-   * the bot joined after startup unopenable until a restart (#20), so it is
-   * recorded here and re-announced on the next call. Only an itemized
-   * `accepted: false` keeps a descriptor out — that IS the host's answer.
+   * refusal: the host may already know the channel from the message that
+   * arrived from it (#20). Only an itemized `accepted: false` keeps a
+   * descriptor out.
    */
   async registerAdditional(
     descriptors: ChannelDescriptor[],
@@ -232,10 +219,9 @@ export class ChannelManager {
       return { announced: [], local: [], refused: refusedNow, reason: 'channels.register is not in the grant' };
     }
 
-    // Recorded BEFORE the announcement goes out. A host that opens a channel
-    // from inside its own `channels/changed` handler (agent-framework
-    // reconciles before it answers) would otherwise be told `Unknown channel`
-    // for the very descriptor it is processing.
+    // Recorded before the announcement goes out: a host that opens a channel
+    // from inside its own `channels/changed` handler would otherwise be told
+    // `Unknown channel` for the very descriptor it is processing.
     for (const d of added) {
       this.allChannels.set(d.id, d);
       this.announcing.add(d.id);
@@ -305,12 +291,10 @@ export class ChannelManager {
   }
 
   /**
-   * The host proved it knows a channel by acting on it — it opened or closed
-   * one this server is still waiting to hear about. Against a host that
-   * reconciles inside its own `channels/changed` handler that action is the
-   * only confirmation this server can ever get, because the answer to the
-   * announcement cannot arrive until the request this server is serving
-   * returns. Without this the backlog would be retried forever (#20 review).
+   * Against a host that reconciles inside its own `channels/changed` handler,
+   * its opening or closing a channel is the only confirmation this server can
+   * get: the answer to the announcement cannot arrive until the request this
+   * server is serving returns (#20).
    */
   confirmAnnounced(channelId: string): void {
     if (this.unannounced.delete(channelId)) {
@@ -339,12 +323,7 @@ export class ChannelManager {
     }
   }
 
-  /**
-   * What the host said about each submitted descriptor (§14.5). An itemized
-   * `accepted: false` is a refusal; an id the itemization does not mention is
-   * unstated, NOT refused. A result with neither `results` nor `registered`
-   * itemizes nothing: the submitted set stands (pre-0.5 shape).
-   */
+  /** §14.5: an itemized `accepted: false` is a refusal. */
   private readVerdicts(
     result: RegisterResultCompat | undefined,
     submitted: ChannelDescriptor[],
@@ -399,12 +378,8 @@ export class ChannelManager {
   }
 
   /**
-   * Handle channels/open from the host. Requires `channels.lifecycle` (§14.1);
-   * a denied capability behaves as if never advertised (§5.4), so this
-   * answers with an error rather than acting.
-   *
-   * An exact `channelId` is preferred; otherwise the first registered channel
-   * of the requested type whose address matches every key the host supplied.
+   * Requires `channels.lifecycle` (§14.1); a denied capability behaves as if
+   * never advertised (§5.4), so this answers with an error rather than acting.
    */
   openChannel(params: { channelId?: string; type: string; address?: unknown }): { channel: ChannelDescriptor } {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
@@ -463,10 +438,7 @@ export class ChannelManager {
     return { closed: existed };
   }
 
-  /**
-   * Handle channels/list from the host. §14.1 keys `channels/list` in either
-   * direction on `channels.register`.
-   */
+  /** §14.1 keys `channels/list` in either direction on `channels.register`. */
   listChannels(): ChannelsListResult {
     if (!this.grant.has('channels.register')) throw capabilityDenied('channels.register');
     return { channels: Array.from(this.allChannels.values()) };
@@ -578,12 +550,8 @@ export class ChannelManager {
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
     const descriptor = this.allChannels.get(channelId);
-    // A topic the host names wins. Like publish, a host that names none means
-    // the conversation's current one, the topic of the newest message
-    // noteConversation took.
-    // The host may send refreshes and the stop with the channel alone, so a run
-    // that a newer message moved must be stopped where it started, or it
-    // lingers there.
+    // The host may send typing refreshes and the stop with the channel alone,
+    // so a run is stopped in the topic it started in.
     const hostTopic = metadata?.topic;
     const named = typeof hostTopic === 'string';
     const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });

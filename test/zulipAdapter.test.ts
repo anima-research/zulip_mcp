@@ -378,7 +378,7 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
     // unknown: the GET only knows the destination, so it is dropped.
     { id: 6, type: 'update_message', message_id: 800, message_ids: [800], user_id: 12, edit_timestamp: 1_700_001_001, orig_subject: 'x', stream_id: 99, new_stream_id: 8 },
     // A move into a stream the bot cannot see, then Zulip's delete for lost
-    // visibility: a vanishing, not a deletion.
+    // visibility.
     { id: 7, type: 'update_message', message_id: 22, message_ids: [22], user_id: 12, edit_timestamp: 1_700_001_002, orig_subject: 'archive', stream_id: 7, new_stream_id: 66 },
     { id: 8, type: 'delete_message', message_ids: [22], message_type: 'stream', stream_id: 66, topic: 'archive' },
   ];
@@ -498,7 +498,7 @@ test('a message from a stream created after startup carries its descriptor, with
   // is the server's registry's call, not the adapter's.
   assert.deepEqual(seen, [
     { id: '10', channelId: 'zulip:general', newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: undefined } },
-    // Described from the message, with the stream id publishing needs.
+    // Described from the message, with the stream id typing needs.
     { id: '11', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
     { id: '12', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
   ]);

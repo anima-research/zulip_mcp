@@ -1,13 +1,4 @@
-/**
- * Capability grant and feature-set declaration conformance (SPEC 0.5 §5.3,
- * §5.4, §6.2, §6.4, §6.7).
- *
- * The theme of every case here is that absence is denial. Nothing the server
- * says — not its advertisement, not its degradation receipt — may widen what
- * the host granted. The message-to-grant step itself is @animalabs/mcpl-core's;
- * these cases pin how this server's wrapper composes it over a connection's
- * lifetime.
- */
+/** Capability grant conformance (SPEC 0.5 §5.3, §5.4, §6.2, §6.4, §6.7): absence is denial. */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
