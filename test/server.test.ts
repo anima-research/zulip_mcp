@@ -2232,7 +2232,7 @@ test('a quote reply pushes on a closed channel without claiming an explicit ment
 });
 
 /** Real history classification, with Zulip's unmentioned raw quote row. */
-function quoteHistory(): ZulipAdapter {
+function quoteHistory(readableTarget = true): ZulipAdapter {
   const original: ZulipRawMessage = {
     id: 2, sender_id: 100, sender_full_name: 'Bot', sender_email: 'reader-bot@example.invalid',
     display_recipient: 'general', subject: 'answers', timestamp: 1_700_000_000,
@@ -2247,7 +2247,10 @@ function quoteHistory(): ZulipAdapter {
       messages: q.num_after > 0 ? [original, reply].filter((m) => m.id > Number(q.anchor)) : [original, reply],
       found_newest: true,
     }),
-    getById: async () => ({ message: original }),
+    getById: async () => {
+      if (!readableTarget) throw new Error('target unavailable');
+      return { message: original };
+    },
   } }, 100, 'session');
 }
 
@@ -2395,7 +2398,7 @@ test('catch-up counts mixed mentions and replies as addressed messages rather th
   } finally { await h.close(); }
 });
 
-test('a reconnect sweep shares one quote-lookup allowance across pages and channels', async () => {
+test('a reconnect sweep gives each history page and channel its own quote-lookup allowance', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-sweep-budget-'));
   let second: Harness | undefined;
   try {
@@ -2413,7 +2416,7 @@ test('a reconnect sweep shares one quote-lookup allowance across pages and chann
       await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 3, 'ambient tally seeded');
     } finally { await first.close(); }
     let gets = 0;
-    const budgets: ChannelHistoryQuery['lookupBudget'][] = [];
+    const queries: ChannelHistoryQuery[] = [];
     const history = new ZulipAdapter({ messages: {
       retrieve: async (q: { narrow: [string, string][]; anchor: number; num_after: number }) => {
         const stream = q.narrow[0][1];
@@ -2436,15 +2439,14 @@ test('a reconnect sweep shares one quote-lookup allowance across pages and chann
     second = harness({ stateDir: dir, sessionId: 'budget' });
     second.adapter.visible.push(other);
     second.adapter.fetchHistory = (channelId, query) => {
-      budgets.push(query.lookupBudget);
+      queries.push(query);
       return history.fetchHistory(channelId, query);
     };
     await initialize(second, true);
     await settled(second);
-    assert.equal(gets, 8, 'the whole sweep, not each page/channel, gets eight target GETs');
-    assert.equal(budgets.length, 12, 'four pages per channel, then four missed-tally backfill pages');
-    assert.ok(budgets[0]);
-    assert.ok(budgets.every((b) => b === budgets[0]));
+    assert.equal(gets, 24, 'all off-page targets in both channels are verified');
+    assert.equal(queries.length, 12, 'four pages per channel, then four missed-tally backfill pages');
+    assert.ok(queries.every((q) => !('lookupBudget' in q)));
     assert.equal(second.server.delivery.watermark('zulip:general'), 16);
     assert.equal(second.server.delivery.watermark(other.id), 36);
   } finally {
@@ -2454,7 +2456,7 @@ test('a reconnect sweep shares one quote-lookup allowance across pages and chann
 });
 
 for (const refuse of [false, true]) {
-  test(`a buffered live reply keeps its verdict when sweep lookups are exhausted${refuse ? ', including after refusal' : ''}`, async () => {
+  test(`a buffered live reply keeps its verdict when the history quote lookup fails${refuse ? ', including after refusal' : ''}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zulip-live-reply-'));
     let second: Harness | undefined;
     let release!: () => void;
@@ -2467,11 +2469,11 @@ for (const refuse of [false, true]) {
         await until(() => first.server.delivery.watermark('zulip:general') === 3, 'initial acceptance');
       } finally { await first.close(); }
       second = harness({ stateDir: dir, sessionId: 'live-reply' });
-      const history = quoteHistory();
+      const history = quoteHistory(false);
       const gate = new Promise<void>((resolve) => { release = resolve; });
       second.adapter.fetchHistory = async (channelId, query) => {
         await gate;
-        return history.fetchHistory(channelId, { ...query, lookupBudget: { remainingRequests: 0 } });
+        return history.fetchHistory(channelId, query);
       };
       const refusedAtWatermarks: number[] = [];
       if (refuse) second.policy.rejectPushes.has = (id) => {
@@ -2616,3 +2618,51 @@ for (const reconnect of [false, true]) {
   }
 });
 }
+
+test('a budget-starved quote row is retried before catch-up advances past it', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    let gets = 0;
+    const rows: ZulipRawMessage[] = Array.from({ length: 9 }, (_, i) => ({
+      id: i + 2, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream',
+      content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`, flags: [],
+    }));
+    const history = new ZulipAdapter({ messages: {
+      retrieve: async ({ anchor }: { anchor: number }) => ({ messages: rows.filter((m) => m.id > anchor), found_newest: true }),
+      getById: async ({ message_id }: { message_id: number }) => {
+        gets++;
+        return { message: { ...rows[0], id: message_id, sender_id: message_id === 508 ? 100 : 102 } };
+      },
+    } }, 100, 'session');
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 9, 'watermark stops before starved row 10');
+    assert.equal(gets, 8);
+    assert.equal(h.pushed.length, 0);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Retry gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 10, 'retry verifies and delivers row 10');
+    assert.equal(gets, 9);
+    assert.ok(h.pushed[0].tags?.includes('chat:reply'));
+  } finally { await h.close(); }
+});
+
+test('the same unverified row defers a channel only once per connection', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.adapter.fetchHistory = async () => ({ messages: [streamMsg(5)], scannedThrough: 5, reachedNewest: true, unverifiedMessageIds: ['5'] });
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 4, 'first unverified verdict deferred');
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Retry gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'repeat verdict fails closed without pinning');
+  } finally { await h.close(); }
+});

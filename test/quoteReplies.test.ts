@@ -259,6 +259,7 @@ test('history quote lookups share a page cap and still use cached authors after 
   rows.push(raw(400, quote()));
   const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
   assert.equal(gets.length, 8);
+  assert.deepEqual(page.unverifiedMessageIds, Array.from({ length: 12 }, (_, i) => String(308 + i)));
   assert.ok(page.messages.slice(0, -1).every((m) => m.metadata?.replyToSelf === false));
   assert.equal(page.messages.at(-1)?.metadata?.replyToSelf, true);
 });
@@ -510,7 +511,7 @@ for (const kind of ['reaction', 'edit'] as const) {
   });
 }
 
-test('history reads sharing a budget do not reset its wait deadline on another channel', async (t) => {
+test('each history page gets a fresh lookup wait budget, even on another channel', async (t) => {
   let now = 0;
   t.mock.method(performance, 'now', () => now);
   let gets = 0;
@@ -523,13 +524,47 @@ test('history reads sharing a budget do not reset its wait deadline on another c
       return { message: raw(message_id, 'original', { sender_id: message_id === 501 ? SELF : 101 }) };
     },
   } }, SELF, 'session');
-  const lookupBudget = {};
-  await adapter.fetchHistory('zulip:general', { limit: 100, lookupBudget });
+  await adapter.fetchHistory('zulip:general', { limit: 100 });
   target = 501;
-  const exhausted = await adapter.fetchHistory('zulip:other', { limit: 100, lookupBudget });
-  assert.equal(gets, 1, 'the shared deadline is not refreshed');
-  assert.equal(exhausted.messages[0].metadata?.replyToSelf, false);
-  const independent = await adapter.fetchHistory('zulip:other', { limit: 100 });
-  assert.equal(gets, 2, 'an unrelated read has its own wait budget');
-  assert.equal(independent.messages[0].metadata?.replyToSelf, true);
+  const page = await adapter.fetchHistory('zulip:other', { limit: 100 });
+  assert.equal(gets, 2, 'the next page is not starved by the previous deadline');
+  assert.equal(page.messages[0].metadata?.replyToSelf, true);
+});
+
+test('sixteen history channels all verify off-page quote targets', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  let gets = 0;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async ({ narrow }: { narrow: [string, string][] }) => {
+      now += 300; // one ordinary history page round trip; no quote lookup waited
+      return { messages: [raw(300, quote(500 + Number(narrow[0][1])))], found_newest: true };
+    },
+    getById: async ({ message_id }: { message_id: number }) => { gets++; return { message: raw(message_id, 'original', { sender_id: SELF }) }; },
+  } }, SELF, 'session');
+  const verdicts: boolean[] = [];
+  for (let ch = 0; ch < 16; ch++) {
+    const page = await adapter.fetchHistory(`zulip:${ch}`, { limit: 100 });
+    verdicts.push(page.messages[0].metadata?.replyToSelf === true);
+  }
+  assert.equal(gets, 16);
+  assert.equal(verdicts.filter(Boolean).length, 16);
+});
+
+test('history reports a quote skipped after the page wait deadline as unverified', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  let gets = 0;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: [raw(300, quote(500)), raw(301, quote(501))], found_newest: true }),
+    getById: async () => {
+      gets++;
+      now += 3_001;
+      return { message: raw(500, 'another author') };
+    },
+  } }, SELF, 'session');
+  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  assert.equal(gets, 1);
+  assert.deepEqual(page.unverifiedMessageIds, ['301']);
+  assert.equal(page.messages[1].metadata?.replyToSelf, false);
 });

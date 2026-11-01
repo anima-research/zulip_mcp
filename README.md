@@ -45,9 +45,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   distinct quote targets are checked; page/cache authors are preferred,
   otherwise live messages/edits share a three-second wait budget each and
   history reads share eight target GETs and a three-second wait budget per
-  page, except a reconnect sweep shares one such budget across all pages
-  and channels (including missed-tally backfill). Cache/page matches remain
-  usable after exhaustion; history retrieval itself still runs normally.
+  page, including reconnect sweeps and tally backfill; one channel cannot
+  consume another page's allowance. Cache/page matches remain usable after
+  exhaustion. A budget-starved quote row stops closed-channel catch-up
+  short of that row so a later sweep can retry it. Each row is deferred only
+  once per connection; a repeat still-unverified verdict then fails closed
+  instead of pinning the channel indefinitely. History retrieval is unchanged.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
   retries even when history cannot verify it again. Failed lookups

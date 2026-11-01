@@ -116,6 +116,9 @@ function quotedMessageIds(content: string): Set<number> {
   return ids;
 }
 
+type QuoteLookup = { authorId: number } | null | 'budget-skipped';
+type QuoteVerdict = 'reply' | 'not-reply' | 'unverified' | 'budget-skipped';
+
 /** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
@@ -413,24 +416,30 @@ export class ZulipAdapter implements PlatformAdapter {
 
   /** Verify at most two quote targets; all readers use the same classifier.
    *  Cached authors remain usable even after the lookup budget is exhausted. */
-  private async isQuoteReply(
+  private async classifyQuoteReply(
     m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'authorEmail' | 'rawContent'>,
-    resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
+    resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
       const known = this.seen.get(id);
       if (known) return known;
-      if (remainingMs <= 0 || this.quoteLookupFailed(id)) return null;
+      if (this.quoteLookupFailed(id)) return null;
+      if (remainingMs <= 0) return 'budget-skipped';
+      const started = performance.now();
       const quoted = await this.locate(id, 'a quote reply', remainingMs);
       if (!quoted) this.rememberFailedQuoteLookup(id);
-      return quoted;
+      return !quoted && performance.now() - started >= remainingMs ? 'budget-skipped' : quoted;
     },
     deadline = performance.now() + QUOTE_TIMEOUT_MS,
-  ): Promise<boolean> {
-    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return false;
+  ): Promise<QuoteVerdict> {
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'not-reply';
+    let verdict: QuoteVerdict = 'not-reply';
     for (const id of quotedMessageIds(m.rawContent)) {
       const quoted = await resolve(id, deadline - performance.now());
-      if (quoted?.authorId === this.identity.selfUserId) return true;
+      if (quoted === 'budget-skipped') verdict = 'budget-skipped';
+      else if (quoted === null) {
+        if (verdict !== 'budget-skipped') verdict = 'unverified';
+      } else if (quoted.authorId === this.identity.selfUserId) return 'reply';
     }
-    return false;
+    return verdict;
   }
 
   /**
@@ -489,7 +498,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
       const replyToSelf = change.content !== null
-        ? await this.isQuoteReply({ ...where, rawContent: change.content, mentioned })
+        ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned }) === 'reply'
         : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
@@ -854,23 +863,27 @@ export class ZulipAdapter implements PlatformAdapter {
     });
     // Page authors take precedence over older cached rows, including targets
     // later in the page and pages larger than the seen cache. Uncached targets
-    // share a GET cap and wait budget for the page, or the caller's whole batch.
+    // share a GET cap and wait budget for this page, never for other channels.
     const pageById = new Map(page.messages.map((m) => [m.id, m]));
-    const budget = query.lookupBudget ?? {};
-    budget.remainingRequests ??= HISTORY_QUOTE_GET_CAP;
-    budget.deadline ??= performance.now() + QUOTE_TIMEOUT_MS;
-    const resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
+    let getsLeft = HISTORY_QUOTE_GET_CAP;
+    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+    const unverifiedMessageIds: string[] = [];
+    const resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
       const known = pageById.get(id) ?? this.seen.get(id);
       if (known) return known;
       if (this.quoteLookupFailed(id)) return null;
-      if (budget.remainingRequests! <= 0 || remainingMs <= 0) return null;
-      budget.remainingRequests!--;
+      if (getsLeft <= 0 || remainingMs <= 0) return 'budget-skipped';
+      getsLeft--;
+      const started = performance.now();
       const quoted = await this.locate(id, 'a history quote reply', remainingMs);
       if (!quoted) this.rememberFailedQuoteLookup(id);
-      return quoted;
+      return !quoted && performance.now() - started >= remainingMs ? 'budget-skipped' : quoted;
     };
     for (const m of page.messages) {
-      if (this.allowed(m)) m.replyToSelf = await this.isQuoteReply(m, resolve, budget.deadline);
+      if (!this.allowed(m)) continue;
+      const verdict = await this.classifyQuoteReply(m, resolve, deadline);
+      m.replyToSelf = verdict === 'reply';
+      if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }
     for (const m of page.messages) this.remember(channelId, m);
     const messages = page.messages
@@ -881,6 +894,7 @@ export class ZulipAdapter implements PlatformAdapter {
       messages,
       scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
       reachedNewest: page.foundNewest,
+      ...(unverifiedMessageIds.length > 0 ? { unverifiedMessageIds } : {}),
     };
   }
 
@@ -980,7 +994,7 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      m.replyToSelf = await this.isQuoteReply(m);
+      m.replyToSelf = await this.classifyQuoteReply(m) === 'reply';
       if (this.eventLoop !== loop) return;
       const cached = this.seen.get(m.id);
       if (cached) cached.replyToSelf = m.replyToSelf;
