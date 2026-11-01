@@ -133,10 +133,12 @@ interface SeenMessage {
 /** How long a GET placing a change may take before the change is dropped
  *  rather than wedging every change behind it. */
 const LOCATE_TIMEOUT_MS = 15_000;
-/** Total lookup budget for one incoming stream message's quote targets. */
+/** Wait budget for one incoming stream message's quote targets. */
 const QUOTE_TIMEOUT_MS = 3_000;
 /** Maximum uncached quote-target GETs shared by a history page. */
 const HISTORY_QUOTE_GET_CAP = 8;
+/** Avoid repeatedly GETting inaccessible/deleted targets; retry after three minutes. */
+const FAILED_LOOKUP_TTL_MS = 3 * 60_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -145,6 +147,8 @@ const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
+/** Bound the wait only: zulip-js does not pass an AbortSignal to fetch, so
+ *  the underlying request can outlive this timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -203,6 +207,8 @@ export class ZulipAdapter implements PlatformAdapter {
    *  evicted. A deletion can only be placed from here — the message is gone. */
   private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
+  /** Failed GETs, bounded like the seen cache; id → retry-after timestamp. */
+  private failedLookups = new Map<number, number>();
   /** Stream names by id, from discovery (refreshed on a miss): how a
    *  deletion or a cross-stream move names a stream the cache does not know. */
   private streamNamesById = new Map<number, string>();
@@ -348,6 +354,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   private remember(channelId: string, m: ZulipMessage): void {
+    this.failedLookups.delete(m.id);
     if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
@@ -365,10 +372,18 @@ export class ZulipAdapter implements PlatformAdapter {
     });
   }
 
+  private lookupFailed(messageId: number): boolean {
+    const retryAfter = this.failedLookups.get(messageId);
+    if (retryAfter !== undefined && Date.now() < retryAfter) return true;
+    this.failedLookups.delete(messageId);
+    return false;
+  }
+
   /** Where a message lives — from the recent-messages cache, else one GET. */
   private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
+    if (this.lookupFailed(messageId)) return null;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
@@ -378,12 +393,17 @@ export class ZulipAdapter implements PlatformAdapter {
       );
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
-      if (!raw) return null;
+      if (!raw) throw new Error('response contained no message');
       const m = normalizeMessage(raw);
       const channelId = channelIdOf(m, this.identity.selfUserId);
       this.remember(channelId, m);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
+      if (this.failedLookups.size >= ZulipAdapter.SEEN_CAP) {
+        const oldest = this.failedLookups.keys().next().value;
+        if (oldest !== undefined) this.failedLookups.delete(oldest);
+      }
+      this.failedLookups.set(messageId, Date.now() + FAILED_LOOKUP_TTL_MS);
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
       return null;
     }
@@ -833,6 +853,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
       const known = pageById.get(id) ?? this.seen.get(id);
       if (known) return known;
+      if (this.lookupFailed(id)) return null;
       if (getsLeft <= 0 || remainingMs <= 0) return null;
       getsLeft--;
       return this.locate(id, 'a history quote reply', remainingMs);

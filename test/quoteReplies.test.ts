@@ -123,14 +123,14 @@ test('a quote of another sender is not addressed even when the silent mention na
 });
 
 for (const failure of ['throw', 'deleted', 'missing'] as const) {
-  test(`quote lookup fails closed on ${failure}, without retrying or losing later events`, { timeout: 2000 }, async () => {
+  test(`quote lookup fails closed on ${failure}, caching repeated targets without losing later events`, { timeout: 2000 }, async () => {
     let gets = 0;
-    const messages = await receive([raw(300, quote()), raw(301, 'later')], async () => {
+    const messages = await receive([raw(300, quote()), raw(301, quote()), raw(302, 'later')], async () => {
       gets++;
       if (failure === 'throw') throw new Error('unavailable');
       return failure === 'deleted' ? { result: 'error', msg: 'not found' } : { result: 'success' };
     });
-    assert.deepEqual(messages.map((m) => m.messageId), ['300', '301']);
+    assert.deepEqual(messages.map((m) => m.messageId), ['300', '301', '302']);
     assert.equal(messages[0].metadata?.mentioned, false);
     assert.equal(gets, 1);
   });
@@ -177,11 +177,12 @@ test('an existing mention needs no quote lookup and retains its addressing', { t
   assert.equal(gets, 0);
 });
 
-test('a hung quote lookup delays an unrelated message by at most the three-second budget', { timeout: 5000 }, async () => {
+test('a hung quote lookup delays an unrelated message by at most the three-second wait budget and caches the timeout', { timeout: 5000 }, async () => {
+  let gets = 0;
   let release!: (value: unknown) => void;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const started = performance.now();
-  const receiving = receive([raw(300, quote()), raw(301, 'unrelated')], () => new Promise((resolve) => { release = resolve; }));
+  const receiving = receive([raw(300, quote()), raw(301, 'unrelated'), raw(302, quote())], () => new Promise((resolve) => { release = resolve; gets++; }));
   try {
     const messages = await Promise.race([
       receiving,
@@ -190,8 +191,9 @@ test('a hung quote lookup delays an unrelated message by at most the three-secon
         timer = setTimeout(() => reject(new Error('unrelated message blocked beyond quote budget')), 3500);
       }),
     ]);
-    assert.deepEqual(messages.map((m) => m.messageId), ['300', '301']);
+    assert.deepEqual(messages.map((m) => m.messageId), ['300', '301', '302']);
     assert.equal(messages[0].metadata?.mentioned, false);
+    assert.equal(gets, 1);
     assert.ok(performance.now() - started < 3500);
   } finally {
     if (timer) clearTimeout(timer);
@@ -418,3 +420,52 @@ for (const restart of [false, true]) {
     }
   });
 }
+
+for (const failure of ['throw', 'deleted', 'missing'] as const) {
+  test(`history caches a ${failure} quote target until its retry window expires`, async (t) => {
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
+    let gets = 0;
+    let succeed = false;
+    const adapter = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [raw(300, quote())], found_newest: true }),
+      getById: async () => {
+        gets++;
+        if (succeed) return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+        if (failure === 'throw') throw new Error('unavailable');
+        return failure === 'deleted' ? { result: 'error', msg: 'not found' } : { result: 'success' };
+      },
+    } }, SELF, 'session');
+    const page = () => adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.equal((await page()).messages[0].metadata?.replyToSelf, false);
+    now += 2 * 60_000;
+    assert.equal((await page()).messages[0].metadata?.replyToSelf, false);
+    assert.equal(gets, 1, 'repeated pages share the failed-target cache');
+    now += 60_001;
+    succeed = true;
+    assert.equal((await page()).messages[0].metadata?.replyToSelf, true);
+    assert.equal(gets, 2, 'expired failures can recover');
+    assert.equal((await page()).messages[0].metadata?.replyToSelf, true);
+    assert.equal(gets, 2, 'the successful author is now cached');
+  });
+}
+
+test('negative-cache hits do not consume the history page GET allowance', async () => {
+  let rows = Array.from({ length: 8 }, (_, i) => raw(300 + i, quote(500 + i)));
+  let gets = 0;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: rows, found_newest: true }),
+    getById: async ({ message_id }: { message_id: number }) => {
+      gets++;
+      return message_id === QUOTED
+        ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
+        : { result: 'error', msg: 'not found' };
+    },
+  } }, SELF, 'session');
+  await adapter.fetchHistory('zulip:general', { limit: 100 });
+  assert.equal(gets, 8);
+  rows = [...rows, raw(400, quote())];
+  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  assert.equal(gets, 9, 'only the new target costs a GET');
+  assert.equal(page.messages.at(-1)?.metadata?.replyToSelf, true);
+});
