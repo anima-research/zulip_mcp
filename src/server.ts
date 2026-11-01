@@ -1218,7 +1218,14 @@ export class ZulipMcplServer {
       author: { id: 'system', name: 'zulip catch-up' },
       timestamp: new Date().toISOString(),
       content: [{ type: 'text', text: block } satisfies TextContent],
-      tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : []), ...(replyCount > 0 ? ['chat:reply'] : []), ...(addressedCount === 0 ? ['chat:ambient'] : [])],
+      tags: [
+        'zulip:missed',
+        ...(isDmChannelId(channelId) ? [CHAT_TAGS.dm, CHAT_TAGS.private] : [
+          ...(mentionCount > 0 ? [CHAT_TAGS.mention] : []),
+          ...(replyCount > 0 ? [CHAT_TAGS.reply] : []),
+          ...(addressedCount === 0 ? [CHAT_TAGS.ambient] : []),
+        ]),
+      ],
       metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, replyToSelf: replyCount > 0, isDM: isDmChannelId(channelId) },
     };
     const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
@@ -1298,7 +1305,7 @@ export class ZulipMcplServer {
     }
     const notes = [
       recovered > 0 ? `${recovered} message(s) on open channels were recovered from history and delivered above.` : null,
-      closedCaughtUp > 0 ? `Mentions on ${closedCaughtUp} closed channel(s) were delivered as catch-up events.` : null,
+      closedCaughtUp > 0 ? `Addressed messages on ${closedCaughtUp} closed channel(s) were delivered as catch-up events.` : null,
     ].filter(Boolean);
     const text = notes.length > 0 ? `${event.text} ${notes.join(' ')}` : event.text;
     this.channelManager.broadcastSystemEvent(this.adapter.type, {
@@ -1760,7 +1767,7 @@ export class ZulipMcplServer {
       content: [{ type: 'text', text: line }],
       // The same addressing tag a message carries, so a debounced or
       // tag-keyed policy sees an ambient change as ambient; the host folds
-      // chat:mention / chat:dm into chat:addressed.
+      // chat:mention / chat:reply / chat:dm into chat:addressed.
       tags: [
         tag,
         ...(ev.kind === 'move' ? ['zulip:moved'] : []),

@@ -380,11 +380,12 @@ export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date
   return { ...m, content, metadata: { ...meta, attributed: true, attributionHeader: prefix } };
 }
 
-/** Messages around each mention, ±`vicinity` by count (robust to channel pace). */
+/** Addressing includes explicit mentions, verified replies, and DMs. */
 export function isAddressed(m: { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }): boolean {
   return m.mentioned || m.replyToSelf === true || m.isDM === true;
 }
 
+/** Messages around each addressed message, ±`vicinity` by count. */
 export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }>(
   msgs: T[],
   opts: { keepAll: boolean; vicinity: number },

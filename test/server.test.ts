@@ -2341,3 +2341,27 @@ test('an edited quote reply pushes on a closed channel with reply tags and no me
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
   } finally { await h.close(); }
 });
+
+test('DM catch-up retains DM tags without synthesizing an explicit mention', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const descriptor: ChannelDescriptor = {
+      id: 'zulip:dm:42', type: 'zulip', label: 'DM: User', direction: 'bidirectional',
+      address: { dm: true, user_ids: [42] },
+    };
+    const dm = (id: number) => streamMsg(id, {
+      channelId: descriptor.id, tags: ['chat:dm', 'chat:private'],
+      metadata: { isDM: true, mentioned: false },
+    });
+    h.adapter.emit!(dm(1), descriptor);
+    await until(() => h.server.delivery.watermark(descriptor.id) === 1, 'initial DM acceptance');
+    h.adapter.history = [dm(5)];
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+    await until(() => h.server.delivery.watermark(descriptor.id) === 5, 'DM catch-up acceptance');
+    const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
+    assert.deepEqual(recovered.tags, ['zulip:missed', 'chat:dm', 'chat:private']);
+    assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
+  } finally { await h.close(); }
+});
