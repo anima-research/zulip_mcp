@@ -383,3 +383,20 @@ test('successful moves remain successful when destination lookups are unavailabl
     assert.equal(f.calls.length, 1, 'the move is not retried or reported as a failure');
   } finally { await f.close(); }
 });
+
+for (const [name, verb, fields] of [
+  ['edit_message', 'editing', { content: 'updated' }],
+  ['move_messages', 'moving', { topic: 'destination' }],
+] as const) {
+  for (const status of [200, 400]) {
+    test(`${name} names the operation and ${status === 200 ? 'omits a successful HTTP status from' : 'preserves a failed HTTP status in'} API errors`, async () => {
+      const f = await fixture({ result: 'error', msg: 'Permission denied' }, status);
+      try {
+        await assert.rejects(f.tools.handleToolCall(name, { message_id: 42, ...fields }), (error: Error) => {
+          assert.equal(error.message, `Zulip refused ${verb} message 42: ${status === 200 ? '' : 'HTTP 400: '}Permission denied`);
+          return true;
+        });
+      } finally { await f.close(); }
+    });
+  }
+}

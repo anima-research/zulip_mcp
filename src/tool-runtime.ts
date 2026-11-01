@@ -708,6 +708,7 @@ export class ZulipToolRuntime {
       case "move_messages": {
         const moving = name === "move_messages";
         if (!Number.isInteger(args.message_id) || args.message_id <= 0) throw new Error("message_id is required");
+        const operation = `${moving ? "moving" : "editing"} message ${args.message_id}`;
         if (!moving) {
           if (typeof args.content !== "string") throw new Error("content must be a string");
           if (args.topic !== undefined || args.stream_id !== undefined) throw new Error("use move_messages for topic or stream moves");
@@ -728,7 +729,7 @@ export class ZulipToolRuntime {
         // zulip-js includes message_id in the query and sends no PATCH body.
         // Keep the id only in the path, with the exposed edit fields in the body.
         if (!this.session.realm || !this.session.authHeader) {
-          throw new Error("Cannot edit messages: realm or bot credentials are unknown");
+          throw new Error(`Cannot ${moving ? "move" : "edit"} messages: realm or bot credentials are unknown`);
         }
         // Keep a fallback before moving: the destination may remove our
         // visibility, in which case the message cannot be read afterwards.
@@ -775,14 +776,15 @@ export class ZulipToolRuntime {
             return [`${field}=${safe.slice(0, 160)}`];
           });
           if (structured.length) detail += ` (${structured.join(", ")})`;
-          throw new Error(`Zulip refused editing message ${args.message_id}: HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+          const diagnostic = [response.ok ? "" : `HTTP ${response.status}`, detail].filter(Boolean).join(": ");
+          throw new Error(`Zulip refused ${operation}${diagnostic ? `: ${diagnostic}` : ""}`);
         }
-        assertApiSuccess(result, `editing message ${args.message_id}`);
+        assertApiSuccess(result, operation);
         if (result?.result !== "success") {
-          throw new Error(`Zulip refused editing message ${args.message_id}: HTTP ${response.status}`);
+          throw new Error(`Zulip refused ${operation}: HTTP ${response.status}`);
         }
         if (result.ignored_parameters_unsupported?.length) {
-          throw new Error(`Zulip refused editing message ${args.message_id}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
+          throw new Error(`Zulip refused ${operation}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
         }
         if (movedTo) {
           // Prefer the actual resulting placement (Zulip may normalise the
