@@ -854,22 +854,23 @@ export class ZulipAdapter implements PlatformAdapter {
     });
     // Page authors take precedence over older cached rows, including targets
     // later in the page and pages larger than the seen cache. Uncached targets
-    // share a GET cap and three-second wait budget for the whole page.
+    // share a GET cap and wait budget for the page, or the caller's whole batch.
     const pageById = new Map(page.messages.map((m) => [m.id, m]));
-    let getsLeft = HISTORY_QUOTE_GET_CAP;
-    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+    const budget = query.lookupBudget ?? {};
+    budget.remainingRequests ??= HISTORY_QUOTE_GET_CAP;
+    budget.deadline ??= performance.now() + QUOTE_TIMEOUT_MS;
     const resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
       const known = pageById.get(id) ?? this.seen.get(id);
       if (known) return known;
       if (this.quoteLookupFailed(id)) return null;
-      if (getsLeft <= 0 || remainingMs <= 0) return null;
-      getsLeft--;
+      if (budget.remainingRequests! <= 0 || remainingMs <= 0) return null;
+      budget.remainingRequests!--;
       const quoted = await this.locate(id, 'a history quote reply', remainingMs);
       if (!quoted) this.rememberFailedQuoteLookup(id);
       return quoted;
     };
     for (const m of page.messages) {
-      if (this.allowed(m)) m.replyToSelf = await this.isQuoteReply(m, resolve, deadline);
+      if (this.allowed(m)) m.replyToSelf = await this.isQuoteReply(m, resolve, budget.deadline);
     }
     for (const m of page.messages) this.remember(channelId, m);
     const messages = page.messages

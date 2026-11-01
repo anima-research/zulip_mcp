@@ -63,7 +63,7 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { HistoryLookupBudget, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
@@ -1113,15 +1113,16 @@ export class ZulipMcplServer {
       ...this.sweepAnchors.keys(),
       ...this.delivery.lastOpenChannels(),
     ]);
+    const lookupBudget: HistoryLookupBudget = {};
     let delivered = 0;
     for (const channelId of candidates) {
       // From the watermark as it stood when this connection began: a
       // channel_open with backscroll answered meanwhile has moved the live
       // one past the offline gap this sweep exists to deliver.
-      if (await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), this.sweepAnchors.get(channelId))) delivered++;
+      if (await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), this.sweepAnchors.get(channelId), lookupBudget)) delivered++;
     }
 
-    await this.backfillMissedTallies();
+    await this.backfillMissedTallies(lookupBudget);
     this.delivery.save();
     if (delivered > 0) {
       console.error(`[zulip-mcp] Reconnect catch-up: delivered missed messages from ${delivered} channel(s)`);
@@ -1142,13 +1143,14 @@ export class ZulipMcplServer {
     channelId: string,
     afterId: number,
     throughId?: number,
+    lookupBudget?: HistoryLookupBudget,
   ): Promise<{ messages: IncomingChannelMessage[]; truncated: boolean; complete: boolean; scannedThrough: number | null }> {
     const out: IncomingChannelMessage[] = [];
     let cursor = afterId;
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor) });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), ...(lookupBudget ? { lookupBudget } : {}) });
       if (page.scannedThrough === null) {
         complete = true;
         break;
@@ -1172,7 +1174,7 @@ export class ZulipMcplServer {
    * its vicinity. Advances the watermark past everything scanned once the
    * host has accepted the push. Returns true when something was delivered.
    */
-  private async catchUpClosedChannel(channelId: string, keepAllHint: boolean, afterId?: number): Promise<boolean> {
+  private async catchUpClosedChannel(channelId: string, keepAllHint: boolean, afterId?: number, lookupBudget?: HistoryLookupBudget): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
     if (this.isMuted(channelId) || !this.isAllowed(channelId)) return false;
@@ -1181,7 +1183,7 @@ export class ZulipMcplServer {
     if (after === undefined) return false;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
-      fetched = await this.fetchAfter(channelId, after);
+      fetched = await this.fetchAfter(channelId, after, undefined, lookupBudget);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
       return false;
@@ -1254,7 +1256,7 @@ export class ZulipMcplServer {
   }
 
   /** Count the ambient that arrived on tallied channels during downtime. */
-  private async backfillMissedTallies(): Promise<void> {
+  private async backfillMissedTallies(lookupBudget?: HistoryLookupBudget): Promise<void> {
     if (!this.adapter.fetchHistory) return;
     for (const channelId of this.delivery.talliedChannels()) {
       if (this.isMuted(channelId) || !this.isAllowed(channelId)) continue;
@@ -1262,7 +1264,7 @@ export class ZulipMcplServer {
       if (!tally.talliedThrough) continue;
       let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
       try {
-        fetched = await this.fetchAfter(channelId, tally.talliedThrough);
+        fetched = await this.fetchAfter(channelId, tally.talliedThrough, undefined, lookupBudget);
       } catch {
         continue;
       }

@@ -509,3 +509,27 @@ for (const kind of ['reaction', 'edit'] as const) {
     } finally { adapter.stopEvents(); }
   });
 }
+
+test('history reads sharing a budget do not reset its wait deadline on another channel', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  let gets = 0;
+  let target = 500;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: [raw(300, quote(target))], found_newest: true }),
+    getById: async ({ message_id }: { message_id: number }) => {
+      gets++;
+      now += 3_001;
+      return { message: raw(message_id, 'original', { sender_id: message_id === 501 ? SELF : 101 }) };
+    },
+  } }, SELF, 'session');
+  const lookupBudget = {};
+  await adapter.fetchHistory('zulip:general', { limit: 100, lookupBudget });
+  target = 501;
+  const exhausted = await adapter.fetchHistory('zulip:other', { limit: 100, lookupBudget });
+  assert.equal(gets, 1, 'the shared deadline is not refreshed');
+  assert.equal(exhausted.messages[0].metadata?.replyToSelf, false);
+  const independent = await adapter.fetchHistory('zulip:other', { limit: 100 });
+  assert.equal(gets, 2, 'an unrelated read has its own wait budget');
+  assert.equal(independent.messages[0].metadata?.replyToSelf, true);
+});

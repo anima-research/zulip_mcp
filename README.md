@@ -44,7 +44,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   moves and deletions retain the last known verdict. Only the first two
   distinct quote targets are checked; page/cache authors are preferred,
   otherwise live messages/edits share a three-second wait budget each and
-  history pages share eight target GETs and a three-second wait budget.
+  history reads share eight target GETs and a three-second wait budget per
+  page, except a reconnect sweep shares one such budget across all pages
+  and channels (including missed-tally backfill). Cache/page matches remain
+  usable after exhaustion; history retrieval itself still runs normally.
   Unreadable targets or an unknown bot identity fail closed. Failed lookups
   are cached for three minutes; the wait budget does not cancel the GET.
   Locale/forward-heading limits and the bot-author exclusion are detailed

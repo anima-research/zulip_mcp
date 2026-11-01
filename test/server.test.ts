@@ -2394,3 +2394,59 @@ test('catch-up counts mixed mentions and replies as addressed messages rather th
     assert.equal((recovered.origin as { isMention: boolean }).isMention, true);
   } finally { await h.close(); }
 });
+
+test('a reconnect sweep shares one quote-lookup allowance across pages and channels', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-sweep-budget-'));
+  let second: Harness | undefined;
+  try {
+    const other = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const first = harness({ stateDir: dir, sessionId: 'budget' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      first.adapter.emit!(streamMsg(2, { channelId: other.id, mentioned: true }), other);
+      await until(() => first.server.delivery.watermark(other.id) === 2, 'both initial channels accepted');
+      first.adapter.emit!(streamMsg(3));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 3, 'ambient tally seeded');
+    } finally { await first.close(); }
+    let gets = 0;
+    const budgets: ChannelHistoryQuery['lookupBudget'][] = [];
+    const history = new ZulipAdapter({ messages: {
+      retrieve: async (q: { narrow: [string, string][]; anchor: number; num_after: number }) => {
+        const stream = q.narrow[0][1];
+        const offset = stream === 'general' ? 0 : 20;
+        const rows = Array.from({ length: 12 }, (_, i): ZulipRawMessage => ({
+          id: offset + 5 + i, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+          display_recipient: stream, subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+          content: `[said](/#narrow/channel/7/near/${500 + offset + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`,
+        })).filter((m) => m.id > q.anchor);
+        return { messages: rows.slice(0, 3), found_newest: rows.length <= 3 };
+      },
+      getById: async ({ message_id }: { message_id: number }) => {
+        gets++;
+        return { message: {
+          id: message_id, sender_id: 102, sender_full_name: 'Other', sender_email: 'other@example.invalid',
+          display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', content: 'original',
+        } };
+      },
+    } }, 100, 'session');
+    second = harness({ stateDir: dir, sessionId: 'budget' });
+    second.adapter.visible.push(other);
+    second.adapter.fetchHistory = (channelId, query) => {
+      budgets.push(query.lookupBudget);
+      return history.fetchHistory(channelId, query);
+    };
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(gets, 8, 'the whole sweep, not each page/channel, gets eight target GETs');
+    assert.equal(budgets.length, 12, 'four pages per channel, then four missed-tally backfill pages');
+    assert.ok(budgets[0]);
+    assert.ok(budgets.every((b) => b === budgets[0]));
+    assert.equal(second.server.delivery.watermark('zulip:general'), 16);
+    assert.equal(second.server.delivery.watermark(other.id), 36);
+  } finally {
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -146,6 +146,14 @@ export interface MessageChangeEvent {
 
 export type OnMessageChange = (event: MessageChangeEvent) => void;
 
+/** Mutable budget for optional history enrichment, shared across related reads.
+ *  The adapter initializes unset limits on first use; the deadline uses
+ *  performance.now(), not wall-clock time. History retrieval itself is not capped. */
+export interface HistoryLookupBudget {
+  remainingRequests?: number;
+  deadline?: number;
+}
+
 /** History request against one channel, in the platform's own id space. */
 export interface ChannelHistoryQuery {
   limit: number;
@@ -153,6 +161,8 @@ export interface ChannelHistoryQuery {
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
   afterMessageId?: string;
+  /** Share optional lookup work across pages/channels (e.g. a reconnect sweep). */
+  lookupBudget?: HistoryLookupBudget;
 }
 
 /**
