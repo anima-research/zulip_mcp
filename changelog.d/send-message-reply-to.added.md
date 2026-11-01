@@ -1,6 +1,6 @@
 - `send_message` accepts `reply_to` to derive a stream/topic or complete DM
   conversation from a message ID. With `reply_to`, omit `to` and `topic`;
   supplying either, a conflicting type, or an unreadable ID is refused before
-  uploading or sending. The tool schema requires `type`; direct runtime callers
-  may omit it with `reply_to` to infer the type. Calls without `reply_to` require
-  both `type` and `to`.
+  uploading or sending. `type` is optional in the schema and inferred for replies;
+  calls without `reply_to` still require both `type` and `to` at runtime. Null
+  optional send arguments are treated as absent.

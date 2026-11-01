@@ -425,11 +425,11 @@ test('send_message without reply_to keeps the exact payload, response and callba
 
 test('send_message schema leaves destination requirements to the runtime', () => {
   const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
-  assert.deepEqual(schema.required, ['type']);
+  assert.equal(schema.required?.includes('type') ?? false, false);
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
   assert.equal(properties.reply_to.type, 'integer');
-  assert.match(properties.reply_to.description, /supplied to\/topic/);
+  assert.match(properties.reply_to.description, /Omit to\/topic/);
 });
 
 test('send_message reply_to supports a canonical stream name fallback and an empty topic', async () => {
@@ -482,7 +482,7 @@ test('send_message reply_to uses the real client GET endpoint before POST and pr
   }
 });
 
-test('send_message review refuses a missing destination before lookups, uploads or sends', async () => {
+test('send_message refuses a missing destination before lookups, uploads or sends', async () => {
   const { tools, dir, gets, userLookups, sends, uploaded } = replyRuntime(replyStream);
   try {
     for (const destination of [{ to: 12 }, { type: 'stream' }, { type: 'private' }, {}]) {
@@ -497,10 +497,8 @@ test('send_message review refuses a missing destination before lookups, uploads 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-// ── Owner-approved LOW findings ──
-
 for (const message of [replyStream, { type: 'private', display_recipient: replyParticipants, subject: '' }]) {
-  test(`send_message review infers omitted type from ${message.type} reply`, async () => {
+  test(`send_message infers omitted type from ${message.type} reply`, async () => {
     const { tools, dir, sends } = replyRuntime(message);
     try {
       await tools.handleToolCall('send_message', { reply_to: 123, content: 'reply' });
@@ -519,7 +517,7 @@ test('send_message reply_to preserves DM participants when bot identity is unkno
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message review keeps the bot in self-DM channel IDs and recipients', async () => {
+test('send_message keeps the bot in self-DM channel IDs and recipients', async () => {
   const { tools, dir, sends } = replyRuntime({ type: 'private', display_recipient: [replyParticipants[0]], subject: '' });
   const sent: { channelId: string }[] = [];
   tools.onSent = (s) => sent.push(s);
@@ -562,7 +560,6 @@ test('send_message reply_to needs only participant IDs and never reads the user 
     assert.deepEqual(userLookups, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-
 
 for (const message of [replyStream, { type: 'private', display_recipient: replyParticipants, subject: '' }]) {
   test(`send_message treats null destination fields and type as absent in a ${message.type} reply`, async () => {

@@ -304,25 +304,11 @@ file, or remove it to re-seed from the environment.
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
 `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
 
-`send_message` accepts an optional integer `reply_to` message ID to keep a
-reply in the original conversation. For example:
-
-```json
-{ "type": "stream", "reply_to": 12345, "content": "Thanks, I'll follow up here." }
-```
-
-The tool fetches the referenced message and infers its type, taking its
-stream and topic, or its complete DM recipient list
-(including the original participants for both 1:1 and group DMs).
-The tool schema requires `type`, which must match the referenced message
-(`stream` or `private`).
-`to` and `topic` must be omitted with `reply_to`: supplying either is refused
-with "reply_to sets the destination; omit to/topic" before uploads or sends.
-Unknown, deleted, or inaccessible
-message IDs fail with Zulip's API error code; there is no fallback destination.
-This selects the destination, not a quoted reply. Without `reply_to`, sending
-is unchanged for calls with a destination and type; without `reply_to`,
-omitting either `to` or `type` is refused locally. No additional permissions are needed.
+`send_message` accepts an integer `reply_to` message ID: `{"reply_to":12345,"content":"Thanks!"}`.
+Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
+Omit `to` and `topic`; `type` is inferred, and an explicit type must match.
+Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes

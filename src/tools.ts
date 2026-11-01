@@ -155,17 +155,14 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a message to a stream or as a direct message. For streams, provide 'to' and 'topic'; for DMs, provide 'to' as user email(s) or IDs. " +
-      "Or pass 'reply_to' (a message ID) to derive the stream/topic or all DM participants from that message; omit 'to' and 'topic'. " +
-      "Supplying to/topic with reply_to is refused before uploads or sends. Unreadable message IDs fail with Zulip's API error code. " +
-      "Pass 'attachments' to send files (root-relative paths under a configured upload root, or base64) with the message.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
     inputSchema: {
       type: "object",
       properties: {
         type: {
           type: "string",
           enum: ["stream", "private"],
-          description: "Type of message: 'stream' for stream messages, 'private' for direct messages. Required by the tool schema; with reply_to, must match the referenced message.",
+          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
         },
         to: {
           anyOf: [
@@ -173,15 +170,15 @@ export const toolDefinitions: ToolDefinition[] = [
             { type: "integer" },
             { type: "array", items: { anyOf: [{ type: "integer" }, { type: "string" }] } },
           ],
-          description: "For stream: stream name or ID. For private: comma-separated emails or user IDs, or an array of emails or user IDs. Numeric strings are IDs. Omit with reply_to.",
+          description: "Stream name/ID, or DM emails/IDs (comma-separated or an array). Required without reply_to; omit with reply_to.",
         },
         topic: {
           type: "string",
-          description: "Topic for stream messages (required for type='stream' without reply_to). Omit with reply_to.",
+          description: "Required for streams without reply_to. Omit with reply_to.",
         },
         reply_to: {
           type: "integer",
-          description: "Message ID whose destination to reply to. Fetches the message and uses its type and stream/topic or complete DM recipient list. An explicit type must match; supplied to/topic or an unreadable ID refuses before uploads or sends. Does not quote the original message.",
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -205,7 +202,6 @@ export const toolDefinitions: ToolDefinition[] = [
           },
         },
       },
-      required: ["type"],
     },
   },
   {
