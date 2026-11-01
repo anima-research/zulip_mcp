@@ -442,7 +442,6 @@ export class ZulipMcplServer {
       // A refused buffered reply must keep its hold below the scanned range.
       for (const id of this.delivery.heldIds(channelId)) {
         if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) {
-          this.forgetPendingReply(channelId, id);
           this.delivery.release(channelId, id);
         }
       }
