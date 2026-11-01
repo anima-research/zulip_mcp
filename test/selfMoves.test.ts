@@ -181,6 +181,20 @@ test('self cross-stream moves transfer reply hints to the destination channel', 
   assert.deepEqual(f.typing.map(s => [s.stream_id, s.topic]), [[8, 'deploys-2026']]);
 });
 
+test('a source typing run can still be stopped after a self cross-stream move', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.type('start');
+  f.feed(move([20, 21], { new_stream_id: 8 }));
+  await until(() => f.reconciled.length === 1, 'cross-stream move reconciled');
+  await f.type('stop');
+  assert.deepEqual(f.typing.map(s => [s.stream_id, s.op, s.topic]), [
+    [7, 'start', 'deploys'], [7, 'stop', 'deploys'],
+  ], 'the source stop cancels the original run rather than typing in the fallback topic');
+});
+
 for (const restriction of ['none', 'allowlist', 'mute']) {
   test(`later reactions and edits after a self move use destination filtering (${restriction})`, async t => {
     const f = await fixture(restriction === 'allowlist' ? { streams: ['general'] }

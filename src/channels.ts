@@ -538,7 +538,8 @@ export class ChannelManager {
       }
     } else {
       this.lastIncoming.delete(change.channelId);
-      this.typingTopic.delete(change.channelId);
+      // Keep the source typing run so a channel-only stop cancels it
+      // in the topic where it started, even after reply hints move away.
       const existing = this.lastIncoming.get(destination);
       if (existing?.from === undefined || source.from >= existing.from) this.lastIncoming.set(destination, updated);
     }
