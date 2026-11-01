@@ -720,7 +720,7 @@ export class ZulipToolRuntime {
         if (args.content !== undefined && args.stream_id !== undefined) {
           throw new Error("a stream move cannot be combined with a content edit; send two calls");
         }
-        if (args.propagate_mode !== undefined && args.topic === undefined && args.stream_id === undefined) {
+        if (args.propagate_mode !== undefined && args.propagate_mode !== "change_one" && args.topic === undefined && args.stream_id === undefined) {
           throw new Error("propagate_mode requires topic or stream_id");
         }
         // zulip-js includes message_id in the query and sends no PATCH body.

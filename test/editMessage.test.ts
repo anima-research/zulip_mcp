@@ -261,7 +261,7 @@ test('edit_message rejects content with a stream move without making a request',
 test('edit_message rejects propagation on content-only edits without making a request', async () => {
   const f = await fixture({ result: 'success', msg: '' });
   try {
-    for (const propagate_mode of ['change_one', 'change_later', 'change_all']) {
+    for (const propagate_mode of ['change_later', 'change_all']) {
       await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, content, propagate_mode }),
         /^Error: propagate_mode requires topic or stream_id$/);
     }
@@ -292,4 +292,15 @@ test('edit_message describes move constraints and server propagation defaults', 
   assert.match(description, /Zulip defaults to change_one \(this message only\)/);
   assert.match(description, /change_later moves this and later messages/);
   assert.match(description, /change_all renames\/moves the whole topic/);
+});
+
+test('edit_message accepts explicit default propagation on a content edit', async () => {
+  const f = await fixture({ result: 'success', msg: '' });
+  try {
+    await f.tools.handleToolCall('edit_message', { message_id: 42, content, propagate_mode: 'change_one' });
+    assert.equal(f.calls.length, 1);
+    assert.equal(new URLSearchParams(f.calls[0].body).get('content'), content);
+  } finally {
+    await f.close();
+  }
 });
