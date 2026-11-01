@@ -343,3 +343,17 @@ test('move_messages returns destination routing even when moving removes visibil
     assert.equal(f.lookups.length, 3, 'source, stream names and resulting placement are read');
   } finally { await f.close(); }
 });
+
+test('structured error codes retain credential redaction and ignore nonnumeric retry fields', async () => {
+  const f = await fixture({
+    result: 'error', msg: 'Permission denied', code: '<b>test-</b><i>key</i>',
+    first_message_id_allowed_to_move: 'test-key',
+  }, 400);
+  try {
+    await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, topic }), (error: Error) => {
+      assert.match(error.message, /code=\[redacted\]/);
+      assert.doesNotMatch(error.message, /test-|key|<b>|first_message_id_allowed_to_move/);
+      return true;
+    });
+  } finally { await f.close(); }
+});

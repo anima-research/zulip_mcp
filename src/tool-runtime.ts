@@ -772,7 +772,7 @@ export class ZulipToolRuntime {
           const structured = fields.flatMap((field) => {
             const value = result?.[field];
             if (field === "code" ? typeof value !== "string" : typeof value !== "number" || !Number.isFinite(value)) return [];
-            let safe = String(value);
+            let safe = String(value).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
             for (const credential of credentials.filter(Boolean)) safe = safe.replaceAll(credential, "[redacted]");
             return [`${field}=${safe.slice(0, 160)}`];
           });
