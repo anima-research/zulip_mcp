@@ -674,6 +674,8 @@ export class ZulipToolRuntime {
       }
 
       case "send_message": {
+        args = { ...args, reply_to: args.reply_to ?? undefined, to: args.to ?? undefined,
+          topic: args.topic ?? undefined, type: args.type ?? undefined };
         if (args.reply_to === undefined && (args.to === undefined || args.type === undefined)) throw new Error("type and to are required without reply_to");
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;

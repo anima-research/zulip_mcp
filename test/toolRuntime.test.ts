@@ -397,7 +397,7 @@ for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
 test('send_message reply_to requires an integer id and a readable message destination', async () => {
   const { tools, dir, gets, sends } = replyRuntime({});
   try {
-    for (const reply_to of ['123', 1.5, null, NaN]) {
+    for (const reply_to of ['123', 1.5, NaN]) {
       await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', reply_to, content: 'reply' }), /reply_to.*integer/);
     }
     assert.deepEqual(gets, []);
@@ -562,3 +562,56 @@ test('send_message reply_to needs only participant IDs and never reads the user 
     assert.deepEqual(userLookups, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+for (const message of [replyStream, { type: 'private', display_recipient: replyParticipants, subject: '' }]) {
+  test(`send_message treats null destination fields and type as absent in a ${message.type} reply`, async () => {
+    const { tools, dir, gets, sends, userLookups } = replyRuntime(message);
+    try {
+      for (const optional of [{ to: null }, { topic: null }, { type: null }, { to: null, topic: null, type: null }]) {
+        const args = { reply_to: 123, content: 'reply', ...optional };
+        const original = { ...args };
+        await tools.handleToolCall('send_message', args);
+        assert.deepEqual(args, original, 'normalization does not mutate the caller');
+      }
+      assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+      assert.deepEqual(sends, Array(4).fill({
+        type: message.type, to: message.type === 'stream' ? 12 : [790, 42, 7],
+        topic: message.type === 'stream' ? replyStream.subject : undefined, content: 'reply',
+      }));
+      assert.deepEqual(userLookups, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('send_message treats a null reply_to and topic as absent on a plain send', async () => {
+  const { tools, dir, gets, sends, result } = replyRuntime(replyStream);
+  try {
+    assert.deepEqual(await tools.handleToolCall('send_message', {
+      type: 'stream', to: 'General', topic: 'Deploy status', reply_to: null, content: 'stream',
+    }), result);
+    assert.deepEqual(await tools.handleToolCall('send_message', {
+      type: 'private', to: [42], topic: null, reply_to: null, content: 'DM',
+    }), result);
+    assert.deepEqual(gets, []);
+    assert.deepEqual(sends, [
+      { type: 'stream', to: 'General', topic: 'Deploy status', content: 'stream' },
+      { type: 'private', to: [42], topic: undefined, content: 'DM' },
+    ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const field of ['to', 'type']) {
+  test(`send_message treats null ${field} as missing without a reply before uploads or sends`, async () => {
+    const { tools, dir, gets, sends, uploaded } = replyRuntime(replyStream);
+    try {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        type: 'stream', to: 12, [field]: null, reply_to: null, content: 'reply',
+        attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), /type and to are required without reply_to/);
+      assert.deepEqual(gets, []);
+      assert.deepEqual(sends, []);
+      assert.deepEqual(uploaded, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
