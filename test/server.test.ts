@@ -2452,3 +2452,111 @@ test('a reconnect sweep shares one quote-lookup allowance across pages and chann
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const refuse of [false, true]) {
+  test(`a buffered live reply keeps its verdict when sweep lookups are exhausted${refuse ? ', including after refusal' : ''}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-live-reply-'));
+    let second: Harness | undefined;
+    let release!: () => void;
+    try {
+      const first = harness({ stateDir: dir, sessionId: 'live-reply' });
+      try {
+        await initialize(first, true);
+        await settled(first);
+        first.adapter.emit!(streamMsg(3, { mentioned: true }));
+        await until(() => first.server.delivery.watermark('zulip:general') === 3, 'initial acceptance');
+      } finally { await first.close(); }
+      second = harness({ stateDir: dir, sessionId: 'live-reply' });
+      const history = quoteHistory();
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      second.adapter.fetchHistory = async (channelId, query) => {
+        await gate;
+        return history.fetchHistory(channelId, { ...query, lookupBudget: { remainingRequests: 0 } });
+      };
+      const refusedAtWatermarks: number[] = [];
+      if (refuse) second.policy.rejectPushes.has = (id) => {
+        if (id !== '5' || refusedAtWatermarks.length >= 2) return false;
+        refusedAtWatermarks.push(second!.server.delivery.watermark('zulip:general') ?? 0);
+        return true;
+      };
+      await initialize(second, true);
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(second, false);
+      // A separate live lookup succeeded, but history cannot GET the off-page
+      // target after watermark 3. Its raw reply row has no mention flag.
+      const liveHistory = quoteHistory();
+      const liveReply = (await liveHistory.fetchHistory('zulip:general', { limit: 100 })).messages[0];
+      second.adapter.emit!(liveReply);
+      release();
+      await until(() => second!.server.isLive, 'go-live');
+      await until(() => second!.server.delivery.watermark('zulip:general') === 5, 'live-verified reply accepted');
+      if (refuse) {
+        assert.equal(refusedAtWatermarks.length, 2);
+        assert.ok(refusedAtWatermarks.every((watermark) => watermark < 5));
+      }
+      const replyPushes = second.pushed.filter((p) => p.tags?.includes('chat:reply'));
+      assert.ok(replyPushes.length > 0);
+      if (!refuse) assert.equal(replyPushes.length, 1, 'accepted sweep delivery deduplicates the buffered copy');
+      assert.ok(replyPushes.every((p) => (p.origin as { isReply: boolean }).isReply));
+      assert.deepEqual(second.server.delivery.heldIds('zulip:general'), []);
+    } finally {
+      release?.();
+      await second?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const rejectOnce of [false, true]) {
+  test(`go-live does not deduplicate a live reply against a scan that never delivered it${rejectOnce ? ', even after a refused push' : ''}`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-live-after-scan-'));
+  let second: Harness | undefined;
+  let release!: () => void;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'after-scan' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
+    } finally { await first.close(); }
+    second = harness({ stateDir: dir, sessionId: 'after-scan', history: [streamMsg(5)] });
+    let refused = false;
+    if (rejectOnce) second.policy.rejectPushes.has = (id) => {
+      if (id !== '5' || refused) return false;
+      assert.ok((second!.server.delivery.watermark('zulip:general') ?? 0) < 5);
+      refused = true;
+      return true;
+    };
+    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+    let calls = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    second.adapter.fetchHistory = async (channelId, query) => {
+      if (++calls === 2) await gate; // Hold tally backfill after the sweep scan.
+      return realFetch(channelId, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => calls === 2, 'backfill to hold go-live');
+    assert.equal(second.server.delivery.watermark('zulip:general'), 1, 'scan advancement waits for buffered verdicts');
+    second.adapter.emit!(streamMsg(5, {
+      metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
+    }));
+    release();
+    await until(() => second!.server.isLive && second!.server.delivery.watermark('zulip:general') === 5, 'buffered reply acceptance');
+    assert.equal(second.pushed.length, rejectOnce ? 2 : 1);
+    assert.equal(refused, rejectOnce);
+    assert.equal(second.pushed[0].eventId, 'zulip_msg_5');
+    assert.equal((second.pushed[0].origin as { isReply: boolean }).isReply, true);
+  } finally {
+    release?.();
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+}

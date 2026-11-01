@@ -27,3 +27,6 @@
   the README alongside the remaining lookup and heading-format limits.
   Addressed-only catch-up blocks use `reason="addressed"` when their count
   includes quote replies, retaining `reason="mention"` for mention-only counts.
+  Unaccepted live reply verdicts survive fail-closed history reclassification
+  during sweeps and retries; go-live deduplication distinguishes scanning from
+  actual acceptance of a buffered reply.

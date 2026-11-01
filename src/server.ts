@@ -148,6 +148,12 @@ export class ZulipMcplServer {
   private live = false;
   private preLive: { message: IncomingChannelMessage; newChannel?: ChannelDescriptor }[] = [];
   private preLiveDropped = 0;
+  /** Live-verified replies not yet accepted: history can fail closed under a
+   *  tighter/shared lookup budget without erasing the verdict held for retry.
+   *  Oldest-first eviction, capped per channel like the pre-live buffer. */
+  private pendingReplies = new Map<string, Set<number>>();
+  /** Commit scan-only advancement after buffered live verdicts are reconciled. */
+  private preLiveScanned = new Map<string, number>();
   /** Watermarks as they stood when the connection began: what the sweep
    *  catches up from, whatever moves them meanwhile (a channel_open with
    *  backscroll in the first seconds must not hide the offline gap). */
@@ -283,6 +289,8 @@ export class ZulipMcplServer {
     this.sweepDone = false;
     this.preLive = [];
     this.preLiveDropped = 0;
+    this.pendingReplies.clear();
+    this.preLiveScanned.clear();
     this.sweepAnchors = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
   }
 
@@ -379,8 +387,9 @@ export class ZulipMcplServer {
   /**
    * Release the pre-live buffer through the normal routing, then open live
    * delivery. Held messages the sweep already covered — id at or below the
-   * channel's watermark as it stood when the sweep finished — are skipped;
-   * that boundary is taken once, before draining, because draining itself
+   * channel's accepted/scanned boundary when the sweep finished — are skipped
+   * unless their buffered reply verdict still awaits acceptance;
+   * the boundary is taken once, before draining, because draining itself
    * moves watermarks. Delivery stays gated until the buffer is empty, so a
    * live message arriving mid-drain (while a held one waits on an
    * attachment fetch) joins the queue behind the held ones instead of
@@ -389,13 +398,23 @@ export class ZulipMcplServer {
   private async goLive(): Promise<void> {
     if (this.live) return;
     const boundary = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
+    for (const [channelId, through] of this.preLiveScanned) {
+      boundary.set(channelId, Math.max(boundary.get(channelId) ?? 0, through));
+    }
     while (this.preLive.length > 0) {
       const held = this.preLive;
       this.preLive = [];
       for (const { message, newChannel } of held) {
         const watermark = boundary.get(message.channelId);
         const id = Number(message.messageId);
-        if (watermark !== undefined && Number.isFinite(id) && id <= watermark) continue;
+        if (watermark !== undefined && Number.isFinite(id) && id <= watermark) {
+          const replyToSelf = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true;
+          // A scan can advance over an ambient history row even though the
+          // buffered live event verified a reply. Only an accepted delivery
+          // (or the connection's original watermark) can deduplicate it.
+          const pendingReply = replyToSelf && this.pendingReplies.get(message.channelId)?.has(id);
+          if (!pendingReply || id <= (this.sweepAnchors.get(message.channelId) ?? 0)) continue;
+        }
         try {
           await this.route(message, newChannel);
         } catch (err) {
@@ -403,6 +422,15 @@ export class ZulipMcplServer {
         }
       }
     }
+    for (const [channelId, through] of this.preLiveScanned) {
+      // A refused buffered reply must keep its hold below the scanned range.
+      for (const id of this.delivery.heldIds(channelId)) {
+        if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) this.delivery.release(channelId, id);
+      }
+      this.delivery.advance(channelId, through);
+    }
+    this.preLiveScanned.clear();
+    this.delivery.save();
     this.live = true;
     if (this.preLiveDropped > 0) {
       console.error(`[zulip-mcp] ${this.preLiveDropped} live message(s) exceeded the pre-live buffer; held below the watermark for replay`);
@@ -798,9 +826,16 @@ export class ZulipMcplServer {
     return !this.isMuted(message.channelId) && this.isAllowed(message.channelId, message);
   }
 
+  private forgetPendingReply(channelId: string, id: number): void {
+    const pending = this.pendingReplies.get(channelId);
+    pending?.delete(id);
+    if (pending?.size === 0) this.pendingReplies.delete(channelId);
+  }
+
   /** The host accepted (or was handed) a message: its hold is released and the watermark may advance. */
   private accepted(channelId: string, id: number): boolean {
     if (!Number.isFinite(id) || id <= 0) return false;
+    this.forgetPendingReply(channelId, id);
     const released = this.delivery.release(channelId, id);
     return this.delivery.advance(channelId, id) || released;
   }
@@ -818,6 +853,7 @@ export class ZulipMcplServer {
     for (const m of accepted) {
       const id = numericId(m);
       if (id === null) continue;
+      this.forgetPendingReply(channelId, id);
       moved = this.delivery.release(channelId, id) || moved;
       high = Math.max(high, id);
     }
@@ -870,6 +906,16 @@ export class ZulipMcplServer {
    * replay after go-live fetches them back. Live, it is routed at once.
    */
   private async onIncoming(message: IncomingChannelMessage, newChannel?: ChannelDescriptor): Promise<void> {
+    const id = numericId(message);
+    if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null && this.mayDeliver(message)) {
+      let pending = this.pendingReplies.get(message.channelId);
+      if (!pending) this.pendingReplies.set(message.channelId, pending = new Set());
+      if (!pending.has(id) && pending.size >= PRE_LIVE_BUFFER_CAP) {
+        const oldest = pending.values().next().value;
+        if (oldest !== undefined) pending.delete(oldest);
+      }
+      pending.add(id);
+    }
     if (!this.live) {
       if (this.preLive.length >= PRE_LIVE_BUFFER_CAP) {
         const dropped = this.preLive.shift()!;
@@ -1155,7 +1201,14 @@ export class ZulipMcplServer {
         complete = true;
         break;
       }
-      out.push(...page.messages);
+      out.push(...page.messages.map((message) => {
+        if (!this.pendingReplies.get(channelId)?.has(Number(message.messageId))) return message;
+        return {
+          ...message,
+          tags: [...new Set([...(message.tags ?? []).filter((tag) => tag !== CHAT_TAGS.ambient), CHAT_TAGS.reply])],
+          metadata: { ...(message.metadata as Record<string, unknown>), replyToSelf: true },
+        };
+      }));
       if (page.scannedThrough <= cursor) break;
       cursor = page.scannedThrough;
       if (page.reachedNewest || (throughId !== undefined && cursor >= throughId)) {
@@ -1165,6 +1218,11 @@ export class ZulipMcplServer {
     }
     // Not complete: the ceiling (or a bound) stopped the walk with more beyond the newest id scanned.
     return { messages: out, truncated: !complete, complete, scannedThrough: cursor > afterId ? cursor : null };
+  }
+
+  private advanceCatchUp(channelId: string, through: number): void {
+    if (this.live) this.delivery.advanceThrough(channelId, through);
+    else this.preLiveScanned.set(channelId, Math.max(this.preLiveScanned.get(channelId) ?? 0, through));
   }
 
   /**
@@ -1195,8 +1253,8 @@ export class ZulipMcplServer {
     const keepAll = keepAllHint || isDmChannelId(channelId);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
-      // Nothing to deliver, but advance the anchor so these are not re-scanned.
-      this.delivery.advanceThrough(channelId, newestId);
+      // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
+      this.advanceCatchUp(channelId, newestId);
       return false;
     }
     const addressedCount = views.filter(isAddressed).length;
@@ -1239,10 +1297,11 @@ export class ZulipMcplServer {
       ...(fetched.truncated ? { truncated: true } : {}),
     });
     if (ok) {
+      for (const view of kept) this.forgetPendingReply(channelId, view.id);
       // Advance past everything scanned, not just what was delivered, so a
       // mention-only channel does not re-surface its non-mention tail; the
       // block covered every held id in the range, so their holds go too.
-      this.delivery.advanceThrough(channelId, newestId);
+      this.advanceCatchUp(channelId, newestId);
       // The agent answers the block through channels/publish too, so the
       // conversation is where its newest message that addresses the agent
       // is (in a backscroll, its newest message), as live pushes or an open
@@ -1712,6 +1771,7 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+    if (ev.kind === 'edit' && ev.replyToSelf === false) this.forgetPendingReply(ev.channelId, Number(ev.messageId));
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;

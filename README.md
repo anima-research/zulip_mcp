@@ -48,7 +48,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   page, except a reconnect sweep shares one such budget across all pages
   and channels (including missed-tally backfill). Cache/page matches remain
   usable after exhaustion; history retrieval itself still runs normally.
-  Unreadable targets or an unknown bot identity fail closed. Failed lookups
+  Unreadable targets or an unknown bot identity fail closed. An unaccepted
+  live-verified reply keeps its verdict through sweep deduplication and
+  retries even when history cannot verify it again. Failed lookups
   are cached for three minutes; the wait budget does not cancel the GET.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
