@@ -12,7 +12,7 @@ import { featureSetForTool } from '../src/feature-sets.ts';
 import { toolDefinitions } from '../src/tools.ts';
 
 /** Exercise the real client and runtime against a local HTTP stand-in. */
-async function fixture(response: unknown, status = 200, loseVisibility = false) {
+async function fixture(response: unknown, status = 200, loseVisibility = false, routingUnavailable = false) {
   const calls: { method?: string; path?: string; body: string; auth?: string; contentType?: string }[] = [];
   let currentTopic = 'deploys';
   let currentStream = 7;
@@ -20,6 +20,11 @@ async function fixture(response: unknown, status = 200, loseVisibility = false) 
   const server = createServer(async (req, res) => {
     if (req.method === 'GET') {
       lookups.push(req.url!);
+      if (routingUnavailable) {
+        res.writeHead(503, { 'Content-Type': 'text/html' });
+        res.end('temporarily unavailable');
+        return;
+      }
       const payload = req.url!.startsWith('/api/v1/streams')
         ? { result: 'success', streams: [{ stream_id: 17, name: 'archive' }] }
         : loseVisibility && currentStream === 17
@@ -355,5 +360,16 @@ test('structured error codes retain credential redaction and ignore nonnumeric r
       assert.doesNotMatch(error.message, /test-|key|<b>|first_message_id_allowed_to_move/);
       return true;
     });
+  } finally { await f.close(); }
+});
+
+test('successful moves remain successful when destination lookups are unavailable', async () => {
+  const f = await fixture({ result: 'success', msg: '' }, 200, false, true);
+  try {
+    const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17 });
+    assert.equal(result.result, 'success');
+    assert.deepEqual(result.moved_to, { channelId: null, topic: null });
+    assert.match(result.routing_note, /Move succeeded.*before publishing/);
+    assert.equal(f.calls.length, 1, 'the move is not retried or reported as a failure');
   } finally { await f.close(); }
 });
