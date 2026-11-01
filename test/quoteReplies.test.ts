@@ -226,3 +226,50 @@ test('tilde quote fences are recognized', { timeout: 2000 }, async () => {
   assert.equal(messages[0].metadata?.mentioned, false);
   assert.equal(messages[0].metadata?.replyToSelf, true);
 });
+
+test('history quote replies resolve page authors before the seen cache or GETs', async () => {
+  const rows = [raw(300, quote()), raw(QUOTED, 'own original', { sender_id: SELF })];
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: rows, found_newest: true }),
+    getById: async () => { throw new Error('page target must not need a GET'); },
+  } }, SELF, 'session');
+  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  assert.deepEqual(page.messages.map((m) => m.messageId), ['300']);
+  assert.equal(page.messages[0].metadata?.replyToSelf, true);
+  assert.equal(page.messages[0].metadata?.mentioned, false);
+  assert.deepEqual(page.messages[0].tags, ['chat:reply', 'chat:from-human']);
+  assert.equal(page.scannedThrough, 300);
+});
+
+test('history quote lookups share a page cap and still use cached authors after it is exhausted', async () => {
+  let rows = [raw(QUOTED, 'own original', { sender_id: SELF })];
+  const gets: number[] = [];
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: rows, found_newest: true }),
+    getById: async ({ message_id }: { message_id: number }) => {
+      gets.push(message_id);
+      return { message: raw(message_id, 'another author') };
+    },
+  } }, SELF, 'session');
+  await adapter.fetchHistory('zulip:general', { limit: 500 });
+  rows = Array.from({ length: 20 }, (_, i) => raw(300 + i, quote(500 + i)));
+  rows.push(raw(400, quote()));
+  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  assert.equal(gets.length, 8);
+  assert.ok(page.messages.slice(0, -1).every((m) => m.metadata?.replyToSelf === false));
+  assert.equal(page.messages.at(-1)?.metadata?.replyToSelf, true);
+});
+
+test('history verifies an off-page own-message quote with a raw-message GET', async () => {
+  const gets: unknown[] = [];
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: [raw(300, quote())], found_newest: true }),
+    getById: async (params: unknown) => {
+      gets.push(params);
+      return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+    },
+  } }, SELF, 'session');
+  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  assert.equal(page.messages[0].metadata?.replyToSelf, true);
+  assert.deepEqual(gets, [{ message_id: QUOTED, apply_markdown: false }]);
+});

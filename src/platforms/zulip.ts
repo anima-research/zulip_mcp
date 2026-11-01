@@ -134,6 +134,8 @@ interface SeenMessage {
 const LOCATE_TIMEOUT_MS = 15_000;
 /** Total lookup budget for one incoming stream message's quote targets. */
 const QUOTE_TIMEOUT_MS = 3_000;
+/** Maximum uncached quote-target GETs shared by a history page. */
+const HISTORY_QUOTE_GET_CAP = 8;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -386,25 +388,20 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  /** Verify quote replies, but never infer addressing from a silent mention.
-   *  Check at most the first two distinct targets per incoming message within
-   *  a shared three-second budget per message. Multiple quote replies in a poll
-   *  batch can delay later events by up to that budget for each message;
-   *  prefer cached authors, otherwise one GET per target, failing closed. */
-  private async markQuoteReply(m: ZulipMessage): Promise<void> {
-    if (m.mentioned || this.identity.selfUserId === null) return;
-    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+  /** Verify at most two quote targets; all readers use the same classifier.
+   *  Cached authors remain usable even after the lookup budget is exhausted. */
+  private async isQuoteReply(
+    m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'rawContent'>,
+    resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> =>
+      this.seen.get(id) ?? (remainingMs > 0 ? this.locate(id, 'a quote reply', remainingMs) : null),
+    deadline = performance.now() + QUOTE_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId) return false;
     for (const id of quotedMessageIds(m.rawContent)) {
-      const remaining = deadline - performance.now();
-      if (remaining <= 0) return;
-      const quoted = await this.locate(id, 'a quote reply', remaining);
-      if (quoted?.authorId === this.identity.selfUserId) {
-        m.replyToSelf = true;
-        const cached = this.seen.get(m.id);
-        if (cached) cached.replyToSelf = true;
-        return;
-      }
+      const quoted = await resolve(id, deadline - performance.now());
+      if (quoted?.authorId === this.identity.selfUserId) return true;
     }
+    return false;
   }
 
   /**
@@ -822,6 +819,22 @@ export class ZulipAdapter implements PlatformAdapter {
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
     });
+    // Page authors take precedence over older cached rows, including targets
+    // later in the page and pages larger than the seen cache. Uncached targets
+    // share a GET cap and three-second wait budget for the whole page.
+    const pageById = new Map(page.messages.map((m) => [m.id, m]));
+    let getsLeft = HISTORY_QUOTE_GET_CAP;
+    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+    const resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
+      const known = pageById.get(id) ?? this.seen.get(id);
+      if (known) return known;
+      if (getsLeft <= 0 || remainingMs <= 0) return null;
+      getsLeft--;
+      return this.locate(id, 'a history quote reply', remainingMs);
+    };
+    for (const m of page.messages) {
+      if (this.allowed(m)) m.replyToSelf = await this.isQuoteReply(m, resolve, deadline);
+    }
     for (const m of page.messages) this.remember(channelId, m);
     const messages = page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
@@ -925,7 +938,9 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      await this.markQuoteReply(m);
+      m.replyToSelf = await this.isQuoteReply(m);
+      const cached = this.seen.get(m.id);
+      if (cached) cached.replyToSelf = m.replyToSelf;
       // A stream the bot joined after startup is unknown to the host; the
       // message proves it is reachable, so it travels with its descriptor
       // (#20). Sent with EVERY message, never suppressed as "already

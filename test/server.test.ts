@@ -29,6 +29,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
+import { ZulipAdapter } from '../src/platforms/zulip.ts';
+import type { ZulipRawMessage } from '../src/history.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
@@ -2226,4 +2228,96 @@ test('a quote reply pushes on a closed channel without claiming an explicit ment
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
     assert.equal(h.server.delivery.tally('zulip:general')?.messages ?? 0, 0);
   } finally { await h.close(); }
+});
+
+/** Real history classification, with Zulip's unmentioned raw quote row. */
+function quoteHistory(): ZulipAdapter {
+  const original: ZulipRawMessage = {
+    id: 2, sender_id: 100, sender_full_name: 'Bot', sender_email: 'reader-bot@example.invalid',
+    display_recipient: 'general', subject: 'answers', timestamp: 1_700_000_000,
+    type: 'stream', flags: [], content: 'original',
+  };
+  const reply: ZulipRawMessage = {
+    ...original, id: 5, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+    content: '@_**Bot|100** [said](/#narrow/channel/7-general/near/2):\n\n```quote\noriginal\n```\nreply',
+  };
+  return new ZulipAdapter({ messages: {
+    retrieve: async (q: { anchor: string | number; num_after: number; num_before: number }) => ({
+      messages: q.num_after > 0 ? [original, reply].filter((m) => m.id > Number(q.anchor)) : [original, reply],
+      found_newest: true,
+    }),
+    getById: async () => ({ message: original }),
+  } }, 100, 'session');
+}
+
+test('a refused quote-reply push is redelivered from classified history when another stream is accepted', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    const history = quoteHistory();
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    const reply = (await history.fetchHistory('zulip:general', { limit: 100 })).messages[0];
+    h.policy.rejectPushes.add('5');
+    h.adapter.emit!(reply);
+    await until(() => h.server.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'refused reply held');
+    assert.equal(h.server.delivery.watermark('zulip:general'), 1);
+    h.policy.rejectPushes.delete('5');
+    const other = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    h.adapter.emit!(streamMsg(6, { channelId: other.id, mentioned: true }), other);
+    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'reply healed');
+    const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
+    assert.ok(recovered);
+    assert.ok(recovered.tags?.includes('chat:reply'));
+    assert.ok(!recovered.tags?.includes('chat:mention'));
+    assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
+    const text = (recovered.payload.content[0] as { text: string }).text;
+    assert.match(text, /id=5\]/);
+    assert.doesNotMatch(text, /\(mention\)/);
+    assert.deepEqual(h.server.delivery.heldIds('zulip:general'), []);
+  } finally { await h.close(); }
+});
+
+test('a quote reply received in the sweep window survives history deduplication exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-quote-sweep-'));
+  let second: Harness | undefined;
+  let release!: () => void;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'quote-sweep' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    } finally { await first.close(); }
+    second = harness({ stateDir: dir, sessionId: 'quote-sweep' });
+    const history = quoteHistory();
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    second.adapter.fetchHistory = async (channelId, query) => {
+      await gate;
+      return history.fetchHistory(channelId, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    assert.equal(second.server.isLive, false);
+    const reply = (await history.fetchHistory('zulip:general', { limit: 100 })).messages[0];
+    second.adapter.emit!(reply);
+    release();
+    await until(() => second!.server.isLive && second!.server.delivery.watermark('zulip:general') === 5, 'sweep acceptance and go-live');
+    assert.equal(second.pushed.length, 1);
+    assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+    assert.ok(!second.pushed[0].tags?.includes('chat:mention'));
+    const text = (second.pushed[0].payload.content[0] as { text: string }).text;
+    assert.match(text, /^<missed /);
+    assert.match(text, /id=5\]/);
+    assert.doesNotMatch(text, /\(mention\)/);
+  } finally {
+    release?.();
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
