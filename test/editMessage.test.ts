@@ -294,3 +294,23 @@ test('move_messages describes visible breadcrumbs and resolving a whole topic', 
   assert.match(String(properties.propagate_mode.description), /Zulip defaults to change_one/);
   assert.match(String(properties.propagate_mode.description), /change_later moves this and later messages/);
 });
+
+test('move_messages preserves structured move limits for a partial-move retry', async () => {
+  for (const status of [400, 200]) {
+    const f = await fixture({
+      result: 'error', msg: 'You only have permission to move the 3/10 most recent messages in this topic.',
+      code: 'MOVE_MESSAGES_TIME_LIMIT_EXCEEDED',
+      first_message_id_allowed_to_move: 123, total_messages_in_topic: 10, total_messages_allowed_to_move: 3,
+    }, status);
+    try {
+      await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, topic, propagate_mode: 'change_all' }), (error: Error) => {
+        assert.match(error.message, /3\/10 most recent messages/);
+        assert.match(error.message, /code=MOVE_MESSAGES_TIME_LIMIT_EXCEEDED/);
+        assert.match(error.message, /first_message_id_allowed_to_move=123/);
+        assert.match(error.message, /total_messages_in_topic=10/);
+        assert.match(error.message, /total_messages_allowed_to_move=3/);
+        return true;
+      });
+    } finally { await f.close(); }
+  }
+});
