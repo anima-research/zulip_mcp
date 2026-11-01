@@ -459,6 +459,9 @@ export class ZulipAdapter implements PlatformAdapter {
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
+      const replyToSelf = change.content !== null
+        ? await this.isQuoteReply({ ...where, rawContent: change.content, mentioned })
+        : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
@@ -466,6 +469,7 @@ export class ZulipAdapter implements PlatformAdapter {
         ...where,
         topic,
         mentioned,
+        replyToSelf,
         ...(content !== null ? { snippet: snippetOf(content) } : {}),
         ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}),
       });
@@ -496,7 +500,7 @@ export class ZulipAdapter implements PlatformAdapter {
         content,
         previousContent,
         mentioned,
-        replyToSelf: where.replyToSelf,
+        replyToSelf,
         previouslyReplyToSelf: cached ? cached.replyToSelf : null,
         // The cache holds the pre-change verdict; a GET only the post-change one.
         previouslyMentioned: cached ? cached.mentioned : null,

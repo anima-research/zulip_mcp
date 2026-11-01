@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
+import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 
@@ -273,3 +274,46 @@ test('history verifies an off-page own-message quote with a raw-message GET', as
   assert.equal(page.messages[0].metadata?.replyToSelf, true);
   assert.deepEqual(gets, [{ message_id: QUOTED, apply_markdown: false }]);
 });
+
+for (const [label, before, after, wasReply, isReply] of [
+  ['keeps', quote(), quote().replace('reply', 'corrected reply'), true, true],
+  ['removes', quote(), 'no quote now', true, false],
+  ['adds', 'no quote yet', quote(), false, true],
+] as const) {
+  test(`an edit that ${label} a quote recomputes reply addressing independently of mentions`, { timeout: 2000 }, async () => {
+    const changes: MessageChangeEvent[] = [];
+    const incoming: IncomingChannelMessage[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    let served = false;
+    const adapter = new ZulipAdapter({
+      queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+      events: { retrieve: async () => {
+        if (served) return new Promise(() => {});
+        served = true;
+        return { events: [
+          { id: 1, type: 'message', message: raw(QUOTED, 'original', { sender_id: SELF }), flags: [] },
+          { id: 2, type: 'message', message: raw(300, before), flags: [] },
+          { id: 3, type: 'update_message', message_id: 300, user_id: 101, orig_content: before, content: after, flags: [] },
+          { id: 4, type: 'delete_message', message_ids: [300], message_type: 'stream', stream_id: 1 },
+        ] };
+      } },
+    }, SELF, 'session');
+    adapter.startEvents((m) => incoming.push(m), undefined, undefined, (c) => {
+      changes.push(c);
+      if (changes.length === 2) finish();
+    });
+    try {
+      await finished;
+      assert.equal(incoming[0].metadata?.mentioned, false);
+      assert.equal(incoming[0].metadata?.replyToSelf, wasReply);
+      assert.equal(changes[0].kind, 'edit');
+      assert.equal(changes[0].mentioned, false);
+      assert.equal(changes[0].previouslyMentioned, false);
+      assert.equal(changes[0].replyToSelf, isReply);
+      assert.equal(changes[0].previouslyReplyToSelf, wasReply);
+      assert.equal(changes[1].kind, 'delete');
+      assert.equal(changes[1].replyToSelf, isReply, 'deletions use the edited verdict');
+    } finally { adapter.stopEvents(); }
+  });
+}

@@ -2321,3 +2321,23 @@ test('a quote reply received in the sweep window survives history deduplication 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an edited quote reply pushes on a closed channel with reply tags and no mention label', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:general', messageId: '10', messageIds: ['10'],
+      authorId: '101', authorName: 'User', authorEmail: 'user@example.invalid', actorId: '101',
+      topic: 'answers', previousTopic: null, movedToChannelId: null,
+      content: 'corrected reply', previousContent: 'reply', replyToSelf: true,
+      previouslyReplyToSelf: true, mentioned: false, previouslyMentioned: false,
+      vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(),
+    });
+    await until(() => h.pushed.length === 1, 'quote-reply edit push');
+    assert.deepEqual(h.pushed[0].tags, ['chat:edited', 'chat:reply']);
+    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
+    assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
+  } finally { await h.close(); }
+});

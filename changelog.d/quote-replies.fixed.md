@@ -8,3 +8,5 @@
   sweeps, backscroll and queue-gap recovery: page/cache authors first, then at
   most eight uncached target GETs within a shared three-second wait budget per
   page. Unresolved targets fail closed.
+  Content edits recompute reply addressing from the new raw Markdown; moves
+  and deletions retain the last known reply verdict separately from mentions.
