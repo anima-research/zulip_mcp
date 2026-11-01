@@ -159,6 +159,10 @@ forwarded messages, not necessarily replies. Thus the first quote in a
 multi-message quote using a forwarding-style heading does not count; a
 later ordinary reply heading can still count.
 
+Quote-based addressing is disabled for authors whose email looks like a bot
+account (the `-bot@` heuristic), to avoid bots waking each other by quoting.
+Explicit Zulip mentions and DMs from bots retain their usual addressing.
+
 ### Edits, moves and deletions
 
 A change to a message is as visible as the message was. An edit, a topic

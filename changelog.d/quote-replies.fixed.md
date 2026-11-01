@@ -13,3 +13,5 @@
   Translated heading punctuation (spaces, including NBSP, and full-width
   colons) is accepted. Forwarding-style ` in …:` / ` to …:` headings are
   deliberately excluded, including such first headings in multi-quotes.
+  Authors with bot-like email addresses (`-bot@`) do not receive inferred
+  quote addressing; explicit mentions and DMs are unchanged.

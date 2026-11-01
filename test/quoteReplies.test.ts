@@ -350,3 +350,31 @@ test('an ordinary later quote still counts after an excluded multi-quote heading
   assert.equal(messages[0].metadata?.replyToSelf, true);
   assert.deepEqual(calls, [QUOTED]);
 });
+
+test('a bot-authored quote does not infer reply addressing or spend a lookup', { timeout: 2000 }, async () => {
+  let gets = 0;
+  const messages = await receive([raw(300, quote(), { sender_email: 'another-bot@example.invalid' })], async () => { gets++; return {}; });
+  assert.equal(messages[0].metadata?.replyToSelf, false);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.deepEqual(messages[0].tags, ['chat:ambient', 'chat:from-bot']);
+  assert.equal(gets, 0);
+});
+
+test('a bot-authored explicit mention remains addressed without a quote lookup', { timeout: 2000 }, async () => {
+  let gets = 0;
+  const messages = await receive([raw(300, quote(), { sender_email: 'another-bot@example.invalid', flags: ['mentioned'] })], async () => { gets++; return {}; });
+  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.deepEqual(messages[0].tags, ['chat:mention', 'chat:from-bot']);
+  assert.equal(gets, 0);
+});
+
+test('history also withholds inferred addressing for bot-authored quotes', async () => {
+  let gets = 0;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: [raw(300, quote(), { sender_email: 'another-bot@example.invalid' })], found_newest: true }),
+    getById: async () => { gets++; return { message: raw(QUOTED, 'original', { sender_id: SELF }) }; },
+  } }, SELF, 'session');
+  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  assert.equal(page.messages[0].metadata?.replyToSelf, false);
+  assert.equal(gets, 0);
+});

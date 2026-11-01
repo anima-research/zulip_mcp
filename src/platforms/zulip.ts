@@ -46,6 +46,7 @@ import {
   editedTrailer,
   fetchHistory,
   normalizeMessage,
+  looksLikeBotEmail,
   parseDmChannelId,
   toIncoming,
   type ZulipIdentity,
@@ -391,12 +392,12 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Verify at most two quote targets; all readers use the same classifier.
    *  Cached authors remain usable even after the lookup budget is exhausted. */
   private async isQuoteReply(
-    m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'rawContent'>,
+    m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'authorEmail' | 'rawContent'>,
     resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> =>
       this.seen.get(id) ?? (remainingMs > 0 ? this.locate(id, 'a quote reply', remainingMs) : null),
     deadline = performance.now() + QUOTE_TIMEOUT_MS,
   ): Promise<boolean> {
-    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId) return false;
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return false;
     for (const id of quotedMessageIds(m.rawContent)) {
       const quoted = await resolve(id, deadline - performance.now());
       if (quoted?.authorId === this.identity.selfUserId) return true;
