@@ -12,15 +12,34 @@ import { featureSetForTool } from '../src/feature-sets.ts';
 import { toolDefinitions } from '../src/tools.ts';
 
 /** Exercise the real client and runtime against a local HTTP stand-in. */
-async function fixture(response: unknown, status = 200) {
+async function fixture(response: unknown, status = 200, loseVisibility = false) {
   const calls: { method?: string; path?: string; body: string; auth?: string; contentType?: string }[] = [];
+  let currentTopic = 'deploys';
+  let currentStream = 7;
+  const lookups: string[] = [];
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET') {
+      lookups.push(req.url!);
+      const payload = req.url!.startsWith('/api/v1/streams')
+        ? { result: 'success', streams: [{ stream_id: 17, name: 'archive' }] }
+        : loseVisibility && currentStream === 17
+          ? { result: 'error', msg: 'Not visible' }
+          : { result: 'success', message: { stream_id: currentStream, display_recipient: currentStream === 17 ? 'archive' : 'general', subject: currentTopic } };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload));
+      return;
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk);
     calls.push({
       method: req.method, path: req.url, body: Buffer.concat(chunks).toString(),
       auth: req.headers.authorization, contentType: req.headers['content-type'],
     });
+    const fields = new URLSearchParams(calls.at(-1)!.body);
+    if (status === 200 && typeof response === 'object' && response !== null && (response as any).result === 'success') {
+      if (fields.has('topic')) currentTopic = fields.get('topic')!.trim();
+      if (fields.has('stream_id')) currentStream = Number(fields.get('stream_id'));
+    }
     res.writeHead(status, { 'Content-Type': typeof response === 'string' ? 'text/html' : 'application/json' });
     res.end(typeof response === 'string' ? response : JSON.stringify(response));
   });
@@ -32,7 +51,7 @@ async function fixture(response: unknown, status = 200) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-edit-'));
   const tools = new ZulipToolRuntime({ client, realm, authHeader, selfUserId: 1, sessionId: 'test' }, dir);
   return {
-    tools, calls, authHeader,
+    tools, calls, authHeader, lookups,
     async close() {
       server.close();
       server.closeAllConnections();
@@ -168,7 +187,7 @@ for (const { label, fields } of edits) {
     try {
       assert.deepEqual(await f.tools.handleToolCall('move_messages', {
         message_id: 42, ...fields, extra: 'not sent',
-      }), response);
+      }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
       const expected = new URLSearchParams(Object.entries(fields).map(([key, value]) => [key, String(value)]));
       assert.deepEqual(f.calls, [{
         method: 'PATCH', path: '/api/v1/messages/42', body: expected.toString(),
@@ -313,4 +332,14 @@ test('move_messages preserves structured move limits for a partial-move retry', 
       });
     } finally { await f.close(); }
   }
+});
+
+test('move_messages returns destination routing even when moving removes visibility', async () => {
+  const f = await fixture({ result: 'success', msg: '' }, 200, true);
+  try {
+    const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, propagate_mode: 'change_all' });
+    assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: 'deploys' });
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.lookups.length, 3, 'source, stream names and resulting placement are read');
+  } finally { await f.close(); }
 });

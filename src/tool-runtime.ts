@@ -730,6 +730,20 @@ export class ZulipToolRuntime {
         if (!this.session.realm || !this.session.authHeader) {
           throw new Error("Cannot edit messages: realm or bot credentials are unknown");
         }
+        // Keep a fallback before moving: the destination may remove our
+        // visibility, in which case the message cannot be read afterwards.
+        let movedTo: { channelId: string | null; topic: string | null } | undefined;
+        if (moving && args.stream_id !== undefined) {
+          const [anchor, streams] = await Promise.all([
+            zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }).catch(() => null),
+            zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }).catch(() => null),
+          ]);
+          const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
+          movedTo = {
+            channelId: typeof destination?.name === "string" ? `zulip:${destination.name}` : null,
+            topic: args.topic ?? (typeof anchor?.message?.subject === "string" ? anchor.message.subject : null),
+          };
+        }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
         const editFields = new URLSearchParams();
         for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
@@ -771,6 +785,25 @@ export class ZulipToolRuntime {
         }
         if (result.ignored_parameters_unsupported?.length) {
           throw new Error(`Zulip refused editing message ${args.message_id}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
+        }
+        if (movedTo) {
+          // Prefer the actual resulting placement (Zulip may normalise the
+          // topic); a failed follow-up read must not turn a successful move
+          // into a tool error and invite a duplicate move.
+          try {
+            const placed = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
+            if (placed?.result === "success" && placed.message?.stream_id === args.stream_id) {
+              if (typeof placed.message.display_recipient === "string") movedTo.channelId = `zulip:${placed.message.display_recipient}`;
+              if (typeof placed.message.subject === "string") movedTo.topic = placed.message.subject;
+            }
+          } catch { /* The bot may have lost visibility after moving. */ }
+          return {
+            ...result,
+            moved_to: movedTo,
+            ...(movedTo.channelId === null || movedTo.topic === null
+              ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
+              : {}),
+          };
         }
         return result;
       }

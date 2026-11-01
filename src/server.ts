@@ -235,6 +235,7 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.adapter.onSelfChanged = (change) => this.channelManager.reconcileSelfChange(change);
   }
 
   /** True when the connected peer negotiated MCPL. */

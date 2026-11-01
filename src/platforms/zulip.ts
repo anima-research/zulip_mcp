@@ -152,6 +152,7 @@ const DEFAULT_DM_DISCOVERY_LIMIT = 300;
 
 export class ZulipAdapter implements PlatformAdapter {
   readonly type = 'zulip';
+  onSelfChanged?: OnMessageChange;
 
   private eventLoop: ZulipEventLoop | null = null;
   private readonly identity: ZulipIdentity;
@@ -432,9 +433,7 @@ export class ZulipAdapter implements PlatformAdapter {
       } else if (movedToChannelId !== null) {
         for (const id of change.messageIds) this.movedAway.delete(id);
       }
-      if (self !== null && change.actorId === self) return;
-      if (!this.changeAllowed(placed)) return;
-      emit({
+      const event: MessageChangeEvent = {
         kind: content !== null ? 'edit' : 'move',
         channelId: fromChannelId,
         messageId: String(change.messageId),
@@ -455,7 +454,12 @@ export class ZulipAdapter implements PlatformAdapter {
         isDM: where.isDm,
         onOwnMessage: self !== null && where.authorId === self,
         timestamp: new Date(change.editedAt * 1000),
-      });
+      };
+      if (self !== null && change.actorId === self) {
+        this.onSelfChanged?.(event);
+        return;
+      }
+      if (this.changeAllowed(placed)) emit(event);
       return;
     }
 
@@ -823,10 +827,10 @@ export class ZulipAdapter implements PlatformAdapter {
     // same message reads backwards otherwise. Every await in the chain is
     // bounded (LOCATE_TIMEOUT_MS), so one hung GET delays, never wedges.
     let changeChain: Promise<void> = Promise.resolve();
-    const changeHandler = onMessageChange
+    const changeHandler = onMessageChange || this.onSelfChanged
       ? (change: ZulipMessageChange) => {
           changeChain = changeChain
-            .then(() => this.onZulipChange(change, onMessageChange))
+            .then(() => this.onZulipChange(change, onMessageChange ?? (() => {})))
             .catch((err) => {
               console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
             });

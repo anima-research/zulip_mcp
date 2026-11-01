@@ -239,6 +239,10 @@ export interface PlatformAdapter {
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
 
+  /** The bot's own changes reconcile local routing without delivering a
+   *  marker to the host or waking the agent. */
+  onSelfChanged?: OnMessageChange;
+
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
    * messages before invoking the callback.

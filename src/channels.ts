@@ -24,7 +24,7 @@ import type {
 } from '@animalabs/mcpl-core';
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
+import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
@@ -510,6 +510,38 @@ export class ChannelManager {
       ...(Number.isFinite(id) ? { from: id } : {}),
     });
     return true;
+  }
+
+  /**
+   * Reconcile a move the bot made itself, without enqueueing a change marker.
+   * Only the conversation's source message can retarget its reply hints.
+   * Cross-channel moves transfer those hints; publish still requires the
+   * host to name the destination channel (reported by the move tool).
+   */
+  reconcileSelfChange(change: MessageChangeEvent): void {
+    if (change.previousTopic === null && change.movedToChannelId === null) return;
+    const source = this.lastIncoming.get(change.channelId);
+    if (source?.from === undefined || !change.messageIds.includes(String(source.from))) return;
+    const updated = {
+      ...source,
+      hints: {
+        ...source.hints,
+        threadId: change.topic,
+        metadata: { ...source.hints.metadata, topic: change.topic },
+      },
+    };
+    const destination = change.movedToChannelId ?? change.channelId;
+    if (destination === change.channelId) {
+      this.lastIncoming.set(destination, updated);
+      if (this.typingTopic.has(destination) && this.typingTopic.get(destination) === source.hints.threadId) {
+        this.typingTopic.set(destination, change.topic);
+      }
+    } else {
+      this.lastIncoming.delete(change.channelId);
+      this.typingTopic.delete(change.channelId);
+      const existing = this.lastIncoming.get(destination);
+      if (existing?.from === undefined || source.from >= existing.from) this.lastIncoming.set(destination, updated);
+    }
   }
 
   /**
