@@ -203,7 +203,9 @@ for (const restriction of ['none', 'allowlist', 'mute']) {
     await f.open();
     if (restriction !== 'allowlist') await f.open(ARCHIVE);
     f.feed({ type: 'message', flags: ['mentioned'], message: raw(20) },
-      { type: 'message', flags: ['mentioned'], message: raw(21) });
+      { type: 'message', flags: ['mentioned'], message: raw(21) },
+      { type: 'message', flags: [], message: { ...raw(22), sender_id: SELF,
+        sender_full_name: 'Bot', sender_email: 'bot@example.com', content: 'original bot message' } });
     await until(() => f.server.delivery.watermark(GENERAL) === 21, 'original messages accepted');
     f.feed(
       move([20, 21], { new_stream_id: 8 }),
@@ -211,9 +213,10 @@ for (const restriction of ['none', 'allowlist', 'mute']) {
         emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji' },
       { type: 'update_message', message_id: 21, message_ids: [21], user_id: 7, stream_id: 8,
         edit_timestamp: 1_700_002_001, content: '@**Bot** edited later', orig_content: 'original', flags: ['mentioned'] },
-      // This non-delivering sentinel observes completion of the shared event chain.
-      { type: 'update_message', message_id: 21, message_ids: [21], user_id: SELF, stream_id: 8,
-        edit_timestamp: 1_700_002_002, content: 'self edited', orig_content: 'edited later', flags: [] },
+      // A bot-owned edit observes completion of queued changes without delivery;
+      // reactions independently await the earlier change-chain tail.
+      { type: 'update_message', message_id: 22, message_ids: [22], user_id: SELF, stream_id: 7,
+        edit_timestamp: 1_700_002_002, content: 'self edited', orig_content: 'original bot message', flags: [] },
     );
     await until(() => f.reconciled.length === 2, 'all queued changes reconciled');
     if (restriction === 'none') await until(() => f.incoming.length === 4, 'destination markers delivered');
