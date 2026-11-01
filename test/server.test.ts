@@ -2695,3 +2695,52 @@ for (const verified of [false, true]) {
     } finally { await h.close(); }
   });
 }
+
+test('releasing a muted channel clears pending reply overlays before it is unmuted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-pending-release-'));
+  const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+  plane.start();
+  const h = harness({ filters: plane });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.policy.rejectPushes.add('5');
+    h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+    await until(() => h.server.delivery.heldIds('zulip:general').includes(5), 'reply held');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
+    await until(() => h.server.delivery.heldIds('zulip:general').length === 0, 'muted channel released');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: [] })).ok, true);
+    h.policy.rejectPushes.delete('5');
+    h.pushed.length = 0;
+    h.adapter.history = [streamMsg(5)];
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'ambient history scanned');
+    assert.equal(h.pushed.length, 0, 'released verdict does not turn ambient history into a reply');
+  } finally {
+    await h.close();
+    plane.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reply missing from replay history releases both its hold and pending verdict', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.policy.rejectIds.add('5');
+    h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+    await until(() => h.server.delivery.heldIds('zulip:general').includes(5), 'reply held');
+    h.adapter.history = [];
+    h.adapter.emit!(streamMsg(6));
+    await until(() => h.server.delivery.watermark('zulip:general') === 6, 'missing reply released');
+    assert.deepEqual(h.server.delivery.heldIds('zulip:general'), []);
+    const pending = (h.server as unknown as { pendingReplies: Map<string, Set<number>> }).pendingReplies;
+    assert.equal(pending.get('zulip:general')?.has(5) ?? false, false);
+  } finally { await h.close(); }
+});

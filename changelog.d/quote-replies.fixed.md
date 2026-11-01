@@ -36,3 +36,5 @@
   connection reset, so accepted blocks are not replayed solely due to that window.
   Quote edits clear a pending live verdict only when the new content has no
   quote target or all inspected targets were verified as not authored by the bot.
+  Releasing a muted/disallowed channel or a message gone from replay history
+  also clears its pending reply verdict, preventing stale history overlays.

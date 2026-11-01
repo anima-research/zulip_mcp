@@ -441,7 +441,10 @@ export class ZulipMcplServer {
     for (const [channelId, through] of this.preLiveScanned) {
       // A refused buffered reply must keep its hold below the scanned range.
       for (const id of this.delivery.heldIds(channelId)) {
-        if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) this.delivery.release(channelId, id);
+        if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) {
+          this.forgetPendingReply(channelId, id);
+          this.delivery.release(channelId, id);
+        }
       }
       this.delivery.advance(channelId, through);
     }
@@ -893,8 +896,10 @@ export class ZulipMcplServer {
     for (const m of messages) {
       const id = numericId(m);
       if (id === null) continue;
-      if (this.isMuted(channelId) || !this.isAllowed(channelId, m)) moved = this.delivery.release(channelId, id) || moved;
-      else this.delivery.hold(channelId, id, 'failed');
+      if (this.isMuted(channelId) || !this.isAllowed(channelId, m)) {
+        this.forgetPendingReply(channelId, id);
+        moved = this.delivery.release(channelId, id) || moved;
+      } else this.delivery.hold(channelId, id, 'failed');
     }
     if (moved) this.delivery.save();
   }
@@ -1034,6 +1039,7 @@ export class ZulipMcplServer {
     try {
       for (const channelId of channels) {
         if (this.isMuted(channelId) || !this.isAllowed(channelId)) {
+          for (const id of this.pendingReplies.get(channelId) ?? []) this.forgetPendingReply(channelId, id);
           this.delivery.releaseAll(channelId);
           continue;
         }
@@ -1075,7 +1081,12 @@ export class ZulipMcplServer {
     // A held id the scan covered but did not find is gone from history (or
     // no longer visible to the agent): nothing left to deliver.
     const scanned = fetched.scannedThrough ?? 0;
-    for (const id of ids) if (!found.has(id) && (id <= scanned || fetched.complete)) this.delivery.release(channelId, id);
+    for (const id of ids) {
+      if (!found.has(id) && (id <= scanned || fetched.complete)) {
+        this.forgetPendingReply(channelId, id);
+        this.delivery.release(channelId, id);
+      }
+    }
     if (replayed > 0) console.error(`[zulip-mcp] ${channelId}: replaying ${replayed} undelivered message(s) from history`);
   }
 
