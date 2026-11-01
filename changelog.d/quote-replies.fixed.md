@@ -34,3 +34,5 @@
   actual acceptance of a buffered reply.
   Staged catch-up progress is also committed on graceful shutdown and before
   connection reset, so accepted blocks are not replayed solely due to that window.
+  Quote edits clear a pending live verdict only when the new content has no
+  quote target or all inspected targets were verified as not authored by the bot.

@@ -129,6 +129,8 @@ export interface MessageChangeEvent {
   mentioned: boolean;
   /** Verified quote-reply addressing, independent of Zulip's mention flag. */
   replyToSelf?: boolean;
+  /** True only for a resolved verdict (including content with no quote targets). */
+  replyToSelfVerified?: boolean;
   previouslyReplyToSelf?: boolean | null;
   /** The bot was mentioned in the message as it read before the change, as
    *  far as the adapter knows (a deleted message keeps its last verdict);

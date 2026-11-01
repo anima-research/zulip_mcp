@@ -430,9 +430,11 @@ export class ZulipAdapter implements PlatformAdapter {
     },
     deadline = performance.now() + QUOTE_TIMEOUT_MS,
   ): Promise<QuoteVerdict> {
-    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'not-reply';
+    const targets = quotedMessageIds(m.rawContent);
+    if (targets.size === 0) return 'not-reply';
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'unverified';
     let verdict: QuoteVerdict = 'not-reply';
-    for (const id of quotedMessageIds(m.rawContent)) {
+    for (const id of targets) {
       const quoted = await resolve(id, deadline - performance.now());
       if (quoted === 'budget-skipped') verdict = 'budget-skipped';
       else if (quoted === null) {
@@ -497,9 +499,10 @@ export class ZulipAdapter implements PlatformAdapter {
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
-      const replyToSelf = change.content !== null
-        ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned }) === 'reply'
-        : where.replyToSelf;
+      const replyVerdict = change.content !== null
+        ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned })
+        : null;
+      const replyToSelf = replyVerdict !== null ? replyVerdict === 'reply' : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
@@ -539,6 +542,7 @@ export class ZulipAdapter implements PlatformAdapter {
         previousContent,
         mentioned,
         replyToSelf,
+        ...(replyVerdict !== null ? { replyToSelfVerified: replyVerdict === 'reply' || replyVerdict === 'not-reply' } : {}),
         previouslyReplyToSelf: cached ? cached.replyToSelf : null,
         // The cache holds the pre-change verdict; a GET only the post-change one.
         previouslyMentioned: cached ? cached.mentioned : null,

@@ -314,6 +314,7 @@ for (const [label, before, after, wasReply, isReply] of [
       assert.equal(changes[0].mentioned, false);
       assert.equal(changes[0].previouslyMentioned, false);
       assert.equal(changes[0].replyToSelf, isReply);
+      assert.equal(changes[0].replyToSelfVerified, true);
       assert.equal(changes[0].previouslyReplyToSelf, wasReply);
       assert.equal(changes[1].kind, 'delete');
       assert.equal(changes[1].replyToSelf, isReply, 'deletions use the edited verdict');
@@ -568,3 +569,40 @@ test('history reports a quote skipped after the page wait deadline as unverified
   assert.deepEqual(page.unverifiedMessageIds, ['301']);
   assert.equal(page.messages[1].metadata?.replyToSelf, false);
 });
+
+for (const resolvedOther of [false, true]) {
+  test(`an intact quote edit ${resolvedOther ? 'resolved to another author is a confident negative verdict' : 'with an unavailable target is not a confident negative verdict'}`, { timeout: 2000 }, async () => {
+  let targetGets = 0;
+  let served = false;
+  let finish!: (change: MessageChangeEvent) => void;
+  const changed = new Promise<MessageChangeEvent>((resolve) => { finish = resolve; });
+  const before = quote();
+  const adapter = new ZulipAdapter({
+    messages: { getById: async ({ message_id }: { message_id: number }) => {
+      if (message_id === 300) return { message: raw(300, before) };
+      if (++targetGets > 1) {
+        if (!resolvedOther) throw new Error('target unavailable after eviction');
+        return { message: raw(QUOTED, 'original', { sender_id: 102 }) };
+      }
+      return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+    } },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (served) return new Promise(() => {});
+      served = true;
+      const rows = [raw(300, before), ...Array.from({ length: 2001 }, (_, i) => raw(1000 + i, 'cache fill', { sender_id: SELF }))];
+      return { events: [
+        ...rows.map((message, i) => ({ id: i, type: 'message', message, flags: [] })),
+        { id: 3000, type: 'update_message', message_id: 300, user_id: 102, orig_content: before, content: before + ' corrected', flags: [] },
+      ] };
+    } },
+  }, SELF, 'session');
+  adapter.startEvents((m) => { assert.equal(m.metadata?.replyToSelf, true); }, undefined, undefined, finish);
+  try {
+    const edit = await changed;
+    assert.equal(edit.replyToSelf, false);
+    assert.equal(edit.replyToSelfVerified, resolvedOther);
+    assert.equal(targetGets, 2);
+  } finally { adapter.stopEvents(); }
+});
+}

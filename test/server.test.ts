@@ -2666,3 +2666,32 @@ test('the same unverified row defers a channel only once per connection', async 
     await until(() => h.server.delivery.watermark('zulip:general') === 5, 'repeat verdict fails closed without pinning');
   } finally { await h.close(); }
 });
+
+for (const verified of [false, true]) {
+  test(`a pending reply is ${verified ? 'cleared by a verified quote-removing edit' : 'preserved by an unverified intact-quote edit'}`, async () => {
+    const h = harness();
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.policy.rejectPushes.add('5');
+      h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+      await until(() => h.server.delivery.heldIds('zulip:general').includes(5), 'reply refused and held');
+      h.adapter.change!({
+        kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'],
+        authorId: '101', authorName: 'User', authorEmail: 'user@example.invalid', actorId: '102',
+        topic: 'topic', previousTopic: null, movedToChannelId: null, content: verified ? 'quote removed' : '[said](/#narrow/near/200):\n```quote\noriginal\n```\ncorrected',
+        previousContent: 'reply', mentioned: false, previouslyMentioned: false,
+        replyToSelf: false, replyToSelfVerified: verified, previouslyReplyToSelf: true,
+        vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(),
+      });
+      h.adapter.history = [streamMsg(5)]; // History also cannot verify a quote.
+      h.policy.rejectPushes.delete('5');
+      const other = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+      h.adapter.emit!(streamMsg(6, { channelId: other.id, mentioned: true }), other);
+      await until(() => h.server.delivery.watermark('zulip:general') === 5, 'history retry completed');
+      const recovered = h.pushed.filter((p) => p.tags?.includes('zulip:missed'));
+      assert.equal(recovered.length, verified ? 0 : 1);
+      if (!verified) assert.ok(recovered[0].tags?.includes('chat:reply'));
+    } finally { await h.close(); }
+  });
+}

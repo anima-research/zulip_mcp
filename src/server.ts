@@ -1793,7 +1793,7 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
-    if (ev.kind === 'edit' && ev.replyToSelf === false) this.forgetPendingReply(ev.channelId, Number(ev.messageId));
+    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.forgetPendingReply(ev.channelId, Number(ev.messageId));
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
