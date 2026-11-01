@@ -734,13 +734,11 @@ export class ZulipToolRuntime {
         // visibility, in which case the message cannot be read afterwards.
         let movedTo: { channelId: string | null; topic: string | null } | undefined;
         if (moving && args.stream_id !== undefined) {
-          const [anchor, streams] = await Promise.all([
-            zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }).catch(() => null),
-            zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }).catch(() => null),
-          ]);
-          const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
+          const anchor = args.topic === undefined
+            ? await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }).catch(() => null)
+            : null;
           movedTo = {
-            channelId: typeof destination?.name === "string" ? `zulip:${destination.name}` : null,
+            channelId: null,
             topic: args.topic ?? (typeof anchor?.message?.subject === "string" ? anchor.message.subject : null),
           };
         }
@@ -797,6 +795,15 @@ export class ZulipToolRuntime {
               if (typeof placed.message.subject === "string") movedTo.topic = placed.message.subject;
             }
           } catch { /* The bot may have lost visibility after moving. */ }
+          if (movedTo.channelId === null) {
+            // Only enumerate streams when the post-move message cannot
+            // name the destination (for example, after losing visibility).
+            try {
+              const streams = await zulipClient.streams.retrieve({ include_public: true, include_subscribed: true });
+              const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
+              if (typeof destination?.name === "string") movedTo.channelId = `zulip:${destination.name}`;
+            } catch { /* Preserve the successful move even if lookup fails. */ }
+          }
           return {
             ...result,
             moved_to: movedTo,

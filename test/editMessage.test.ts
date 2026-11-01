@@ -193,6 +193,12 @@ for (const { label, fields } of edits) {
       assert.deepEqual(await f.tools.handleToolCall('move_messages', {
         message_id: 42, ...fields, extra: 'not sent',
       }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
+      if ('stream_id' in fields) {
+        assert.equal(f.lookups.length, 'topic' in fields ? 1 : 2, 'only omitted topics need a pre-move read');
+        assert.ok(f.lookups.every(path => path.startsWith('/api/v1/messages/')), 'readable destinations need no stream enumeration');
+      } else {
+        assert.deepEqual(f.lookups, []);
+      }
       const expected = new URLSearchParams(Object.entries(fields).map(([key, value]) => [key, String(value)]));
       assert.deepEqual(f.calls, [{
         method: 'PATCH', path: '/api/v1/messages/42', body: expected.toString(),
@@ -339,14 +345,18 @@ test('move_messages preserves structured move limits for a partial-move retry', 
   }
 });
 
-test('move_messages returns destination routing even when moving removes visibility', async () => {
-  const f = await fixture({ result: 'success', msg: '' }, 200, true);
-  try {
-    const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, propagate_mode: 'change_all' });
-    assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: 'deploys' });
-    assert.equal(f.calls.length, 1);
-    assert.equal(f.lookups.length, 3, 'source, stream names and resulting placement are read');
-  } finally { await f.close(); }
+test('move_messages resolves destination names only as a fallback after losing visibility', async () => {
+  for (const topic of [undefined, 'destination']) {
+    const f = await fixture({ result: 'success', msg: '' }, 200, true);
+    try {
+      const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic, propagate_mode: 'change_all' });
+      assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: topic ?? 'deploys' });
+      assert.equal(f.calls.length, 1);
+      assert.equal(f.lookups.length, topic === undefined ? 3 : 2, 'a supplied topic skips the pre-move read');
+      assert.ok(f.lookups.at(-1)!.startsWith('/api/v1/streams'), 'stream names are requested only after the placement read fails');
+      assert.equal(f.lookups.filter(path => path.startsWith('/api/v1/streams')).length, 1);
+    } finally { await f.close(); }
+  }
 });
 
 test('structured error codes retain credential redaction and ignore nonnumeric retry fields', async () => {
