@@ -53,7 +53,7 @@ import {
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { ContextProvider } from './context.js';
-import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
@@ -893,7 +893,7 @@ export class ZulipMcplServer {
     const channelId = message.channelId;
     const id = Number(message.messageId);
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
-    const addressed = meta.mentioned === true || meta.isDM === true;
+    const addressed = meta.mentioned === true || meta.isDM === true || meta.replyToSelf === true;
 
     // Muted stream, or outside the allowlist: nothing reaches the agent —
     // ambient AND mentions — and nothing is tallied, before any other
@@ -1196,7 +1196,9 @@ export class ZulipMcplServer {
       this.delivery.advanceThrough(channelId, newestId);
       return false;
     }
+    const addressedCount = views.filter(isAddressed).length;
     const mentionCount = views.filter((v) => v.mentioned).length;
+    const replyCount = views.filter((v) => v.replyToSelf).length;
     const streamName = isDmChannelId(channelId)
       ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
       : channelId.slice('zulip:'.length);
@@ -1204,7 +1206,7 @@ export class ZulipMcplServer {
       streamName,
       channelId,
       reason: keepAll ? 'backscroll' : 'mention',
-      count: keepAll ? kept.length : mentionCount,
+      count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
       moreBeyond: fetched.truncated,
@@ -1216,8 +1218,8 @@ export class ZulipMcplServer {
       author: { id: 'system', name: 'zulip catch-up' },
       timestamp: new Date().toISOString(),
       content: [{ type: 'text', text: block } satisfies TextContent],
-      tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : ['chat:ambient'])],
-      metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, isDM: isDmChannelId(channelId) },
+      tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : []), ...(replyCount > 0 ? ['chat:reply'] : []), ...(addressedCount === 0 ? ['chat:ambient'] : [])],
+      metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, replyToSelf: replyCount > 0, isDM: isDmChannelId(channelId) },
     };
     const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
@@ -1235,7 +1237,7 @@ export class ZulipMcplServer {
       // is (in a backscroll, its newest message), as live pushes or an open
       // channel's deliveries would have left it.
       for (let i = msgs.length - 1; i >= 0; i--) {
-        if (!keepAll && !views[i].mentioned) continue;
+        if (!keepAll && !isAddressed(views[i])) continue;
         if (this.channelManager.noteConversation(channelId, msgs[i])) break;
       }
     }
@@ -1258,7 +1260,7 @@ export class ZulipMcplServer {
       if (fetched.scannedThrough === null) continue;
       const views = fetched.messages.map(viewOf);
       // Only ambient counts as missed: mentions are delivered by the sweep.
-      const ambient = views.filter((v) => !v.mentioned);
+      const ambient = views.filter((v) => !isAddressed(v));
       this.delivery.backfillMissed(channelId, ambient, fetched.scannedThrough);
     }
   }
@@ -1701,7 +1703,7 @@ export class ZulipMcplServer {
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
-    const addressed = ev.mentioned || ev.isDM;
+    const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a
     // stream the bot was added to after startup — a message edited into a
     // mention, say. Register the channel from it for the same reason a
@@ -1762,7 +1764,7 @@ export class ZulipMcplServer {
       tags: [
         tag,
         ...(ev.kind === 'move' ? ['zulip:moved'] : []),
-        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : [CHAT_TAGS.ambient]),
+        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : ev.replyToSelf ? [CHAT_TAGS.reply] : [CHAT_TAGS.ambient]),
       ],
       metadata: {
         change: ev.kind,
@@ -1775,6 +1777,8 @@ export class ZulipMcplServer {
         ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
         ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
         mentioned: ev.mentioned,
+        replyToSelf: ev.replyToSelf === true,
+        ...(ev.previouslyReplyToSelf != null ? { previouslyReplyToSelf: ev.previouslyReplyToSelf } : {}),
         ...(ev.previouslyMentioned !== null ? { previouslyMentioned: ev.previouslyMentioned } : {}),
         ...(ev.vanished ? { vanished: true } : {}),
         isDM: ev.isDM,

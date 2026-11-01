@@ -54,15 +54,16 @@ async function receive(
   }
 }
 
-test('own-message quote sets the mention verdict in a stream', { timeout: 2000 }, async () => {
+test('own-message quote is tagged as a reply without changing the mention verdict', { timeout: 2000 }, async () => {
   const calls: Record<string, unknown>[] = [];
   // The silent mention's id is deliberately not SELF: the quoted sender decides.
   const messages = await receive([raw(300, quote(QUOTED, 102))], async (params) => {
     calls.push(params);
     return { result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }) };
   });
-  assert.equal(messages[0].metadata?.mentioned, true);
-  assert.ok(messages[0].tags?.includes('chat:mention'));
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
+  assert.ok(messages[0].tags?.includes('chat:reply'));
   assert.deepEqual(calls, [{ message_id: QUOTED, apply_markdown: false }]);
 });
 
@@ -88,7 +89,8 @@ test('quote authors already seen locally need no GET; self messages remain ignor
     raw(300, quote()),
   ], async () => { gets++; throw new Error('unexpected GET'); });
   assert.deepEqual(messages.map((m) => m.messageId), ['300']);
-  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
   assert.equal(gets, 0);
 });
 
@@ -153,7 +155,8 @@ test('multiple quotes resolve only their own headers, once per id, in delivery o
   });
   assert.deepEqual(calls, [201, QUOTED]);
   assert.deepEqual(messages.map((m) => m.messageId), ['300', '301']);
-  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
 });
 
 test('absolute quote links, CRLF and longer quote fences are recognized', { timeout: 2000 }, async () => {
@@ -161,7 +164,8 @@ test('absolute quote links, CRLF and longer quote fences are recognized', { time
   const messages = await receive([raw(300, content)], async () => ({
     result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }),
   }));
-  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
 });
 
 test('an existing mention needs no quote lookup and retains its addressing', { timeout: 2000 }, async () => {
@@ -211,12 +215,14 @@ test('translated quote heading link text is recognized', { timeout: 2000 }, asyn
   const messages = await receive([raw(300, quote().replace('[said]', '[dijo]'))], async () => ({
     result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }),
   }));
-  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
 });
 
 test('tilde quote fences are recognized', { timeout: 2000 }, async () => {
   const messages = await receive([raw(300, quote().replaceAll('```', '~~~'))], async () => ({
     result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }),
   }));
-  assert.equal(messages[0].metadata?.mentioned, true);
+  assert.equal(messages[0].metadata?.mentioned, false);
+  assert.equal(messages[0].metadata?.replyToSelf, true);
 });

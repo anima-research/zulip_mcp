@@ -315,6 +315,8 @@ function num(v: unknown): number {
 export interface MissedView {
   id: number;
   mentioned: boolean;
+  replyToSelf?: boolean;
+  isDM?: boolean;
   topic: string;
   authorName: string;
   text: string;
@@ -332,7 +334,9 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
     .join('\n');
   return {
     id: Number(m.messageId),
-    mentioned: meta.mentioned === true || meta.isDM === true,
+    mentioned: meta.mentioned === true,
+    replyToSelf: meta.replyToSelf === true,
+    isDM: meta.isDM === true,
     topic: typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? ''),
     authorName: m.author.name,
     text,
@@ -377,14 +381,18 @@ export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date
 }
 
 /** Messages around each mention, ±`vicinity` by count (robust to channel pace). */
-export function selectMissed<T extends { mentioned: boolean }>(
+export function isAddressed(m: { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }): boolean {
+  return m.mentioned || m.replyToSelf === true || m.isDM === true;
+}
+
+export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }>(
   msgs: T[],
   opts: { keepAll: boolean; vicinity: number },
 ): T[] {
   if (opts.keepAll) return msgs;
   const keep = new Set<number>();
   for (let i = 0; i < msgs.length; i++) {
-    if (!msgs[i].mentioned) continue;
+    if (!isAddressed(msgs[i])) continue;
     for (let j = Math.max(0, i - opts.vicinity); j <= Math.min(msgs.length - 1, i + opts.vicinity); j++) keep.add(j);
   }
   return [...keep].sort((a, b) => a - b).map((i) => msgs[i]);

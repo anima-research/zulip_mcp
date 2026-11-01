@@ -127,6 +127,9 @@ export interface MessageChangeEvent {
   previousContent: string | null;
   /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
   mentioned: boolean;
+  /** Verified quote-reply addressing, independent of Zulip's mention flag. */
+  replyToSelf?: boolean;
+  previouslyReplyToSelf?: boolean | null;
   /** The bot was mentioned in the message as it read before the change, as
    *  far as the adapter knows (a deleted message keeps its last verdict);
    *  null when the message was not in the adapter's cache and only its

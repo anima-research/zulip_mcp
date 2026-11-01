@@ -100,7 +100,10 @@ export interface ZulipMessage {
   rawContent: string;
   /** Raw markdown with line endings normalised and trimmed; not HTML-stripped (#24). */
   cleanContent: string;
+  /** Zulip's explicit mention verdict. */
   mentioned: boolean;
+  /** A verified quote reply to one of our messages. */
+  replyToSelf: boolean;
   wildcardMentioned: boolean;
   attachments: AttachmentRef[];
   /** Reactions currently on the message (history fetches carry them; events do not). */
@@ -228,6 +231,7 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     rawContent: raw.content,
     cleanContent: cleanMarkdown(raw.content),
     mentioned: flags.includes('mentioned'),
+    replyToSelf: false,
     wildcardMentioned: flags.includes('wildcard_mentioned'),
     attachments: extractZulipAttachments(raw.content),
     reactions: summarizeReactions(raw.reactions),
@@ -332,6 +336,7 @@ export function tagsFor(m: ZulipMessage): string[] {
   const tags: string[] = [];
   if (m.isDm) tags.push(CHAT_TAGS.dm, CHAT_TAGS.private);
   else if (m.mentioned) tags.push(CHAT_TAGS.mention);
+  else if (m.replyToSelf) tags.push(CHAT_TAGS.reply);
   else tags.push(CHAT_TAGS.ambient);
   if (m.wildcardMentioned) tags.push('zulip:wildcard-mention');
   tags.push(looksLikeBotEmail(m.authorEmail) ? CHAT_TAGS.fromBot : CHAT_TAGS.fromHuman);
@@ -376,9 +381,9 @@ export function toIncoming(
     metadata: {
       senderEmail: m.authorEmail,
       topic: m.topic,
-      // Personal/user-group mention, or a live quote reply to the bot's own
-      // message. Wildcards (@all/@everyone) deliberately don't count.
+      // Zulip's personal/user-group mention verdict; wildcards don't count.
       mentioned: m.mentioned,
+      replyToSelf: m.replyToSelf,
       isDM: m.isDm,
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),

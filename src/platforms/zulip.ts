@@ -124,8 +124,9 @@ interface SeenMessage {
   isDm: boolean;
   topic: string;
   snippet: string | null;
-  /** Mention verdict, including live quote replies to the bot's own messages. */
+  /** Zulip's mention verdict. */
   mentioned: boolean;
+  replyToSelf: boolean;
 }
 
 /** How long a GET placing a change may take before the change is dropped
@@ -357,6 +358,7 @@ export class ZulipAdapter implements PlatformAdapter {
       topic: m.topic,
       snippet: snippetOf(m.cleanContent),
       mentioned: m.mentioned,
+      replyToSelf: m.replyToSelf,
     });
   }
 
@@ -384,12 +386,12 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  /** Reuse the mention path, but never infer addressing from a silent mention.
+  /** Verify quote replies, but never infer addressing from a silent mention.
    *  Check at most the first two distinct targets per incoming message within
    *  a shared three-second budget per message. Multiple quote replies in a poll
    *  batch can delay later events by up to that budget for each message;
    *  prefer cached authors, otherwise one GET per target, failing closed. */
-  private async markQuoteMention(m: ZulipMessage): Promise<void> {
+  private async markQuoteReply(m: ZulipMessage): Promise<void> {
     if (m.mentioned || this.identity.selfUserId === null) return;
     const deadline = performance.now() + QUOTE_TIMEOUT_MS;
     for (const id of quotedMessageIds(m.rawContent)) {
@@ -397,9 +399,9 @@ export class ZulipAdapter implements PlatformAdapter {
       if (remaining <= 0) return;
       const quoted = await this.locate(id, 'a quote reply', remaining);
       if (quoted?.authorId === this.identity.selfUserId) {
-        m.mentioned = true;
+        m.replyToSelf = true;
         const cached = this.seen.get(m.id);
-        if (cached) cached.mentioned = true;
+        if (cached) cached.replyToSelf = true;
         return;
       }
     }
@@ -497,6 +499,8 @@ export class ZulipAdapter implements PlatformAdapter {
         content,
         previousContent,
         mentioned,
+        replyToSelf: where.replyToSelf,
+        previouslyReplyToSelf: cached ? cached.replyToSelf : null,
         // The cache holds the pre-change verdict; a GET only the post-change one.
         previouslyMentioned: cached ? cached.mentioned : null,
         vanished: false,
@@ -540,6 +544,8 @@ export class ZulipAdapter implements PlatformAdapter {
         previousContent: cached.snippet,
         // A deleted mention is the one the agent was about to answer.
         mentioned: cached.mentioned,
+        replyToSelf: cached.replyToSelf,
+        previouslyReplyToSelf: cached.replyToSelf,
         previouslyMentioned: cached.mentioned,
         vanished,
         isDM: cached.isDm,
@@ -919,7 +925,7 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
-      await this.markQuoteMention(m);
+      await this.markQuoteReply(m);
       // A stream the bot joined after startup is unknown to the host; the
       // message proves it is reachable, so it travels with its descriptor
       // (#20). Sent with EVERY message, never suppressed as "already

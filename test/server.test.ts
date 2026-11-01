@@ -2213,3 +2213,17 @@ test('an edit from a stream the bot joined after startup registers the channel t
   assert.equal(opened.channel.id, 'zulip:ops');
   await h.close();
 });
+
+test('a quote reply pushes on a closed channel without claiming an explicit mention', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(5, { metadata: { topic: 'answers', mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+    await until(() => h.pushed.length === 1, 'reply push');
+    assert.deepEqual(h.pushed[0].tags, ['chat:reply']);
+    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
+    assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
+    assert.equal(h.server.delivery.tally('zulip:general')?.messages ?? 0, 0);
+  } finally { await h.close(); }
+});
