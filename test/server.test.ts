@@ -24,7 +24,7 @@ import {
   type JsonRpcRequest,
   type PushEventParams,
 } from '@animalabs/mcpl-core';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
@@ -2543,7 +2543,7 @@ for (const rejectOnce of [false, true]) {
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
     await until(() => calls === 2, 'backfill to hold go-live');
-    assert.equal(second.server.delivery.watermark('zulip:general'), 1, 'scan advancement waits for buffered verdicts');
+    assert.equal(second.server.delivery.watermark('zulip:general'), 1, 'while connected and pre-live, scans await reconciliation; shutdown or reconnect also commits them');
     second.adapter.emit!(streamMsg(5, {
       metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
     }));
@@ -2556,6 +2556,62 @@ for (const rejectOnce of [false, true]) {
   } finally {
     release?.();
     await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+}
+
+for (const reconnect of [false, true]) {
+  test(`an accepted sweep catch-up survives ${reconnect ? 'reconnecting' : 'shutdown'} before go-live`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-staged-'));
+  let second: Harness | undefined;
+  let third: Harness | undefined;
+  let release!: () => void;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'probe' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
+    } finally { await first.close(); }
+
+    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5, { mentioned: true })] });
+    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+    let calls = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    second.adapter.fetchHistory = async (channelId, query) => {
+      if (++calls === 2) await gate; // hang the tally backfill: go-live never happens
+      return realFetch(channelId, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => second!.pushed.some((p) => p.tags?.includes('zulip:missed')), 'catch-up block pushed and accepted');
+    assert.equal(second.server.isLive, false, 'still pre-live');
+
+    if (reconnect) {
+      await second.close();
+      second.adapter.fetchHistory = realFetch;
+      third = harness({ reuse: { server: second.server, adapter: second.adapter } });
+      await initialize(third, true);
+      await settled(third);
+      assert.equal(third.pushed.length, 0, 'accepted catch-up is not offered again');
+      assert.equal(third.server.delivery.watermark('zulip:general'), 5);
+    } else {
+      await second.server.shutdown();
+    }
+    const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
+    assert.equal(persisted.watermarks['zulip:general'], 5,
+      `host accepted the catch-up through id 5 but the persisted watermark is ${persisted.watermarks['zulip:general']}: the next start re-delivers it`);
+  } finally {
+    release?.();
+    await third?.close();
+    await second?.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

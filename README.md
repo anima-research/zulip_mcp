@@ -57,7 +57,11 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`), and never past a message the host was offered but did not
+  `push/event`). During the pre-live sweep, scan advancement is staged while
+  buffered live replies are reconciled; it is committed at go-live, graceful
+  shutdown, or before a new connection resets the staged state, preserving
+  accepted catch-up progress while refused replies retain their holds. It
+  never advances past a message the host was offered but did not
   accept — a refusal, a batch lost to a transport failure — which is
   replayed from history once the host answers again. On the next connection
   a `<missed>` block per channel delivers what arrived meanwhile (full

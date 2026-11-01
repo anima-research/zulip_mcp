@@ -30,3 +30,5 @@
   Unaccepted live reply verdicts survive fail-closed history reclassification
   during sweeps and retries; go-live deduplication distinguishes scanning from
   actual acceptance of a buffered reply.
+  Staged catch-up progress is also committed on graceful shutdown and before
+  connection reset, so accepted blocks are not replayed solely due to that window.

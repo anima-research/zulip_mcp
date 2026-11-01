@@ -283,6 +283,7 @@ export class ZulipMcplServer {
    * peer's grant, registration or sweep carries over.
    */
   private beginConnection(): void {
+    this.commitScannedCatchUp();
     this.grant.reset();
     this.channelManager.reset();
     this.live = false;
@@ -381,6 +382,7 @@ export class ZulipMcplServer {
       console.error('[zulip-mcp] final flush failed:', (error as Error).message ?? error);
     }
     this.channelManager.destroy();
+    this.commitScannedCatchUp();
     this.delivery.save();
   }
 
@@ -422,6 +424,17 @@ export class ZulipMcplServer {
         }
       }
     }
+    this.commitScannedCatchUp();
+    this.delivery.save();
+    this.live = true;
+    if (this.preLiveDropped > 0) {
+      console.error(`[zulip-mcp] ${this.preLiveDropped} live message(s) exceeded the pre-live buffer; held below the watermark for replay`);
+      this.preLiveDropped = 0;
+    }
+    void this.healUndelivered();
+  }
+
+  private commitScannedCatchUp(): void {
     for (const [channelId, through] of this.preLiveScanned) {
       // A refused buffered reply must keep its hold below the scanned range.
       for (const id of this.delivery.heldIds(channelId)) {
@@ -430,13 +443,6 @@ export class ZulipMcplServer {
       this.delivery.advance(channelId, through);
     }
     this.preLiveScanned.clear();
-    this.delivery.save();
-    this.live = true;
-    if (this.preLiveDropped > 0) {
-      console.error(`[zulip-mcp] ${this.preLiveDropped} live message(s) exceeded the pre-live buffer; held below the watermark for replay`);
-      this.preLiveDropped = 0;
-    }
-    void this.healUndelivered();
   }
 
   // ── Handshake ──
