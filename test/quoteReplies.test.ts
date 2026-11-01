@@ -469,3 +469,43 @@ test('negative-cache hits do not consume the history page GET allowance', async 
   assert.equal(gets, 9, 'only the new target costs a GET');
   assert.equal(page.messages.at(-1)?.metadata?.replyToSelf, true);
 });
+
+for (const kind of ['reaction', 'edit'] as const) {
+  test(`a ${kind} retries placement after a transient failed quote-target lookup`, { timeout: 2000 }, async () => {
+    let gets = 0;
+    const placed: string[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    let served = false;
+    const following = kind === 'reaction'
+      ? { type: 'reaction', op: 'add', emoji_name: 'eyes', message_id: QUOTED, user_id: 101 }
+      : { type: 'update_message', message_id: QUOTED, user_id: 101, orig_content: 'original', content: 'corrected original', flags: [] };
+    const adapter = new ZulipAdapter({
+      messages: { getById: async () => {
+        gets++;
+        if (gets === 1) throw new Error('503 transient');
+        return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+      } },
+      queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+      events: { retrieve: async () => {
+        if (served) return new Promise(() => {});
+        served = true;
+        return { events: [
+          { id: 1, type: 'message', message: raw(300, quote()), flags: [] },
+          { id: 2, ...following },
+          { id: 3, type: 'message', message: raw(999, 'done'), flags: [] },
+        ] };
+      } },
+    }, SELF, 'session');
+    adapter.startEvents(
+      (m) => { if (m.messageId === '999') finish(); }, undefined,
+      (ev) => { placed.push(ev.messageId); }, (ev) => { placed.push(ev.messageId); },
+    );
+    try {
+      await finished;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(gets, 2, 'placement retries independently of the quote failure cache');
+      assert.deepEqual(placed, [String(QUOTED)]);
+    } finally { adapter.stopEvents(); }
+  });
+}

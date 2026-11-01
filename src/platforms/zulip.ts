@@ -207,8 +207,8 @@ export class ZulipAdapter implements PlatformAdapter {
    *  evicted. A deletion can only be placed from here — the message is gone. */
   private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
-  /** Failed GETs, bounded like the seen cache; id → retry-after timestamp. */
-  private failedLookups = new Map<number, number>();
+  /** Failed quote-target GETs only; id → retry-after timestamp. Bounded like seen. */
+  private failedQuoteLookups = new Map<number, number>();
   /** Stream names by id, from discovery (refreshed on a miss): how a
    *  deletion or a cross-stream move names a stream the cache does not know. */
   private streamNamesById = new Map<number, string>();
@@ -354,7 +354,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   private remember(channelId: string, m: ZulipMessage): void {
-    this.failedLookups.delete(m.id);
+    this.failedQuoteLookups.delete(m.id);
     if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
@@ -372,18 +372,25 @@ export class ZulipAdapter implements PlatformAdapter {
     });
   }
 
-  private lookupFailed(messageId: number): boolean {
-    const retryAfter = this.failedLookups.get(messageId);
+  private quoteLookupFailed(messageId: number): boolean {
+    const retryAfter = this.failedQuoteLookups.get(messageId);
     if (retryAfter !== undefined && Date.now() < retryAfter) return true;
-    this.failedLookups.delete(messageId);
+    this.failedQuoteLookups.delete(messageId);
     return false;
+  }
+
+  private rememberFailedQuoteLookup(messageId: number): void {
+    if (this.failedQuoteLookups.size >= ZulipAdapter.SEEN_CAP) {
+      const oldest = this.failedQuoteLookups.keys().next().value;
+      if (oldest !== undefined) this.failedQuoteLookups.delete(oldest);
+    }
+    this.failedQuoteLookups.set(messageId, Date.now() + FAILED_LOOKUP_TTL_MS);
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
   private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
-    if (this.lookupFailed(messageId)) return null;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
@@ -399,11 +406,6 @@ export class ZulipAdapter implements PlatformAdapter {
       this.remember(channelId, m);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
-      if (this.failedLookups.size >= ZulipAdapter.SEEN_CAP) {
-        const oldest = this.failedLookups.keys().next().value;
-        if (oldest !== undefined) this.failedLookups.delete(oldest);
-      }
-      this.failedLookups.set(messageId, Date.now() + FAILED_LOOKUP_TTL_MS);
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
       return null;
     }
@@ -413,8 +415,14 @@ export class ZulipAdapter implements PlatformAdapter {
    *  Cached authors remain usable even after the lookup budget is exhausted. */
   private async isQuoteReply(
     m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'authorEmail' | 'rawContent'>,
-    resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> =>
-      this.seen.get(id) ?? (remainingMs > 0 ? this.locate(id, 'a quote reply', remainingMs) : null),
+    resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
+      const known = this.seen.get(id);
+      if (known) return known;
+      if (remainingMs <= 0 || this.quoteLookupFailed(id)) return null;
+      const quoted = await this.locate(id, 'a quote reply', remainingMs);
+      if (!quoted) this.rememberFailedQuoteLookup(id);
+      return quoted;
+    },
     deadline = performance.now() + QUOTE_TIMEOUT_MS,
   ): Promise<boolean> {
     if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return false;
@@ -853,10 +861,12 @@ export class ZulipAdapter implements PlatformAdapter {
     const resolve = async (id: number, remainingMs: number): Promise<{ authorId: number } | null> => {
       const known = pageById.get(id) ?? this.seen.get(id);
       if (known) return known;
-      if (this.lookupFailed(id)) return null;
+      if (this.quoteLookupFailed(id)) return null;
       if (getsLeft <= 0 || remainingMs <= 0) return null;
       getsLeft--;
-      return this.locate(id, 'a history quote reply', remainingMs);
+      const quoted = await this.locate(id, 'a history quote reply', remainingMs);
+      if (!quoted) this.rememberFailedQuoteLookup(id);
+      return quoted;
     };
     for (const m of page.messages) {
       if (this.allowed(m)) m.replyToSelf = await this.isQuoteReply(m, resolve, deadline);

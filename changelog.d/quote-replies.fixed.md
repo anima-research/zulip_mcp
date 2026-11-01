@@ -18,8 +18,9 @@
   quote addressing; explicit mentions and DMs are unchanged.
   Stopping event delivery during a lookup or poll drops stale callbacks and
   the rest of the stopped batch, including across connection restarts.
-  Failed, missing and timed-out message lookups are negatively cached for
-  three minutes (bounded to 2,000 ids). Budgets limit waiting, not request
+  Failed, missing and timed-out quote-target lookups are negatively cached for
+  three minutes (bounded to 2,000 ids), without suppressing independent
+  reaction or edit placement retries. Budgets limit waiting, not request
   lifetime: the underlying zulip-js GET cannot be cancelled by the timer.
   The delivery model, edit tags and line-label semantics are documented in
   the README alongside the remaining lookup and heading-format limits.
