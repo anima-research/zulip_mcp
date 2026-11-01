@@ -2407,6 +2407,8 @@ test('a reconnect sweep shares one quote-lookup allowance across pages and chann
       first.adapter.emit!(streamMsg(1, { mentioned: true }));
       first.adapter.emit!(streamMsg(2, { channelId: other.id, mentioned: true }), other);
       await until(() => first.server.delivery.watermark(other.id) === 2, 'both initial channels accepted');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
       first.adapter.emit!(streamMsg(3));
       await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 3, 'ambient tally seeded');
     } finally { await first.close(); }
