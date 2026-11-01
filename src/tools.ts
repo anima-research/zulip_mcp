@@ -251,31 +251,29 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "edit_message",
-    description: "Edit a Zulip message by ID, or rename/move a topic. Provide at least one of content, topic, or stream_id. A stream move cannot be combined with a content edit; send two calls. Zulip defaults to change_one (this message only); use change_all to rename/move the whole topic. Permissions and edit limits are determined by the realm.",
+    description: "Edit the content of your own Zulip messages by ID (subject to the realm's message-edit time limit). Use move_messages to rename topics or move messages.",
     inputSchema: {
       type: "object",
       properties: {
-        message_id: {
-          type: "number",
-          description: "ID of the message to edit",
-        },
-        content: {
-          type: "string",
-          description: "The new message content (supports Markdown, replaces the old content entirely)",
-        },
-        topic: {
-          type: "string",
-          description: "New topic name",
-        },
+        message_id: { type: "number", description: "ID of the message to edit" },
+        content: { type: "string", description: "The new message content (supports Markdown, replaces the old content entirely)" },
+      },
+      required: ["message_id", "content"],
+    },
+  },
+  {
+    name: "move_messages",
+    description: "Rename a topic or move Zulip messages by message ID. Provide topic or stream_id. Zulip defaults to change_one (this message only); use change_all for the whole topic. Realm permissions and move time limits apply, including to other people's messages. Use list_streams to find a destination stream_id. Content edits use edit_message separately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "number", description: "ID of the message to move" },
+        topic: { type: "string", description: "New topic name" },
+        stream_id: { type: "integer", minimum: 1, description: "Destination stream ID" },
         propagate_mode: {
           type: "string",
           enum: ["change_one", "change_later", "change_all"],
           description: "Requires topic or stream_id. Zulip defaults to change_one (this message only); change_later moves this and later messages in the same topic; change_all renames/moves the whole topic. Omit to use the server default.",
-        },
-        stream_id: {
-          type: "integer",
-          minimum: 1,
-          description: "Destination stream ID for moving messages",
         },
       },
       required: ["message_id"],

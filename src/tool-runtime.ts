@@ -704,24 +704,26 @@ export class ZulipToolRuntime {
         }
       }
 
-      case "edit_message": {
+      case "edit_message":
+      case "move_messages": {
+        const moving = name === "move_messages";
         if (!Number.isInteger(args.message_id) || args.message_id <= 0) throw new Error("message_id is required");
-        if (args.content !== undefined && typeof args.content !== "string") throw new Error("content must be a string");
-        if (args.topic !== undefined && typeof args.topic !== "string") throw new Error("topic must be a string");
-        if (args.stream_id !== undefined && (!Number.isInteger(args.stream_id) || args.stream_id <= 0)) {
-          throw new Error("stream_id must be a positive integer");
-        }
-        if (args.propagate_mode !== undefined && !["change_one", "change_later", "change_all"].includes(args.propagate_mode)) {
-          throw new Error("propagate_mode must be change_one, change_later, or change_all");
-        }
-        if (args.content === undefined && args.topic === undefined && args.stream_id === undefined) {
-          throw new Error("At least one of content, topic, or stream_id is required");
-        }
-        if (args.content !== undefined && args.stream_id !== undefined) {
-          throw new Error("a stream move cannot be combined with a content edit; send two calls");
-        }
-        if (args.propagate_mode !== undefined && args.propagate_mode !== "change_one" && args.topic === undefined && args.stream_id === undefined) {
-          throw new Error("propagate_mode requires topic or stream_id");
+        if (!moving) {
+          if (typeof args.content !== "string") throw new Error("content must be a string");
+          if (args.topic !== undefined || args.stream_id !== undefined) throw new Error("use move_messages for topic or stream moves");
+          if (args.propagate_mode !== undefined && args.propagate_mode !== "change_one") {
+            throw new Error("propagate_mode requires topic or stream_id; use move_messages");
+          }
+        } else {
+          if (args.content !== undefined) throw new Error("use edit_message for content edits");
+          if (args.topic !== undefined && typeof args.topic !== "string") throw new Error("topic must be a string");
+          if (args.stream_id !== undefined && (!Number.isInteger(args.stream_id) || args.stream_id <= 0)) {
+            throw new Error("stream_id must be a positive integer");
+          }
+          if (args.propagate_mode !== undefined && !["change_one", "change_later", "change_all"].includes(args.propagate_mode)) {
+            throw new Error("propagate_mode must be change_one, change_later, or change_all");
+          }
+          if (args.topic === undefined && args.stream_id === undefined) throw new Error("topic or stream_id is required");
         }
         // zulip-js includes message_id in the query and sends no PATCH body.
         // Keep the id only in the path, with the exposed edit fields in the body.
@@ -730,7 +732,7 @@ export class ZulipToolRuntime {
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
         const editFields = new URLSearchParams();
-        for (const field of ["content", "topic", "propagate_mode", "stream_id"]) {
+        for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
           if (args[field] !== undefined) editFields.set(field, String(args[field]));
         }
         const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {

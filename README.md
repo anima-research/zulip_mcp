@@ -302,7 +302,8 @@ file, or remove it to re-seed from the environment.
 
 **Writing**
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
-`edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+`edit_message` (own-message content only), `move_messages` (topic/stream moves),
+`delete_message`, `add_reaction`, `remove_reaction`.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes

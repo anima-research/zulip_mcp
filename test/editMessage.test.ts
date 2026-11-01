@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import zulipInit from 'zulip-js';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { TOOL_CLASSES } from '../src/tool-classes.ts';
+import { featureSetForTool } from '../src/feature-sets.ts';
 import { toolDefinitions } from '../src/tools.ts';
 
 /** Exercise the real client and runtime against a local HTTP stand-in. */
@@ -149,7 +151,6 @@ test('edit_message reports the HTTP status for an empty error body', async () =>
 });
 
 const topic = 'New topic & + = \n✓';
-const content = 'Updated **text** & + = \n✓';
 const edits = [
   { label: 'topic only', fields: { topic } },
   ...['change_one', 'change_later', 'change_all'].map(propagate_mode => ({
@@ -157,17 +158,15 @@ const edits = [
   })),
   { label: 'stream only', fields: { stream_id: 17 } },
   { label: 'stream and topic', fields: { topic, stream_id: 17 } },
-  { label: 'content and topic', fields: { content, topic } },
   { label: 'stream with propagation', fields: { propagate_mode: 'change_later', stream_id: 17 } },
   { label: 'empty topic', fields: { topic: '' } },
-  { label: 'empty content', fields: { content: '' } },
 ];
 for (const { label, fields } of edits) {
-  test(`edit_message encodes ${label} in the PATCH body`, async () => {
+  test(`move_messages encodes ${label} in the PATCH body`, async () => {
     const response = { result: 'success', msg: '' };
     const f = await fixture(response);
     try {
-      assert.deepEqual(await f.tools.handleToolCall('edit_message', {
+      assert.deepEqual(await f.tools.handleToolCall('move_messages', {
         message_id: 42, ...fields, extra: 'not sent',
       }), response);
       const expected = new URLSearchParams(Object.entries(fields).map(([key, value]) => [key, String(value)]));
@@ -181,12 +180,12 @@ for (const { label, fields } of edits) {
   });
 }
 
-test('edit_message requires content, topic, or stream_id without making a request', async () => {
+test('move_messages requires a topic or stream_id without making a request', async () => {
   const f = await fixture({ result: 'success', msg: '' });
   try {
     for (const fields of [{}, { propagate_mode: 'change_all' }]) {
-      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, ...fields }),
-        /^Error: At least one of content, topic, or stream_id is required$/);
+      await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, ...fields }),
+        /^Error: topic or stream_id is required$/);
     }
     assert.deepEqual(f.calls, []);
   } finally {
@@ -201,12 +200,12 @@ for (const { field, invalid, error } of [
     error: /^Error: stream_id must be a positive integer$/ },
   { field: 'topic', invalid: [null, 1, false, {}], error: /^Error: topic must be a string$/ },
 ]) {
-  test(`edit_message rejects invalid ${field} without making a request`, async () => {
+  test(`move_messages rejects invalid ${field} without making a request`, async () => {
     const f = await fixture({ result: 'success', msg: '' });
     try {
       for (const value of invalid) {
-        await assert.rejects(f.tools.handleToolCall('edit_message', {
-          message_id: 42, content: 'updated', [field]: value,
+        await assert.rejects(f.tools.handleToolCall('move_messages', {
+          message_id: 42, topic, [field]: value,
         }), error);
       }
       assert.deepEqual(f.calls, []);
@@ -216,10 +215,10 @@ for (const { field, invalid, error } of [
   });
 }
 
-test('edit_message surfaces realm permission errors for topic moves', async () => {
+test('move_messages surfaces realm permission errors for topic moves', async () => {
   const f = await fixture({ result: 'error', msg: 'You do not have permission to move this message' }, 400);
   try {
-    await assert.rejects(f.tools.handleToolCall('edit_message', {
+    await assert.rejects(f.tools.handleToolCall('move_messages', {
       message_id: 42, topic, stream_id: 17, propagate_mode: 'change_all',
     }), /HTTP 400.*You do not have permission to move this message/);
     assert.equal(f.calls.length, 1, 'permissions are checked by Zulip, not locally');
@@ -228,11 +227,11 @@ test('edit_message surfaces realm permission errors for topic moves', async () =
   }
 });
 
-test('edit_message schema exposes optional topic, propagation, and stream fields', () => {
-  const schema = toolDefinitions.find(tool => tool.name === 'edit_message')!.inputSchema;
+test('move_messages schema exposes optional topic, propagation, and stream fields', () => {
+  const schema = toolDefinitions.find(tool => tool.name === 'move_messages')!.inputSchema;
   assert.deepEqual(schema.required, ['message_id']);
   const properties = schema.properties as Record<string, Record<string, unknown>>;
-  assert.equal(properties.content.type, 'string');
+  assert.equal(properties.content, undefined);
   assert.equal(properties.topic.type, 'string');
   assert.equal(properties.stream_id.type, 'integer');
   assert.equal(properties.stream_id.minimum, 1);
@@ -241,41 +240,11 @@ test('edit_message schema exposes optional topic, propagation, and stream fields
 });
 
 
-test('edit_message rejects content with a stream move without making a request', async () => {
-  const f = await fixture({ result: 'success', msg: '' });
-  try {
-    for (const fields of [
-      { content, stream_id: 17 },
-      { content, topic, propagate_mode: 'change_all', stream_id: 17 },
-      { content: '', stream_id: 17 },
-    ]) {
-      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, ...fields }),
-        /^Error: a stream move cannot be combined with a content edit; send two calls$/);
-    }
-    assert.deepEqual(f.calls, []);
-  } finally {
-    await f.close();
-  }
-});
-
-test('edit_message rejects propagation on content-only edits without making a request', async () => {
-  const f = await fixture({ result: 'success', msg: '' });
-  try {
-    for (const propagate_mode of ['change_later', 'change_all']) {
-      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, content, propagate_mode }),
-        /^Error: propagate_mode requires topic or stream_id$/);
-    }
-    assert.deepEqual(f.calls, []);
-  } finally {
-    await f.close();
-  }
-});
-
-test('edit_message validates message_id before edit fields', async () => {
+test('move_messages validates message_id before edit fields', async () => {
   const f = await fixture({ result: 'success', msg: '' });
   try {
     for (const args of [{}, { message_id: 0, content: null, topic: false, stream_id: -1, propagate_mode: 'invalid' }]) {
-      await assert.rejects(f.tools.handleToolCall('edit_message', args), /^Error: message_id is required$/);
+      await assert.rejects(f.tools.handleToolCall('move_messages', args), /^Error: message_id is required$/);
     }
     assert.deepEqual(f.calls, []);
   } finally {
@@ -283,24 +252,36 @@ test('edit_message validates message_id before edit fields', async () => {
   }
 });
 
-test('edit_message describes move constraints and server propagation defaults', () => {
+
+test('edit_message stays content-only and rejects moves without a request', async () => {
   const tool = toolDefinitions.find(tool => tool.name === 'edit_message')!;
-  assert.match(tool.description, /stream move cannot be combined with a content edit; send two calls/);
-  const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
-  const description = String(properties.propagate_mode.description);
-  assert.match(description, /Requires topic or stream_id/);
-  assert.match(description, /Zulip defaults to change_one \(this message only\)/);
-  assert.match(description, /change_later moves this and later messages/);
-  assert.match(description, /change_all renames\/moves the whole topic/);
+  assert.deepEqual(tool.inputSchema.required, ['message_id', 'content']);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties), ['message_id', 'content']);
+  assert.match(tool.description, /your own/);
+  const f = await fixture({ result: 'success', msg: '' });
+  try {
+    for (const fields of [{ topic }, { stream_id: 17 }]) {
+      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, content: 'updated', ...fields }), /use move_messages/);
+    }
+    await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42 }), /content must be a string/);
+    for (const propagate_mode of ['change_later', 'change_all']) {
+      await assert.rejects(f.tools.handleToolCall('edit_message', { message_id: 42, content: 'updated', propagate_mode }), /propagate_mode requires topic or stream_id/);
+    }
+    await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, content: 'updated', topic }), /use edit_message/);
+    assert.deepEqual(f.calls, []);
+  } finally { await f.close(); }
 });
 
 test('edit_message accepts explicit default propagation on a content edit', async () => {
   const f = await fixture({ result: 'success', msg: '' });
   try {
-    await f.tools.handleToolCall('edit_message', { message_id: 42, content, propagate_mode: 'change_one' });
+    await f.tools.handleToolCall('edit_message', { message_id: 42, content: 'updated', propagate_mode: 'change_one' });
     assert.equal(f.calls.length, 1);
-    assert.equal(new URLSearchParams(f.calls[0].body).get('content'), content);
-  } finally {
-    await f.close();
-  }
+    assert.equal(f.calls[0].body, 'content=updated');
+  } finally { await f.close(); }
+});
+
+test('move_messages is independently named and classed as a messaging tool', () => {
+  assert.deepEqual(TOOL_CLASSES.move_messages, ['comms']);
+  assert.equal(featureSetForTool('move_messages'), 'zulip.messaging');
 });
