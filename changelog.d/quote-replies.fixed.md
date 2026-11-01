@@ -24,3 +24,5 @@
   lifetime: the underlying zulip-js GET cannot be cancelled by the timer.
   The delivery model, edit tags and line-label semantics are documented in
   the README alongside the remaining lookup and heading-format limits.
+  Addressed-only catch-up blocks use `reason="addressed"` when their count
+  includes quote replies, retaining `reason="mention"` for mention-only counts.

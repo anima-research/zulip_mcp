@@ -57,7 +57,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   replayed from history once the host answers again. On the next connection
   a `<missed>` block per channel delivers what arrived meanwhile (full
   backscroll for channels the host had open, addressed message ± 7 for the
-  rest), paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
+  rest). Addressed-only blocks use `reason="mention"` when every counted
+  addressed message is a mention, otherwise `reason="addressed"`; full
+  backscroll uses `reason="backscroll"`. Blocks are paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
   event-queue expiry is healed the same way — open channels replayed, closed
   channels' addressed messages pushed — not merely reported. Live events
   that arrive before the sweep has run are held and released in order after it, so a

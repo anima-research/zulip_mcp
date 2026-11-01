@@ -1200,13 +1200,14 @@ export class ZulipMcplServer {
     const addressedCount = views.filter(isAddressed).length;
     const mentionCount = views.filter((v) => v.mentioned).length;
     const replyCount = views.filter((v) => v.replyToSelf).length;
+    const reason = keepAll ? 'backscroll' : addressedCount === mentionCount ? 'mention' : 'addressed';
     const streamName = isDmChannelId(channelId)
       ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
       : channelId.slice('zulip:'.length);
     const block = renderMissedBlock(kept, {
       streamName,
       channelId,
-      reason: keepAll ? 'backscroll' : 'mention',
+      reason,
       count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
@@ -1231,7 +1232,7 @@ export class ZulipMcplServer {
     };
     const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
-      reason: keepAll ? 'backscroll' : 'mention',
+      reason,
       messages: kept.length,
       ...(fetched.truncated ? { truncated: true } : {}),
     });

@@ -405,8 +405,8 @@ export const DEFAULT_MISSED_BLOCK_MAX_CHARS = 40_000;
 export interface MissedBlockOptions {
   streamName: string;
   channelId: string;
-  reason: 'backscroll' | 'mention';
-  /** Number of actual mentions (for the mention reason); total lines otherwise. */
+  reason: 'backscroll' | 'mention' | 'addressed';
+  /** Selected addressed-message count for mention/addressed; total lines for backscroll. */
   count: number;
   formatTime: (d: Date) => string;
   /** Character budget for the block; the OLDEST lines are elided first. */
@@ -453,7 +453,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
 
   const assemble = (elided: number, cut: string | null): string => {
     const attrs = [`stream="#${opts.streamName}"`, `channelId="${opts.channelId}"`, `count="${opts.count}"`];
-    if (opts.reason === 'mention') attrs.push(`lines="${msgs.length}"`);
+    if (opts.reason !== 'backscroll') attrs.push(`lines="${msgs.length}"`);
     attrs.push(`reason="${opts.reason}"`);
     const head: string[] = [];
     const tail: string[] = [];

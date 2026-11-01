@@ -2278,6 +2278,8 @@ test('a refused quote-reply push is redelivered from classified history when ano
     assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
     const text = (recovered.payload.content[0] as { text: string }).text;
     assert.match(text, /id=5\]/);
+    assert.match(text, /count="1" lines="1" reason="addressed"/);
+    assert.equal((recovered.origin as { reason: string }).reason, 'addressed');
     assert.doesNotMatch(text, /\(mention\)/);
     assert.deepEqual(h.server.delivery.heldIds('zulip:general'), []);
   } finally { await h.close(); }
@@ -2368,5 +2370,27 @@ test('DM catch-up retains DM tags without synthesizing an explicit mention', asy
     assert.deepEqual(recovered.tags, ['zulip:missed', 'chat:dm', 'chat:private']);
     assert.equal((recovered.origin as { isReply: boolean }).isReply, false);
     assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
+  } finally { await h.close(); }
+});
+
+test('catch-up counts mixed mentions and replies as addressed messages rather than mentions', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    h.adapter.history = [
+      streamMsg(4), streamMsg(5, { mentioned: true }),
+      streamMsg(6, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }),
+    ];
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+    await until(() => h.server.delivery.watermark('zulip:general') === 6, 'mixed catch-up acceptance');
+    const recovered = h.pushed[0];
+    assert.match((recovered.payload.content[0] as { text: string }).text, /count="2" lines="3" reason="addressed"/);
+    assert.equal((recovered.origin as { reason: string }).reason, 'addressed');
+    assert.equal((recovered.origin as { isReply: boolean }).isReply, true);
+    assert.equal((recovered.origin as { isMention: boolean }).isMention, true);
   } finally { await h.close(); }
 });
