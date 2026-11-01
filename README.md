@@ -151,6 +151,14 @@ on an open channel are ordinary `channels/incoming` messages carrying only
 them, but an unconditional "always wake on this channel" policy wakes on
 them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
 
+**Quote heading formats.** Reply detection accepts translated link text,
+whitespace between the link label and URL or before the colon (including
+non-breaking spaces), and ASCII or full-width colons. Headings ending in
+` in …:` or ` to …:` are deliberately excluded: these also describe
+forwarded messages, not necessarily replies. Thus the first quote in a
+multi-message quote using a forwarding-style heading does not count; a
+later ordinary reply heading can still count.
+
 ### Edits, moves and deletions
 
 A change to a message is as visible as the message was. An edit, a topic

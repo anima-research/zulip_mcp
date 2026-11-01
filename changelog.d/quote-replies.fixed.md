@@ -10,3 +10,6 @@
   page. Unresolved targets fail closed.
   Content edits recompute reply addressing from the new raw Markdown; moves
   and deletions retain the last known reply verdict separately from mentions.
+  Translated heading punctuation (spaces, including NBSP, and full-width
+  colons) is accepted. Forwarding-style ` in …:` / ` to …:` headings are
+  deliberately excluded, including such first headings in multi-quotes.

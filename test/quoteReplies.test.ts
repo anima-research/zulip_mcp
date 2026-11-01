@@ -317,3 +317,36 @@ for (const [label, before, after, wasReply, isReply] of [
     } finally { adapter.stopEvents(); }
   });
 }
+
+for (const [label, content] of [
+  ['non-breaking space before the colon', quote().replace('):', ')\u00a0:')],
+  ['full-width colon', quote().replace('):', ')：')],
+  ['space between link label and URL', quote().replace('](', '] (')],
+] as const) {
+  test(`a quote heading with ${label} is recognized`, { timeout: 2000 }, async () => {
+    const messages = await receive([raw(300, content)], async () => ({
+      message: raw(QUOTED, 'original', { sender_id: SELF }),
+    }));
+    assert.equal(messages[0].metadata?.replyToSelf, true);
+    assert.equal(messages[0].metadata?.mentioned, false);
+  });
+}
+
+for (const suffix of [' in #**general>topic**:', ' to **User**:']) {
+  test(`a forwarding-style quote heading ending${suffix} is not reply addressing`, { timeout: 2000 }, async () => {
+    let gets = 0;
+    const messages = await receive([raw(300, quote().replace('):', `)${suffix}`))], async () => { gets++; return {}; });
+    assert.equal(messages[0].metadata?.replyToSelf, false);
+    assert.equal(gets, 0);
+  });
+}
+
+test('an ordinary later quote still counts after an excluded multi-quote heading', { timeout: 2000 }, async () => {
+  const calls: number[] = [];
+  const messages = await receive([raw(300, `${quote(201).replace('):', ') in #**general>topic**:')}\n${quote()}`)], async (params) => {
+    calls.push(Number(params.message_id));
+    return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+  });
+  assert.equal(messages[0].metadata?.replyToSelf, true);
+  assert.deepEqual(calls, [QUOTED]);
+});

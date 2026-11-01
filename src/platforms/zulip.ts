@@ -108,7 +108,7 @@ function quotedMessageIds(content: string): Set<number> {
       continue;
     }
     if (!line.trim()) continue;
-    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[[^\]\n]*\]\([^\s)]*\/near\/([1-9]\d*)\):[ \t]*$/.exec(line);
+    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[[^\]\n]*\]\s*\([^\s)]*\/near\/([1-9]\d*)\)\s*[:：][ \t]*$/.exec(line);
     const id = header ? Number(header[1]) : NaN;
     pending = Number.isSafeInteger(id) ? id : null;
   }
