@@ -7,3 +7,6 @@
   `moved_to: {channelId, topic}` for publishing into the destination; unresolved
   routing fields are null with a diagnostic if Zulip cannot supply them.
 - Move-limit errors include the Zulip code and partial-move retry fields.
+- Moves out of filtered streams also update cached placement: the source move
+  marker stays filtered, while later reactions, edits and deletions are judged
+  against the destination stream, including snippets of messages now there.

@@ -639,3 +639,48 @@ test('reactions wait for earlier moves but stay parallel and do not block later 
     adapter.stopEvents();
   }
 });
+
+test('moves from filtered streams re-seat cached messages for later destination activity', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20, { display_recipient: 'secret', stream_id: 9 }) },
+    { id: 2, type: 'message', flags: [], message: raw(21, { display_recipient: 'secret', stream_id: 9 }) },
+    { id: 3, type: 'update_message', message_id: 20, message_ids: [20, 21], user_id: 12,
+      stream_id: 9, new_stream_id: 7, orig_subject: 'deploys', subject: 'public' },
+    { id: 4, type: 'reaction', message_id: 21, user_id: 7, op: 'add', emoji_name: 'thumbs_up' },
+    { id: 5, type: 'update_message', message_id: 21, message_ids: [21], user_id: 7, stream_id: 7,
+      orig_content: 'm21', content: 'updated in public', flags: [] },
+    { id: 6, type: 'delete_message', message_ids: [20], message_type: 'stream', stream_id: 7 },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [
+      { name: 'secret', stream_id: 9 }, { name: 'general', stream_id: 7 },
+    ] }) },
+    messages: { getById: async () => { throw new Error('placement must use the re-seated cache'); } },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (++polls === 1) return { events };
+      await new Promise(resolve => setTimeout(resolve, 5)); return { events: [] };
+    } },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', {
+    dmDiscoveryLimit: 0, filters: { streamAllowed: s => s === 'general', dmAllowed: () => true },
+  });
+  const delivered: string[] = [];
+  const reactions: { channelId: string; messageSnippet: string | null }[] = [];
+  const changes: MessageChangeEvent[] = [];
+  try {
+    await adapter.discoverChannels();
+    adapter.startEvents(m => delivered.push(m.messageId), undefined, r => reactions.push(r), c => changes.push(c));
+    const deadline = Date.now() + 2000;
+    while ((reactions.length < 1 || changes.length < 2) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(delivered, [], 'messages in the filtered source are not delivered');
+    assert.deepEqual(reactions.map(r => [r.channelId, r.messageSnippet]), [['zulip:general', 'm21']]);
+    assert.deepEqual(changes.map(c => [c.kind, c.channelId, c.topic, c.previousContent]), [
+      ['edit', 'zulip:general', 'public', 'm21'],
+      ['delete', 'zulip:general', 'public', 'm20'],
+    ], 'the source move marker is withheld, but later activity belongs to the allowed destination');
+  } finally { adapter.stopEvents(); }
+});
