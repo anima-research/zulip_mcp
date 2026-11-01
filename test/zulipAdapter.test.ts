@@ -222,11 +222,14 @@ test('a descriptor built from an event without a stream_id still addresses the s
 
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
   const events = [
+    { id: 0, type: 'message', flags: [], message: raw(50, {
+      sender_id: SELF, sender_full_name: 'Bot', sender_email: 'bot@example.com', content: 'x',
+    }) },
     // Ann's message arrives live (cached), then she edits it to mention the bot.
     { id: 1, type: 'message', flags: [], message: { ...raw(5), content: 'first draft' } },
     { id: 2, type: 'update_message', message_id: 5, message_ids: [5], user_id: 7, edit_timestamp: 1_700_000_900, orig_content: 'first draft', content: 'second draft @**Bot**', flags: ['mentioned'], stream_id: 7 },
-    // The bot's own edit is its own doing.
-    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
+    // The bot edits its own message: reconcile the cache without a marker.
+    { id: 3, type: 'update_message', message_id: 50, message_ids: [50], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
     // A message the cache never saw: one GET places it.
     { id: 4, type: 'update_message', message_id: 6, message_ids: [6], user_id: 7, edit_timestamp: 1_700_000_902, orig_content: 'm6', content: 'm6 fixed', flags: [], stream_id: 7 },
     // A moderator moves Ann's message to another topic.
@@ -243,6 +246,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
     { id: 8, type: 'delete_message', message_id: 902, message_type: 'private' },
     // A stream outside the allowlist: nothing.
     { id: 9, type: 'delete_message', message_ids: [903], message_type: 'stream', stream_id: 8, topic: 't' },
+    { id: 10, type: 'reaction', message_id: 50, user_id: 7, op: 'add', emoji_name: 'thumbs_up' },
   ];
   let polls = 0;
   const getById: number[] = [];
@@ -273,17 +277,19 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   await adapter.discoverChannels();
   const delivered: string[] = [];
   const changes: MessageChangeEvent[] = [];
+  const reactions: { onOwnMessage: boolean; messageSnippet: string | null }[] = [];
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, (r) => { reactions.push(r); }, (c) => { changes.push(c); });
     const deadline = Date.now() + 2000;
-    while (changes.length < 6 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while ((changes.length < 6 || reactions.length < 1) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
   }
   assert.deepEqual(delivered, ['5'], 'the live message still reaches onMessage');
+  assert.deepEqual(reactions.map(r => [r.onOwnMessage, r.messageSnippet]), [[true, 'y']], 'self content edits refresh the bot-authored message snippet without emitting an edit');
   assert.deepEqual(getById, [6, 700], 'only the uncached messages cost a GET');
   const view = changes.map((c) => ({
     kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
@@ -296,12 +302,12 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
     { kind: 'edit', channelId: 'zulip:general', messageId: '6', messageIds: ['6'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'm6 fixed', previousContent: 'm6', mentioned: false, wasMentioned: null, onOwnMessage: false },
     // A move quotes nothing (the content did not change) and keeps the
     // mention it had: the mention the agent is answering moved topics.
-    { kind: 'move', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', movedTo: null, content: null, previousContent: null, mentioned: false, wasMentioned: false, onOwnMessage: false },
+    { kind: 'move', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', movedTo: null, content: null, previousContent: null, mentioned: true, wasMentioned: true, onOwnMessage: false },
     // Placed on the stream it left, pointing at the one it went to; the
     // topic name did not change, so there is no previous topic.
     { kind: 'move', channelId: 'zulip:general', messageId: '700', messageIds: ['700'], authorName: 'Ann', actorId: '12', topic: 'deploys', previousTopic: null, movedTo: 'zulip:secret', content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
     // The deleted message kept its last mention verdict: it is the one the agent was about to answer.
-    { kind: 'delete', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, movedTo: null, content: null, previousContent: 'y', mentioned: false, wasMentioned: false, onOwnMessage: false },
+    { kind: 'delete', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, movedTo: null, content: null, previousContent: 'second draft @**Bot**', mentioned: true, wasMentioned: true, onOwnMessage: false },
     { kind: 'delete', channelId: 'zulip:general', messageId: '900', messageIds: ['900', '901'], authorName: null, actorId: null, topic: 'old', previousTopic: null, movedTo: null, content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
   ]);
   assert.deepEqual(changes[0].timestamp, new Date(1_700_000_900_000), 'an edit is stamped with Zulip\'s edit time');
