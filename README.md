@@ -314,25 +314,11 @@ reply in the original conversation. For example:
 The tool fetches the referenced message and infers its type, taking its
 stream and topic, or its complete DM recipient list
 (including the original participants for both 1:1 and group DMs).
-`to` and `topic` can be omitted with `reply_to`; the tool schema requires
-`type`, which must match the referenced message (`stream` or `private`).
-If supplied, `to` must identify the same stream (numeric ID or
-case-insensitive, trimmed name), or the same DM participant set (emails or
-user IDs; numeric strings are treated as IDs). The sending user is implicit
-only when the bot's own user ID is known. An all-digit `to` is always an ID,
-so digit-named streams must be addressed by ID when using `reply_to`.
-If the bot's profile lookup failed, omit
-`to` or include every participant, including the bot. When message metadata
-uses synthetic emails (`user<ID>@...`), visible real emails may be resolved
-through the user directory and compared by user ID; real-email-only metadata
-never falls back to the directory. A directory match is accepted only for a
-participant whose own metadata address looks synthetic. A genuine address
-shaped `user<own id>@...` is also treated as synthetic.
-ID-based `to` is the only exact cross-check:
-emails are mutable and directory results may be up to 60 seconds stale.
-`topic` must match the returned
-subject after trimming surrounding whitespace, with case preserved.
-Conflicts fail before any uploads or sends. Unknown, deleted, or inaccessible
+The tool schema requires `type`, which must match the referenced message
+(`stream` or `private`).
+`to` and `topic` must be omitted with `reply_to`: supplying either is refused
+with "reply_to sets the destination; omit to/topic" before uploads or sends.
+Unknown, deleted, or inaccessible
 message IDs fail with Zulip's API error code; there is no fallback destination.
 This selects the destination, not a quoted reply. Without `reply_to`, sending
 is unchanged for calls with a destination and type; without `reply_to`,

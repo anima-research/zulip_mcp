@@ -283,6 +283,7 @@ export class ZulipToolRuntime {
   private async replyDestination(args: Record<string, any>) {
     const id = args.reply_to;
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
+    if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
     const result = await this.zulipClient.messages.getById({ message_id: id });
     if (result?.result === "error") {
       // Keep the API code as well as its wording: missing/deleted/inaccessible
@@ -291,25 +292,13 @@ export class ZulipToolRuntime {
     }
     const message = result?.message;
     const unreadable = () => new Error(`reply_to ${id} has no readable destination`);
-    const conflict = (field: string, hint = "") => new Error(`reply_to ${id}: ${field} disagrees with the referenced message${hint}`);
     if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
-    if (args.type !== undefined && args.type !== message.type) throw conflict("type");
-    // Zulip strips surrounding topic whitespace, but preserves case and
-    // internal whitespace. Always send the subject returned by the API.
-    if (args.topic !== undefined && (typeof args.topic !== "string" || args.topic.trim() !== message.subject)) {
-      throw conflict("topic");
+    if (args.type !== undefined && args.type !== message.type) {
+      throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
     }
     if (message.type === "stream") {
       const name = message.display_recipient;
       if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
-      if (args.to !== undefined) {
-        let to = Array.isArray(args.to) && args.to.length === 1 ? args.to[0] : args.to;
-        if (typeof to === "string" && /^\d+$/.test(to.trim())) to = Number(to.trim());
-        const matches = typeof to === "number"
-          ? to === message.stream_id
-          : typeof to === "string" && to.trim().toLowerCase() === name.toLowerCase();
-        if (!matches) throw conflict("to (stream)");
-      }
       return { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: `zulip:${name}` };
     }
 
@@ -318,41 +307,6 @@ export class ZulipToolRuntime {
       throw unreadable();
     }
     const ids = recipients.map((r) => r.id);
-    const missingEmailHint = recipients.some((r) => !r.email) ? "; some participants have no email in this conversation's metadata — use user IDs" : "";
-    if (args.to !== undefined) {
-      // Zulip's restricted-visibility addresses use user<ID>@<dummy domain>.
-      const isSynthetic = (r: ZulipRecipient) => r.email?.toLowerCase().startsWith(`user${r.id}@`);
-      const hasSyntheticEmails = recipients.some(isSynthetic);
-      const wanted: unknown[] = Array.isArray(args.to) ? args.to
-        : typeof args.to === "string" ? args.to.split(",") : [args.to];
-      const resolved = await Promise.all(wanted.map(async (value) => {
-        if (typeof value === "number") return value;
-        if (typeof value !== "string") return undefined;
-        const query = value.trim();
-        if (/^\d+$/.test(query)) return Number(query);
-        const email = query.toLowerCase();
-        const recipient = recipients.find((r) => r.email?.toLowerCase() === email);
-        if (recipient) return recipient.id;
-        if (!hasSyntheticEmails) return undefined;
-        // Message metadata may use a synthetic email. Resolve a visible real
-        // email via the user directory, then compare the stable participant ID.
-        let members: any[];
-        try {
-          members = await this.members();
-        } catch {
-          throw new Error(`reply_to ${id}: could not resolve ${JSON.stringify(query)} (user directory unavailable)`);
-        }
-        const matches = members.filter((u) => typeof u.email === "string" && u.email.toLowerCase() === email);
-        return matches.length === 1 && recipients.some((r) => r.id === matches[0].user_id && isSynthetic(r)) ? matches[0].user_id : undefined;
-      }));
-      if (resolved.length === 0 || resolved.some((id) => id === undefined)) throw conflict("to (DM participants)", missingEmailHint);
-      const supplied = new Set(resolved);
-      // A DM send implicitly includes the authenticated sender, even when
-      // `to` lists only the other participants. Keep everyone in the send.
-      if (this.session.selfUserId !== null) supplied.add(this.session.selfUserId);
-      const expected = new Set(ids);
-      if (supplied.size !== expected.size || ids.some((id) => !supplied.has(id))) throw conflict("to (DM participants)", missingEmailHint);
-    }
     return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
   }
 
@@ -1038,20 +992,15 @@ export class ZulipToolRuntime {
   // ── User resolution ──
 
   private userCache: { at: number; members: any[] } | null = null;
-  private userLookup: Promise<any[]> | null = null;
 
   private async members(): Promise<any[]> {
     const now = Date.now();
     if (this.userCache && now - this.userCache.at < 60_000) return this.userCache.members;
-    if (!this.userLookup) {
-      this.userLookup = (async () => {
-        const result = await this.zulipClient.users.retrieve({});
-        const members = Array.isArray(result?.members) ? result.members : [];
-        this.userCache = { at: now, members };
-        return members;
-      })().finally(() => { this.userLookup = null; });
-    }
-    return this.userLookup;
+    const result = await this.zulipClient.users.retrieve({});
+    assertApiSuccess(result, "listing users");
+    const members = Array.isArray(result?.members) ? result.members : [];
+    this.userCache = { at: now, members };
+    return members;
   }
 
   /**
