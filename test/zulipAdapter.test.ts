@@ -572,3 +572,70 @@ test('a self move to an inaccessible stream explains the following deletion', as
     assert.deepEqual(changes.map(c => [c.kind, c.vanished]), [['delete', true]]);
   } finally { adapter.stopEvents(); }
 });
+
+test('reactions wait for earlier moves but stay parallel and do not block later changes', async () => {
+  let releaseMove!: () => void;
+  const moveReady = new Promise<void>(resolve => { releaseMove = resolve; });
+  let releaseReactions!: () => void;
+  const reactionsReady = new Promise<void>(resolve => { releaseReactions = resolve; });
+  let streamCalls = 0;
+  const lookups: number[] = [];
+  const changes: MessageChangeEvent[] = [];
+  const reactions: { channelId: string; messageSnippet: string | null }[] = [];
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20) },
+    { id: 2, type: 'update_message', message_id: 20, message_ids: [20], user_id: 12,
+      stream_id: 7, new_stream_id: 8, orig_subject: 'deploys' },
+    ...[20, 99, 100].map((message_id, index) => ({
+      id: 3 + index, type: 'reaction', message_id, user_id: 7, op: 'add', emoji_name: 'thumbs_up',
+    })),
+    { id: 6, type: 'update_message', message_id: 20, message_ids: [20], user_id: 7,
+      stream_id: 8, orig_content: 'm20', content: 'updated', flags: [] },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => {
+      if (++streamCalls === 1) return { result: 'success', streams: [{ name: 'general', stream_id: 7 }] };
+      await moveReady;
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'archive', stream_id: 8 }] };
+    } },
+    messages: { getById: async ({ message_id }: { message_id: number }) => {
+      lookups.push(message_id);
+      await reactionsReady;
+      return { result: 'success', message: raw(message_id, { display_recipient: 'archive', stream_id: 8 }) };
+    } },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (++polls === 1) return { events };
+      await new Promise(resolve => setTimeout(resolve, 5)); return { events: [] };
+    } },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const until = async (predicate: () => boolean) => {
+    const deadline = Date.now() + 2000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, 'event handling completed before the deadline');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  };
+  try {
+    await adapter.discoverChannels();
+    adapter.startEvents(() => {}, undefined, r => reactions.push(r), c => changes.push(c));
+    await until(() => streamCalls === 2);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(reactions, [], 'no reaction overtakes the blocked move');
+    assert.deepEqual(lookups, [], 'even uncached reaction lookups wait for the earlier move');
+    releaseMove();
+    await until(() => lookups.length === 2 && changes.length === 2);
+    assert.deepEqual(lookups, [99, 100], 'both uncached reactions start before either lookup completes');
+    assert.equal(changes[1].kind, 'edit', 'the later edit is not blocked by reaction lookups');
+    assert.equal(changes[1].channelId, 'zulip:archive');
+    releaseReactions();
+    await until(() => reactions.length === 3);
+    assert.deepEqual(reactions.map(r => r.channelId), ['zulip:archive', 'zulip:archive', 'zulip:archive']);
+  } finally {
+    releaseMove();
+    releaseReactions();
+    adapter.stopEvents();
+  }
+});

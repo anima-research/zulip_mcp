@@ -824,8 +824,10 @@ export class ZulipAdapter implements PlatformAdapter {
     this.eventLoop = new ZulipEventLoop();
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
-    // same message reads backwards otherwise. Every await in the chain is
-    // bounded (LOCATE_TIMEOUT_MS), so one hung GET delays, never wedges.
+    // same message reads backwards otherwise. Reactions await the earlier
+    // change-chain tail so they see completed moves, but do not extend it:
+    // reaction lookups stay parallel and cannot delay later changes.
+    // Every placement lookup is bounded by LOCATE_TIMEOUT_MS.
     let changeChain: Promise<void> = Promise.resolve();
     const changeHandler = onMessageChange || this.onSelfChanged
       ? (change: ZulipMessageChange) => {
@@ -840,7 +842,8 @@ export class ZulipAdapter implements PlatformAdapter {
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
           // The bot's own reactions are its own doing; only others' are news.
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
-          changeChain = changeChain.then(async () => {
+          const tail = changeChain;
+          void tail.then(async () => {
             const where = await this.locate(ev.message_id);
             if (!where) return;
             if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
