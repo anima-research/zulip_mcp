@@ -428,10 +428,10 @@ test('send_message without reply_to keeps the exact payload, response and callba
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message reply_to schema requires type and makes to optional only for replies', () => {
+test('send_message schema leaves destination requirements to the runtime', () => {
   const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
   assert.deepEqual(schema.required, ['type']);
-  assert.deepEqual(schema.anyOf, [{ required: ['to'] }, { required: ['reply_to'] }]);
+  for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
   assert.equal(properties.reply_to.type, 'integer');
   assert.match(properties.reply_to.description, /conflicting to\/topic/);

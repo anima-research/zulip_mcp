@@ -206,7 +206,6 @@ export const toolDefinitions: ToolDefinition[] = [
         },
       },
       required: ["type"],
-      anyOf: [{ required: ["to"] }, { required: ["reply_to"] }],
     },
   },
   {
