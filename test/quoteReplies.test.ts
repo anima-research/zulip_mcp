@@ -378,3 +378,43 @@ test('history also withholds inferred addressing for bot-authored quotes', async
   assert.equal(page.messages[0].metadata?.replyToSelf, false);
   assert.equal(gets, 0);
 });
+
+for (const restart of [false, true]) {
+  test(`stopping during a quote lookup drops the message and remaining batch${restart ? ' across a restart' : ''}`, { timeout: 2000 }, async () => {
+    let release!: (value: unknown) => void;
+    let lookupStarted!: () => void;
+    const started = new Promise<void>((resolve) => { lookupStarted = resolve; });
+    let registrations = 0;
+    const served = new Set<string>();
+    const adapter = new ZulipAdapter({
+      messages: { getById: () => new Promise((resolve) => { release = resolve; lookupStarted(); }) },
+      queues: { register: async () => ({ queue_id: `q${++registrations}`, last_event_id: -1 }) },
+      events: { retrieve: async ({ queue_id }: { queue_id: string }) => {
+        if (served.has(queue_id)) return new Promise(() => {});
+        served.add(queue_id);
+        const rows = queue_id === 'q1' ? [raw(300, quote()), raw(301, 'later in old batch')] : [raw(400, 'new connection')];
+        return { events: rows.map((message, i) => ({ id: i + 1, type: 'message', message, flags: [] })) };
+      } },
+    }, SELF, 'session');
+    const oldMessages: string[] = [];
+    const newMessages: string[] = [];
+    try {
+      adapter.startEvents((m) => oldMessages.push(m.messageId));
+      await started;
+      adapter.stopEvents();
+      if (restart) {
+        let received!: () => void;
+        const done = new Promise<void>((resolve) => { received = resolve; });
+        adapter.startEvents((m) => { newMessages.push(m.messageId); received(); });
+        await done;
+      }
+      release({ message: raw(QUOTED, 'original', { sender_id: SELF }) });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(oldMessages, []);
+      assert.deepEqual(newMessages, restart ? ['400'] : []);
+    } finally {
+      adapter.stopEvents();
+      release?.({ result: 'error' });
+    }
+  });
+}

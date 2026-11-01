@@ -889,7 +889,7 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
-    this.eventLoop = new ZulipEventLoop();
+    const loop = this.eventLoop = new ZulipEventLoop();
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
     // same message reads backwards otherwise. Every await in the chain is
@@ -898,7 +898,12 @@ export class ZulipAdapter implements PlatformAdapter {
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {
           changeChain = changeChain
-            .then(() => this.onZulipChange(change, onMessageChange))
+            .then(() => {
+              if (this.eventLoop !== loop) return;
+              return this.onZulipChange(change, (event) => {
+                if (this.eventLoop === loop) onMessageChange(event);
+              });
+            })
             .catch((err) => {
               console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
             });
@@ -909,7 +914,7 @@ export class ZulipAdapter implements PlatformAdapter {
           // The bot's own reactions are its own doing; only others' are news.
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
           void this.locate(ev.message_id).then((where) => {
-            if (!where) return;
+            if (!where || this.eventLoop !== loop) return;
             if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
             onReaction({
               action: ev.op,
@@ -927,7 +932,7 @@ export class ZulipAdapter implements PlatformAdapter {
           });
         }
       : undefined;
-    this.eventLoop.start(this.zulipClient, async (_streamName, msg, flags) => {
+    loop.start(this.zulipClient, async (_streamName, msg, flags) => {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
@@ -944,6 +949,7 @@ export class ZulipAdapter implements PlatformAdapter {
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
       m.replyToSelf = await this.isQuoteReply(m);
+      if (this.eventLoop !== loop) return;
       const cached = this.seen.get(m.id);
       if (cached) cached.replyToSelf = m.replyToSelf;
       // A stream the bot joined after startup is unknown to the host; the

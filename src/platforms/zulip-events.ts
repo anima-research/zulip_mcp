@@ -378,6 +378,7 @@ export class ZulipEventLoop {
         this.consecutiveFailures = 0;
 
         for (const event of response.events) {
+          if (this.stopped) return;
           lastEventId = event.id;
 
           if (event.type === 'reaction' && onReaction && typeof event.message_id === 'number') {

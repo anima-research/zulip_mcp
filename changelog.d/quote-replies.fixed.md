@@ -15,3 +15,5 @@
   deliberately excluded, including such first headings in multi-quotes.
   Authors with bot-like email addresses (`-bot@`) do not receive inferred
   quote addressing; explicit mentions and DMs are unchanged.
+  Stopping event delivery during a lookup or poll drops stale callbacks and
+  the rest of the stopped batch, including across connection restarts.
