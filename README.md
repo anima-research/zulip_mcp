@@ -35,8 +35,8 @@ Discord and Slack adapters that once lived here moved to those servers.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
-  the bot authored. It carries `metadata.replyToSelf` and `chat:reply`, not
-  `chat:mention`: `mentioned` remains Zulip's verdict, and the line has no
+  the bot authored. It carries `metadata.replyToSelf` on channel messages,
+  `origin.isReply` on pushes, and `chat:reply`, not `chat:mention`: `mentioned` remains Zulip's verdict, and the line has no
   `(mention)` label unless Zulip reports one. Silent mentions and links alone
   do not count. The same rule applies to live delivery, content edits, and
   channel history used by backscroll, refused-push healing, reconnect sweeps

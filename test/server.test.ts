@@ -2224,6 +2224,7 @@ test('a quote reply pushes on a closed channel without claiming an explicit ment
     h.adapter.emit!(streamMsg(5, { metadata: { topic: 'answers', mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
     await until(() => h.pushed.length === 1, 'reply push');
     assert.deepEqual(h.pushed[0].tags, ['chat:reply']);
+    assert.equal((h.pushed[0].origin as { isReply: boolean }).isReply, true);
     assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
     assert.equal(h.server.delivery.tally('zulip:general')?.messages ?? 0, 0);
@@ -2271,6 +2272,7 @@ test('a refused quote-reply push is redelivered from classified history when ano
     await until(() => h.server.delivery.watermark('zulip:general') === 5, 'reply healed');
     const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
     assert.ok(recovered);
+    assert.equal((recovered.origin as { isReply: boolean }).isReply, true);
     assert.ok(recovered.tags?.includes('chat:reply'));
     assert.ok(!recovered.tags?.includes('chat:mention'));
     assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
@@ -2310,6 +2312,7 @@ test('a quote reply received in the sweep window survives history deduplication 
     await until(() => second!.server.isLive && second!.server.delivery.watermark('zulip:general') === 5, 'sweep acceptance and go-live');
     assert.equal(second.pushed.length, 1);
     assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+    assert.equal((second.pushed[0].origin as { isReply: boolean }).isReply, true);
     assert.ok(!second.pushed[0].tags?.includes('chat:mention'));
     const text = (second.pushed[0].payload.content[0] as { text: string }).text;
     assert.match(text, /^<missed /);
@@ -2337,6 +2340,7 @@ test('an edited quote reply pushes on a closed channel with reply tags and no me
     });
     await until(() => h.pushed.length === 1, 'quote-reply edit push');
     assert.deepEqual(h.pushed[0].tags, ['chat:edited', 'chat:reply']);
+    assert.equal((h.pushed[0].origin as { isReply: boolean }).isReply, true);
     assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
   } finally { await h.close(); }
@@ -2362,6 +2366,7 @@ test('DM catch-up retains DM tags without synthesizing an explicit mention', asy
     await until(() => h.server.delivery.watermark(descriptor.id) === 5, 'DM catch-up acceptance');
     const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
     assert.deepEqual(recovered.tags, ['zulip:missed', 'chat:dm', 'chat:private']);
+    assert.equal((recovered.origin as { isReply: boolean }).isReply, false);
     assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
   } finally { await h.close(); }
 });
