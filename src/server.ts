@@ -1250,12 +1250,17 @@ export class ZulipMcplServer {
 
   /**
    * Deliver what a closed (or not-yet-reopened) channel accumulated past its
-   * watermark as one `<missed>` push event: the full backscroll when
+   * watermark as `<missed>` push events: the full backscroll when
    * `keepAll` (the host had it open, or it is a DM), else each mention with
    * its vicinity. Advances the watermark past everything scanned once the
    * host has accepted the push. Returns true when something was delivered.
    */
-  private async catchUpClosedChannel(channelId: string, keepAllHint: boolean, afterId?: number): Promise<boolean> {
+  private async catchUpClosedChannel(
+    channelId: string,
+    keepAllHint: boolean,
+    afterId?: number,
+    retryWindow?: { through: number; truncated: boolean; deferred: Set<number> },
+  ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
     if (this.isMuted(channelId) || !this.isAllowed(channelId)) return false;
@@ -1264,23 +1269,33 @@ export class ZulipMcplServer {
     if (after === undefined) return false;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
-      fetched = await this.fetchAfter(channelId, after);
+      fetched = await this.fetchAfter(channelId, after, retryWindow?.through);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
       return false;
     }
     if (fetched.scannedThrough === null) return false;
-    let newestId = fetched.scannedThrough;
-    let msgs = fetched.messages;
+    // Retries stay inside the first walk's ceiling and remember every row
+    // attempted in this call, even if the connection-level cache evicts it.
+    const window = retryWindow ?? {
+      through: fetched.scannedThrough,
+      truncated: fetched.truncated,
+      deferred: new Set(this.deferredQuotes.get(channelId)),
+    };
+    fetched.truncated ||= window.truncated;
+    let newestId = Math.min(fetched.scannedThrough, window.through);
+    let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const deferred = this.deferredQuotes.get(channelId) ?? new Set<number>();
-    const blocked = fetched.unverifiedMessageIds.find((id) => id > after && !deferred.has(id));
+    const blocked = fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId && !window.deferred.has(id));
+    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window);
     if (blocked !== undefined) {
       if (deferred.size >= PRE_LIVE_BUFFER_CAP) deferred.delete(deferred.values().next().value!);
       deferred.add(blocked);
+      window.deferred.add(blocked);
       this.deferredQuotes.set(channelId, deferred);
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
-      if (newestId <= after) return false;
+      if (newestId <= after) return retry(after);
     }
     const views = msgs.map(viewOf);
     const keepAll = keepAllHint || isDmChannelId(channelId);
@@ -1288,7 +1303,7 @@ export class ZulipMcplServer {
     if (kept.length === 0) {
       // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
       this.advanceCatchUp(channelId, newestId);
-      return false;
+      return blocked !== undefined ? retry(newestId) : false;
     }
     const addressedCount = views.filter(isAddressed).length;
     const mentionCount = views.filter((v) => v.mentioned).length;
@@ -1343,6 +1358,11 @@ export class ZulipMcplServer {
         if (!keepAll && !isAddressed(views[i])) continue;
         if (this.channelManager.noteConversation(channelId, msgs[i])) break;
       }
+    }
+    if (blocked !== undefined) {
+      // A refused prefix must be re-offered too; an accepted prefix need not.
+      const retried = await retry(ok ? newestId : after);
+      return ok || retried;
     }
     return ok;
   }

@@ -2642,11 +2642,7 @@ test('a budget-starved quote row is retried before catch-up advances past it', a
     } }, 100, 'session');
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
-    await until(() => h.server.delivery.watermark('zulip:general') === 9, 'watermark stops before starved row 10');
-    assert.equal(gets, 8);
-    assert.equal(h.pushed.length, 0);
-    h.adapter.systemEvent!({ kind: 'gap', text: 'Retry gap.', metadata: {} });
-    await until(() => h.server.delivery.watermark('zulip:general') === 10, 'retry verifies and delivers row 10');
+    await until(() => h.server.delivery.watermark('zulip:general') === 10, 'immediate retry verifies and delivers row 10 without another gap');
     assert.equal(gets, 9);
     assert.ok(h.pushed[0].tags?.includes('chat:reply'));
   } finally { await h.close(); }
@@ -2659,11 +2655,14 @@ test('the same unverified row defers a channel only once per connection', async 
     await settled(h);
     h.adapter.emit!(streamMsg(1, { mentioned: true }));
     await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-    h.adapter.fetchHistory = async () => ({ messages: [streamMsg(5)], scannedThrough: 5, reachedNewest: true, unverifiedMessageIds: ['5'] });
+    let pages = 0;
+    h.adapter.fetchHistory = async () => {
+      pages++;
+      return { messages: [streamMsg(5)], scannedThrough: 5, reachedNewest: true, unverifiedMessageIds: ['5'] };
+    };
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
-    await until(() => h.server.delivery.watermark('zulip:general') === 4, 'first unverified verdict deferred');
-    h.adapter.systemEvent!({ kind: 'gap', text: 'Retry gap.', metadata: {} });
-    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'repeat verdict fails closed without pinning');
+    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'immediate repeat verdict fails closed without pinning');
+    assert.equal(pages, 2, 'one extra history read for the deferred row');
   } finally { await h.close(); }
 });
 
@@ -2743,4 +2742,39 @@ test('a reply missing from replay history releases both its hold and pending ver
     const pending = (h.server as unknown as { pendingReplies: Map<string, Set<number>> }).pendingReplies;
     assert.equal(pending.get('zulip:general')?.has(5) ?? false, false);
   } finally { await h.close(); }
+});
+
+test('a starved first row is retried within the sweep so its addressed tail is delivered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-defer-'));
+  let second: Harness | undefined;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'probe' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    } finally { await first.close(); }
+    // Offline backlog: id 2 is a quote row whose target lookup was starved,
+    // id 3 is an ordinary mention the host must see.
+    second = harness({ stateDir: dir, sessionId: 'probe' });
+    let pages = 0;
+    second.adapter.fetchHistory = async () => {
+      pages++;
+      return {
+        messages: [streamMsg(2), streamMsg(3, { mentioned: true }), ...(pages > 1 ? [streamMsg(4, { mentioned: true })] : [])],
+        scannedThrough: pages > 1 ? 4 : 3, reachedNewest: true, unverifiedMessageIds: ['2'],
+      };
+    };
+    await initialize(second, true);
+    await settled(second);
+    await until(() => second!.server.delivery.watermark('zulip:general') === 3, 'the addressed backlog is delivered without another gap or reconnect');
+    assert.equal(pages, 2, 'exactly one immediate retry');
+    assert.doesNotMatch(JSON.stringify(second.pushed), /id=4\]/, 'retry stays within the original catch-up window');
+    assert.ok(second.pushed.some((p) => p.tags?.includes('zulip:missed')),
+      `the mention at id 3 was never offered on this connection (watermark ${second.server.delivery.watermark('zulip:general')}, ${pages} history page(s) fetched)`);
+  } finally {
+    await second?.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

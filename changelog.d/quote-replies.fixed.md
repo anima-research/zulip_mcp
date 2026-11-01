@@ -9,8 +9,8 @@
   sweeps, backscroll and queue-gap recovery: page/cache authors first, then at
   most eight uncached target GETs within a shared three-second wait budget per
   page, including reconnect sweeps and tally backfill. Budget-starved rows
-  stop closed-channel watermark advancement once per connection so a later
-  sweep can retry; repeated unverified rows then fail closed. Other unresolved
+  stop closed-channel watermark advancement once per connection and retry
+  immediately in the same catch-up call; repeated unverified rows fail closed. Other unresolved
   targets fail closed.
   Content edits recompute reply addressing from the new raw Markdown; moves
   and deletions retain the last known reply verdict separately from mentions.

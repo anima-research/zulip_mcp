@@ -48,9 +48,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   page, including reconnect sweeps and tally backfill; one channel cannot
   consume another page's allowance. Cache/page matches remain usable after
   exhaustion. A budget-starved quote row stops closed-channel catch-up
-  short of that row so a later sweep can retry it. Each row is deferred only
-  once per connection; a repeat still-unverified verdict then fails closed
-  instead of pinning the channel indefinitely. History retrieval is unchanged.
+  short of that row, then retries immediately within the same catch-up call
+  with a fresh page allowance and cached lookups. Each row is deferred only
+  once per connection: if still unverified on retry it fails closed, allowing
+  the backlog to proceed without another gap event or reconnect. Retries stay
+  within the original catch-up ceiling, with at most one extra history walk
+  per newly deferred row.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
   retries even when history cannot verify it again. Failed lookups
