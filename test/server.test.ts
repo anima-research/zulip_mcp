@@ -2778,3 +2778,32 @@ test('a starved first row is retried within the sweep so its addressed tail is d
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a deferred partial block marks its withheld tail in text and push origin', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    h.adapter.fetchHistory = async () => ({
+      messages: [streamMsg(2, { mentioned: true }), streamMsg(3), streamMsg(4, { mentioned: true })],
+      scannedThrough: 4, reachedNewest: true, unverifiedMessageIds: ['3'],
+    });
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.pushed.some((p) => p.tags?.includes('zulip:missed')), 'missed block pushed');
+    const block = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
+    const text = (block.payload.content[0] as { text: string }).text;
+    assert.match(text, /truncated="true"/);
+    assert.match(text, /newer messages exist/);
+    assert.match(text, /after=2/);
+    assert.equal((block.origin as { truncated: boolean }).truncated, true);
+    await until(() => h.server.delivery.watermark('zulip:general') === 4, 'immediate retry delivers the withheld tail');
+    const blocks = h.pushed.filter((p) => p.tags?.includes('zulip:missed'));
+    assert.equal(blocks.length, 2);
+    const tail = (blocks[1].payload.content[0] as { text: string }).text;
+    assert.match(tail, /id=4\]/);
+    assert.doesNotMatch(tail, /id=2\]/, 'accepted prefix is not delivered twice');
+  } finally { await h.close(); }
+});

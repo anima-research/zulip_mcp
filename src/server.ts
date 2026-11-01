@@ -1319,7 +1319,7 @@ export class ZulipMcplServer {
       count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
-      moreBeyond: fetched.truncated,
+      moreBeyond: fetched.truncated || blocked !== undefined,
       newestScannedId: newestId,
     });
     const synthetic: IncomingChannelMessage = {
@@ -1342,7 +1342,7 @@ export class ZulipMcplServer {
       missed: true,
       reason,
       messages: kept.length,
-      ...(fetched.truncated ? { truncated: true } : {}),
+      ...(fetched.truncated || blocked !== undefined ? { truncated: true } : {}),
     });
     if (ok) {
       for (const view of kept) this.forgetPendingReply(channelId, view.id);
