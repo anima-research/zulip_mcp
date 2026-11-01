@@ -382,7 +382,6 @@ export class ZulipAdapter implements PlatformAdapter {
   private async onZulipChange(change: ZulipMessageChange, emit: OnMessageChange): Promise<void> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
-      if (self !== null && change.actorId === self) return;
       const cached = this.seen.get(change.messageId) ?? null;
       // A cache miss GETs the message as it reads NOW. For a content edit
       // that is the right place; for a cross-stream move it is the stream
@@ -400,7 +399,6 @@ export class ZulipAdapter implements PlatformAdapter {
       }
       const fromChannelId = fromStream !== null ? zulipChannelId(fromStream) : where.channelId;
       const placed: SeenMessage = { ...where, channelId: fromChannelId };
-      if (!this.changeAllowed(placed)) return;
       const content = change.content !== null ? cleanMarkdown(change.content) : null;
       const previousContent = change.origContent !== null ? cleanMarkdown(change.origContent) : null;
       const topic = change.topic ?? where.topic;
@@ -431,7 +429,11 @@ export class ZulipAdapter implements PlatformAdapter {
         const now = Date.now();
         for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
         for (const id of change.messageIds) this.movedAway.set(id, now);
+      } else if (movedToChannelId !== null) {
+        for (const id of change.messageIds) this.movedAway.delete(id);
       }
+      if (self !== null && change.actorId === self) return;
+      if (!this.changeAllowed(placed)) return;
       emit({
         kind: content !== null ? 'edit' : 'move',
         channelId: fromChannelId,
@@ -834,7 +836,8 @@ export class ZulipAdapter implements PlatformAdapter {
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
           // The bot's own reactions are its own doing; only others' are news.
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
-          void this.locate(ev.message_id).then((where) => {
+          changeChain = changeChain.then(async () => {
+            const where = await this.locate(ev.message_id);
             if (!where) return;
             if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
             onReaction({
@@ -850,6 +853,8 @@ export class ZulipAdapter implements PlatformAdapter {
               messageSnippet: where.snippet,
               timestamp: new Date(),
             });
+          }).catch((err) => {
+            console.error('[zulip-mcp] reaction handling failed:', (err as Error).message);
           });
         }
       : undefined;
