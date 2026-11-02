@@ -58,6 +58,19 @@ test('non-API formats are rasterized rather than emitted as-is, and garbage yiel
   assert.equal(await normalizeImageForInference(Buffer.from('not an image')), null);
 });
 
+test('an animated GIF under the cap is inlined as it is, frames unresized, even past the long-edge ceiling', async () => {
+  const frame = (background: string) =>
+    sharp({ create: { width: IMAGE_LONG_EDGE_MAX + 400, height: 20, channels: 3, background } }).png().toBuffer();
+  const gif = await sharp([await frame('#ff0000'), await frame('#0000ff')], { join: { animated: true } })
+    .gif()
+    .toBuffer();
+  assert.equal((await sharp(gif, { animated: true }).metadata()).pages, 2);
+  const norm = await normalizeImageForInference(gif);
+  assert.ok(norm);
+  assert.equal(norm.mimeType, 'image/gif');
+  assert.equal(Buffer.from(norm.data, 'base64').equals(gif), true);
+});
+
 test('resolveInlineOptions clamps the text cap and reads the knobs', () => {
   assert.deepEqual(resolveInlineOptions({}), { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 });
   const opts = resolveInlineOptions({ ZULIP_INLINE_IMAGES: 'false', ZULIP_ATTACHMENT_INLINE_MAX_BYTES: '99999999', ZULIP_INLINE_IMAGES_MAX: '1' });

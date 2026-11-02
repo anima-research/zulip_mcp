@@ -64,7 +64,7 @@ npm install
 npm run build
 ```
 
-Requires Node 20+. `npm test` runs the suite (`node --test`, no network).
+Requires Node 20.10 or later. `npm test` runs the suite (`node --test`, no network).
 
 ## Configuration
 
