@@ -1141,8 +1141,9 @@ export class ZulipMcplServer {
         topic: meta.topic,
         authorId: message.author.id,
         authorName: message.author.name,
-        isMention: meta.mentioned === true,
-        isReply: meta.replyToSelf === true,
+        isMention: meta.mentioned === true || meta.replyToSelf === true,
+        isExplicitMention: meta.mentioned === true,
+        isReplyToBot: meta.replyToSelf === true,
         isDM: meta.isDM === true,
         // agent-framework stores `origin` (not message metadata) as the
         // stored message's metadata on this path, so the attribution stamp

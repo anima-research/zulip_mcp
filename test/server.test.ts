@@ -2224,8 +2224,8 @@ test('a quote reply pushes on a closed channel without claiming an explicit ment
     h.adapter.emit!(streamMsg(5, { metadata: { topic: 'answers', mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
     await until(() => h.pushed.length === 1, 'reply push');
     assert.deepEqual(h.pushed[0].tags, ['chat:reply']);
-    assert.equal((h.pushed[0].origin as { isReply: boolean }).isReply, true);
-    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
+    assert.equal((h.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
+    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, true);
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
     assert.equal(h.server.delivery.tally('zulip:general')?.messages ?? 0, 0);
   } finally { await h.close(); }
@@ -2275,10 +2275,10 @@ test('a refused quote-reply push is redelivered from classified history when ano
     await until(() => h.server.delivery.watermark('zulip:general') === 5, 'reply healed');
     const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
     assert.ok(recovered);
-    assert.equal((recovered.origin as { isReply: boolean }).isReply, true);
+    assert.equal((recovered.origin as { isReplyToBot: boolean }).isReplyToBot, true);
     assert.ok(recovered.tags?.includes('chat:reply'));
     assert.ok(!recovered.tags?.includes('chat:mention'));
-    assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
+    assert.equal((recovered.origin as { isMention: boolean }).isMention, true);
     const text = (recovered.payload.content[0] as { text: string }).text;
     assert.match(text, /id=5\]/);
     assert.match(text, /count="1" lines="1" reason="addressed"/);
@@ -2317,7 +2317,7 @@ test('a quote reply received in the sweep window survives history deduplication 
     await until(() => second!.server.isLive && second!.server.delivery.watermark('zulip:general') === 5, 'sweep acceptance and go-live');
     assert.equal(second.pushed.length, 1);
     assert.ok(second.pushed[0].tags?.includes('chat:reply'));
-    assert.equal((second.pushed[0].origin as { isReply: boolean }).isReply, true);
+    assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
     assert.ok(!second.pushed[0].tags?.includes('chat:mention'));
     const text = (second.pushed[0].payload.content[0] as { text: string }).text;
     assert.match(text, /^<missed /);
@@ -2345,8 +2345,8 @@ test('an edited quote reply pushes on a closed channel with reply tags and no me
     });
     await until(() => h.pushed.length === 1, 'quote-reply edit push');
     assert.deepEqual(h.pushed[0].tags, ['chat:edited', 'chat:reply']);
-    assert.equal((h.pushed[0].origin as { isReply: boolean }).isReply, true);
-    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, false);
+    assert.equal((h.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
+    assert.equal((h.pushed[0].origin as { isMention: boolean }).isMention, true);
     assert.doesNotMatch((h.pushed[0].payload.content[0] as { text: string }).text, /\(mention\)/);
   } finally { await h.close(); }
 });
@@ -2371,7 +2371,7 @@ test('DM catch-up retains DM tags without synthesizing an explicit mention', asy
     await until(() => h.server.delivery.watermark(descriptor.id) === 5, 'DM catch-up acceptance');
     const recovered = h.pushed.find((p) => p.tags?.includes('zulip:missed'))!;
     assert.deepEqual(recovered.tags, ['zulip:missed', 'chat:dm', 'chat:private']);
-    assert.equal((recovered.origin as { isReply: boolean }).isReply, false);
+    assert.equal((recovered.origin as { isReplyToBot: boolean }).isReplyToBot, false);
     assert.equal((recovered.origin as { isMention: boolean }).isMention, false);
   } finally { await h.close(); }
 });
@@ -2393,7 +2393,7 @@ test('catch-up counts mixed mentions and replies as addressed messages rather th
     const recovered = h.pushed[0];
     assert.match((recovered.payload.content[0] as { text: string }).text, /count="2" lines="3" reason="addressed"/);
     assert.equal((recovered.origin as { reason: string }).reason, 'addressed');
-    assert.equal((recovered.origin as { isReply: boolean }).isReply, true);
+    assert.equal((recovered.origin as { isReplyToBot: boolean }).isReplyToBot, true);
     assert.equal((recovered.origin as { isMention: boolean }).isMention, true);
   } finally { await h.close(); }
 });
@@ -2499,7 +2499,7 @@ for (const refuse of [false, true]) {
       const replyPushes = second.pushed.filter((p) => p.tags?.includes('chat:reply'));
       assert.ok(replyPushes.length > 0);
       if (!refuse) assert.equal(replyPushes.length, 1, 'accepted sweep delivery deduplicates the buffered copy');
-      assert.ok(replyPushes.every((p) => (p.origin as { isReply: boolean }).isReply));
+      assert.ok(replyPushes.every((p) => (p.origin as { isReplyToBot: boolean }).isReplyToBot));
       assert.deepEqual(second.server.delivery.heldIds('zulip:general'), []);
     } finally {
       release?.();
@@ -2554,7 +2554,7 @@ for (const rejectOnce of [false, true]) {
     assert.equal(second.pushed.length, rejectOnce ? 2 : 1);
     assert.equal(refused, rejectOnce);
     assert.equal(second.pushed[0].eventId, 'zulip_msg_5');
-    assert.equal((second.pushed[0].origin as { isReply: boolean }).isReply, true);
+    assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
   } finally {
     release?.();
     await second?.close();
@@ -2985,5 +2985,26 @@ test('R2-2: catch-up shares a total quote wait budget across history pages', asy
     await until(() => h.server.delivery.watermark('zulip:general') === 11, 'all pages scanned with bounded quote waiting');
     assert.equal(gets, 4, 'two three-second pass budgets, not a fresh total budget per page');
     assert.equal(now, 6000);
+  } finally { await h.close(); }
+});
+
+
+test('R2-3: push origins expose umbrella mention and specific addressing flags', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    for (const [i, [mentioned, replyToSelf]] of [[true, false], [false, true], [true, true]].entries()) {
+      h.adapter.emit!(streamMsg(5 + i, {
+        metadata: { mentioned, replyToSelf, isDM: false },
+        tags: [...(mentioned ? ['chat:mention'] : []), ...(replyToSelf ? ['chat:reply'] : [])],
+      }));
+      await until(() => h.pushed.length === i + 1, 'addressed push');
+      const origin = h.pushed[i].origin as Record<string, unknown>;
+      assert.equal(origin.isExplicitMention, mentioned);
+      assert.equal(origin.isReplyToBot, replyToSelf);
+      assert.equal(origin.isMention, mentioned || replyToSelf);
+      assert.equal('isReply' in origin, false, 'do not publish the ambiguous reply-to-anything name');
+    }
   } finally { await h.close(); }
 });

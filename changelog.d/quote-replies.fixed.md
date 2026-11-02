@@ -1,5 +1,5 @@
 - Treat stream quote replies to the connector's own messages as addressed
-  replies (`chat:reply`, not `chat:mention`, with `origin.isReply` on pushes),
+  replies (`chat:reply`, not `chat:mention`, with `origin.isReplyToBot` on pushes),
   using the quoted message's sender rather than the silent mention's label.
   Message handlers are awaited to preserve delivery order, with quote lookups
   limited to at most the first two distinct targets per incoming message and a
@@ -39,3 +39,6 @@
   quote target or all inspected targets were verified as not authored by the bot.
   Releasing a muted/disallowed channel or a message gone from replay history
   also clears its pending reply verdict, preventing stale history overlays.
+  Push origins use umbrella `isMention` for explicit mentions or bot replies,
+  with separate `isExplicitMention` and `isReplyToBot` flags for gate matching;
+  message `mentioned` metadata and `chat:mention` stay explicit-mention-only.
