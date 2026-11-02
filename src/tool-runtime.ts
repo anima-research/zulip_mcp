@@ -281,7 +281,7 @@ export class ZulipToolRuntime {
 
   /** Resolve and check a reply before uploading files or sending any chunks. */
   private async replyDestination(args: Record<string, any>) {
-    const id = args.reply_to;
+    const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
     if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
     const result = await this.zulipClient.messages.getById({ message_id: id });
@@ -293,7 +293,8 @@ export class ZulipToolRuntime {
     const message = result?.message;
     const unreadable = () => new Error(`reply_to ${id} has no readable destination`);
     if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
-    if (args.type !== undefined && args.type !== message.type) {
+    const type = args.type === "direct" ? "private" : args.type === "channel" ? "stream" : args.type;
+    if (type !== undefined && type !== message.type) {
       throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
     }
     if (message.type === "stream") {

@@ -394,15 +394,57 @@ for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
   });
 }
 
-test('send_message reply_to requires an integer id and a readable message destination', async () => {
-  const { tools, dir, gets, sends } = replyRuntime({});
+test('send_message reply_to accepts integer-valued strings without mutating arguments', async () => {
+  const { tools, dir, gets, sends, userLookups } = replyRuntime(replyStream);
   try {
-    for (const reply_to of ['123', 1.5, NaN]) {
-      await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', reply_to, content: 'reply' }), /reply_to.*integer/);
+    for (const reply_to of ['123', ' 123 ', '123.0', '1.23e2']) {
+      const args = { reply_to, content: 'reply' };
+      await tools.handleToolCall('send_message', args);
+      assert.deepEqual(args, { reply_to, content: 'reply' });
+    }
+    assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+    assert.deepEqual(sends, Array(4).fill({ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }));
+    assert.deepEqual(userLookups, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const [alias, message] of [
+  ['channel', replyStream],
+  ['direct', { type: 'private', display_recipient: replyParticipants }],
+] as const) {
+  test(`send_message reply_to normalizes the ${alias} type alias and still refuses a conflict`, async () => {
+    const { tools, dir, gets, sends, uploaded } = replyRuntime(message);
+    try {
+      const args = { type: alias, reply_to: 123, content: 'reply' };
+      await tools.handleToolCall('send_message', args);
+      assert.deepEqual(args, { type: alias, reply_to: 123, content: 'reply' });
+      assert.deepEqual(sends, [{
+        type: message.type, to: message.type === 'stream' ? 12 : [790, 42, 7],
+        topic: message.type === 'stream' ? replyStream.subject : undefined, content: 'reply',
+      }]);
+      await assert.rejects(tools.handleToolCall('send_message', {
+        type: alias === 'channel' ? 'direct' : 'channel', reply_to: 123, content: 'reply',
+        attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), /type disagrees/);
+      assert.deepEqual(gets, [{ message_id: 123 }, { message_id: 123 }]);
+      assert.equal(sends.length, 1, 'a conflicting alias sends nothing');
+      assert.deepEqual(uploaded, [], 'a conflicting alias uploads nothing');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('send_message reply_to requires an integer id and a readable message destination', async () => {
+  const { tools, dir, gets, sends, uploaded } = replyRuntime({});
+  try {
+    for (const reply_to of ['', ' ', 'abc', '123.5', 'Infinity', '9007199254740992', 1.5, NaN, Infinity, 9007199254740992, true, {}, []]) {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        type: 'stream', reply_to, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), /reply_to.*integer/);
     }
     assert.deepEqual(gets, []);
     await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), /reply_to.*destination/);
     assert.deepEqual(sends, []);
+    assert.deepEqual(uploaded, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -449,7 +491,7 @@ test('send_message reply_to supports a canonical stream name fallback and an emp
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message reply_to uses the real client GET endpoint before POST and propagates HTTP API errors', async () => {
+test('send_message reply_to uses the real client with numeric strings and aliases before POST and propagates HTTP API errors', async () => {
   const requests: { method?: string; url?: string; body: string }[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -475,7 +517,7 @@ test('send_message reply_to uses the real client GET endpoint before POST and pr
     const client = await zulipInit({ realm: `http://127.0.0.1:${port}`, username: 'bot@example.com', apiKey: 'test-only' });
     const state = runtime(client);
     dir = state.dir;
-    await state.tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' });
+    await state.tools.handleToolCall('send_message', { type: 'channel', reply_to: '123', content: 'reply' });
     assert.deepEqual(requests.map(({ method, url }) => ({ method, url })), [
       { method: 'GET', url: '/api/v1/messages/123?message_id=123' },
       { method: 'POST', url: '/api/v1/messages' },
