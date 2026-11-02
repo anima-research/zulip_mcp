@@ -150,12 +150,14 @@ const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
+class LookupTimeoutError extends Error {}
+
 /** Bound the wait only: zulip-js does not pass an AbortSignal to fetch, so
  *  the underlying request can outlive this timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+    timer = setTimeout(() => reject(new LookupTimeoutError(`${what} timed out after ${ms}ms`)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
@@ -391,7 +393,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS): Promise<SeenMessage | null> {
+  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS, throwOnTimeout = false): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
@@ -410,7 +412,21 @@ export class ZulipAdapter implements PlatformAdapter {
       return this.seen.get(messageId) ?? null;
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
+      if (throwOnTimeout && err instanceof LookupTimeoutError) throw err;
       return null;
+    }
+  }
+
+  /** Cache definite failures, not deadlines: a deferred pass needs a fresh
+   *  chance to resolve a target whose earlier request merely timed out. */
+  private async resolveQuoteTarget(id: number, remainingMs: number): Promise<QuoteLookup> {
+    try {
+      const quoted = await this.locate(id, 'a quote reply', remainingMs, true);
+      if (!quoted) this.rememberFailedQuoteLookup(id);
+      return quoted;
+    } catch (err) {
+      if (err instanceof LookupTimeoutError) return 'budget-skipped';
+      throw err;
     }
   }
 
@@ -423,10 +439,7 @@ export class ZulipAdapter implements PlatformAdapter {
       if (known) return known;
       if (this.quoteLookupFailed(id)) return null;
       if (remainingMs <= 0) return 'budget-skipped';
-      const started = performance.now();
-      const quoted = await this.locate(id, 'a quote reply', remainingMs);
-      if (!quoted) this.rememberFailedQuoteLookup(id);
-      return !quoted && performance.now() - started >= remainingMs ? 'budget-skipped' : quoted;
+      return this.resolveQuoteTarget(id, remainingMs);
     },
     deadline = performance.now() + QUOTE_TIMEOUT_MS,
   ): Promise<QuoteVerdict> {
@@ -870,7 +883,7 @@ export class ZulipAdapter implements PlatformAdapter {
     // share a GET cap and wait budget for this page, never for other channels.
     const pageById = new Map(page.messages.map((m) => [m.id, m]));
     let getsLeft = HISTORY_QUOTE_GET_CAP;
-    const deadline = performance.now() + QUOTE_TIMEOUT_MS;
+    const deadline = Math.min(performance.now() + QUOTE_TIMEOUT_MS, query.quoteLookupDeadline ?? Infinity);
     const unverifiedMessageIds: string[] = [];
     const resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
       const known = pageById.get(id) ?? this.seen.get(id);
@@ -878,10 +891,7 @@ export class ZulipAdapter implements PlatformAdapter {
       if (this.quoteLookupFailed(id)) return null;
       if (getsLeft <= 0 || remainingMs <= 0) return 'budget-skipped';
       getsLeft--;
-      const started = performance.now();
-      const quoted = await this.locate(id, 'a history quote reply', remainingMs);
-      if (!quoted) this.rememberFailedQuoteLookup(id);
-      return !quoted && performance.now() - started >= remainingMs ? 'budget-skipped' : quoted;
+      return this.resolveQuoteTarget(id, remainingMs);
     };
     for (const m of page.messages) {
       if (!this.allowed(m)) continue;

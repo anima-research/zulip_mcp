@@ -2718,7 +2718,7 @@ test('a budget-starved quote row is retried before catch-up advances past it', a
   } finally { await h.close(); }
 });
 
-test('the same unverified row defers a channel only once per connection', async () => {
+test('the same unverified row defers a channel only once per catch-up call', async () => {
   const h = harness();
   try {
     await initialize(h, true);
@@ -2875,5 +2875,115 @@ test('a deferred partial block marks its withheld tail in text and push origin',
     const tail = (blocks[1].payload.content[0] as { text: string }).text;
     assert.match(tail, /id=4\]/);
     assert.doesNotMatch(tail, /id=2\]/, 'accepted prefix is not delivered twice');
+  } finally { await h.close(); }
+});
+
+
+test('R2-2: a timed-out quote target can answer on the single deferred pass', { timeout: 8000 }, async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    let gets = 0;
+    const row: ZulipRawMessage = {
+      id: 5, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+      content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
+    };
+    const history = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [row], found_newest: true }),
+      getById: async () => {
+        if (++gets === 1) return new Promise(() => {});
+        return { message: { ...row, id: 500, sender_id: 100 } };
+      },
+    } }, 100, 'session');
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 5, 'timeout retried', 7000);
+    assert.equal(gets, 2, 'timeouts must not enter the definite-failure negative cache');
+    assert.equal(h.pushed.length, 1);
+    assert.ok(h.pushed[0].tags?.includes('chat:reply'));
+  } finally { await h.close(); }
+});
+
+test('R2-2: many hung quote targets use at most two walks and six seconds of waiting', { timeout: 10000 }, async () => {
+  const h = harness();
+  let cleaningUp = false;
+  const release: (() => void)[] = [];
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.pushed.length = 0;
+    let walks = 0;
+    let gets = 0;
+    const rows: ZulipRawMessage[] = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 2, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+      content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`,
+    }));
+    const history = new ZulipAdapter({ messages: {
+      retrieve: async ({ anchor }: { anchor: number }) => {
+        walks++;
+        return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
+      },
+      getById: async () => {
+        gets++;
+        if (cleaningUp) return { result: 'error' };
+        return new Promise((resolve) => release.push(() => resolve({ result: 'error' })));
+      },
+    } }, 100, 'session');
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    const started = performance.now();
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 101, 'bounded fail-closed catch-up', 6500);
+    assert.ok(performance.now() - started < 6500);
+    assert.equal(walks, 2, 'one initial walk and one retry for ALL deferred rows');
+    assert.ok(gets >= 2 && gets <= 16, 'at most eight GETs per page on each of two passes');
+    assert.equal(h.pushed.length, 0);
+  } finally {
+    cleaningUp = true;
+    for (const done of release) done();
+    await until(() => h.server.delivery.watermark('zulip:general') === 101, 'cleanup finishes the sweep');
+    await h.close();
+  }
+});
+
+
+test('R2-2: catch-up shares a total quote wait budget across history pages', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    let gets = 0;
+    const rows: ZulipRawMessage[] = Array.from({ length: 10 }, (_, i) => ({
+      id: i + 2, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+      content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`,
+    }));
+    const history = new ZulipAdapter({ messages: {
+      retrieve: async ({ anchor }: { anchor: number }) => {
+        const tail = rows.filter((m) => m.id > anchor);
+        return { messages: tail.slice(0, 1), found_newest: tail.length <= 1 };
+      },
+      getById: async ({ message_id }: { message_id: number }) => {
+        gets++;
+        now += 1500;
+        return { message: { ...rows[0], id: message_id, sender_id: 102 } };
+      },
+    } }, 100, 'session');
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 11, 'all pages scanned with bounded quote waiting');
+    assert.equal(gets, 4, 'two three-second pass budgets, not a fresh total budget per page');
+    assert.equal(now, 6000);
   } finally { await h.close(); }
 });

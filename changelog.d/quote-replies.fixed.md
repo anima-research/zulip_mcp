@@ -9,9 +9,10 @@
   sweeps, backscroll and queue-gap recovery: page/cache authors first, then at
   most eight uncached target GETs within a shared three-second wait budget per
   page, including reconnect sweeps and tally backfill. Budget-starved rows
-  stop closed-channel watermark advancement once per connection and retry
-  immediately in the same catch-up call; repeated unverified rows fail closed. Other unresolved
-  targets fail closed.
+  stop the initial closed-channel block short of the first deferred row and
+  receive one retry walk over all deferred rows in the same catch-up call.
+  Quote waiting across all pages and both walks is capped at six seconds
+  (three seconds per pass); rows still unverified then fail closed.
   Content edits recompute reply addressing from the new raw Markdown; moves
   and deletions retain the last known reply verdict separately from mentions.
   Translated heading punctuation (spaces, including NBSP, and full-width
@@ -21,7 +22,7 @@
   quote addressing; explicit mentions and DMs are unchanged.
   Stopping event delivery during a lookup or poll drops stale callbacks and
   the rest of the stopped batch, including across connection restarts.
-  Failed, missing and timed-out quote-target lookups are negatively cached for
+  Failed or missing quote-target lookups (not timeouts) are negatively cached for
   three minutes (bounded to 2,000 ids), without suppressing independent
   reaction or edit placement retries. Budgets limit waiting, not request
   lifetime: the underlying zulip-js GET cannot be cancelled by the timer.

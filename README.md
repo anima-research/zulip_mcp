@@ -45,19 +45,20 @@ Discord and Slack adapters that once lived here moved to those servers.
   distinct quote targets are checked; page/cache authors are preferred,
   otherwise live messages/edits share a three-second wait budget each and
   history reads share eight target GETs and a three-second wait budget per
-  page, including reconnect sweeps and tally backfill; one channel cannot
-  consume another page's allowance. Cache/page matches remain usable after
-  exhaustion. A budget-starved quote row stops closed-channel catch-up
-  short of that row, then retries immediately within the same catch-up call
-  with a fresh page allowance and cached lookups. Each row is deferred only
-  once per connection: if still unverified on retry it fails closed, allowing
-  the backlog to proceed without another gap event or reconnect. Retries stay
-  within the original catch-up ceiling, with at most one extra history walk
-  per newly deferred row.
+  page. Closed-channel catch-up additionally shares at most six seconds of
+  quote-lookup waiting across all pages and both passes: three seconds for
+  the initial walk and up to three more for one retry walk over all deferred
+  rows. Other channels have separate call allowances. Cache/page matches
+  remain usable after exhaustion. A budget-starved quote row stops the
+  initial catch-up block short of that row; the single retry stays within
+  the original catch-up ceiling. Any rows still unverified on retry fail
+  closed, allowing the backlog to proceed without another gap or reconnect.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
   retries even when history cannot verify it again. Failed lookups
-  are cached for three minutes; the wait budget does not cancel the GET.
+  with a definite error or missing message are cached for three minutes;
+  timeouts are not cached. The wait budget does not cancel the GET or bound
+  history-page HTTP latency.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 

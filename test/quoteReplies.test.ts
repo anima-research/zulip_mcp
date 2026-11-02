@@ -177,12 +177,15 @@ test('an existing mention needs no quote lookup and retains its addressing', { t
   assert.equal(gets, 0);
 });
 
-test('a hung quote lookup delays an unrelated message by at most the three-second wait budget and caches the timeout', { timeout: 5000 }, async () => {
+test('R2-2: a live timeout bounds waiting without poisoning a later lookup', { timeout: 5000 }, async () => {
   let gets = 0;
   let release!: (value: unknown) => void;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const started = performance.now();
-  const receiving = receive([raw(300, quote()), raw(301, 'unrelated'), raw(302, quote())], () => new Promise((resolve) => { release = resolve; gets++; }));
+  const receiving = receive([raw(300, quote()), raw(301, 'unrelated'), raw(302, quote())], async () => {
+    if (++gets === 1) return new Promise((resolve) => { release = resolve; });
+    return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+  });
   try {
     const messages = await Promise.race([
       receiving,
@@ -193,7 +196,8 @@ test('a hung quote lookup delays an unrelated message by at most the three-secon
     ]);
     assert.deepEqual(messages.map((m) => m.messageId), ['300', '301', '302']);
     assert.equal(messages[0].metadata?.mentioned, false);
-    assert.equal(gets, 1);
+    assert.equal(gets, 2);
+    assert.equal(messages[2].metadata?.replyToSelf, true);
     assert.ok(performance.now() - started < 3500);
   } finally {
     if (timer) clearTimeout(timer);

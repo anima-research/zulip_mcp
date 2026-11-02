@@ -154,8 +154,6 @@ export class ZulipMcplServer {
   private pendingReplies = new Map<string, Set<number>>();
   /** Commit scan-only advancement after buffered live verdicts are reconciled. */
   private preLiveScanned = new Map<string, number>();
-  /** Budget-starved rows defer advancement once per connection, not forever. */
-  private deferredQuotes = new Map<string, Set<number>>();
   /** Watermarks as they stood when the connection began: what the sweep
    *  catches up from, whatever moves them meanwhile (a channel_open with
    *  backscroll in the first seconds must not hide the offline gap). */
@@ -294,7 +292,6 @@ export class ZulipMcplServer {
     this.preLiveDropped = 0;
     this.pendingReplies.clear();
     this.preLiveScanned.clear();
-    this.deferredQuotes.clear();
     this.sweepAnchors = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
   }
 
@@ -1216,6 +1213,7 @@ export class ZulipMcplServer {
     channelId: string,
     afterId: number,
     throughId?: number,
+    quoteLookupDeadline?: number,
   ): Promise<{ messages: IncomingChannelMessage[]; truncated: boolean; complete: boolean; scannedThrough: number | null; unverifiedMessageIds: number[] }> {
     const out: IncomingChannelMessage[] = [];
     const unverified = new Set<number>();
@@ -1223,7 +1221,7 @@ export class ZulipMcplServer {
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor) });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupDeadline });
       if (page.scannedThrough === null) {
         complete = true;
         break;
@@ -1267,7 +1265,7 @@ export class ZulipMcplServer {
     channelId: string,
     keepAllHint: boolean,
     afterId?: number,
-    retryWindow?: { through: number; truncated: boolean; deferred: Set<number> },
+    retryWindow?: { through: number; truncated: boolean; deadline: number },
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
@@ -1275,32 +1273,31 @@ export class ZulipMcplServer {
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return false;
     const after = afterId ?? this.delivery.watermark(channelId);
     if (after === undefined) return false;
+    // At most two quote-wait allowances for the entire call, not per row or
+    // page. Reserve the second allowance for one pass over ALL deferred rows.
+    const deadline = retryWindow?.deadline ?? performance.now() + 6_000;
+    const passDeadline = retryWindow ? deadline : Math.min(deadline, performance.now() + 3_000);
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
-      fetched = await this.fetchAfter(channelId, after, retryWindow?.through);
+      fetched = await this.fetchAfter(channelId, after, retryWindow?.through, passDeadline);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
       return false;
     }
     if (fetched.scannedThrough === null) return false;
-    // Retries stay inside the first walk's ceiling and remember every row
-    // attempted in this call, even if the connection-level cache evicts it.
+    // The one retry stays inside the first walk's ceiling. Any quote still
+    // unverified on that pass fails closed rather than starting another walk.
     const window = retryWindow ?? {
       through: fetched.scannedThrough,
       truncated: fetched.truncated,
-      deferred: new Set(this.deferredQuotes.get(channelId)),
+      deadline,
     };
     fetched.truncated ||= window.truncated;
     let newestId = Math.min(fetched.scannedThrough, window.through);
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
-    const deferred = this.deferredQuotes.get(channelId) ?? new Set<number>();
-    const blocked = fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId && !window.deferred.has(id));
+    const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
     const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window);
     if (blocked !== undefined) {
-      if (deferred.size >= PRE_LIVE_BUFFER_CAP) deferred.delete(deferred.values().next().value!);
-      deferred.add(blocked);
-      window.deferred.add(blocked);
-      this.deferredQuotes.set(channelId, deferred);
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
       if (newestId <= after) return retry(after);
