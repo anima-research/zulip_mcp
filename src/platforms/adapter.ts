@@ -135,13 +135,12 @@ export interface MessageChangeEvent {
   newStreamId?: number | null;
   /** Tool success can cover uncached conversation sources by original topic. */
   moveScope?: { topic: string; propagateMode: SelfMove['propagateMode'] };
-  /** Successful move whose stored destination topic is not yet known. */
+  /** Placement is unconfirmed; refuse automatic reply routing. */
   routingUncertain?: boolean;
   /** An echo of an already reconciled tool operation, not a new placement. */
   confirmationOnly?: boolean;
-  /** Current placement read from Zulip, reconciled per affected message. */
-  authoritativePlacement?: boolean;
-  placementChannelId?: string | null;
+  /** Exact-message route invalidation across channels, without placement reads. */
+  invalidatePlacement?: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;

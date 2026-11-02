@@ -189,13 +189,19 @@ reply hints when the current conversation's source message moved. Successful
 `move_messages` calls reconcile routing and cached placement before returning;
 move echoes are not a prerequisite. Outstanding echo tokens are limited to
 16, expire after 60 seconds (including while idle), and are cleared on event
-queue registration/re-registration and stop. A matching token acknowledges
-without replay only while affected cached placements still match the tool
-result and no intervening applied event invalidated it. Superseded, expired,
-or otherwise ambiguous self moves read current stored placement per affected
-message instead of replaying the echo's historical destination. Failed reads
-leave routing unconfirmed and refuse channel-only publishing until placement
-can be established. This is not global timestamp ordering of Zulip activity.
+queue registration/re-registration and stop. Matching completed tokens acknowledge
+without replay only while cached placement retains a recognized local-move
+provenance: later tool results can advance that placement, but an intervening
+unrelated applied event invalidates the token. This preserves same-second and
+partially overlapping tool moves without treating timestamps as a global order.
+An ambiguous, expired, or unmatched self echo issues **zero placement GETs**,
+including for uncached IDs or bulk ranges. It invalidates affected cached
+placement and marks exact-message reply routes unconfirmed, rather than
+replaying the historical destination or starting validation requests. Automatic
+channel-only publishes then fail closed until a later real message or tool
+result establishes the conversation's placement; another ambiguous echo does
+not clear that uncertainty. Normal reaction/edit cache-miss lookups and the
+tool's own source/result reads are separate, unchanged paths.
 A typing refresh stops the run in its original topic before following a same-stream
 rename.
 After a cross-stream move, a source-channel publish is refused with an error

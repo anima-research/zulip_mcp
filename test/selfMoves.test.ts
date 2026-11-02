@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { createServer } from 'node:http';
+import { createServer, get } from 'node:http';
 import { once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -45,6 +45,8 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   let registrations = 0;
   let expireQueue = false;
   let failReads = false;
+  let placementReader: ((id: number) => Promise<any>) | undefined;
+  const placementReads: number[] = [];
   const sent: any[] = [];
   const typing: any[] = [];
   const placements = new Map<number, any>();
@@ -88,6 +90,8 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
     messages: {
       retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
       getById: async ({ message_id }: any) => {
+        placementReads.push(message_id);
+        if (placementReader) return placementReader(message_id);
         if (failReads) return { result: 'error', msg: 'Placement unavailable' };
         const message = placements.get(message_id) ?? raw(message_id);
         if (invisibleDestination && message.stream_id !== 7) return { result: 'error', msg: 'Not visible' };
@@ -150,9 +154,12 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   return {
     host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
     outstandingMoves() { return (adapter as any).selfMoves.length; },
+    cachedPlacement(id: number) { return (adapter as any).seen.get(id); },
     registrations() { return registrations; },
     expireQueue() { expireQueue = true; },
     failReads(value: boolean) { failReads = value; },
+    placementReads,
+    readPlacementWith(reader: (id: number) => Promise<any>) { placementReader = reader; },
     stopEvents() { adapter.stopEvents(); },
     onPatch(hook?: (event: any) => Promise<void>) { patchHook = hook; },
     async callMove(args: Record<string, unknown>) {
@@ -367,10 +374,14 @@ test('cross-stream tool success blocks source immediately and re-seats co-moved 
   await until(() => f.incoming.some(m => m.metadata?.reaction), 'reaction delivered');
   assert.equal(f.incoming.find(m => m.metadata?.reaction)!.channelId, ARCHIVE);
   f.feed(move([20, 21], { new_stream_id: 8, subject: undefined }));
-  await until(() => f.reconciled.length >= 2, 'echo confirmation');
-  await assert.rejects(f.publish(), /moved.*zulip:archive.*deploys/);
+  await until(() => f.reconciled.some(c => c.routingUncertain), 'echo fails closed after intervening reaction');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  await assert.rejects(f.publish(ARCHIVE), /unconfirmed topic/);
+  // A fresh real message re-establishes the destination conversation.
+  f.feed({ type: 'message', flags: ['mentioned'], message: f.placements.get(21) });
+  await until(() => f.server.delivery.watermark(ARCHIVE) === 21, 'destination mention');
   await f.publish(ARCHIVE);
-  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['archive', 'deploys'], 'echo does not turn destination into a moved marker');
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['archive', 'deploys']);
   assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [['start', 'deploys'], ['stop', 'deploys']]);
 });
 
@@ -531,12 +542,14 @@ for (const actor of [SELF, 7]) {
     assert.equal(f.incoming.find(m => m.metadata?.reaction)!.channelId, ARCHIVE);
     const edit = f.incoming.find(m => m.metadata?.change === 'edit')!;
     assert.deepEqual([edit.channelId, edit.metadata?.topic], [ARCHIVE, 'external']);
-    if (actor === SELF) await assert.rejects(f.publish(), /moved.*zulip:archive.*external/);
+    if (actor === SELF) await assert.rejects(f.publish(), /unconfirmed topic/);
     // Delayed tool echoes must not roll back even this later external move.
-    const confirmations = f.reconciled.filter(c => c.confirmationOnly).length;
+    const beforeEchoes = f.reconciled.length;
     f.feed(move([21], { message_id: 21, subject: 'first' }),
       move([21], { message_id: 21, orig_subject: 'first', subject: 'second' }));
-    await until(() => f.reconciled.filter(c => c.confirmationOnly).length >= confirmations + 2, 'old operations confirmed');
+    await until(() => f.reconciled.length >= beforeEchoes + 2, 'old operations fail closed');
+    assert.equal(f.reconciled.at(-1).routingUncertain, true);
+    await assert.rejects(f.publish(), /unconfirmed topic/);
     f.feed({ type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
       edit_timestamp: 1_700_002_000, content: 'edited again', orig_content: 'old', flags: ['mentioned'] });
     await until(() => f.incoming.filter(m => m.metadata?.change === 'edit').length === 2, 'later edit placed');
@@ -560,17 +573,16 @@ for (const crossStream of [false, true]) {
     f.feed(move([21], { message_id: 21, stream_id: crossStream ? 8 : 7,
       orig_subject: 'first', subject: 'deploys', ...(crossStream ? { new_stream_id: 7 } : {}) }));
     await until(() => f.reconciled.length >= 2, 'external move back');
-    await f.publish();
-    assert.equal(f.sent.at(-1).topic, 'deploys');
+    await assert.rejects(f.publish(), /unconfirmed topic/);
+    assert.equal(f.reconciled.at(-1).confirmationOnly, undefined);
+    assert.equal(f.outstandingMoves(), 0, 'intervening move invalidates the lost token');
     f.placements.set(21, { ...raw(21, 'first'), ...(crossStream ? { stream_id: 8, display_recipient: 'archive' } : {}) });
     const before = f.reconciled.length;
     f.feed(move([21], { message_id: 21, subject: 'first', ...(crossStream ? { new_stream_id: 8 } : {}) }));
     await until(() => f.reconciled.length > before, 'genuine repeated transition');
-    if (crossStream) await assert.rejects(f.publish(), /moved.*zulip:archive.*first/);
-    else {
-      await f.publish();
-      assert.equal(f.sent.at(-1).topic, 'first');
-    }
+    await assert.rejects(f.publish(), /unconfirmed topic/);
+    assert.equal(f.reconciled.at(-1).confirmationOnly, undefined, 'genuine transition is not swallowed as confirmation');
+    assert.equal(f.reconciled.at(-1).routingUncertain, true);
     f.feed({ type: 'reaction', op: 'add', message_id: 21, user_id: 7, emoji_name: 'eyes' },
       { type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
         edit_timestamp: 1_700_002_000, content: 'later edit', orig_content: 'old', flags: ['mentioned'] });
@@ -593,8 +605,8 @@ test('24 sequential moves with lost echoes have bounded outstanding tracking', a
   const before = f.reconciled.length;
   f.feed(move([21], { message_id: 21, subject: 'move-0' }));
   await until(() => f.reconciled.length > before, 'evicted-token echo processed');
-  await f.publish();
-  assert.equal(f.sent.at(-1).topic, 'move-23');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  assert.equal(f.placements.get(21).subject, 'move-23', 'old echo never replays');
 });
 
 test('aged tokens expire without replaying the old echo', async t => {
@@ -611,11 +623,11 @@ test('aged tokens expire without replaying the old echo', async t => {
   f.feed(move([21], { message_id: 21, subject: 'first' }));
   await until(() => f.reconciled.length > before, 'expired-token echo processed');
   assert.equal(f.outstandingMoves(), 0);
-  await f.publish();
-  assert.equal(f.sent.at(-1).topic, 'second');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  assert.equal(f.placements.get(21).subject, 'second');
 });
 
-test('queue re-registration clears tokens but late echoes still use stored placement', async t => {
+test('queue re-registration clears tokens and late echoes fail closed without replay', async t => {
   const f = await fixture();
   t.after(() => f.close());
   f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
@@ -629,8 +641,8 @@ test('queue re-registration clears tokens but late echoes still use stored place
   const before = f.reconciled.length;
   f.feed(move([21], { message_id: 21, subject: 'first' }));
   await until(() => f.reconciled.length > before, 'old echo after replacement');
-  await f.publish();
-  assert.equal(f.sent.at(-1).topic, 'second');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  assert.equal(f.placements.get(21).subject, 'second');
 });
 
 test('stopping event delivery clears outstanding move tokens', async t => {
@@ -644,7 +656,7 @@ test('stopping event delivery clears outstanding move tokens', async t => {
   assert.equal(f.outstandingMoves(), 0);
 });
 
-test('an intervening content event invalidates a token and unavailable validation fails closed', async t => {
+test('intervening edits invalidate tokens; unmatched echoes stay closed until a real tool result', async t => {
   const f = await fixture();
   t.after(() => f.close());
   await f.open();
@@ -664,9 +676,11 @@ test('an intervening content event invalidates a token and unavailable validatio
   f.failReads(false);
   const next = f.reconciled.length;
   f.feed(move([21], { message_id: 21, subject: 'first' }));
-  await until(() => f.reconciled.length > next, 'placement recovered');
+  await until(() => f.reconciled.length > next, 'second ambiguous echo');
+  await assert.rejects(f.publish(), /unconfirmed topic/, 'restoring GET availability is not a validation request');
+  await f.callMove({ message_id: 21, topic: 'confirmed' });
   await f.publish();
-  assert.equal(f.sent.at(-1).topic, 'first');
+  assert.equal(f.sent.at(-1).topic, 'confirmed');
 });
 
 test('idle tokens age out without another move or event', async t => {
@@ -699,6 +713,122 @@ test('a pending result cannot restore tokens cleared by queue replacement', asyn
   const before = f.reconciled.length;
   f.feed(move([21], { message_id: 21, subject: 'first' }));
   await until(() => f.reconciled.length > before, 'echo with no retained token');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  assert.equal(f.placements.get(21).subject, 'first');
+});
+
+
+test('ambiguous bulk self echo has a zero placement-request budget for 1,000 IDs', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  const reads = f.placementReads.length;
+  const before = f.reconciled.length;
+  const ids = [21, ...Array.from({ length: 999 }, (_, i) => 1000 + i)];
+  f.feed(move(ids, { message_id: 21, orig_subject: 'first', subject: 'ambiguous' }));
+  await until(() => f.reconciled.length > before, 'bulk echo processed');
+  assert.equal(f.placementReads.length - reads, 0, 'ambiguous echo budget is zero, including uncached IDs');
+  assert.equal(f.cachedPlacement(1000), undefined, 'bulk echoes do not populate unseen messages');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+});
+
+test('ambiguous self echoes leave zero live HTTP requests across events and after stop', async t => {
+  const f = await fixture();
+  const sockets = new Set<import('node:net').Socket>();
+  let live = 0, peak = 0, requests = 0;
+  const blackhole = createServer((_req, res) => {
+    requests++; live++; peak = Math.max(peak, live);
+    res.on('close', () => live--);
+    // Deliberately never send headers or a body.
+  });
+  blackhole.on('connection', socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  blackhole.listen(0, '127.0.0.1');
+  await once(blackhole, 'listening');
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    blackhole.close();
+    blackhole.closeAllConnections();
+    await once(blackhole, 'close');
+    await f.close();
+  });
+  const url = `http://127.0.0.1:${(blackhole.address() as { port: number }).port}`;
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  f.readPlacementWith(id => new Promise((resolve, reject) => {
+    const req = get(`${url}/${id}`, res => {
+      res.resume();
+      res.on('end', () => resolve({ result: 'error' }));
+    });
+    req.on('error', reject);
+  }));
+  for (let event = 0; event < 3; event++) {
+    // A real message event re-establishes cached placement before each echo,
+    // so baseline failures exercise the bulk read path, not locate().
+    const beforeMessage = f.reconciled.length;
+    const previousReads = f.placementReads.length;
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+    // Message events and subsequent changes share one poll batch in order.
+    f.feed(move([21, ...Array.from({ length: 7 }, (_, i) => 100 + event * 7 + i)],
+      { message_id: 21, subject: `ambiguous-${event}` }));
+    await until(() => f.reconciled.length > beforeMessage || f.placementReads.length > previousReads,
+      'echo reconciled or baseline GETs started');
+    if (f.placementReads.length > previousReads) {
+      // On the rejected implementation, allow the 15s Promise timeout to
+      // expire: it does not cancel these sockets, and the next event adds 8.
+      await new Promise(r => setTimeout(r, 15_050));
+      await until(() => f.reconciled.length > beforeMessage, 'baseline timeout completed');
+    }
+  }
+  f.stopEvents();
+  await new Promise(r => setTimeout(r, 25));
+  assert.deepEqual({ requests, peak, liveAfterStop: live }, { requests: 0, peak: 0, liveAfterStop: 0 },
+    'ambiguous-echo validation must create no requests, including after stop');
+});
+
+test('a delayed pending echo cannot roll back a newer completed tool move', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let firstEcho: any;
+  f.onPatch(async event => {
+    if (event.subject === 'first') { firstEcho = event; await held; }
+  });
+  const first = f.callMove({ message_id: 21, topic: 'first' });
+  try {
+    await until(() => firstEcho !== undefined, 'first PATCH held');
+    // The host serializes tools/call requests. Invoke the second runtime call
+    // directly to exercise genuinely overlapping local tool operations.
+    await f.tools.handleToolCall('move_messages', { message_id: 21, topic: 'second' });
+    assert.equal(f.cachedPlacement(21).topic, 'second');
+    const before = f.reconciled.length;
+    f.feed(firstEcho);
+    await until(() => f.reconciled.length > before, 'old pending echo');
+    assert.equal(f.reconciled.at(-1).routingUncertain, true);
+    assert.equal(f.cachedPlacement(21).topic, 'second', 'old pending echo never replays first');
+  } finally { release(); await first; }
   await f.publish();
-  assert.equal(f.sent.at(-1).topic, 'first');
+  assert.equal(f.sent.at(-1).topic, 'second', 'tool result reads actual stored placement');
+});
+
+test('an uncached ambiguous self anchor and unknown stream do not trigger fallback GETs', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  const reads = f.placementReads.length;
+  const before = f.reconciled.length;
+  f.feed(move([999, 21], { message_id: 999, stream_id: 404, new_stream_id: 405, subject: 'ambiguous' }));
+  await until(() => f.reconciled.length > before, 'uncached-anchor echo');
+  assert.equal(f.placementReads.length - reads, 0);
+  await assert.rejects(f.publish(), /unconfirmed topic/);
 });
