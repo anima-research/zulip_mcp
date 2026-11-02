@@ -49,10 +49,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   otherwise live messages/edits share a three-second wait budget each and
   history reads share eight target GETs and a three-second wait budget per
   page. Closed-channel catch-up additionally shares at most six seconds of
-  quote-lookup waiting across all pages and both passes: three seconds for
-  the initial walk and up to three more for one retry walk over all deferred
-  rows. Other channels have separate call allowances. Cache/page matches
-  remain usable after exhaustion. All uncached quote-target GETs, live and
+  quote-lookup waiting across all pages and both walks. The initial walk
+  waits at most three seconds; the retry walk uses whatever remains of the
+  shared six-second allowance. Other channels have separate call allowances.
+  Cache/page matches remain usable after exhaustion. All uncached quote-target GETs, live and
   history, also share a process-wide token bucket: a burst of 30 and refill
   of 30 per minute (one token every two seconds). A page, channel, reconnect
   or additional adapter cannot reset it. Exhaustion reports budget-skipped

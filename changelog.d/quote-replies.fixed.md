@@ -11,8 +11,9 @@
   page, including reconnect sweeps and tally backfill. Budget-starved rows
   stop the initial closed-channel block short of the first deferred row and
   receive one retry walk over all deferred rows in the same catch-up call.
-  Quote waiting across all pages and both walks is capped at six seconds
-  (three seconds per pass); rows still unverified then fail closed.
+  Quote waiting across all pages and both walks is capped at six seconds.
+  The initial walk waits at most three seconds; the retry walk uses whatever
+  remains of the shared six-second allowance. Rows still unverified then fail closed.
   Content edits recompute reply addressing from the new raw Markdown; moves
   and deletions retain the last known reply verdict separately from mentions.
   Translated heading punctuation (spaces, including NBSP, and full-width
