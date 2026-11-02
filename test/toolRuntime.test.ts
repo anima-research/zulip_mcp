@@ -434,7 +434,7 @@ test('send_message schema advertises string destinations and DM email addresses'
 
 test('send_message schema leaves destination requirements to the runtime', () => {
   const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
-  assert.equal(schema.required?.includes('type') ?? false, false);
+  assert.equal(schema.required, undefined);
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
   assert.equal(properties.reply_to.type, 'integer');
