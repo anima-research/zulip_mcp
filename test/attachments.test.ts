@@ -9,6 +9,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import sharp from 'sharp';
 import {
   IMAGE_LONG_EDGE_MAX,
@@ -69,6 +73,40 @@ test('an animated GIF under the cap is inlined as it is, frames unresized, even 
   assert.ok(norm);
   assert.equal(norm.mimeType, 'image/gif');
   assert.equal(Buffer.from(norm.data, 'base64').equals(gif), true);
+});
+
+const REFUSE_SHARP = `data:text/javascript,${encodeURIComponent(
+  `import { register } from 'node:module';
+register('data:text/javascript,' + encodeURIComponent('export async function resolve(s, c, n) { if (s === "sharp") throw new Error("sharp refused by this test"); return n(s, c); }'));`,
+)}`;
+
+function startWithoutSharp(env: Record<string, string>) {
+  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('ZULIP_')));
+  return spawnSync(process.execPath, ['--import', 'tsx', '--import', REFUSE_SHARP, fileURLToPath(new URL('../src/index.ts', import.meta.url))], {
+    env: { ...base, ...env },
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+}
+
+test('with image inlining on, a server whose sharp cannot load exits at start, naming both ways through', () => {
+  const run = startWithoutSharp({});
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /sharp refused by this test/);
+  const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+  const { version } = JSON.parse(readFileSync(new URL('../node_modules/sharp/package.json', import.meta.url), 'utf8')) as { version: string };
+  assert.ok(run.stderr.includes(`by running npm install @img/sharp-wasm32@${version} in this directory:\n${root}\n`), run.stderr);
+  assert.match(run.stderr, /ZULIP_INLINE_IMAGES=false/);
+  assert.doesNotMatch(run.stderr, /ZULIP_REALM must be set/);
+});
+
+test('with image inlining off, or its per-message limit at 0, the server starts without loading sharp', () => {
+  for (const env of [{ ZULIP_INLINE_IMAGES: 'false' }, { ZULIP_INLINE_IMAGES_MAX: '0' }]) {
+    const run = startWithoutSharp(env);
+    assert.equal(run.status, 1, JSON.stringify(env));
+    assert.match(run.stderr, /ZULIP_REALM must be set/, JSON.stringify(env));
+    assert.doesNotMatch(run.stderr, /sharp refused by this test/, JSON.stringify(env));
+  }
 });
 
 test('resolveInlineOptions clamps the text cap and reads the knobs', () => {

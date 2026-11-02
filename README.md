@@ -64,7 +64,7 @@ npm install
 npm run build
 ```
 
-Requires Node 20.10 or later. `npm test` runs the suite (`node --test`, no network).
+Requires Node 20.10 or later. Image inlining uses sharp: where it can't load and images may be inlined, the server exits at start, naming the two ways through, installing sharp's WebAssembly build where the server is installed or setting `ZULIP_INLINE_IMAGES=false`. `npm test` runs the suite (`node --test`, no network).
 
 ## Configuration
 
