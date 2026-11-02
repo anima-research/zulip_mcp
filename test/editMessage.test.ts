@@ -350,7 +350,7 @@ test('move_messages resolves destination names only as a fallback after losing v
     const f = await fixture({ result: 'success', msg: '' }, 200, true);
     try {
       const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic, propagate_mode: 'change_all' });
-      assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: topic ?? 'deploys' });
+      assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: topic === undefined ? 'deploys' : null });
       assert.equal(f.calls.length, 1);
       assert.equal(f.lookups.length, topic === undefined ? 3 : 2, 'a supplied topic skips the pre-move read');
       assert.ok(f.lookups.at(-1)!.startsWith('/api/v1/streams'), 'stream names are requested only after the placement read fails');
@@ -414,5 +414,14 @@ test('move_messages preserves a null partial-retry target', async () => {
   try {
     await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, topic: 'next' }),
       /first_message_id_allowed_to_move=null/);
+  } finally { await f.close(); }
+});
+
+test('a requested topic is unconfirmed when post-move placement cannot be read', async () => {
+  const f = await fixture({ result: 'success', msg: '' }, 200, true);
+  try {
+    const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic: '  deploys ' });
+    assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: null });
+    assert.match(result.routing_note, /Move succeeded.*before publishing/);
   } finally { await f.close(); }
 });

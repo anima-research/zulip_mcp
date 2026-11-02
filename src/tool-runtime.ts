@@ -740,7 +740,7 @@ export class ZulipToolRuntime {
             : null;
           movedTo = {
             channelId: null,
-            topic: args.topic ?? (typeof anchor?.message?.subject === "string" ? anchor.message.subject : null),
+            topic: typeof anchor?.message?.subject === "string" ? anchor.message.subject : null,
           };
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
