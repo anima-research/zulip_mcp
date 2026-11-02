@@ -150,6 +150,11 @@ const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
+/** Process-wide quote-only bucket: burst 30, sustained 30 GETs/minute.
+ *  Sends, reactions and edit placement do not spend these tokens. */
+const QUOTE_GET_BURST = 30;
+const QUOTE_GET_REFILL_PER_MS = 30 / 60_000;
+
 class LookupTimeoutError extends Error {}
 
 /** Bound the wait only: zulip-js does not pass an AbortSignal to fetch, so
@@ -212,6 +217,18 @@ export class ZulipAdapter implements PlatformAdapter {
    *  evicted. A deletion can only be placed from here — the message is gone. */
   private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
+  private static quoteBudget = { tokens: QUOTE_GET_BURST, updatedAt: performance.now() };
+
+  private static takeQuoteToken(): boolean {
+    const budget = ZulipAdapter.quoteBudget;
+    const now = performance.now();
+    budget.tokens = Math.min(QUOTE_GET_BURST, budget.tokens + Math.max(0, now - budget.updatedAt) * QUOTE_GET_REFILL_PER_MS);
+    budget.updatedAt = now;
+    if (budget.tokens < 1) return false;
+    budget.tokens--;
+    return true;
+  }
+
   /** Failed quote-target GETs only; id → retry-after timestamp. Bounded like seen. */
   private failedQuoteLookups = new Map<number, number>();
   /** Stream names by id, from discovery (refreshed on a miss): how a
@@ -420,6 +437,7 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Cache definite failures, not deadlines: a deferred pass needs a fresh
    *  chance to resolve a target whose earlier request merely timed out. */
   private async resolveQuoteTarget(id: number, remainingMs: number): Promise<QuoteLookup> {
+    if (!ZulipAdapter.takeQuoteToken()) return 'budget-skipped';
     try {
       const quoted = await this.locate(id, 'a quote reply', remainingMs, true);
       if (!quoted) this.rememberFailedQuoteLookup(id);
@@ -880,7 +898,8 @@ export class ZulipAdapter implements PlatformAdapter {
     });
     // Page authors take precedence over older cached rows, including targets
     // later in the page and pages larger than the seen cache. Uncached targets
-    // share a GET cap and wait budget for this page, never for other channels.
+    // share a page GET cap and wait budget, within the process-wide quote
+    // bucket and any catch-up call deadline supplied by the server.
     const pageById = new Map(page.messages.map((m) => [m.id, m]));
     let getsLeft = HISTORY_QUOTE_GET_CAP;
     const deadline = Math.min(performance.now() + QUOTE_TIMEOUT_MS, query.quoteLookupDeadline ?? Infinity);

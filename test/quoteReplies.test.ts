@@ -1,9 +1,17 @@
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
 import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
+
+// Isolate the process-wide limiter between tests, without bypassing it in
+// individual cases (including the multi-adapter saturation regression).
+beforeEach(() => {
+  (ZulipAdapter as unknown as {
+    quoteBudget: { tokens: number; updatedAt: number };
+  }).quoteBudget = { tokens: 30, updatedAt: performance.now() };
+});
 
 const SELF = 100;
 const QUOTED = 200;
@@ -610,3 +618,45 @@ for (const resolvedOther of [false, true]) {
   } finally { adapter.stopEvents(); }
 });
 }
+
+test('R2-5: quote GETs share one process-wide bucket across pages, adapters and live events', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  let target = 500;
+  let gets = 0;
+  const getById = async ({ message_id }: Record<string, unknown>) => {
+    gets++;
+    return { message: raw(Number(message_id), 'original', { sender_id: SELF }) };
+  };
+  const client = { messages: {
+    retrieve: async () => ({ messages: [raw(2000 + target, quote(target))], found_newest: true }),
+    getById,
+  } };
+  const adapters = [new ZulipAdapter(client, SELF, 'one'), new ZulipAdapter(client, SELF, 'two')];
+  for (; target < 530; target++) {
+    const page = await adapters[target % 2].fetchHistory(`zulip:channel-${target}`, { limit: 100 });
+    assert.equal(page.messages[0].metadata?.replyToSelf, true);
+  }
+  assert.equal(gets, 30);
+  target = 999;
+  const blocked = () => adapters[0].fetchHistory('zulip:other', { limit: 100 });
+  assert.deepEqual((await blocked()).unverifiedMessageIds, ['2999']);
+  assert.equal(gets, 30, 'a fresh page or adapter cannot reset the process allowance');
+  const live = await receive([raw(1800, quote(1801))], getById);
+  assert.equal(live[0].metadata?.replyToSelf, false);
+  assert.equal(gets, 30, 'live lookups share the same bucket');
+  target = 500;
+  assert.equal((await blocked()).messages[0].metadata?.replyToSelf, true, 'cache hits stay usable without a token');
+  target = 999;
+  now = 1999;
+  assert.deepEqual((await blocked()).unverifiedMessageIds, ['2999']);
+  now = 2000;
+  assert.equal((await blocked()).messages[0].metadata?.replyToSelf, true, 'one token refills every two seconds; rate skips are not negative-cached');
+  assert.equal(gets, 31);
+  now = 3_600_000;
+  for (target = 10_000; target < 10_030; target++) {
+    assert.equal((await blocked()).messages[0].metadata?.replyToSelf, true);
+  }
+  assert.deepEqual((await blocked()).unverifiedMessageIds, ['12030']);
+  assert.equal(gets, 61, 'long idle periods refill at most the 30-token burst');
+});

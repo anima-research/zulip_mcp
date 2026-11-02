@@ -9,7 +9,7 @@
  * Run: node --import tsx --test test/server.test.ts
  */
 
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import {
@@ -35,6 +35,14 @@ import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
+
+// Isolate the process-wide limiter between tests, without bypassing it in
+// individual cases (including the multi-adapter saturation regression).
+beforeEach(() => {
+  (ZulipAdapter as unknown as {
+    quoteBudget: { tokens: number; updatedAt: number };
+  }).quoteBudget = { tokens: 30, updatedAt: performance.now() };
+});
 
 const DESCRIPTOR: ChannelDescriptor = {
   id: 'zulip:general',

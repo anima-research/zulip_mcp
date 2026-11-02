@@ -52,7 +52,14 @@ Discord and Slack adapters that once lived here moved to those servers.
   quote-lookup waiting across all pages and both passes: three seconds for
   the initial walk and up to three more for one retry walk over all deferred
   rows. Other channels have separate call allowances. Cache/page matches
-  remain usable after exhaustion. A budget-starved quote row stops the
+  remain usable after exhaustion. All uncached quote-target GETs, live and
+  history, also share a process-wide token bucket: a burst of 30 and refill
+  of 30 per minute (one token every two seconds). A page, channel, reconnect
+  or additional adapter cannot reset it. Exhaustion reports budget-skipped
+  rows without waiting for a token or negative-caching the target; ordinary
+  sends, reactions and edit-placement lookups do not spend these tokens.
+  This limits quote traffic only, not all Zulip API requests.
+  A budget-starved quote row stops the
   initial catch-up block short of that row; the single retry stays within
   the original catch-up ceiling. Any rows still unverified on retry fail
   closed, allowing the backlog to proceed without another gap or reconnect.
@@ -70,13 +77,20 @@ Discord and Slack adapters that once lived here moved to those servers.
   `push/event`). During the pre-live sweep, scan advancement is staged while
   buffered live replies are reconciled; it is committed at go-live, graceful
   shutdown, or before a new connection resets the staged state, preserving
-  accepted catch-up progress while refused replies retain their holds. It
+  accepted catch-up progress while refused replies retain their holds and
+  unoffered buffered replies cap the committed scan below their ids. It
   never advances past a message the host was offered but did not
   accept — a refusal, a batch lost to a transport failure — which is
   replayed from history once the host answers again. On the next connection
-  a `<missed>` block per channel delivers what arrived meanwhile (full
+  one or more `<missed>` blocks per channel deliver what arrived meanwhile (full
   backscroll for channels the host had open, addressed message ± 7 for the
-  rest). Addressed-only blocks use `reason="mention"` when every counted
+  rest). Deferred quote verification can split a channel into an accepted
+  prefix block and a retry block; consumers must not assume one block per
+  channel. Closed-DM catch-up uses `chat:dm` and `chat:private`, not a
+  synthesized `chat:mention`; unmentioned DMs have `metadata.mentioned: false`
+  and `origin.isMention: false`. Policies that previously matched DM catch-up
+  via mention tags or flags should match the DM/private tags instead.
+  Addressed-only blocks use `reason="mention"` when every counted
   addressed message is a mention, otherwise `reason="addressed"`; full
   backscroll uses `reason="backscroll"`. Blocks are paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
   event-queue expiry is healed the same way — open channels replayed, closed
