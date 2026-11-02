@@ -251,7 +251,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "edit_message",
-    description: "Edit the content of your own Zulip messages by ID (subject to the realm's message-edit time limit). Use move_messages to rename topics or move messages.",
+    description: "Edit the content of your own Zulip messages by ID (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic. Use move_messages to rename topics or move messages.",
     inputSchema: {
       type: "object",
       properties: {

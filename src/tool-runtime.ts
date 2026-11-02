@@ -770,7 +770,7 @@ export class ZulipToolRuntime {
           const fields = ["code", "first_message_id_allowed_to_move", "total_messages_in_topic", "total_messages_allowed_to_move"];
           const structured = fields.flatMap((field) => {
             const value = result?.[field];
-            if (field === "code" ? typeof value !== "string" : typeof value !== "number" || !Number.isFinite(value)) return [];
+            if (field === "code" ? typeof value !== "string" : value !== null && (typeof value !== "number" || !Number.isFinite(value))) return [];
             let safe = String(value).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
             for (const credential of credentials.filter(Boolean)) safe = safe.replaceAll(credential, "[redacted]");
             return [`${field}=${safe.slice(0, 160)}`];

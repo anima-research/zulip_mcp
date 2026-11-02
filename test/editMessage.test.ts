@@ -400,3 +400,19 @@ for (const [name, verb, fields] of [
     });
   }
 }
+
+test('edit_message keeps live-status anti-flood and expired-window guidance', () => {
+  const description = toolDefinitions.find(tool => tool.name === 'edit_message')!.description;
+  assert.match(description, /an expired window returns an error/);
+  assert.match(description, /post once with send_message, then update it in place instead of flooding the topic/);
+});
+
+test('move_messages preserves a null partial-retry target', async () => {
+  const f = await fixture({ result: 'error', msg: 'No messages may move',
+    code: 'MOVE_MESSAGES_TIME_LIMIT_EXCEEDED', first_message_id_allowed_to_move: null,
+    total_messages_in_topic: 10, total_messages_allowed_to_move: 0 }, 400);
+  try {
+    await assert.rejects(f.tools.handleToolCall('move_messages', { message_id: 42, topic: 'next' }),
+      /first_message_id_allowed_to_move=null/);
+  } finally { await f.close(); }
+});
