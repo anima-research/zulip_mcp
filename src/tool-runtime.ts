@@ -17,6 +17,7 @@ import {
   parseZulipAttachmentUrl,
   toFetchResult,
 } from "./content.js";
+import type { SelfMove } from "./platforms/adapter.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
@@ -230,6 +231,8 @@ export class ZulipToolRuntime {
   /** Set by the MCPL server: every message sent by a tool is reported here
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
+  /** Successful moves reconcile routing/cache without waiting for an echo. */
+  onMoved: ((move: SelfMove) => void) | null = null;
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
@@ -731,17 +734,22 @@ export class ZulipToolRuntime {
         if (!this.session.realm || !this.session.authHeader) {
           throw new Error(`Cannot ${moving ? "move" : "edit"} messages: realm or bot credentials are unknown`);
         }
-        // Keep a fallback before moving: the destination may remove our
-        // visibility, in which case the message cannot be read afterwards.
+        // The original placement decides the propagation range even when the
+        // acted-on message is not the current conversation's source.
+        let original: any = null;
+        if (moving) {
+          try {
+            const before = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
+            if (before?.result === "success") original = before.message;
+          } catch { /* Cache/event reconciliation remains available. */ }
+        }
+        const source = typeof original?.display_recipient === "string" && typeof original?.subject === "string"
+          ? { channelId: `zulip:${original.display_recipient}`, topic: original.subject } : null;
+        const newStreamId = moving && args.stream_id !== undefined && args.stream_id !== original?.stream_id
+          ? args.stream_id : null;
         let movedTo: { channelId: string | null; topic: string | null } | undefined;
         if (moving && args.stream_id !== undefined) {
-          const anchor = args.topic === undefined
-            ? await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }).catch(() => null)
-            : null;
-          movedTo = {
-            channelId: null,
-            topic: typeof anchor?.message?.subject === "string" ? anchor.message.subject : null,
-          };
+          movedTo = { channelId: null, topic: args.topic === undefined ? source?.topic ?? null : null };
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
         const editFields = new URLSearchParams();
@@ -786,33 +794,41 @@ export class ZulipToolRuntime {
         if (result.ignored_parameters_unsupported?.length) {
           throw new Error(`Zulip refused ${operation}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
         }
-        if (movedTo) {
-          // Prefer the actual resulting placement (Zulip may normalise the
-          // topic); a failed follow-up read must not turn a successful move
-          // into a tool error and invite a duplicate move.
+        if (moving) {
+          // Never report a failed follow-up read as a failed move: retrying
+          // would repeat an already successful write. Only stored subjects
+          // confirm a requested (possibly normalized/truncated) topic.
+          let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
+          let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
           try {
             const placed = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
-            if (placed?.result === "success" && placed.message?.stream_id === args.stream_id) {
-              if (typeof placed.message.display_recipient === "string") movedTo.channelId = `zulip:${placed.message.display_recipient}`;
-              if (typeof placed.message.subject === "string") movedTo.topic = placed.message.subject;
+            if (placed?.result === "success" &&
+                (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
+              if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
+              if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
             }
           } catch { /* The bot may have lost visibility after moving. */ }
-          if (movedTo.channelId === null) {
-            // Only enumerate streams when the post-move message cannot
-            // name the destination (for example, after losing visibility).
+          if (movedTo && destinationChannelId === null) {
             try {
               const streams = await zulipClient.streams.retrieve({ include_public: true, include_subscribed: true });
               const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
-              if (typeof destination?.name === "string") movedTo.channelId = `zulip:${destination.name}`;
+              if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
             } catch { /* Preserve the successful move even if lookup fails. */ }
           }
-          return {
-            ...result,
-            moved_to: movedTo,
-            ...(movedTo.channelId === null || movedTo.topic === null
-              ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
-              : {}),
-          };
+          this.onMoved?.({
+            messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
+            newStreamId, destinationChannelId, topic: storedTopic,
+          });
+          if (movedTo) {
+            movedTo = { channelId: destinationChannelId, topic: storedTopic };
+            return {
+              ...result,
+              moved_to: movedTo,
+              ...(movedTo.channelId === null || movedTo.topic === null
+                ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
+                : {}),
+            };
+          }
         }
         return result;
       }

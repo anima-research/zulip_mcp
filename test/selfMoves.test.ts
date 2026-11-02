@@ -2,6 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,7 +34,7 @@ function raw(id: number, topic = 'deploys') {
   };
 }
 
-async function fixture(policy: ZulipFilters = {}) {
+async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-self-move-'));
   const filtersPath = join(dir, 'filters.json');
   writeFileSync(filtersPath, JSON.stringify({ reactionChannels: [GENERAL, ARCHIVE], ...policy }));
@@ -42,13 +44,41 @@ async function fixture(policy: ZulipFilters = {}) {
   let eventId = 0;
   const sent: any[] = [];
   const typing: any[] = [];
+  const placements = new Map<number, any>();
+  const api = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const fields = new URLSearchParams(Buffer.concat(chunks).toString());
+    const id = Number(req.url!.split('/').at(-1));
+    const original = placements.get(id) ?? raw(id);
+    const mode = fields.get('propagate_mode') ?? 'change_one';
+    for (const n of [20, 21, 30]) {
+      const m = placements.get(n) ?? raw(n);
+      if (n !== id && (mode === 'change_one' || m.subject !== original.subject ||
+          m.stream_id !== original.stream_id || (mode === 'change_later' && n < id))) continue;
+      placements.set(n, { ...m,
+        ...(fields.has('topic') ? { subject: fields.get('topic')!.trim() } : {}),
+        ...(fields.has('stream_id') ? { stream_id: Number(fields.get('stream_id')),
+          display_recipient: Number(fields.get('stream_id')) === 8 ? 'archive' : 'new-stream' } : {}),
+      });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ result: 'success', msg: '' }));
+  });
+  api.listen(0, '127.0.0.1');
+  await once(api, 'listening');
+  const realm = `http://127.0.0.1:${(api.address() as { port: number }).port}`;
   const client = {
     streams: { retrieve: async () => ({ result: 'success', streams: [
       { name: 'general', stream_id: 7 }, { name: 'archive', stream_id: 8 },
     ] }) },
     messages: {
       retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-      getById: async ({ message_id }: any) => ({ result: 'success', message: raw(message_id) }),
+      getById: async ({ message_id }: any) => {
+        const message = placements.get(message_id) ?? raw(message_id);
+        if (invisibleDestination && message.stream_id !== 7) return { result: 'error', msg: 'Not visible' };
+        return { result: 'success', message };
+      },
       send: async (args: any) => { sent.push(args); return { result: 'success', id: 1000 + sent.length }; },
     },
     typing: { send: async (args: any) => { typing.push(args); return { result: 'success' }; } },
@@ -60,7 +90,7 @@ async function fixture(policy: ZulipFilters = {}) {
     } },
   };
   const adapter = new ZulipAdapter(client, SELF, 'test', { filters, dmDiscoveryLimit: 0 });
-  const tools = new ZulipToolRuntime({ client, selfUserId: SELF, sessionId: 'test' }, dir);
+  const tools = new ZulipToolRuntime({ client, selfUserId: SELF, sessionId: 'test', realm, authHeader: 'Basic dGVzdDp0ZXN0' }, dir);
   const server = new ZulipMcplServer(adapter, tools, {
     mcplEnabled: true, filters, stateDir: null, batchWindowMs: 5, formatTime: () => 'T',
   });
@@ -100,7 +130,7 @@ async function fixture(policy: ZulipFilters = {}) {
   ] });
   await until(() => server.isLive, 'live delivery');
   return {
-    host, server, tools, sent, typing, incoming, pushes, reconciled,
+    host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
     feed(...events: any[]) { pending.push(...events.map(event => ({ ...event, id: ++eventId }))); },
     async open(channelId = GENERAL) {
       await host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {}, backscroll: 0 });
@@ -117,6 +147,9 @@ async function fixture(policy: ZulipFilters = {}) {
       await server.shutdown();
       host.close();
       filters.stop();
+      api.close();
+      api.closeAllConnections();
+      await once(api, 'close');
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -270,3 +303,84 @@ for (const busyDestination of [false, true]) {
     assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['archive', 'deploys']);
   });
 }
+
+for (const mode of ['change_one', 'change_later', 'change_all'] as const) {
+  for (const hintId of [20, 21, 30]) {
+    test(`tool success reconciles ${mode} without an echo (hint ${hintId})`, async t => {
+      const f = await fixture();
+      t.after(() => f.close());
+      const message = raw(hintId, hintId === 30 ? 'support' : 'deploys');
+      f.placements.set(hintId, message);
+      f.feed({ type: 'message', flags: ['mentioned'], message });
+      await until(() => f.server.delivery.watermark(GENERAL) === hintId, 'mention accepted');
+      await f.tools.handleToolCall('move_messages', { message_id: 21, topic: '  renamed ', propagate_mode: mode });
+      await f.publish();
+      const affected = hintId === 21 || (mode === 'change_all' && hintId === 20);
+      assert.equal(f.sent[0].topic, affected ? 'renamed' : message.subject);
+    });
+  }
+}
+
+test('cross-stream tool success blocks source immediately and re-seats co-moved reactions before any echo', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  await f.open(ARCHIVE);
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.type('start');
+  const result = await f.tools.handleToolCall('move_messages', { message_id: 20, stream_id: 8, propagate_mode: 'change_later' });
+  assert.deepEqual(result.moved_to, { channelId: ARCHIVE, topic: 'deploys' });
+  await assert.rejects(f.publish(), /moved.*zulip:archive.*deploys/);
+  await f.type('start');
+  f.feed({ type: 'reaction', op: 'add', message_id: 21, user_id: 7,
+    emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji' });
+  await until(() => f.incoming.some(m => m.metadata?.reaction), 'reaction delivered');
+  assert.equal(f.incoming.find(m => m.metadata?.reaction)!.channelId, ARCHIVE);
+  f.feed(move([20, 21], { new_stream_id: 8, subject: undefined }));
+  await until(() => f.reconciled.length >= 2, 'echo confirmation');
+  await assert.rejects(f.publish(), /moved.*zulip:archive.*deploys/);
+  await f.publish(ARCHIVE);
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['archive', 'deploys'], 'echo does not turn destination into a moved marker');
+  assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [['start', 'deploys'], ['stop', 'deploys']]);
+});
+
+test('an unresolved destination echo blocks source routing and invalidates old placement', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  f.placements.set(21, { ...raw(21), stream_id: 9, display_recipient: 'new-stream' });
+  f.feed(move([20, 21], { new_stream_id: 9, subject: undefined }));
+  await until(() => f.reconciled.length === 1, 'unresolved move reconciled');
+  await assert.rejects(f.publish(), /moved.*stream 9/);
+  f.feed({ type: 'reaction', op: 'add', message_id: 21, user_id: 7, emoji_name: 'eyes' });
+  await new Promise(r => setTimeout(r, 30));
+  assert.ok(!f.incoming.some(m => m.metadata?.reaction && m.channelId === GENERAL), 'no stale source reaction');
+});
+
+test('tool success with an invisible unknown destination still blocks the source', async t => {
+  const f = await fixture({}, true);
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  const result = await f.tools.handleToolCall('move_messages', { message_id: 20, stream_id: 9, propagate_mode: 'change_all' });
+  assert.equal(result.result, 'success');
+  assert.equal(result.moved_to.channelId, null);
+  await assert.rejects(f.publish(), /moved.*stream 9/);
+});
+
+test('a successful placement read resolves a new stream for the later echo too', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.tools.handleToolCall('move_messages', { message_id: 20, stream_id: 9, propagate_mode: 'change_all' });
+  await assert.rejects(f.publish(), /moved.*zulip:new-stream.*deploys/);
+  f.feed(move([20, 21], { new_stream_id: 9, subject: undefined }));
+  await until(() => f.reconciled.length === 2, 'echo confirmation');
+  await assert.rejects(f.publish(), /moved.*zulip:new-stream.*deploys/);
+  await f.publish('zulip:new-stream');
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['new-stream', 'deploys']);
+});

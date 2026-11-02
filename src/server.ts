@@ -235,6 +235,7 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.tools.onMoved = (move) => this.adapter.noteSelfMoved?.(move);
     this.adapter.onSelfChanged = (change) => this.channelManager.reconcileSelfChange(change);
   }
 

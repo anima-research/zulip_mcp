@@ -523,11 +523,26 @@ export class ChannelManager {
    * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
-    if (change.previousTopic === null && change.movedToChannelId === null) return;
+    if (change.previousTopic === null && change.movedToChannelId === null &&
+        change.newStreamId == null && !change.routingUncertain) return;
     const source = this.lastIncoming.get(change.channelId);
-    if (source?.from === undefined || !change.messageIds.includes(String(source.from))) return;
+    if (source?.from === undefined) return;
+    const scope = change.moveScope;
+    const inScope = scope && source.hints.threadId === scope.topic &&
+      (scope.propagateMode === 'change_all' ||
+        (scope.propagateMode === 'change_later' && source.from >= Number(change.messageId)));
+    if (!change.messageIds.includes(String(source.from)) && !inScope) return;
+    if ((change.newStreamId != null && change.movedToChannelId === null) || change.routingUncertain) {
+      this.lastIncoming.set(change.channelId, { ...source, movedTo: {
+        channelId: change.movedToChannelId,
+        topic: change.routingUncertain ? null : change.topic,
+        ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
+      } });
+      return;
+    }
+    const { movedTo: _movedTo, ...current } = source;
     const updated = {
-      ...source,
+      ...current,
       hints: {
         ...source.hints,
         threadId: change.topic,

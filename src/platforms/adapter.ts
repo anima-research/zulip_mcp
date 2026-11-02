@@ -93,6 +93,17 @@ export interface ReactionEvent {
 
 export type OnReaction = (event: ReactionEvent) => void;
 
+/** Confirmed tool success, independent of the asynchronous event echo. */
+export interface SelfMove {
+  messageId: number;
+  source: { channelId: string; topic: string } | null;
+  propagateMode: 'change_one' | 'change_later' | 'change_all';
+  newStreamId: number | null;
+  destinationChannelId: string | null;
+  /** Null if the stored topic could not be confirmed. */
+  topic: string | null;
+}
+
 /**
  * A message the agent may have seen was edited, moved to another topic or
  * stream, or deleted — resolved to the channel the message lived in.
@@ -120,6 +131,12 @@ export interface MessageChangeEvent {
   previousTopic: string | null;
   /** The channel the message moved to, when it left this one. */
   movedToChannelId: string | null;
+  /** Retained even when the destination name cannot be resolved. */
+  newStreamId?: number | null;
+  /** Tool success can cover uncached conversation sources by original topic. */
+  moveScope?: { topic: string; propagateMode: SelfMove['propagateMode'] };
+  /** Successful move whose stored destination topic is not yet known. */
+  routingUncertain?: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -242,6 +259,8 @@ export interface PlatformAdapter {
   /** The bot's own changes reconcile local routing without delivering a
    *  marker to the host or waking the agent. */
   onSelfChanged?: OnMessageChange;
+  /** Reconcile a successful tool move before returning its result. */
+  noteSelfMoved?(move: SelfMove): void;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

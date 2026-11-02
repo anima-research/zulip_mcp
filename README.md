@@ -185,7 +185,11 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 read). A change line never sets `threadId` and never moves this server's
 reply routing: a moderator archiving an old message does not retarget the
 reply the agent is composing. The bot's own moves emit no marker but update
-reply and typing hints when the current conversation's source message moved.
+reply hints when the current conversation's source message moved. Successful
+`move_messages` calls reconcile routing and cached placement before returning;
+the event echo is an idempotent confirmation, not a prerequisite. A typing
+refresh stops the run in its original topic before following a same-stream
+rename.
 After a cross-stream move, a source-channel publish is refused with an error
 naming the destination, and source typing stops. Confirm with `send_message`
 using the stream named by `moved_to.channelId` and the explicit `moved_to.topic`.

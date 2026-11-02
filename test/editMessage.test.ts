@@ -194,10 +194,10 @@ for (const { label, fields } of edits) {
         message_id: 42, ...fields, extra: 'not sent',
       }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
       if ('stream_id' in fields) {
-        assert.equal(f.lookups.length, 'topic' in fields ? 1 : 2, 'only omitted topics need a pre-move read');
+        assert.equal(f.lookups.length, 2, 'all moves read original and resulting placement');
         assert.ok(f.lookups.every(path => path.startsWith('/api/v1/messages/')), 'readable destinations need no stream enumeration');
       } else {
-        assert.deepEqual(f.lookups, []);
+        assert.equal(f.lookups.length, 2, 'same-stream moves also reconcile from tool success');
       }
       const expected = new URLSearchParams(Object.entries(fields).map(([key, value]) => [key, String(value)]));
       assert.deepEqual(f.calls, [{
@@ -352,7 +352,7 @@ test('move_messages resolves destination names only as a fallback after losing v
       const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic, propagate_mode: 'change_all' });
       assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: topic === undefined ? 'deploys' : null });
       assert.equal(f.calls.length, 1);
-      assert.equal(f.lookups.length, topic === undefined ? 3 : 2, 'a supplied topic skips the pre-move read');
+      assert.equal(f.lookups.length, 3, 'pre-move, post-move, and fallback stream lookup');
       assert.ok(f.lookups.at(-1)!.startsWith('/api/v1/streams'), 'stream names are requested only after the placement read fails');
       assert.equal(f.lookups.filter(path => path.startsWith('/api/v1/streams')).length, 1);
     } finally { await f.close(); }

@@ -32,6 +32,7 @@ import type {
   PlatformAdapter,
   PublishResult,
   RoutingHints,
+  SelfMove,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { chunkMessage, cleanMarkdown } from '../content.js';
@@ -356,6 +357,46 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
+  /** Re-seat the known propagation range and routing before the tool returns. */
+  noteSelfMoved(move: SelfMove): void {
+    // The post-move read can name a stream absent from discovery/refresh.
+    // Retain that fact so an unresolved echo cannot downgrade known routing.
+    if (move.newStreamId !== null && move.destinationChannelId !== null) {
+      this.streamNamesById.set(move.newStreamId, streamNameOf(move.destinationChannelId));
+    }
+    const anchor = this.seen.get(move.messageId);
+    const source = move.source ?? (anchor ? { channelId: anchor.channelId, topic: anchor.topic } : null);
+    if (!source) return; // No original placement; an echo can still reconcile it.
+    const ids = new Set([move.messageId]);
+    for (const [id, where] of this.seen) {
+      if (where.channelId === source.channelId && where.topic === source.topic &&
+          (move.propagateMode === 'change_all' || (move.propagateMode === 'change_later' && id >= move.messageId))) ids.add(id);
+    }
+    for (const id of ids) {
+      const where = this.seen.get(id);
+      if (move.destinationChannelId === null || move.topic === null) {
+        // An unknown destination is not the old stream. The next reaction
+        // must locate it again rather than read stale cached placement.
+        this.seen.delete(id);
+        if (move.newStreamId !== null) this.movedAway.set(id, Date.now());
+      } else if (where) {
+        this.seen.set(id, { ...where, channelId: move.destinationChannelId, topic: move.topic });
+        this.movedAway.delete(id);
+      }
+    }
+    this.onSelfChanged?.({
+      kind: 'move', channelId: source.channelId, messageId: String(move.messageId), messageIds: [...ids].map(String),
+      authorId: anchor ? String(anchor.authorId) : null, authorName: anchor?.authorName ?? null,
+      authorEmail: anchor?.authorEmail ?? null, actorId: this.identity.selfUserId === null ? null : String(this.identity.selfUserId),
+      topic: move.topic ?? source.topic, previousTopic: source.topic,
+      movedToChannelId: move.destinationChannelId === source.channelId ? null : move.destinationChannelId,
+      newStreamId: move.newStreamId, moveScope: { topic: source.topic, propagateMode: move.propagateMode },
+      routingUncertain: move.topic === null, content: null, previousContent: null,
+      mentioned: anchor?.mentioned ?? false, previouslyMentioned: anchor?.mentioned ?? null,
+      vanished: false, isDM: false, onOwnMessage: anchor?.authorId === this.identity.selfUserId, timestamp: new Date(),
+    });
+  }
+
   /**
    * The allowlists as the live event path applies them to a placed message.
    * A DM is judged by its sender; the bot's own DM message has no sender to
@@ -429,7 +470,10 @@ export class ZulipAdapter implements PlatformAdapter {
       if (crossStream && movedToStream === null) {
         const now = Date.now();
         for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
-        for (const id of change.messageIds) this.movedAway.set(id, now);
+        for (const id of change.messageIds) {
+          this.movedAway.set(id, now);
+          this.seen.delete(id);
+        }
       } else if (movedToChannelId !== null) {
         for (const id of change.messageIds) this.movedAway.delete(id);
       }
@@ -445,6 +489,7 @@ export class ZulipAdapter implements PlatformAdapter {
         topic,
         previousTopic: change.topic !== null ? change.origTopic : null,
         movedToChannelId,
+        newStreamId: change.newStreamId,
         content,
         previousContent,
         mentioned,
