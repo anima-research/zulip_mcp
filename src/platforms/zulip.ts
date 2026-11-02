@@ -92,6 +92,9 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
 /** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
+  /** Historical placement retained only to explain a lost-visibility delete.
+   *  Reactions/edits must GET again rather than route by this old channel. */
+  placementUnknown?: boolean;
   authorId: number;
   authorName: string;
   authorEmail: string;
@@ -336,7 +339,7 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Where a message lives — from the recent-messages cache, else one GET. */
   private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
-    if (cached) return cached;
+    if (cached && !cached.placementUnknown) return cached;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
@@ -350,6 +353,7 @@ export class ZulipAdapter implements PlatformAdapter {
       const m = normalizeMessage(raw);
       const channelId = channelIdOf(m, this.identity.selfUserId);
       this.remember(channelId, m);
+      this.movedAway.delete(messageId);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
@@ -365,22 +369,22 @@ export class ZulipAdapter implements PlatformAdapter {
       this.streamNamesById.set(move.newStreamId, streamNameOf(move.destinationChannelId));
     }
     const anchor = this.seen.get(move.messageId);
-    const source = move.source ?? (anchor ? { channelId: anchor.channelId, topic: anchor.topic } : null);
+    const source = move.source ?? (anchor && !anchor.placementUnknown ? { channelId: anchor.channelId, topic: anchor.topic } : null);
     if (!source) return; // No original placement; an echo can still reconcile it.
     const ids = new Set([move.messageId]);
     for (const [id, where] of this.seen) {
-      if (where.channelId === source.channelId && where.topic === source.topic &&
+      if (!where.placementUnknown && where.channelId === source.channelId && where.topic === source.topic &&
           (move.propagateMode === 'change_all' || (move.propagateMode === 'change_later' && id >= move.messageId))) ids.add(id);
     }
     for (const id of ids) {
       const where = this.seen.get(id);
       if (move.destinationChannelId === null || move.topic === null) {
-        // An unknown destination is not the old stream. The next reaction
-        // must locate it again rather than read stale cached placement.
-        this.seen.delete(id);
+        // Keep history for a lost-visibility delete, but never use its old
+        // placement for a reaction or edit without locating it again.
+        if (where) this.seen.set(id, { ...where, placementUnknown: true });
         if (move.newStreamId !== null) this.movedAway.set(id, Date.now());
       } else if (where) {
-        this.seen.set(id, { ...where, channelId: move.destinationChannelId, topic: move.topic });
+        this.seen.set(id, { ...where, channelId: move.destinationChannelId, topic: move.topic, placementUnknown: false });
         this.movedAway.delete(id);
       }
     }
@@ -390,7 +394,7 @@ export class ZulipAdapter implements PlatformAdapter {
       authorEmail: anchor?.authorEmail ?? null, actorId: this.identity.selfUserId === null ? null : String(this.identity.selfUserId),
       topic: move.topic ?? source.topic, previousTopic: source.topic,
       movedToChannelId: move.destinationChannelId === source.channelId ? null : move.destinationChannelId,
-      newStreamId: move.newStreamId, moveScope: { topic: source.topic, propagateMode: move.propagateMode },
+      newStreamId: move.destinationChannelId === source.channelId ? null : move.newStreamId, moveScope: { topic: source.topic, propagateMode: move.propagateMode },
       routingUncertain: move.topic === null, content: null, previousContent: null,
       mentioned: anchor?.mentioned ?? false, previouslyMentioned: anchor?.mentioned ?? null,
       vanished: false, isDM: false, onOwnMessage: anchor?.authorId === this.identity.selfUserId, timestamp: new Date(),
@@ -429,7 +433,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // that is the right place; for a cross-stream move it is the stream
       // the message went to, and the agent only ever saw it in the one it
       // came from — which the event names.
-      const where = cached ?? await this.locate(change.messageId, 'an edit');
+      const where = cached && !cached.placementUnknown ? cached : await this.locate(change.messageId, 'an edit');
       if (!where) return;
       const crossStream = change.newStreamId !== null && !where.isDm;
       const fromStream = crossStream && change.streamId !== null ? await this.streamNameById(change.streamId) : null;
@@ -464,7 +468,7 @@ export class ZulipAdapter implements PlatformAdapter {
         for (const id of change.messageIds) {
           if (id === change.messageId) continue;
           const co = this.seen.get(id);
-          if (co) this.seen.set(id, { ...co, topic, ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}) });
+          if (co) this.seen.set(id, { ...co, topic, ...(movedToChannelId !== null ? { channelId: movedToChannelId, placementUnknown: false } : {}) });
         }
       }
       if (crossStream && movedToStream === null) {
@@ -472,7 +476,8 @@ export class ZulipAdapter implements PlatformAdapter {
         for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
         for (const id of change.messageIds) {
           this.movedAway.set(id, now);
-          this.seen.delete(id);
+          const historical = this.seen.get(id);
+          if (historical) this.seen.set(id, { ...historical, placementUnknown: true });
         }
       } else if (movedToChannelId !== null) {
         for (const id of change.messageIds) this.movedAway.delete(id);
