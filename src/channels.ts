@@ -540,7 +540,7 @@ export class ChannelManager {
     const source = this.lastIncoming.get(change.channelId);
     if (source?.from === undefined) return;
     const scope = change.moveScope;
-    const inScope = scope && source.hints.threadId === scope.topic &&
+    const inScope = scope && !source.movedTo && source.hints.threadId === scope.topic &&
       (scope.propagateMode === 'change_all' ||
         (scope.propagateMode === 'change_later' && source.from >= Number(change.messageId)));
     if (!change.messageIds.includes(String(source.from)) && !inScope) return;

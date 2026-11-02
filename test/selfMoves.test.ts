@@ -155,6 +155,7 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
     host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
     outstandingMoves() { return (adapter as any).selfMoves.length; },
     cachedPlacement(id: number) { return (adapter as any).seen.get(id); },
+    forgetPlacement(id: number) { (adapter as any).seen.delete(id); },
     registrations() { return registrations; },
     expireQueue() { expireQueue = true; },
     failReads(value: boolean) { failReads = value; },
@@ -831,4 +832,46 @@ test('an uncached ambiguous self anchor and unknown stream do not trigger fallba
   await until(() => f.reconciled.length > before, 'uncached-anchor echo');
   assert.equal(f.placementReads.length - reads, 0);
   await assert.rejects(f.publish(), /unconfirmed topic/);
+});
+
+
+test('uncertain reply hint cannot be revalidated by a different anchor topic-only scope', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source conversation accepted');
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  // Another client using the bot identity moves only the conversation source.
+  f.placements.set(30, raw(30, 'external'));
+  const before = f.reconciled.length;
+  f.feed(move([30], { message_id: 30, orig_subject: 'first', subject: 'external' }));
+  await until(() => f.reconciled.length > before, 'unmatched self move invalidates route');
+  assert.equal(f.cachedPlacement(30).placementUnknown, true);
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  // This tool moves 20/21, not 30. The historical hint topic is not proof.
+  await f.callMove({ message_id: 21, topic: 'confirmed', propagate_mode: 'change_all' });
+  assert.equal(f.reconciled.at(-1).messageIds.includes('30'), false, 'no exact affected-message proof');
+  assert.equal(f.cachedPlacement(30).placementUnknown, true);
+  assert.equal(f.placements.get(30).subject, 'external');
+  await assert.rejects(f.publish(), /unconfirmed topic/, 'another anchor must not clear uncertainty');
+  assert.equal(f.sent.length, 0, 'no reply to the incorrectly inferred topic');
+  // Exact proof for the source message is still allowed to restore routing.
+  await f.callMove({ message_id: 30, topic: 'resolved', propagate_mode: 'change_one' });
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'resolved');
+});
+
+test('trustworthy uncached reply hint still follows a change_all move', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source conversation accepted');
+  // Cache eviction alone is not uncertainty: the conversation hint is trusted.
+  f.forgetPlacement(30);
+  await f.callMove({ message_id: 21, topic: 'confirmed', propagate_mode: 'change_all' });
+  assert.equal(f.reconciled.at(-1).messageIds.includes('30'), false, 'control must use scope inference');
+  assert.equal(f.cachedPlacement(30), undefined);
+  assert.equal(f.placements.get(30).subject, 'confirmed');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'confirmed');
 });
