@@ -38,7 +38,8 @@
   Quote edits clear a pending live verdict only when the new content has no
   quote target or all inspected targets were verified as not authored by the bot.
   Releasing a muted/disallowed channel or a message gone from replay history
-  also clears its pending reply verdict, preventing stale history overlays.
+  also clears its pending reply verdict, including in closed-channel catch-up,
+  preventing stale history overlays.
   Push origins use umbrella `isMention` for explicit mentions or bot replies,
   with separate `isExplicitMention` and `isReplyToBot` flags for gate matching;
   message `mentioned` metadata and `chat:mention` stay explicit-mention-only.

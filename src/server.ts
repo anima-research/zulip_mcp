@@ -1251,6 +1251,11 @@ export class ZulipMcplServer {
   }
 
   private advanceCatchUp(channelId: string, through: number): void {
+    // An accepted/empty catch-up scan releases every hold in its range,
+    // including ids deleted from history. Their pending verdicts go too.
+    for (const id of this.delivery.heldIds(channelId)) {
+      if (id <= through) this.forgetPendingReply(channelId, id);
+    }
     if (this.live) this.delivery.advanceThrough(channelId, through);
     else this.preLiveScanned.set(channelId, Math.max(this.preLiveScanned.get(channelId) ?? 0, through));
   }

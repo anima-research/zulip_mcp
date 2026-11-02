@@ -3008,3 +3008,26 @@ test('R2-3: push origins expose umbrella mention and specific addressing flags',
     }
   } finally { await h.close(); }
 });
+
+
+test('R2-7: closed-channel catch-up forgets a held reply missing from history', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.policy.rejectPushes.add('5');
+    h.adapter.emit!(streamMsg(5, {
+      metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
+    }));
+    await until(() => h.server.delivery.heldIds('zulip:general').includes(5), 'reply held');
+    const pending = (h.server as unknown as { pendingReplies: Map<string, Set<number>> }).pendingReplies;
+    assert.equal(pending.get('zulip:general')?.has(5), true);
+    h.adapter.history = [streamMsg(6)];
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.server.delivery.watermark('zulip:general') === 6, 'catch-up releases missing reply hold');
+    assert.deepEqual(h.server.delivery.heldIds('zulip:general'), []);
+    assert.equal(pending.get('zulip:general')?.has(5) ?? false, false);
+  } finally { await h.close(); }
+});
