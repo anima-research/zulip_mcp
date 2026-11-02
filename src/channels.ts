@@ -533,9 +533,6 @@ export class ChannelManager {
     const destination = change.movedToChannelId ?? change.channelId;
     if (destination === change.channelId) {
       this.lastIncoming.set(destination, updated);
-      if (this.typingTopic.has(destination) && this.typingTopic.get(destination) === source.hints.threadId) {
-        this.typingTopic.set(destination, change.topic);
-      }
     } else {
       this.lastIncoming.delete(change.channelId);
       // Keep the source typing run so a channel-only stop cancels it

@@ -146,7 +146,7 @@ for (const opened of [false, true]) {
     await f.type('stop');
     assert.deepEqual(f.sent.map(s => [s.to, s.topic]), [['general', 'deploys-2026']]);
     assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [
-      ['start', 'deploys'], ['start', 'deploys-2026'], ['stop', 'deploys-2026'],
+      ['start', 'deploys'], ['stop', 'deploys'], ['start', 'deploys-2026'], ['stop', 'deploys-2026'],
     ]);
     assert.equal(f.incoming.length + f.pushes.length, 1, 'no change marker or breadcrumb is needed');
   });
@@ -227,3 +227,16 @@ for (const restriction of ['none', 'allowlist', 'mute']) {
     assert.equal(f.pushes.length, 0, 'self changes do not wake the agent');
   });
 }
+
+// R2-3: no refresh is needed to stop the topic where typing began.
+test('a stop immediately after a self rename cancels typing in the original topic', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.type('start');
+  f.feed(move());
+  await until(() => f.reconciled.length === 1, 'rename reconciled');
+  await f.type('stop');
+  assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [['start', 'deploys'], ['stop', 'deploys']]);
+});
