@@ -4,9 +4,13 @@
   Zulip enforces realm permissions and move limits.
 - The bot's own moves reconcile message placement and current reply/typing
   hints without delivering a change marker. Successful tool moves reconcile
-  before returning, without depending on the event echo. Matching echoes of
-  fully resolved successful moves do not overwrite newer placement or reply
-  hints, including for overlapping propagation ranges. Typing stops in the
+  before returning, without depending on the event echo. Echo tokens are
+  capped at 16, expire after 60 seconds, and clear on queue registration/stop.
+  Intervening events invalidate affected tokens; only unchanged cached tool
+  placements can acknowledge without replay. Ambiguous or expired self moves
+  read current stored placement per message, preserving overlapping ranges
+  and genuine later moves with the same transition. Failed placement reads
+  leave routing unconfirmed rather than publishing to stale placement. Typing stops in the
   topic where its run began. Cross-stream moves return
   `moved_to: {channelId, topic}` for confirmation via `send_message` with an
   explicit stream and topic, not a channel-only publish. Source-channel

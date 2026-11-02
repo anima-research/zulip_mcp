@@ -245,10 +245,11 @@ export class ZulipEventLoop {
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
     onChange?: OnZulipMessageChange,
+    onQueueRegistered?: () => void,
   ): Promise<void> {
     while (!this.stopped) {
       try {
-        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction, onChange);
+        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction, onChange, onQueueRegistered);
       } catch (error) {
         if (this.stopped) return;
         console.error('Zulip event loop error, restarting in 5s:', error);
@@ -270,6 +271,7 @@ export class ZulipEventLoop {
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
     onChange?: OnZulipMessageChange,
+    onQueueRegistered?: () => void,
   ): Promise<void> {
     // Register event queue.
     // Two zulip-js quirks to work around:
@@ -306,6 +308,7 @@ export class ZulipEventLoop {
     }
 
     this.queueId = registration.queue_id;
+    onQueueRegistered?.();
     let lastEventId = registration.last_event_id;
 
     console.error(`Zulip event queue registered: ${this.queueId}`);

@@ -139,6 +139,9 @@ export interface MessageChangeEvent {
   routingUncertain?: boolean;
   /** An echo of an already reconciled tool operation, not a new placement. */
   confirmationOnly?: boolean;
+  /** Current placement read from Zulip, reconciled per affected message. */
+  authoritativePlacement?: boolean;
+  placementChannelId?: string | null;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;

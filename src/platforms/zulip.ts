@@ -111,6 +111,8 @@ const LOCATE_TIMEOUT_MS = 15_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
+const SELF_MOVE_CAP = 16;
+const SELF_MOVE_TTL_MS = 60_000;
 /** How long a stream id that the list did not resolve is not asked about again. */
 const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
@@ -160,7 +162,15 @@ export class ZulipAdapter implements PlatformAdapter {
 
   private eventLoop: ZulipEventLoop | null = null;
   /** Outstanding tool/echo pairs, not a timestamp-based last-write-wins rule. */
-  private selfMoves: { move: SelfMove; confirmed: boolean; echoed: boolean }[] = [];
+  private selfMoves: {
+    move: SelfMove; confirmed: boolean; echoed: boolean; createdAt: number;
+    ids: Set<number>; placement: Map<number, SeenMessage>;
+  }[] = [];
+  private selfMoveTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Once tools have moved messages, unmatched self moves must be read back:
+   *  expiry/eviction/queue loss is never permission to replay an old echo. */
+  private hasToolMoves = false;
+  private toolPlacementVersion = 0;
   private readonly identity: ZulipIdentity;
   private readonly backscrollDefault: number;
   private readonly backscrollLimits: ReadonlyMap<string, number>;
@@ -366,12 +376,22 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Start before PATCH so echo-before-result and result-before-echo pair
    *  with the same operation. Remove failures and completed pairs. */
   trackSelfMove(move: SelfMove): (confirmed: SelfMove | null) => void {
+    this.hasToolMoves = true;
     const cached = this.seen.get(move.messageId);
     const source = move.source ?? (cached && !cached.placementUnknown
       ? { channelId: cached.channelId, topic: cached.topic } : null);
     if (!source) return () => {}; // No original placement to pair an echo with.
-    const operation = { move: { ...move, source }, confirmed: false, echoed: false };
+    const ids = new Set([move.messageId]);
+    for (const [id, at] of this.seen) {
+      if (at.channelId === source.channelId && at.topic === source.topic &&
+          (move.propagateMode === 'change_all' || (move.propagateMode === 'change_later' && id >= move.messageId))) ids.add(id);
+    }
+    this.pruneSelfMoves();
+    const operation = { move: { ...move, source }, confirmed: false, echoed: false,
+      createdAt: Date.now(), ids, placement: new Map<number, SeenMessage>() };
     this.selfMoves.push(operation);
+    if (this.selfMoves.length > SELF_MOVE_CAP) this.selfMoves.shift();
+    this.scheduleSelfMoveExpiry();
     return confirmed => {
       if (confirmed === null || operation.echoed ||
           (source.channelId === confirmed.destinationChannelId && source.topic === confirmed.topic)) {
@@ -379,18 +399,53 @@ export class ZulipAdapter implements PlatformAdapter {
       } else {
         operation.move = { ...confirmed, source: confirmed.source ?? source };
         operation.confirmed = true;
+        for (const id of ids) {
+          const at = this.seen.get(id);
+          if (at) operation.placement.set(id, at);
+        }
       }
+      this.pruneSelfMoves();
+      this.scheduleSelfMoveExpiry();
     };
   }
 
-  /** A confirmed tool operation already applied its entire propagation range.
-   *  Its echo cannot re-seat even a co-moved message: a newer operation may
-   *  have split that range across topics/streams. Pending echoes still apply
-   *  normally; tool completion reconciles their final stored placement later.
-   *  Pair by operation/source/destination, never edit_timestamp (seconds). */
+  private pruneSelfMoves(): void {
+    const cutoff = Date.now() - SELF_MOVE_TTL_MS;
+    this.selfMoves = this.selfMoves.filter(op => op.createdAt > cutoff);
+  }
+
+  private scheduleSelfMoveExpiry(): void {
+    if (this.selfMoveTimer) clearTimeout(this.selfMoveTimer);
+    this.selfMoveTimer = null;
+    if (!this.selfMoves.length) return;
+    const delay = Math.max(1, this.selfMoves[0].createdAt + SELF_MOVE_TTL_MS - Date.now());
+    this.selfMoveTimer = setTimeout(() => {
+      this.selfMoveTimer = null;
+      this.pruneSelfMoves();
+      this.scheduleSelfMoveExpiry();
+    }, delay);
+    this.selfMoveTimer.unref();
+  }
+
+  private clearSelfMoves(): void {
+    this.selfMoves = [];
+    if (this.selfMoveTimer) clearTimeout(this.selfMoveTimer);
+    this.selfMoveTimer = null;
+  }
+
+  private invalidateSelfMoves(ids: number[]): void {
+    this.selfMoves = this.selfMoves.filter(op => !ids.some(id => op.ids.has(id)));
+    this.scheduleSelfMoveExpiry();
+  }
+
+  /** An echo signature is only a candidate. A token may acknowledge without
+   *  replay only while cached affected placements are still that exact tool
+   *  result. Superseded/invalidated/expired matches require current reads,
+   *  including partial ranges. Never order by edit_timestamp (seconds). */
   private confirmSelfMove(change: ZulipMessageChange, fromChannelId: string): boolean {
     if (change.kind !== 'edit' || change.actorId !== this.identity.selfUserId ||
         change.content !== null || (change.topic === null && change.newStreamId === null)) return false;
+    this.pruneSelfMoves();
     const index = this.selfMoves.findIndex(({ move, confirmed, echoed }) => !echoed &&
       move.messageId === change.messageId &&
       move.source?.channelId === fromChannelId && move.source.topic === change.origTopic &&
@@ -400,12 +455,74 @@ export class ZulipAdapter implements PlatformAdapter {
     const operation = this.selfMoves[index];
     operation.echoed = true;
     if (operation.confirmed) this.selfMoves.splice(index, 1);
-    // Unconfirmed topics/names still need the echo to resolve routing.
-    return operation.confirmed && operation.move.topic !== null && operation.move.destinationChannelId !== null;
+    this.scheduleSelfMoveExpiry();
+    // A signature alone proves nothing. Every cached affected message must
+    // still hold that tool result, with no intervening event/replacement.
+    const cached = change.messageIds.flatMap(id => {
+      const at = this.seen.get(id);
+      return at ? [[id, at] as const] : [];
+    });
+    return operation.confirmed && cached.length > 0 && cached.every(([id, at]) =>
+      operation.placement.get(id) === at && !at.placementUnknown &&
+      at.channelId === operation.move.destinationChannelId && at.topic === operation.move.topic);
+  }
+
+  /** Ambiguous/expired/unmatched self moves use current stored placement,
+   *  per message, not the echo's historical target. Bound concurrency and the
+   *  entire lookup window so a bulk move cannot wedge the change chain. */
+  private async readSelfPlacement(change: Extract<ZulipMessageChange, { kind: 'edit' }>, sourceChannelId: string,
+    deadline = Date.now() + LOCATE_TIMEOUT_MS): Promise<void> {
+    const version = this.toolPlacementVersion;
+    const ids = [...new Set([change.messageId, ...change.messageIds])];
+    let cursor = 0;
+    const results = new Map<number, ZulipMessage | null>();
+    await Promise.all(Array.from({ length: Math.min(8, ids.length) }, async () => {
+      while (cursor < ids.length) {
+        const id = ids[cursor++];
+        let placed: ZulipMessage | null = null;
+        try {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error('placement lookup window expired');
+          const result: any = await withTimeout(this.zulipClient.messages.getById({ message_id: id, apply_markdown: false }), remaining, `GET message ${id}`);
+          assertApiSuccess(result, `message ${id}`);
+          if (result?.result === 'success' && result.message) placed = normalizeMessage(result.message);
+        } catch { /* Fail closed: unknown placement must not route by old cache. */ }
+        results.set(id, placed);
+      }
+    }));
+    if (version !== this.toolPlacementVersion) {
+      if (Date.now() < deadline) return this.readSelfPlacement(change, sourceChannelId, deadline);
+      for (const id of ids) results.set(id, null);
+    }
+    this.invalidateSelfMoves(ids);
+    for (const id of ids) {
+      const placed = results.get(id);
+      const historical = this.seen.get(id);
+      const channelId = placed ? channelIdOf(placed, this.identity.selfUserId) : null;
+      if (placed && channelId !== null) {
+        this.remember(channelId, placed);
+        this.movedAway.delete(id);
+      } else if (historical) this.seen.set(id, { ...historical, placementUnknown: true });
+      this.onSelfChanged?.({
+        kind: 'move', channelId: sourceChannelId, messageId: String(id), messageIds: [String(id)],
+        authorId: placed ? String(placed.authorId) : historical ? String(historical.authorId) : null,
+        authorName: placed?.authorName ?? historical?.authorName ?? null,
+        authorEmail: placed?.authorEmail ?? historical?.authorEmail ?? null,
+        actorId: change.actorId === null ? null : String(change.actorId),
+        topic: placed?.topic ?? historical?.topic ?? '', previousTopic: change.origTopic,
+        movedToChannelId: channelId === sourceChannelId ? null : channelId,
+        authoritativePlacement: true, placementChannelId: channelId, routingUncertain: !placed,
+        content: null, previousContent: null, mentioned: placed?.mentioned ?? historical?.mentioned ?? false,
+        previouslyMentioned: historical?.mentioned ?? null, vanished: false, isDM: placed?.isDm ?? false,
+        onOwnMessage: placed?.authorId === this.identity.selfUserId, timestamp: new Date(change.editedAt * 1000),
+      });
+    }
   }
 
   /** Re-seat the known propagation range and routing before the tool returns. */
   noteSelfMoved(move: SelfMove): void {
+    this.hasToolMoves = true;
+    this.toolPlacementVersion++;
     // The post-move read can name a stream absent from discovery/refresh.
     // Retain that fact so an unresolved echo cannot downgrade known routing.
     if (move.newStreamId !== null && move.destinationChannelId !== null) {
@@ -477,7 +594,13 @@ export class ZulipAdapter implements PlatformAdapter {
       // the message went to, and the agent only ever saw it in the one it
       // came from — which the event names.
       const where = cached && !cached.placementUnknown ? cached : await this.locate(change.messageId, 'an edit');
-      if (!where) return;
+      if (!where) {
+        if (change.actorId === self && this.hasToolMoves && (change.topic !== null || change.newStreamId !== null)) {
+          const name = change.streamId === null ? null : await this.streamNameById(change.streamId);
+          await this.readSelfPlacement(change, name === null ? 'zulip:unknown' : zulipChannelId(name));
+        }
+        return;
+      }
       const crossStream = change.newStreamId !== null && !where.isDm;
       const fromStream = (crossStream || change.origTopic !== null) && change.streamId !== null
         ? await this.streamNameById(change.streamId) : null;
@@ -498,11 +621,17 @@ export class ZulipAdapter implements PlatformAdapter {
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
-      const confirmationOnly = this.confirmSelfMove(change, fromChannelId);
+      let confirmationOnly = this.confirmSelfMove(change, fromChannelId);
+      const selfMove = change.actorId === self && (change.topic !== null || change.newStreamId !== null);
+      if (!confirmationOnly && selfMove && this.hasToolMoves) {
+        await this.readSelfPlacement(change, fromChannelId);
+        confirmationOnly = true; // The historical event must not overwrite those reads.
+      }
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
       if (!confirmationOnly) {
+        this.invalidateSelfMoves(change.messageIds);
         this.seen.set(change.messageId, {
           ...where,
           topic,
@@ -563,6 +692,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
     // The bot's own deletions (rollback, the delete tool) echo back without
     // an actor: drop what this adapter deleted itself.
+    this.invalidateSelfMoves(change.messageIds);
     const ids = change.messageIds.filter((id) => !this.wasSelfDeleted(id));
     if (ids.length === 0) return;
     // A bulk deletion is reported under an id the cache can vouch for, so the
@@ -919,6 +1049,7 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
+    this.clearSelfMoves();
     this.eventLoop = new ZulipEventLoop();
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
@@ -942,6 +1073,7 @@ export class ZulipAdapter implements PlatformAdapter {
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
           const tail = changeChain;
           void tail.then(async () => {
+            this.invalidateSelfMoves([ev.message_id]);
             const where = await this.locate(ev.message_id);
             if (!where) return;
             if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
@@ -967,6 +1099,7 @@ export class ZulipAdapter implements PlatformAdapter {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
+      this.invalidateSelfMoves([m.id]);
       this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
       if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       if (m.isDm) {
@@ -992,12 +1125,13 @@ export class ZulipAdapter implements PlatformAdapter {
       if (m.streamName !== null && streamId !== undefined) this.streamNamesById.set(streamId, m.streamName);
       const descriptor = m.streamName !== null ? this.streamDescriptor(m.streamName, streamId) : undefined;
       onMessage(toIncoming(channelId, m, this.identity), descriptor);
-    }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
+    }, onSystemEvent, reactionHandler, changeHandler, () => this.clearSelfMoves()).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }
 
   stopEvents(): void {
+    this.clearSelfMoves();
     this.eventLoop?.stop();
     this.eventLoop = null;
   }

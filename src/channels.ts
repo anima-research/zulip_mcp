@@ -524,6 +524,20 @@ export class ChannelManager {
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
     if (change.confirmationOnly) return;
+    if (change.authoritativePlacement) {
+      // A delayed echo's origin need not be where a current conversation hint
+      // lives. Reconcile only references to this exact message, across channels.
+      for (const [channelId, source] of [...this.lastIncoming]) {
+        if (source.from === undefined || !change.messageIds.includes(String(source.from))) continue;
+        this.reconcileSelfChange({
+          ...change, channelId, authoritativePlacement: false,
+          previousTopic: source.hints.threadId ?? '',
+          movedToChannelId: change.placementChannelId === channelId ? null : change.placementChannelId ?? null,
+          newStreamId: null, moveScope: undefined,
+        });
+      }
+      return;
+    }
     if (change.previousTopic === null && change.movedToChannelId === null &&
         change.newStreamId == null && !change.routingUncertain) return;
     const source = this.lastIncoming.get(change.channelId);

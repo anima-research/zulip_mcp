@@ -42,6 +42,9 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   filters.start();
   const pending: any[] = [];
   let eventId = 0;
+  let registrations = 0;
+  let expireQueue = false;
+  let failReads = false;
   const sent: any[] = [];
   const typing: any[] = [];
   const placements = new Map<number, any>();
@@ -85,6 +88,7 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
     messages: {
       retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
       getById: async ({ message_id }: any) => {
+        if (failReads) return { result: 'error', msg: 'Placement unavailable' };
         const message = placements.get(message_id) ?? raw(message_id);
         if (invisibleDestination && message.stream_id !== 7) return { result: 'error', msg: 'Not visible' };
         return { result: 'success', message };
@@ -93,9 +97,13 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
     },
     typing: { send: async (args: any) => { typing.push(args); return { result: 'success' }; } },
     users: { me: { subscriptions: { add: async () => ({ result: 'success', already_subscribed: {} }) } } },
-    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    queues: { register: async () => ({ queue_id: `q-${++registrations}`, last_event_id: -1 }) },
     events: { retrieve: async () => {
       await new Promise(r => setTimeout(r, 5));
+      if (expireQueue) {
+        expireQueue = false;
+        return { result: 'error', code: 'BAD_EVENT_QUEUE_ID' };
+      }
       return { events: pending.splice(0) };
     } },
   };
@@ -141,6 +149,11 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   await until(() => server.isLive, 'live delivery');
   return {
     host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
+    outstandingMoves() { return (adapter as any).selfMoves.length; },
+    registrations() { return registrations; },
+    expireQueue() { expireQueue = true; },
+    failReads(value: boolean) { failReads = value; },
+    stopEvents() { adapter.stopEvents(); },
     onPatch(hook?: (event: any) => Promise<void>) { patchHook = hook; },
     async callMove(args: Record<string, unknown>) {
       const result = await host.sendRequest('tools/call', { name: 'move_messages', arguments: args });
@@ -395,7 +408,7 @@ test('a successful placement read resolves a new stream for the later echo too',
   await f.tools.handleToolCall('move_messages', { message_id: 20, stream_id: 9, propagate_mode: 'change_all' });
   await assert.rejects(f.publish(), /moved.*zulip:new-stream.*deploys/);
   f.feed(move([20, 21], { new_stream_id: 9, subject: undefined }));
-  await until(() => f.reconciled.length === 2, 'echo confirmation');
+  await until(() => f.reconciled.some(c => c.confirmationOnly), 'echo confirmation');
   await assert.rejects(f.publish(), /moved.*zulip:new-stream.*deploys/);
   await f.publish('zulip:new-stream');
   assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['new-stream', 'deploys']);
@@ -411,7 +424,7 @@ test('delayed first self echo cannot undo a second tool-confirmed rename', async
   await f.publish();
   assert.equal(f.sent.at(-1).topic, 'second');
   f.feed(move([21], { message_id: 21, subject: 'first' }));
-  await until(() => f.reconciled.length === 3, 'delayed first echo processed');
+  await until(() => f.reconciled.some(c => c.confirmationOnly), 'delayed first echo processed');
   await f.publish();
   assert.equal(f.placements.get(21).subject, 'second', 'stored placement did not change');
   assert.equal(f.sent.at(-1).topic, 'second', 'old echo must not roll back the current reply hint');
@@ -476,7 +489,7 @@ test('old cross-stream range echo cannot move newer reactions or edits back', as
   await f.callMove({ message_id: 20, topic: 'first', stream_id: 8, propagate_mode: 'change_all' });
   await f.callMove({ message_id: 21, topic: 'second', stream_id: 7, propagate_mode: 'change_one' });
   f.feed(echoes[0], echoes[1]);
-  await until(() => f.reconciled.length === 4, 'both echoes confirmed');
+  await until(() => f.reconciled.filter(c => c.confirmationOnly).length >= 2, 'both echoes confirmed');
   for (const id of [20, 21, 30]) f.feed(
     { type: 'reaction', op: 'add', message_id: id, user_id: 7, emoji_name: 'eyes' },
     { type: 'update_message', message_id: id, message_ids: [id], user_id: 7,
@@ -520,9 +533,10 @@ for (const actor of [SELF, 7]) {
     assert.deepEqual([edit.channelId, edit.metadata?.topic], [ARCHIVE, 'external']);
     if (actor === SELF) await assert.rejects(f.publish(), /moved.*zulip:archive.*external/);
     // Delayed tool echoes must not roll back even this later external move.
+    const confirmations = f.reconciled.filter(c => c.confirmationOnly).length;
     f.feed(move([21], { message_id: 21, subject: 'first' }),
       move([21], { message_id: 21, orig_subject: 'first', subject: 'second' }));
-    await until(() => f.reconciled.filter(c => c.confirmationOnly).length === 2, 'old operations confirmed');
+    await until(() => f.reconciled.filter(c => c.confirmationOnly).length >= confirmations + 2, 'old operations confirmed');
     f.feed({ type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
       edit_timestamp: 1_700_002_000, content: 'edited again', orig_content: 'old', flags: ['mentioned'] });
     await until(() => f.incoming.filter(m => m.metadata?.change === 'edit').length === 2, 'later edit placed');
@@ -530,3 +544,161 @@ for (const actor of [SELF, 7]) {
     assert.deepEqual([last.channelId, last.metadata?.topic], [ARCHIVE, 'external']);
   });
 }
+
+for (const crossStream of [false, true]) {
+  test(`lost echo does not consume a genuine later identical ${crossStream ? 'cross-stream' : 'same-stream'} move`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    await f.open(ARCHIVE);
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+    await f.callMove({ message_id: 21, topic: 'first', ...(crossStream ? { stream_id: 8 } : {}) });
+    // The tool echo is lost. Another client using the same identity cycles
+    // back, then repeats the original transition in the same second.
+    f.placements.set(21, raw(21));
+    f.feed(move([21], { message_id: 21, stream_id: crossStream ? 8 : 7,
+      orig_subject: 'first', subject: 'deploys', ...(crossStream ? { new_stream_id: 7 } : {}) }));
+    await until(() => f.reconciled.length >= 2, 'external move back');
+    await f.publish();
+    assert.equal(f.sent.at(-1).topic, 'deploys');
+    f.placements.set(21, { ...raw(21, 'first'), ...(crossStream ? { stream_id: 8, display_recipient: 'archive' } : {}) });
+    const before = f.reconciled.length;
+    f.feed(move([21], { message_id: 21, subject: 'first', ...(crossStream ? { new_stream_id: 8 } : {}) }));
+    await until(() => f.reconciled.length > before, 'genuine repeated transition');
+    if (crossStream) await assert.rejects(f.publish(), /moved.*zulip:archive.*first/);
+    else {
+      await f.publish();
+      assert.equal(f.sent.at(-1).topic, 'first');
+    }
+    f.feed({ type: 'reaction', op: 'add', message_id: 21, user_id: 7, emoji_name: 'eyes' },
+      { type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
+        edit_timestamp: 1_700_002_000, content: 'later edit', orig_content: 'old', flags: ['mentioned'] });
+    await until(() => f.incoming.some(m => m.metadata?.reaction) &&
+      f.incoming.some(m => m.metadata?.change === 'edit'), 'reaction/edit placement');
+    assert.equal(f.incoming.find(m => m.metadata?.reaction)!.channelId, crossStream ? ARCHIVE : GENERAL);
+    const edit = f.incoming.find(m => m.metadata?.change === 'edit')!;
+    assert.deepEqual([edit.channelId, edit.metadata?.topic], [crossStream ? ARCHIVE : GENERAL, 'first']);
+  });
+}
+
+test('24 sequential moves with lost echoes have bounded outstanding tracking', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  for (let i = 0; i < 24; i++) await f.callMove({ message_id: 21, topic: `move-${i}` });
+  assert.ok(f.outstandingMoves() <= 16, `retained ${f.outstandingMoves()} records`);
+  // Eviction must not bring back blind replay of the oldest lost echo.
+  const before = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'move-0' }));
+  await until(() => f.reconciled.length > before, 'evicted-token echo processed');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'move-23');
+});
+
+test('aged tokens expire without replaying the old echo', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  await f.callMove({ message_id: 21, topic: 'second' });
+  assert.equal(f.outstandingMoves(), 2);
+  t.mock.timers.tick(60_001);
+  const before = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length > before, 'expired-token echo processed');
+  assert.equal(f.outstandingMoves(), 0);
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'second');
+});
+
+test('queue re-registration clears tokens but late echoes still use stored placement', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  await f.callMove({ message_id: 21, topic: 'second' });
+  assert.equal(f.outstandingMoves(), 2);
+  f.expireQueue();
+  await until(() => f.registrations() === 2, 'replacement queue');
+  assert.equal(f.outstandingMoves(), 0);
+  const before = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length > before, 'old echo after replacement');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'second');
+});
+
+test('stopping event delivery clears outstanding move tokens', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  assert.equal(f.outstandingMoves(), 1);
+  f.stopEvents();
+  assert.equal(f.outstandingMoves(), 0);
+});
+
+test('an intervening content event invalidates a token and unavailable validation fails closed', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  assert.equal(f.outstandingMoves(), 1);
+  f.feed({ type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
+    edit_timestamp: 1_700_002_000, content: 'intervening edit', orig_content: 'old', flags: ['mentioned'] });
+  await until(() => f.incoming.some(m => m.metadata?.change === 'edit'), 'content edit applied');
+  assert.equal(f.outstandingMoves(), 0);
+  f.failReads(true);
+  const before = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length > before, 'unverifiable self move');
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  f.failReads(false);
+  const next = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length > next, 'placement recovered');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'first');
+});
+
+test('idle tokens age out without another move or event', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  try {
+    await f.callMove({ message_id: 21, topic: 'first' });
+    assert.equal(f.outstandingMoves(), 1);
+    t.mock.timers.tick(60_001);
+    assert.equal(f.outstandingMoves(), 0, 'idle expiry must not depend on another API operation');
+  } finally { t.mock.timers.reset(); }
+});
+
+test('a pending result cannot restore tokens cleared by queue replacement', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  f.onPatch(async () => {
+    assert.equal(f.outstandingMoves(), 1);
+    f.expireQueue();
+    await until(() => f.registrations() === 2, 'replacement while PATCH response pending');
+    assert.equal(f.outstandingMoves(), 0);
+  });
+  await f.callMove({ message_id: 21, topic: 'first' });
+  assert.equal(f.outstandingMoves(), 0, 'completion must not resurrect the old-generation token');
+  const before = f.reconciled.length;
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length > before, 'echo with no retained token');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'first');
+});

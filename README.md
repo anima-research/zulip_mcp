@@ -187,13 +187,16 @@ reply routing: a moderator archiving an old message does not retarget the
 reply the agent is composing. The bot's own moves emit no marker but update
 reply hints when the current conversation's source message moved. Successful
 `move_messages` calls reconcile routing and cached placement before returning;
-move echoes are not a prerequisite. Each tool write is tracked before its
-request, so a matching echo received before the result is reconciled normally,
-while a matching echo of a fully resolved success is confirmation-only: it
-cannot overwrite newer cached placement or reply hints, including after
-partially overlapping moves in the same second. Other changes still follow
-the normal event path; this is not timestamp-based ordering of all Zulip
-activity. A typing refresh stops the run in its original topic before following a same-stream
+move echoes are not a prerequisite. Outstanding echo tokens are limited to
+16, expire after 60 seconds (including while idle), and are cleared on event
+queue registration/re-registration and stop. A matching token acknowledges
+without replay only while affected cached placements still match the tool
+result and no intervening applied event invalidated it. Superseded, expired,
+or otherwise ambiguous self moves read current stored placement per affected
+message instead of replaying the echo's historical destination. Failed reads
+leave routing unconfirmed and refuse channel-only publishing until placement
+can be established. This is not global timestamp ordering of Zulip activity.
+A typing refresh stops the run in its original topic before following a same-stream
 rename.
 After a cross-stream move, a source-channel publish is refused with an error
 naming the destination, and source typing stops. Confirm with `send_message`
