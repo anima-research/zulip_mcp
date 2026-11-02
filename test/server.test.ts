@@ -2681,6 +2681,7 @@ for (const reconnect of [false, true]) {
     }
     if (!reconnect) {
       const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8'));
+      assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must not persist past the unoffered reply');
       // Exercise beginConnection independently of quiesce: it must cap its own commit too.
       const staged = second.server as unknown as { beginConnection(): void; preLiveScanned: Map<string, number> };
       staged.preLiveScanned.set('zulip:general', 5);
