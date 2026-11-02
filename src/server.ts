@@ -438,7 +438,16 @@ export class ZulipMcplServer {
   }
 
   private commitScannedCatchUp(): void {
-    for (const [channelId, through] of this.preLiveScanned) {
+    for (const [channelId, scannedThrough] of this.preLiveScanned) {
+      // Shutdown/reset can precede go-live: a buffered, live-verified reply
+      // has not been offered yet and therefore has no delivery hold. Keep
+      // it inside the next sweep rather than committing an ambient scan over it.
+      let through = scannedThrough;
+      for (const { message } of this.preLive) {
+        if (message.channelId !== channelId) continue;
+        const id = Number(message.messageId);
+        if (this.pendingReplies.get(channelId)?.has(id)) through = Math.min(through, id - 1);
+      }
       // A refused buffered reply must keep its hold below the scanned range.
       for (const id of this.delivery.heldIds(channelId)) {
         if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) {

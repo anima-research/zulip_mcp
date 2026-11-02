@@ -2619,6 +2619,76 @@ for (const reconnect of [false, true]) {
 });
 }
 
+for (const reconnect of [false, true]) {
+  test(`R2-1: a buffered pending reply survives ${reconnect ? 'reconnecting' : 'shutdown'} before go-live`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-staged-'));
+  let second: Harness | undefined;
+  let third: Harness | undefined;
+  let release!: () => void;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'probe' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
+    } finally { await first.close(); }
+
+    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5)] });
+    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+    let calls = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    second.adapter.fetchHistory = async (channelId, query) => {
+      if (++calls === 2) await gate; // hang the tally backfill: go-live never happens
+      return realFetch(channelId, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => calls === 2, 'tally backfill holds go-live after scanning ambient id 5');
+    second.adapter.emit!(streamMsg(5, {
+      metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
+    }));
+    assert.equal(second.server.isLive, false);
+    assert.equal(second.pushed.length, 0, 'buffered reply has not been offered');
+
+    if (reconnect) {
+      await second.close();
+      const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8'));
+      const history = quoteHistory();
+      second.adapter.fetchHistory = history.fetchHistory.bind(history);
+      third = harness({ reuse: { server: second.server, adapter: second.adapter } });
+      await initialize(third, true);
+      await settled(third);
+      assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must not persist past the unoffered reply');
+      assert.equal(third.pushed.length, 1, 'fresh sweep recovers the unoffered reply');
+      assert.ok(third.pushed[0].tags?.includes('chat:reply'));
+      assert.equal(third.server.delivery.watermark('zulip:general'), 5);
+    } else {
+      await second.server.shutdown();
+    }
+    if (!reconnect) {
+      const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8'));
+      // Exercise beginConnection independently of quiesce: it must cap its own commit too.
+      const staged = second.server as unknown as { beginConnection(): void; preLiveScanned: Map<string, number> };
+      staged.preLiveScanned.set('zulip:general', 5);
+      staged.beginConnection();
+      assert.ok(second.server.delivery.watermark('zulip:general')! < 5);
+    }
+  } finally {
+    release?.();
+    if (second) await until(() => second!.server.isLive, 'released sweep finishes before closing its transport');
+    await third?.close();
+    await second?.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+}
+
 test('a budget-starved quote row is retried before catch-up advances past it', async () => {
   const h = harness();
   try {
