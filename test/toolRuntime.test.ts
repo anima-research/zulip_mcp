@@ -423,6 +423,15 @@ test('send_message without reply_to keeps the exact payload, response and callba
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('send_message schema advertises string destinations and DM email addresses', () => {
+  const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
+  const properties = schema.properties as Record<string, any>;
+  assert.deepEqual(properties.to, {
+    type: 'string',
+    description: 'For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.',
+  });
+});
+
 test('send_message schema leaves destination requirements to the runtime', () => {
   const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
   assert.equal(schema.required?.includes('type') ?? false, false);

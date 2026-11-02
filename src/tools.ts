@@ -165,12 +165,8 @@ export const toolDefinitions: ToolDefinition[] = [
           description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
         },
         to: {
-          anyOf: [
-            { type: "string" },
-            { type: "integer" },
-            { type: "array", items: { anyOf: [{ type: "integer" }, { type: "string" }] } },
-          ],
-          description: "Stream name/ID, or DM emails/IDs (comma-separated or an array). Required without reply_to; omit with reply_to.",
+          type: "string",
+          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.",
         },
         topic: {
           type: "string",
