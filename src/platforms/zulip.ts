@@ -396,7 +396,17 @@ export class ZulipAdapter implements PlatformAdapter {
     if (this.selfMoves.length > SELF_MOVE_CAP) this.selfMoves.shift();
     this.scheduleSelfMoveExpiry();
     return confirmed => {
-      if (confirmed === null || operation.echoed ||
+      this.pruneSelfMoves();
+      if (confirmed && move.propagateMode !== 'change_one' &&
+          (confirmed.unconfirmedRange !== undefined || !this.selfMoves.includes(operation) ||
+           confirmed.source === null || confirmed.topic === null ||
+           confirmed.topic !== move.topic?.trim() || confirmed.destinationChannelId === null ||
+           (move.newStreamId === null && confirmed.destinationChannelId !== source.channelId))) {
+        // An intervening applied event invalidates/removes this operation.
+        // Its anchor's current placement is not proof of the original range.
+        confirmed.unconfirmedRange = [...ids].filter(id => id !== move.messageId);
+      }
+      if (confirmed === null || confirmed.unconfirmedRange !== undefined || operation.echoed ||
           (source.channelId === confirmed.destinationChannelId && source.topic === confirmed.topic)) {
         this.selfMoves = this.selfMoves.filter(op => op !== operation);
       } else {
@@ -436,8 +446,12 @@ export class ZulipAdapter implements PlatformAdapter {
     this.selfMoveTimer = null;
   }
 
-  private invalidateSelfMoves(ids: number[]): void {
-    this.selfMoves = this.selfMoves.filter(op => !ids.some(id => op.ids.has(id)));
+  private invalidateSelfMoves(ids: number[], pendingEcho?: SelfMove): void {
+    // An applied change can touch an uncached member of a pending range.
+    // Without proof of disjointness, invalidate that range conservatively.
+    this.selfMoves = this.selfMoves.filter(op =>
+      (op.move === pendingEcho || op.confirmed || op.move.propagateMode === 'change_one') &&
+      !ids.some(id => op.ids.has(id)));
     this.scheduleSelfMoveExpiry();
   }
 
@@ -465,9 +479,12 @@ export class ZulipAdapter implements PlatformAdapter {
       const at = this.seen.get(id);
       return at ? [[id, at] as const] : [];
     });
-    return cached.length > 0 && cached.every(([id, at]) =>
-      operation.placement.get(id) === at && !at.placementUnknown)
-      ? operation.confirmed ? 'confirmed' : 'pending' : null;
+    if (!cached.length || !cached.every(([id, at]) =>
+      operation.placement.get(id) === at && !at.placementUnknown)) return null;
+    // This recognized pending echo may be applied, but it is intervening
+    // activity for any other in-flight range operation.
+    if (!operation.confirmed) this.invalidateSelfMoves([], operation.move);
+    return operation.confirmed ? 'confirmed' : 'pending';
   }
 
   private advanceSelfMovePlacements(ids: Iterable<number>): void {
@@ -509,6 +526,9 @@ export class ZulipAdapter implements PlatformAdapter {
 
   /** Re-seat the known propagation range and routing before the tool returns. */
   noteSelfMoved(move: SelfMove): void {
+    // Completion has certified this operation; any other pending ranges
+    // cannot use their old provenance across this applied tool placement.
+    this.invalidateSelfMoves([]);
     this.hasToolMoves = true;
     // The post-move read can name a stream absent from discovery/refresh.
     // Retain that fact so an unresolved echo cannot downgrade known routing.
@@ -519,8 +539,15 @@ export class ZulipAdapter implements PlatformAdapter {
     const source = move.source ?? (anchor && !anchor.placementUnknown ? { channelId: anchor.channelId, topic: anchor.topic } : null);
     if (!source) return; // No original placement; an echo can still reconcile it.
     const ids = new Set([move.messageId]);
+    if (move.unconfirmedRange !== undefined) {
+      for (const id of move.unconfirmedRange) {
+        const where = this.seen.get(id);
+        if (where) this.seen.set(id, { ...where, placementUnknown: true });
+        if (move.newStreamId !== null && move.destinationChannelId === null) this.movedAway.set(id, Date.now());
+      }
+    }
     for (const [id, where] of this.seen) {
-      if (!where.placementUnknown && where.channelId === source.channelId && where.topic === source.topic &&
+      if (move.unconfirmedRange === undefined && !where.placementUnknown && where.channelId === source.channelId && where.topic === source.topic &&
           (move.propagateMode === 'change_all' || (move.propagateMode === 'change_later' && id >= move.messageId))) ids.add(id);
     }
     for (const id of ids) {
@@ -536,17 +563,26 @@ export class ZulipAdapter implements PlatformAdapter {
       }
     }
     this.advanceSelfMovePlacements(ids);
-    this.onSelfChanged?.({
+    const event: MessageChangeEvent = {
       kind: 'move', channelId: source.channelId, messageId: String(move.messageId), messageIds: [...ids].map(String),
       authorId: anchor ? String(anchor.authorId) : null, authorName: anchor?.authorName ?? null,
       authorEmail: anchor?.authorEmail ?? null, actorId: this.identity.selfUserId === null ? null : String(this.identity.selfUserId),
       topic: move.topic ?? source.topic, previousTopic: source.topic,
       movedToChannelId: move.destinationChannelId === source.channelId ? null : move.destinationChannelId,
-      newStreamId: move.destinationChannelId === source.channelId ? null : move.newStreamId, moveScope: { topic: source.topic, propagateMode: move.propagateMode },
+      newStreamId: move.destinationChannelId === source.channelId ? null : move.newStreamId,
+      ...(move.unconfirmedRange === undefined ? { moveScope: { topic: source.topic, propagateMode: move.propagateMode } } : {}),
       routingUncertain: move.topic === null, content: null, previousContent: null,
       mentioned: anchor?.mentioned ?? false, previouslyMentioned: anchor?.mentioned ?? null,
       vanished: false, isDM: false, onOwnMessage: anchor?.authorId === this.identity.selfUserId, timestamp: new Date(),
-    });
+    };
+    if (move.unconfirmedRange !== undefined) {
+      this.onSelfChanged?.({
+        ...event, messageIds: move.unconfirmedRange.map(String), topic: source.topic,
+        movedToChannelId: null, newStreamId: move.newStreamId, routingUncertain: true,
+        moveScope: { topic: source.topic, propagateMode: move.propagateMode },
+      });
+    }
+    this.onSelfChanged?.(event);
   }
 
   /**

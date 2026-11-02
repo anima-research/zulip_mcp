@@ -875,3 +875,67 @@ test('trustworthy uncached reply hint still follows a change_all move', async t 
   await f.publish();
   assert.equal(f.sent.at(-1).topic, 'confirmed');
 });
+
+for (const mode of ['change_all', 'change_later'] as const) for (const actor of [SELF, 7]) {
+  test(`pending range result does not certify co-moved placement: ${mode}, actor ${actor}`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source conversation accepted');
+    await f.type('start');
+    f.onPatch(async () => {
+      // The original range PATCH has applied "first", but its response is held.
+      // Another client moves only its anchor; the post-result GET sees "second".
+      f.placements.set(21, raw(21, 'second'));
+      const before = f.reconciled.length;
+      f.feed(move([21], { message_id: 21, user_id: actor, orig_subject: 'first', subject: 'second' }));
+      await until(() => actor === SELF ? f.reconciled.length > before : f.cachedPlacement(21)?.topic === 'second',
+        'intervening anchor event applied');
+    });
+    await f.callMove({ message_id: 21, topic: 'first', propagate_mode: mode });
+    assert.equal(f.placements.get(30).subject, 'first');
+    await assert.rejects(f.publish(), /unconfirmed topic/, 'anchor read must not certify the original range');
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.cachedPlacement(21).topic, 'second', 'the anchor itself is exactly proven');
+    assert.equal(f.cachedPlacement(21).placementUnknown, false);
+    assert.equal(f.cachedPlacement(30).placementUnknown, true);
+    assert.equal(Boolean(f.cachedPlacement(20).placementUnknown), mode === 'change_all');
+    await f.type('start');
+    assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [['start', 'deploys'], ['stop', 'deploys']],
+      'uncertain co-moved source must not start typing in the anchor-only destination');
+  });
+}
+
+test('uncontested pending range result still confirms normalized placement and routing', async t => {
+  for (const mode of ['change_all', 'change_later'] as const) {
+    const f = await fixture();
+    try {
+      for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+      await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source conversation accepted');
+      await f.type('start');
+      await f.callMove({ message_id: 21, topic: ' first ', propagate_mode: mode });
+      await f.publish();
+      assert.equal(f.sent.at(-1).topic, 'first');
+      assert.equal(f.cachedPlacement(30).topic, 'first');
+      assert.equal(f.cachedPlacement(30).placementUnknown, false);
+      await f.type('start');
+      assert.deepEqual(f.typing.map(s => [s.op, s.topic]),
+        [['start', 'deploys'], ['stop', 'deploys'], ['start', 'first']]);
+    } finally { await f.close(); }
+  }
+});
+
+test('a mismatched anchor read without an event does not certify a range', async t => {
+  for (const mode of ['change_all', 'change_later'] as const) {
+    const f = await fixture();
+    try {
+      for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+      await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source conversation accepted');
+      f.onPatch(async () => { f.placements.set(21, raw(21, 'second')); });
+      await f.callMove({ message_id: 21, topic: 'first', propagate_mode: mode });
+      assert.equal(f.placements.get(30).subject, 'first');
+      await assert.rejects(f.publish(), /unconfirmed topic/);
+      assert.equal(f.cachedPlacement(21).topic, 'second');
+    } finally { await f.close(); }
+  }
+});

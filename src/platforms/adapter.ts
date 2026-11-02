@@ -93,7 +93,7 @@ export interface ReactionEvent {
 
 export type OnReaction = (event: ReactionEvent) => void;
 
-/** Confirmed tool success, independent of the asynchronous event echo. */
+/** Tool success and anchor placement, independent of its event echo. */
 export interface SelfMove {
   messageId: number;
   source: { channelId: string; topic: string } | null;
@@ -102,6 +102,8 @@ export interface SelfMove {
   destinationChannelId: string | null;
   /** Null if the stored topic could not be confirmed. */
   topic: string | null;
+  /** Captured co-moved IDs whose placement the anchor read cannot prove. */
+  unconfirmedRange?: number[];
 }
 
 /**

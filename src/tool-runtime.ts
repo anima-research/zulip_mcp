@@ -759,7 +759,7 @@ export class ZulipToolRuntime {
           if (args[field] !== undefined) editFields.set(field, String(args[field]));
         }
         let confirmedMove: SelfMove | null = null;
-        const finishMove = moving ? this.onMoveStarted?.({
+        let finishMove = moving ? this.onMoveStarted?.({
           messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
           newStreamId, destinationChannelId: newStreamId === null ? source?.channelId ?? null : null,
           topic: args.topic ?? source?.topic ?? null,
@@ -809,10 +809,13 @@ export class ZulipToolRuntime {
             // confirm a requested (possibly normalized/truncated) topic.
             let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
             let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
+            let readPlacementConfirmed = false;
             try {
               const placed = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
               if (placed?.result === "success" &&
                   (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
+                readPlacementConfirmed = typeof placed.message?.display_recipient === "string" &&
+                  typeof placed.message?.subject === "string";
                 if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
                 if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
               }
@@ -827,7 +830,14 @@ export class ZulipToolRuntime {
             confirmedMove = {
               messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
               newStreamId, destinationChannelId, topic: storedTopic,
+              ...(!readPlacementConfirmed && ["change_all", "change_later"].includes(args.propagate_mode)
+                ? { unconfirmedRange: [] } : {}),
             };
+            // Validate the operation's range provenance before applying the
+            // anchor read as placement. Completion still runs exactly once.
+            const finish = finishMove;
+            finishMove = undefined;
+            finish?.(confirmedMove);
             this.onMoved?.(confirmedMove);
             if (movedTo) {
               movedTo = { channelId: destinationChannelId, topic: storedTopic };
