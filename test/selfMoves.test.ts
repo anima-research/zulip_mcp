@@ -45,6 +45,7 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   const sent: any[] = [];
   const typing: any[] = [];
   const placements = new Map<number, any>();
+  let patchHook: ((event: any) => Promise<void>) | undefined;
   const api = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -52,16 +53,25 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
     const id = Number(req.url!.split('/').at(-1));
     const original = placements.get(id) ?? raw(id);
     const mode = fields.get('propagate_mode') ?? 'change_one';
+    const messageIds: number[] = [];
     for (const n of [20, 21, 30]) {
       const m = placements.get(n) ?? raw(n);
       if (n !== id && (mode === 'change_one' || m.subject !== original.subject ||
           m.stream_id !== original.stream_id || (mode === 'change_later' && n < id))) continue;
+      messageIds.push(n);
       placements.set(n, { ...m,
         ...(fields.has('topic') ? { subject: fields.get('topic')!.trim() } : {}),
         ...(fields.has('stream_id') ? { stream_id: Number(fields.get('stream_id')),
-          display_recipient: Number(fields.get('stream_id')) === 8 ? 'archive' : 'new-stream' } : {}),
+          display_recipient: Number(fields.get('stream_id')) === 7 ? 'general'
+            : Number(fields.get('stream_id')) === 8 ? 'archive' : 'new-stream' } : {}),
       });
     }
+    await patchHook?.(move(messageIds, {
+      message_id: id, stream_id: original.stream_id, orig_subject: original.subject,
+      subject: fields.has('topic') ? fields.get('topic')!.trim() : undefined,
+      ...(fields.has('stream_id') && Number(fields.get('stream_id')) !== original.stream_id
+        ? { new_stream_id: Number(fields.get('stream_id')) } : {}),
+    }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ result: 'success', msg: '' }));
   });
@@ -131,6 +141,12 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false) 
   await until(() => server.isLive, 'live delivery');
   return {
     host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
+    onPatch(hook?: (event: any) => Promise<void>) { patchHook = hook; },
+    async callMove(args: Record<string, unknown>) {
+      const result = await host.sendRequest('tools/call', { name: 'move_messages', arguments: args });
+      assert.notEqual((result as any).isError, true);
+      return result;
+    },
     feed(...events: any[]) { pending.push(...events.map(event => ({ ...event, id: ++eventId }))); },
     async open(channelId = GENERAL) {
       await host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {}, backscroll: 0 });
@@ -384,3 +400,133 @@ test('a successful placement read resolves a new stream for the later echo too',
   await f.publish('zulip:new-stream');
   assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['new-stream', 'deploys']);
 });
+
+test('delayed first self echo cannot undo a second tool-confirmed rename', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+  await f.callMove({ message_id: 21, topic: 'first' });
+  await f.callMove({ message_id: 21, topic: 'second' });
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'second');
+  f.feed(move([21], { message_id: 21, subject: 'first' }));
+  await until(() => f.reconciled.length === 3, 'delayed first echo processed');
+  await f.publish();
+  assert.equal(f.placements.get(21).subject, 'second', 'stored placement did not change');
+  assert.equal(f.sent.at(-1).topic, 'second', 'old echo must not roll back the current reply hint');
+});
+
+const modes = ['change_one', 'change_later', 'change_all'] as const;
+for (const firstMode of modes) for (const secondMode of modes) {
+  for (const order of ['early', 'late', 'reverse', 'first-early', 'second-early'] as const) {
+    test(`move echoes preserve split ranges: ${firstMode}/${secondMode}, ${order}`, async t => {
+      const f = await fixture();
+      t.after(() => f.close());
+      await f.open();
+      for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+      await until(() => f.server.delivery.watermark(GENERAL) === 30, 'messages accepted');
+      const echoes: any[] = [];
+      const delayed: any[] = [];
+      f.onPatch(async event => {
+        echoes.push(event);
+        if (order === 'early' || (order === 'first-early' && echoes.length === 1) ||
+            (order === 'second-early' && echoes.length === 2)) {
+          const before = f.reconciled.length;
+          f.feed(event);
+          await until(() => f.reconciled.length > before, 'echo before PATCH response');
+        } else delayed.push(event);
+      });
+      await f.callMove({ message_id: 21, topic: ' first ', propagate_mode: firstMode });
+      await f.callMove({ message_id: 21, topic: 'second', propagate_mode: secondMode });
+      const expected = [20, 21, 30].map(id => (f.placements.get(id) ?? raw(id)).subject);
+      await f.publish();
+      assert.equal(f.sent.at(-1).topic, expected[2]);
+      assert.equal(echoes[0].edit_timestamp, echoes[1].edit_timestamp, 'same-second operations are deliberate');
+      if (order !== 'early') {
+        for (const echo of order === 'reverse' ? [...delayed].reverse() : delayed) {
+          const before = f.reconciled.length;
+          f.feed(echo);
+          await until(() => f.reconciled.length > before, 'delayed echo');
+          assert.equal(f.reconciled.at(-1).confirmationOnly, true);
+          await f.publish();
+          assert.equal(f.sent.at(-1).topic, expected[2], 'hint must not follow an older operation');
+        }
+      }
+      // Content-only edits read cached placement rather than the tool fixture's
+      // stored placements. Check every side of each partial propagation range.
+      for (const id of [20, 21, 30]) f.feed({ type: 'update_message', message_id: id, message_ids: [id],
+        user_id: 7, stream_id: 7, edit_timestamp: 1_700_002_000,
+        content: `edited ${id}`, orig_content: `old ${id}`, flags: ['mentioned'] });
+      await until(() => f.incoming.filter(m => m.metadata?.change === 'edit').length === 3, 'placed edits');
+      assert.deepEqual(f.incoming.filter(m => m.metadata?.change === 'edit').map(m => m.metadata?.topic), expected);
+    });
+  }
+}
+
+test('old cross-stream range echo cannot move newer reactions or edits back', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  await f.open(ARCHIVE);
+  for (const id of [20, 21, 30]) f.feed({ type: 'message', flags: ['mentioned'], message: raw(id) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'messages accepted');
+  const echoes: any[] = [];
+  f.onPatch(async event => { echoes.push(event); });
+  await f.callMove({ message_id: 20, topic: 'first', stream_id: 8, propagate_mode: 'change_all' });
+  await f.callMove({ message_id: 21, topic: 'second', stream_id: 7, propagate_mode: 'change_one' });
+  f.feed(echoes[0], echoes[1]);
+  await until(() => f.reconciled.length === 4, 'both echoes confirmed');
+  for (const id of [20, 21, 30]) f.feed(
+    { type: 'reaction', op: 'add', message_id: id, user_id: 7, emoji_name: 'eyes' },
+    { type: 'update_message', message_id: id, message_ids: [id], user_id: 7,
+      edit_timestamp: 1_700_002_000, content: `edited ${id}`, orig_content: `old ${id}`, flags: ['mentioned'] },
+  );
+  await until(() => f.incoming.filter(m => m.metadata?.reaction).length === 3 &&
+    f.incoming.filter(m => m.metadata?.change === 'edit').length === 3, 'placed reactions and edits');
+  for (const kind of ['reaction', 'edit']) {
+    const markers = f.incoming.filter(m => kind === 'reaction' ? m.metadata?.reaction : m.metadata?.change === kind)
+      .sort((a, b) => Number(a.metadata?.targetMessageId) - Number(b.metadata?.targetMessageId));
+    assert.deepEqual(markers.map(m => [m.metadata?.targetMessageId, m.channelId]), [
+      ['20', ARCHIVE], ['21', GENERAL], ['30', ARCHIVE],
+    ]);
+  }
+  assert.deepEqual(f.incoming.filter(m => m.metadata?.change === 'edit')
+    .sort((a, b) => Number(a.metadata?.targetMessageId) - Number(b.metadata?.targetMessageId))
+    .map(m => m.metadata?.topic), ['first', 'second', 'first']);
+});
+
+for (const actor of [SELF, 7]) {
+  test(`genuine later move still applies after tool confirmations (actor ${actor})`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    await f.open(ARCHIVE);
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 21, 'mention accepted');
+    await f.callMove({ message_id: 21, topic: 'first' });
+    await f.callMove({ message_id: 21, topic: 'second' });
+    // Same-second genuine change, including a content change not made by the
+    // move tool: it must not be mistaken for one of its delayed echoes.
+    f.placements.set(21, { ...raw(21, 'external'), stream_id: 8, display_recipient: 'archive' });
+    f.feed(move([21], { message_id: 21, user_id: actor, orig_subject: 'second', subject: 'external', new_stream_id: 8 }),
+      { type: 'reaction', op: 'add', message_id: 21, user_id: 7, emoji_name: 'eyes' },
+      { type: 'update_message', message_id: 21, message_ids: [21], user_id: 7, stream_id: 8,
+        edit_timestamp: 1_700_002_000, content: 'edited externally', orig_content: 'old', flags: ['mentioned'] });
+    await until(() => f.incoming.some(m => m.metadata?.reaction) &&
+      f.incoming.some(m => m.metadata?.change === 'edit'), 'external placement observed');
+    assert.equal(f.incoming.find(m => m.metadata?.reaction)!.channelId, ARCHIVE);
+    const edit = f.incoming.find(m => m.metadata?.change === 'edit')!;
+    assert.deepEqual([edit.channelId, edit.metadata?.topic], [ARCHIVE, 'external']);
+    if (actor === SELF) await assert.rejects(f.publish(), /moved.*zulip:archive.*external/);
+    // Delayed tool echoes must not roll back even this later external move.
+    f.feed(move([21], { message_id: 21, subject: 'first' }),
+      move([21], { message_id: 21, orig_subject: 'first', subject: 'second' }));
+    await until(() => f.reconciled.filter(c => c.confirmationOnly).length === 2, 'old operations confirmed');
+    f.feed({ type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
+      edit_timestamp: 1_700_002_000, content: 'edited again', orig_content: 'old', flags: ['mentioned'] });
+    await until(() => f.incoming.filter(m => m.metadata?.change === 'edit').length === 2, 'later edit placed');
+    const last = f.incoming.filter(m => m.metadata?.change === 'edit').at(-1)!;
+    assert.deepEqual([last.channelId, last.metadata?.topic], [ARCHIVE, 'external']);
+  });
+}

@@ -523,6 +523,7 @@ export class ChannelManager {
    * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
+    if (change.confirmationOnly) return;
     if (change.previousTopic === null && change.movedToChannelId === null &&
         change.newStreamId == null && !change.routingUncertain) return;
     const source = this.lastIncoming.get(change.channelId);

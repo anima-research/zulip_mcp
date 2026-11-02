@@ -187,8 +187,13 @@ reply routing: a moderator archiving an old message does not retarget the
 reply the agent is composing. The bot's own moves emit no marker but update
 reply hints when the current conversation's source message moved. Successful
 `move_messages` calls reconcile routing and cached placement before returning;
-the event echo is an idempotent confirmation, not a prerequisite. A typing
-refresh stops the run in its original topic before following a same-stream
+move echoes are not a prerequisite. Each tool write is tracked before its
+request, so a matching echo received before the result is reconciled normally,
+while a matching echo of a fully resolved success is confirmation-only: it
+cannot overwrite newer cached placement or reply hints, including after
+partially overlapping moves in the same second. Other changes still follow
+the normal event path; this is not timestamp-based ordering of all Zulip
+activity. A typing refresh stops the run in its original topic before following a same-stream
 rename.
 After a cross-stream move, a source-channel publish is refused with an error
 naming the destination, and source typing stops. Confirm with `send_message`

@@ -425,3 +425,28 @@ test('a requested topic is unconfirmed when post-move placement cannot be read',
     assert.match(result.routing_note, /Move succeeded.*before publishing/);
   } finally { await f.close(); }
 });
+
+for (const success of [false, true]) {
+  test(`move tracking completes exactly once on ${success ? 'success with stored placement' : 'failure'}`, async () => {
+    const f = await fixture(success ? { result: 'success', msg: '' } : { result: 'error', msg: 'Permission denied' }, success ? 200 : 400);
+    const starts: any[] = [];
+    const completions: any[] = [];
+    f.tools.onMoveStarted = move => {
+      assert.equal(f.calls.length, 0, 'tracking must start before PATCH');
+      starts.push(move);
+      return completed => { completions.push(completed); };
+    };
+    try {
+      const call = f.tools.handleToolCall('move_messages', { message_id: 42, topic: ' normalized ', propagate_mode: 'change_all' });
+      if (success) await call;
+      else await assert.rejects(call, /Permission denied/);
+      assert.equal(starts.length, 1);
+      assert.deepEqual(starts[0].source, { channelId: 'zulip:general', topic: 'deploys' });
+      assert.equal(completions.length, 1);
+      if (success) {
+        assert.equal(completions[0].topic, 'normalized');
+        assert.equal(completions[0].destinationChannelId, 'zulip:general');
+      } else assert.equal(completions[0], null, 'failed writes cannot remain paired to future changes');
+    } finally { await f.close(); }
+  });
+}

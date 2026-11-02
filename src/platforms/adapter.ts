@@ -137,6 +137,8 @@ export interface MessageChangeEvent {
   moveScope?: { topic: string; propagateMode: SelfMove['propagateMode'] };
   /** Successful move whose stored destination topic is not yet known. */
   routingUncertain?: boolean;
+  /** An echo of an already reconciled tool operation, not a new placement. */
+  confirmationOnly?: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -261,6 +263,9 @@ export interface PlatformAdapter {
   onSelfChanged?: OnMessageChange;
   /** Reconcile a successful tool move before returning its result. */
   noteSelfMoved?(move: SelfMove): void;
+  /** Track the write before dispatch, including echoes preceding its result.
+   *  Complete with the stored placement on success, or null on failure. */
+  trackSelfMove?(move: SelfMove): (confirmed: SelfMove | null) => void;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
