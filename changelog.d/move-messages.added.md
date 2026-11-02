@@ -4,7 +4,9 @@
   Zulip enforces realm permissions and move limits.
 - The bot's own moves reconcile message placement and current reply/typing
   hints without delivering a change marker. Cross-stream moves return
-  `moved_to: {channelId, topic}` for publishing into the destination; unresolved
+  `moved_to: {channelId, topic}` for confirmation via `send_message` with an
+  explicit stream and topic, not a channel-only publish. Source-channel
+  publishes are refused and source typing stops after the move; unresolved
   routing fields are null with a diagnostic if Zulip cannot supply them.
 - Move-limit errors include the Zulip code and partial-move retry fields.
 - Moves out of filtered streams also update cached placement: the source move

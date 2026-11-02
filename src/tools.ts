@@ -263,7 +263,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "move_messages",
-    description: "Rename a topic or move Zulip messages by message ID. Provide topic or stream_id. Zulip defaults to change_one (this message only); use change_all for the whole topic. Realm permissions and move time limits apply, including to other people's messages. Use list_streams to find a destination stream_id. Content edits use edit_message separately. Zulip posts a Notification Bot breadcrumb in the destination topic by default. To resolve a topic, rename it to ✔ <topic> with change_all.",
+    description: "Rename a topic or move Zulip messages by message ID. Provide topic or stream_id. Zulip defaults to change_one (this message only); use change_all for the whole topic. Realm permissions and move time limits apply, including to other people's messages. Use list_streams to find a destination stream_id. Content edits use edit_message separately. Zulip posts a Notification Bot breadcrumb in the destination topic by default. To resolve a topic, rename it to ✔ <topic> with change_all. After a cross-stream move, confirm with send_message to moved_to's stream and topic, not channels/publish (the destination channel may have a newer conversation).",
     inputSchema: {
       type: "object",
       properties: {

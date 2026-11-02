@@ -186,9 +186,11 @@ read). A change line never sets `threadId` and never moves this server's
 reply routing: a moderator archiving an old message does not retarget the
 reply the agent is composing. The bot's own moves emit no marker but update
 reply and typing hints when the current conversation's source message moved.
-Cross-stream moves transfer the hints to the destination: use the move tool's
-`moved_to.channelId` for the next publish; a source-channel publish cannot
-reach another stream. A move into a stream the bot cannot see
+After a cross-stream move, a source-channel publish is refused with an error
+naming the destination, and source typing stops. Confirm with `send_message`
+using the stream named by `moved_to.channelId` and the explicit `moved_to.topic`.
+Do not use a destination-channel publish to confirm: its newest conversation
+may be unrelated to the moved topic. A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
 takes (a deleted id can no longer be fetched). History and backscroll

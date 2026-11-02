@@ -100,7 +100,7 @@ async function fixture(policy: ZulipFilters = {}) {
   ] });
   await until(() => server.isLive, 'live delivery');
   return {
-    host, server, sent, typing, incoming, pushes, reconciled,
+    host, server, tools, sent, typing, incoming, pushes, reconciled,
     feed(...events: any[]) { pending.push(...events.map(event => ({ ...event, id: ++eventId }))); },
     async open(channelId = GENERAL) {
       await host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {}, backscroll: 0 });
@@ -240,3 +240,33 @@ test('a stop immediately after a self rename cancels typing in the original topi
   await f.type('stop');
   assert.deepEqual(f.typing.map(s => [s.op, s.topic]), [['start', 'deploys'], ['stop', 'deploys']]);
 });
+
+for (const busyDestination of [false, true]) {
+  test(`cross-stream moves refuse source publishes and confirm by explicit topic (${busyDestination ? 'busy' : 'empty'} destination)`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open(ARCHIVE);
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+    if (busyDestination) f.feed({ type: 'message', flags: ['mentioned'], message: {
+      ...raw(30, 'ops'), stream_id: 8, display_recipient: 'archive',
+    } });
+    await until(() => f.server.delivery.watermark(GENERAL) === 21 &&
+      (!busyDestination || f.server.delivery.watermark(ARCHIVE) === 30), 'conversations accepted');
+    await f.type('start');
+    f.feed(move([20, 21], { new_stream_id: 8, subject: undefined }));
+    await until(() => f.reconciled.length === 1, 'cross-stream move reconciled');
+    await f.type('start');
+    await assert.rejects(f.publish(), /moved.*zulip:archive.*deploys.*send_message/);
+    await f.type('stop');
+    assert.deepEqual(f.typing.map(s => [s.stream_id, s.op, s.topic]), [
+      [7, 'start', 'deploys'], [7, 'stop', 'deploys'],
+    ]);
+    assert.deepEqual(f.sent, [], 'no fallback write to mcpl');
+    if (busyDestination) {
+      await f.publish(ARCHIVE);
+      assert.equal(f.sent[0].topic, 'ops', 'an unrelated newer destination conversation is not overwritten');
+    }
+    await f.tools.handleToolCall('send_message', { type: 'stream', to: 'archive', topic: 'deploys', content: 'Done' });
+    assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['archive', 'deploys']);
+  });
+}

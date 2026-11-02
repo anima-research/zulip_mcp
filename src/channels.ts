@@ -105,7 +105,11 @@ export class ChannelManager {
    *  took, so publishes can land in the active thread/topic, with the id of
    *  the message they came from, so an older message delivered late doesn't
    *  move them back. */
-  private lastIncoming = new Map<string, { hints: RoutingHints; from?: number }>();
+  private lastIncoming = new Map<string, {
+    hints: RoutingHints;
+    from?: number;
+    movedTo?: { channelId: string | null; topic: string | null; streamId?: number };
+  }>();
   /** Per-channel topic the current typing run started in, so a refresh that
    *  moves to a newer topic, and the final stop, cancel it there. */
   private typingTopic = new Map<string, string | undefined>();
@@ -515,8 +519,8 @@ export class ChannelManager {
   /**
    * Reconcile a move the bot made itself, without enqueueing a change marker.
    * Only the conversation's source message can retarget its reply hints.
-   * Cross-channel moves transfer those hints; publish still requires the
-   * host to name the destination channel (reported by the move tool).
+   * Cross-channel moves leave a source marker: a channel-only publish cannot
+   * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
     if (change.previousTopic === null && change.movedToChannelId === null) return;
@@ -534,7 +538,7 @@ export class ChannelManager {
     if (destination === change.channelId) {
       this.lastIncoming.set(destination, updated);
     } else {
-      this.lastIncoming.delete(change.channelId);
+      this.lastIncoming.set(change.channelId, { ...source, movedTo: { channelId: destination, topic: change.topic } });
       // Keep the source typing run so a channel-only stop cancels it
       // in the topic where it started, even after reply hints move away.
       const existing = this.lastIncoming.get(destination);
@@ -587,6 +591,12 @@ export class ChannelManager {
       throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel format: ${channelId}`, { channelId });
     }
 
+    const movedTo = this.lastIncoming.get(channelId)?.movedTo;
+    if (movedTo) {
+      throw new McplRpcError(-32602,
+        `Conversation moved to ${movedTo.channelId ?? `stream ${movedTo.streamId ?? 'unknown'}`} > ${movedTo.topic ?? '(unconfirmed topic)'}; confirm with send_message using the destination stream and topic.`,
+        { channelId, movedTo });
+    }
     return adapter.publish(
       channelId,
       this.allChannels.get(channelId),
@@ -608,6 +618,16 @@ export class ChannelManager {
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
     const descriptor = this.allChannels.get(channelId);
+    if (this.lastIncoming.get(channelId)?.movedTo) {
+      // Stop the original source run once; neither refreshes nor later stops
+      // may start/fall back to another topic after the conversation left.
+      if (this.typingTopic.has(channelId)) {
+        const topic = this.typingTopic.get(channelId);
+        this.typingTopic.delete(channelId);
+        await adapter.sendTyping(channelId, descriptor, topic === undefined ? undefined : { topic }, 'stop');
+      }
+      return;
+    }
     // A topic the host names wins. Like publish, a host that names none means
     // the conversation's current one, the topic of the newest message
     // noteConversation took.
