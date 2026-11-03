@@ -1219,7 +1219,7 @@ export class ZulipMcplServer {
     channelId: string,
     afterId: number,
     throughId?: number,
-    quoteLookupDeadline?: number,
+    quoteLookupBudget?: { remainingMs: number },
   ): Promise<{ messages: IncomingChannelMessage[]; truncated: boolean; complete: boolean; scannedThrough: number | null; unverifiedMessageIds: number[] }> {
     const out: IncomingChannelMessage[] = [];
     const unverified = new Set<number>();
@@ -1227,7 +1227,7 @@ export class ZulipMcplServer {
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupDeadline });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget });
       if (page.scannedThrough === null) {
         complete = true;
         break;
@@ -1241,7 +1241,7 @@ export class ZulipMcplServer {
         return {
           ...message,
           tags: [...new Set([...(message.tags ?? []).filter((tag) => tag !== CHAT_TAGS.ambient), CHAT_TAGS.reply])],
-          metadata: { ...(message.metadata as Record<string, unknown>), replyToSelf: true },
+          metadata: { ...(message.metadata as Record<string, unknown>), replyToSelf: true, isMention: true, isReplyToBot: true },
         };
       }));
       if (page.scannedThrough <= cursor) break;
@@ -1276,7 +1276,7 @@ export class ZulipMcplServer {
     channelId: string,
     keepAllHint: boolean,
     afterId?: number,
-    retryWindow?: { through: number; truncated: boolean; deadline: number },
+    retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
@@ -1286,14 +1286,17 @@ export class ZulipMcplServer {
     if (after === undefined) return false;
     // At most two quote-wait allowances for the entire call, not per row or
     // page. Reserve the second allowance for one pass over ALL deferred rows.
-    const deadline = retryWindow?.deadline ?? performance.now() + 6_000;
-    const passDeadline = retryWindow ? deadline : Math.min(deadline, performance.now() + 3_000);
+    const budget = retryWindow?.budget ?? { remainingMs: 6_000 };
+    const passBudget = { remainingMs: retryWindow ? budget.remainingMs : Math.min(budget.remainingMs, 3_000) };
+    const startedWith = passBudget.remainingMs;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
-      fetched = await this.fetchAfter(channelId, after, retryWindow?.through, passDeadline);
+      fetched = await this.fetchAfter(channelId, after, retryWindow?.through, passBudget);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
       return false;
+    } finally {
+      budget.remainingMs -= startedWith - passBudget.remainingMs;
     }
     if (fetched.scannedThrough === null) return false;
     // The one retry stays inside the first walk's ceiling. Any quote still
@@ -1301,7 +1304,7 @@ export class ZulipMcplServer {
     const window = retryWindow ?? {
       through: fetched.scannedThrough,
       truncated: fetched.truncated,
-      deadline,
+      budget,
     };
     fetched.truncated ||= window.truncated;
     let newestId = Math.min(fetched.scannedThrough, window.through);

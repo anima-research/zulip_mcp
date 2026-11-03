@@ -3003,7 +3003,7 @@ test('R2-3: push origins expose umbrella mention and specific addressing flags',
   try {
     await initialize(h, true);
     await settled(h);
-    for (const [i, [mentioned, replyToSelf]] of [[true, false], [false, true], [true, true]].entries()) {
+    for (const [i, [mentioned, replyToSelf]] of [[true, false], [false, true]].entries()) {
       h.adapter.emit!(streamMsg(5 + i, {
         metadata: { mentioned, replyToSelf, isDM: false },
         tags: [...(mentioned ? ['chat:mention'] : []), ...(replyToSelf ? ['chat:reply'] : [])],
@@ -3109,5 +3109,48 @@ for (const beforeGrant of [false, true]) {
       await second?.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+}
+
+for (const slowPart of ['history HTTP', 'prefix acceptance'] as const) {
+  test(`R3-3: slow ${slowPart} does not spend the quote-GET wait allowance`, async (t) => {
+    let now = 0;
+    t.mock.method(performance, 'now', () => now);
+    const h = harness();
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => h.server.delivery.watermark('zulip:general') === 1, 'seed watermark');
+      h.pushed.length = 0;
+      let gets = 0;
+      const row: ZulipRawMessage = {
+        id: 3, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+        display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+        content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
+      };
+      const history = new ZulipAdapter({ messages: {
+        retrieve: async ({ anchor }: { anchor: number }) => {
+          if (slowPart === 'history HTTP') now += 3100;
+          const rows = slowPart === 'prefix acceptance'
+            ? [{ ...row, id: 2, content: 'explicit mention', flags: ['mentioned'] }, row] : [row];
+          return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
+        },
+        getById: async () => {
+          if (++gets === 1 && slowPart === 'prefix acceptance') return { result: 'error', code: 'RATE_LIMIT_HIT' };
+          return { message: { ...row, id: 500, sender_id: 100 } };
+        },
+      } }, 100, 'session');
+      h.adapter.fetchHistory = history.fetchHistory.bind(history);
+      const respond = h.host.sendResponse.bind(h.host);
+      t.mock.method(h.host, 'sendResponse', (...args: Parameters<typeof h.host.sendResponse>) => {
+        if (slowPart === 'prefix acceptance' && (args[1] as { accepted?: boolean })?.accepted) now += 7000;
+        return respond(...args);
+      });
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+      await until(() => h.server.delivery.watermark('zulip:general') === 3, 'catch-up complete');
+      assert.equal(gets, slowPart === 'history HTTP' ? 1 : 2, 'unrelated waits must not starve quote verification');
+      assert.ok(h.pushed.some((p) => p.tags?.includes('chat:reply')), 'verified quote reaches the host');
+    } finally { await h.close(); }
   });
 }

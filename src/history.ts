@@ -384,6 +384,9 @@ export function toIncoming(
       // Zulip's personal/user-group mention verdict; wildcards don't count.
       mentioned: m.mentioned,
       replyToSelf: m.replyToSelf,
+      isMention: m.mentioned || m.replyToSelf,
+      isExplicitMention: m.mentioned,
+      isReplyToBot: m.replyToSelf,
       isDM: m.isDm,
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),

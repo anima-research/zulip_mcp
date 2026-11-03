@@ -11,7 +11,8 @@
   page, including reconnect sweeps and tally backfill. Budget-starved rows
   stop the initial closed-channel block short of the first deferred row and
   receive one retry walk over all deferred rows in the same catch-up call.
-  Quote waiting across all pages and both walks is capped at six seconds.
+  Only quote-GET waits spend the six-second allowance across pages and both
+  walks; history HTTP and host acceptance do not spend it.
   The initial walk waits at most three seconds; the retry walk uses whatever
   remains of the shared six-second allowance. Rows still unverified then fail closed.
   Content edits recompute reply addressing from the new raw Markdown; moves
@@ -23,7 +24,7 @@
   quote addressing; explicit mentions and DMs are unchanged.
   Stopping event delivery during a lookup or poll drops stale callbacks and
   the rest of the stopped batch, including across connection restarts.
-  Failed or missing quote-target lookups (not timeouts) are negatively cached for
+  Missing or inaccessible quote-target lookups are negatively cached for
   three minutes (bounded to 2,000 ids), without suppressing independent
   reaction or edit placement retries. Budgets limit waiting, not request
   lifetime: the underlying zulip-js GET cannot be cancelled by the timer.
@@ -41,7 +42,7 @@
   Releasing a muted/disallowed channel or a message gone from replay history
   also clears its pending reply verdict, including in closed-channel catch-up,
   preventing stale history overlays.
-  Push origins use umbrella `isMention` for explicit mentions or bot replies,
+  Push origins and channel-message metadata use umbrella `isMention` for explicit mentions or bot replies,
   with separate `isExplicitMention` and `isReplyToBot` flags for gate matching;
   message `mentioned` metadata and `chat:mention` stay explicit-mention-only.
   Uncached quote-target GETs share a process-wide token bucket across live

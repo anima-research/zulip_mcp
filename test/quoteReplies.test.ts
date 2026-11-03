@@ -681,3 +681,22 @@ for (const failure of ['rejecting promise', 'RATE_LIMIT_HIT', 'non-JSON response
     assert.equal(gets, 2, 'the retry must issue a fresh GET');
   });
 }
+
+test('R3-4: channel messages expose umbrella and specific addressing metadata', async () => {
+  const rows = [raw(300, quote()), raw(301, quote(), { flags: ['mentioned'] }), raw(302, 'ambient')];
+  const messages = await receive(rows, async () => ({ message: raw(QUOTED, 'original', { sender_id: SELF }) }));
+  for (const [i, [explicit, reply]] of [[false, true], [true, false], [false, false]].entries()) {
+    assert.equal(messages[i].metadata?.isMention, explicit || reply);
+    assert.equal(messages[i].metadata?.isExplicitMention, explicit);
+    assert.equal(messages[i].metadata?.isReplyToBot, reply);
+  }
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: rows, found_newest: true }),
+    getById: async () => ({ message: raw(QUOTED, 'original', { sender_id: SELF }) }),
+  } }, SELF, 'session');
+  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  assert.equal(page.messages[0].metadata?.isMention, true);
+  assert.equal(page.messages[0].metadata?.isReplyToBot, true);
+  assert.equal(page.messages[1].metadata?.isExplicitMention, true);
+  assert.equal(page.messages[1].metadata?.isReplyToBot, false, 'explicit mentions do not infer quote addressing');
+});

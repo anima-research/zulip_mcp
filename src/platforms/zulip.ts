@@ -901,22 +901,30 @@ export class ZulipAdapter implements PlatformAdapter {
     // Page authors take precedence over older cached rows, including targets
     // later in the page and pages larger than the seen cache. Uncached targets
     // share a page GET cap and wait budget, within the process-wide quote
-    // bucket and any catch-up call deadline supplied by the server.
+    // bucket and any shared quote-wait allowance supplied by the server.
     const pageById = new Map(page.messages.map((m) => [m.id, m]));
     let getsLeft = HISTORY_QUOTE_GET_CAP;
-    const deadline = Math.min(performance.now() + QUOTE_TIMEOUT_MS, query.quoteLookupDeadline ?? Infinity);
+    let pageRemainingMs = QUOTE_TIMEOUT_MS;
     const unverifiedMessageIds: string[] = [];
     const resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
       const known = pageById.get(id) ?? this.seen.get(id);
       if (known) return known;
       if (this.quoteLookupFailed(id)) return null;
+      remainingMs = Math.min(remainingMs, pageRemainingMs, query.quoteLookupBudget?.remainingMs ?? Infinity);
       if (getsLeft <= 0 || remainingMs <= 0) return 'budget-skipped';
       getsLeft--;
-      return this.resolveQuoteTarget(id, remainingMs);
+      const started = performance.now();
+      try {
+        return await this.resolveQuoteTarget(id, remainingMs);
+      } finally {
+        const waited = Math.max(0, performance.now() - started);
+        pageRemainingMs = Math.max(0, pageRemainingMs - waited);
+        if (query.quoteLookupBudget) query.quoteLookupBudget.remainingMs = Math.max(0, query.quoteLookupBudget.remainingMs - waited);
+      }
     };
     for (const m of page.messages) {
       if (!this.allowed(m)) continue;
-      const verdict = await this.classifyQuoteReply(m, resolve, deadline);
+      const verdict = await this.classifyQuoteReply(m, resolve, Infinity);
       m.replyToSelf = verdict === 'reply';
       if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }

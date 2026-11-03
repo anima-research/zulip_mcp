@@ -151,9 +151,9 @@ export type OnMessageChange = (event: MessageChangeEvent) => void;
 /** History request against one channel, in the platform's own id space. */
 export interface ChannelHistoryQuery {
   limit: number;
-  /** Optional process-local performance.now() deadline shared by a catch-up
-   *  walk. Bounds quote waiting across pages, not history HTTP requests. */
-  quoteLookupDeadline?: number;
+  /** Mutable allowance shared across a catch-up walk. Adapters subtract only
+   *  milliseconds awaiting quote GETs, not history HTTP or host acceptance. */
+  quoteLookupBudget?: { remainingMs: number };
   /** Exclusive: only messages older than this id. */
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */

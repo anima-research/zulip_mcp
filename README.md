@@ -37,10 +37,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   `/near/N` immediately heads a `quote` fence and N resolves to a message
   the bot authored. It carries `metadata.replyToSelf` on channel messages,
   `origin.isReplyToBot` on pushes, and `chat:reply`, not `chat:mention`.
-  Push origins expose `isMention` as the umbrella (explicit mention or reply
-  to the bot), plus `isExplicitMention` and `isReplyToBot` for precise gate
+  Push origins and channel-message metadata expose umbrella `isMention`
+  (explicit mention or reply to the bot), plus `isExplicitMention` and `isReplyToBot` for precise gate
   matching. `metadata.mentioned` remains Zulip's verdict, and the line has no
-  `(mention)` label unless Zulip reports one. Silent mentions and links alone
+  `(mention)` label unless Zulip reports one. When Zulip already reports an
+  explicit mention, quote classification is skipped and `isReplyToBot` is
+  false even if the message also quotes the bot. Silent mentions and links alone
   do not count. The same rule applies to live delivery, content edits, and
   channel history used by backscroll, refused-push healing, reconnect sweeps
   and queue-gap recovery. Removing the quote removes reply addressing;
@@ -51,14 +53,20 @@ Discord and Slack adapters that once lived here moved to those servers.
   page. Closed-channel catch-up additionally shares at most six seconds of
   quote-lookup waiting across all pages and both walks. The initial walk
   waits at most three seconds; the retry walk uses whatever remains of the
-  shared six-second allowance. Other channels have separate call allowances.
+  shared six-second allowance. Only time awaiting quote GETs spends it, not
+  history HTTP or host acceptance. Go-live can wait about six seconds per
+  channel with uncached quote targets, in addition to those other waits.
+  Other channels have separate call allowances.
   Cache/page matches remain usable after exhaustion. All uncached quote-target GETs, live and
   history, also share a process-wide token bucket: a burst of 30 and refill
   of 30 per minute (one token every two seconds). A page, channel, reconnect
   or additional adapter cannot reset it. Exhaustion reports budget-skipped
   rows without waiting for a token or negative-caching the target; ordinary
   sends, reactions and edit-placement lookups do not spend these tokens.
-  This limits quote traffic only, not all Zulip API requests.
+  This limits quote traffic only, not all Zulip API requests. The sweep can
+  exhaust the bucket shared with live delivery: live quotes to uncached
+  targets then degrade to ambient, with no immediate retry (a later sweep
+  may revisit them). Cached targets and explicit mentions remain usable.
   A budget-starved quote row stops the
   initial catch-up block short of that row; the single retry stays within
   the original catch-up ceiling. Any rows still unverified on retry fail
@@ -66,9 +74,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
   retries even when history cannot verify it again. Failed lookups
-  with a definite error or missing message are cached for three minutes;
-  timeouts are not cached. The wait budget does not cancel the GET or bound
-  history-page HTTP latency.
+  for missing or inaccessible messages (Zulip's invalid-message-id error)
+  are cached for three minutes; rate limits, malformed/non-JSON responses,
+  transport errors and timeouts are uncached and eligible for the retry pass.
+  The wait budget does not cancel the GET or bound history-page HTTP latency.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 
