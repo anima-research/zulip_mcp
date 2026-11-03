@@ -304,6 +304,12 @@ file, or remove it to re-seed from the environment.
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
 `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
 
+`send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
+Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
+Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
+Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
+
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes
 (`{ "data": "<base64>", "name": "chart.png" }`), with an optional

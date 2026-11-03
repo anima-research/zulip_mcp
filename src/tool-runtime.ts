@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, editedTrailer } from './history.js';
+import { assertApiSuccess, dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
@@ -277,6 +277,38 @@ export class ZulipToolRuntime {
   /** Reaction suppression for history rendering (the filters plane). */
   setReactionPolicy(policy: ReactionPolicy): void {
     this.reactionPolicy = policy;
+  }
+
+  /** Resolve and check a reply before uploading files or sending any chunks. */
+  private async replyDestination(args: Record<string, any>) {
+    const id = numberOrUndefined(args.reply_to);
+    if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
+    if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
+    const result = await this.zulipClient.messages.getById({ message_id: id });
+    if (result?.result === "error") {
+      // Keep the API code as well as its wording: missing/deleted/inaccessible
+      // messages must never fall back to a caller-supplied destination.
+      throw new Error(`Zulip refused reply_to ${id}${result.code ? ` (${result.code})` : ""}: ${result.msg ?? "unknown error"}`);
+    }
+    const message = result?.message;
+    const unreadable = () => new Error(`reply_to ${id} has no readable destination`);
+    if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
+    const type = args.type === "direct" ? "private" : args.type === "channel" ? "stream" : args.type;
+    if (type !== undefined && type !== message.type) {
+      throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
+    }
+    if (message.type === "stream") {
+      const name = message.display_recipient;
+      if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
+      return { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: `zulip:${name}` };
+    }
+
+    const recipients: ZulipRecipient[] = message.display_recipient;
+    if (!Array.isArray(recipients) || recipients.length === 0 || recipients.some((r) => !Number.isSafeInteger(r?.id))) {
+      throw unreadable();
+    }
+    const ids = recipients.map((r) => r.id);
+    return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
   }
 
   // ── Persistent monitoring state ──
@@ -643,16 +675,21 @@ export class ZulipToolRuntime {
       }
 
       case "send_message": {
+        args = { ...args, reply_to: args.reply_to ?? undefined, to: args.to ?? undefined,
+          topic: args.topic ?? undefined, type: args.type ?? undefined };
+        if (args.reply_to === undefined && (args.to === undefined || args.type === undefined)) throw new Error("type and to are required without reply_to");
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
+        const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
+        if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
         const uploaded = await this.uploadFor(args);
         const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
         const ids: number[] = [];
         let last: any = null;
-        const channelId = args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
+        const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
-          : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`;
+          : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
         for (const chunk of chunkMessage(content)) {
           last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
@@ -963,6 +1000,7 @@ export class ZulipToolRuntime {
     const now = Date.now();
     if (this.userCache && now - this.userCache.at < 60_000) return this.userCache.members;
     const result = await this.zulipClient.users.retrieve({});
+    assertApiSuccess(result, "listing users");
     const members = Array.isArray(result?.members) ? result.members : [];
     this.userCache = { at: now, members };
     return members;
