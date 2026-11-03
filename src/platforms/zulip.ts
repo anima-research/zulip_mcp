@@ -410,7 +410,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS, throwOnTimeout = false): Promise<SeenMessage | null> {
+  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS, quoteLookup = false): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
@@ -420,6 +420,9 @@ export class ZulipAdapter implements PlatformAdapter {
         timeoutMs,
         `GET message ${messageId}`,
       );
+      // Zulip deliberately uses the same invalid-id response for a missing
+      // message and one this user cannot access. Only that is a cached miss.
+      if (quoteLookup && result?.result === 'error' && result.msg === 'Invalid message(s)') return null;
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
       if (!raw) throw new Error('response contained no message');
@@ -429,22 +432,21 @@ export class ZulipAdapter implements PlatformAdapter {
       return this.seen.get(messageId) ?? null;
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
-      if (throwOnTimeout && err instanceof LookupTimeoutError) throw err;
+      if (quoteLookup) throw err;
       return null;
     }
   }
 
-  /** Cache definite failures, not deadlines: a deferred pass needs a fresh
-   *  chance to resolve a target whose earlier request merely timed out. */
+  /** Cache inaccessible/missing messages only; transient failures must get
+   *  a fresh chance in the deferred pass. */
   private async resolveQuoteTarget(id: number, remainingMs: number): Promise<QuoteLookup> {
     if (!ZulipAdapter.takeQuoteToken()) return 'budget-skipped';
     try {
       const quoted = await this.locate(id, 'a quote reply', remainingMs, true);
       if (!quoted) this.rememberFailedQuoteLookup(id);
       return quoted;
-    } catch (err) {
-      if (err instanceof LookupTimeoutError) return 'budget-skipped';
-      throw err;
+    } catch {
+      return 'budget-skipped';
     }
   }
 

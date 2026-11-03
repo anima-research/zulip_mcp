@@ -131,16 +131,16 @@ test('a quote of another sender is not addressed even when the silent mention na
 });
 
 for (const failure of ['throw', 'deleted', 'missing'] as const) {
-  test(`quote lookup fails closed on ${failure}, caching repeated targets without losing later events`, { timeout: 2000 }, async () => {
+  test(`quote lookup fails closed on ${failure}, without losing later events`, { timeout: 2000 }, async () => {
     let gets = 0;
     const messages = await receive([raw(300, quote()), raw(301, quote()), raw(302, 'later')], async () => {
       gets++;
       if (failure === 'throw') throw new Error('unavailable');
-      return failure === 'deleted' ? { result: 'error', msg: 'not found' } : { result: 'success' };
+      return failure === 'deleted' ? { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' } : { result: 'success' };
     });
     assert.deepEqual(messages.map((m) => m.messageId), ['300', '301', '302']);
     assert.equal(messages[0].metadata?.mentioned, false);
-    assert.equal(gets, 1);
+    assert.equal(gets, failure === 'deleted' ? 1 : 2);
   });
 }
 
@@ -435,7 +435,7 @@ for (const restart of [false, true]) {
   });
 }
 
-for (const failure of ['throw', 'deleted', 'missing'] as const) {
+for (const failure of ['deleted'] as const) {
   test(`history caches a ${failure} quote target until its retry window expires`, async (t) => {
     let now = Date.now();
     t.mock.method(Date, 'now', () => now);
@@ -446,8 +446,7 @@ for (const failure of ['throw', 'deleted', 'missing'] as const) {
       getById: async () => {
         gets++;
         if (succeed) return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
-        if (failure === 'throw') throw new Error('unavailable');
-        return failure === 'deleted' ? { result: 'error', msg: 'not found' } : { result: 'success' };
+        return failure === 'deleted' ? { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' } : { result: 'success' };
       },
     } }, SELF, 'session');
     const page = () => adapter.fetchHistory('zulip:general', { limit: 100 });
@@ -473,7 +472,7 @@ test('negative-cache hits do not consume the history page GET allowance', async 
       gets++;
       return message_id === QUOTED
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
-        : { result: 'error', msg: 'not found' };
+        : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
     },
   } }, SELF, 'session');
   await adapter.fetchHistory('zulip:general', { limit: 100 });
@@ -660,3 +659,25 @@ test('R2-5: quote GETs share one process-wide bucket across pages, adapters and 
   assert.deepEqual((await blocked()).unverifiedMessageIds, ['12030']);
   assert.equal(gets, 61, 'long idle periods refill at most the 30-token burst');
 });
+
+for (const failure of ['rejecting promise', 'RATE_LIMIT_HIT', 'non-JSON response'] as const) {
+  test(`R3-2: a ${failure} quote lookup is deferred and retried without negative caching`, async () => {
+    let gets = 0;
+    const adapter = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [raw(300, quote())], found_newest: true }),
+      getById: async () => {
+        if (++gets === 1) {
+          if (failure === 'rejecting promise') throw new Error('ECONNRESET');
+          if (failure === 'non-JSON response') throw new SyntaxError('Unexpected token <');
+          return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'Too many requests' };
+        }
+        return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+      },
+    } }, SELF, 'session');
+    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.deepEqual(first.unverifiedMessageIds, ['300'], 'transient failures participate in the retry pass');
+    const second = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.equal(second.messages[0].metadata?.replyToSelf, true);
+    assert.equal(gets, 2, 'the retry must issue a fresh GET');
+  });
+}
