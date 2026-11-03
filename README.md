@@ -184,31 +184,21 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `previouslyMentioned` (absent when only the post-change state could be
 read). A change line never sets `threadId` and never moves this server's
 reply routing: a moderator archiving an old message does not retarget the
-reply the agent is composing. The bot's own moves emit no marker but update
-reply hints when the current conversation's source message moved. Successful
-`move_messages` calls reconcile routing and cached placement before returning;
-move echoes are not a prerequisite. Outstanding echo tokens are limited to
-16, expire after 60 seconds (including while idle), and are cleared on event
-queue registration/re-registration and stop. Matching completed tokens acknowledge
-without replay only while cached placement retains a recognized local-move
-provenance: later tool results can advance that placement, but an intervening
-unrelated applied event invalidates the token. This preserves same-second and
-partially overlapping tool moves without treating timestamps as a global order.
-An ambiguous, expired, or unmatched self echo issues **zero placement GETs**,
-including for uncached IDs or bulk ranges. It invalidates affected cached
-placement and marks exact-message reply routes unconfirmed, rather than
-replaying the historical destination or starting validation requests. Automatic
-channel-only publishes then fail closed until a later real message or tool
-result establishes the conversation's placement; another ambiguous echo does
-not clear that uncertainty. Normal reaction/edit cache-miss lookups and the
-tool's own source/result reads are separate, unchanged paths.
-A typing refresh stops the run in its original topic before following a same-stream
-rename.
-After a cross-stream move, a source-channel publish is refused with an error
-naming the destination, and source typing stops. Confirm with `send_message`
-using the stream named by `moved_to.channelId` and the explicit `moved_to.topic`.
-Do not use a destination-channel publish to confirm: its newest conversation
-may be unrelated to the moved topic. A move into a stream the bot cannot see
+reply the agent is composing. The bot's own moves emit no change marker. For host integrations:
+
+1. A tool result confirms the anchor unless intervening movement has invalidated
+   that reference. A channel-only publish follows it or refuses. Other references
+   a range move may have touched become unconfirmed, with the anchor destination
+   as a hint.
+2. On refusal, use `send_message` with an explicit bare stream name and topic.
+   `moved_to.stream` is the bare stream; `moved_to.channelId` is for channel
+   operations. Inspect `list_streams` / `get_stream_topics` if anything is unknown.
+3. Co-moved conversations wait for a new message from someone other than the
+   bot in that channel to re-establish routing. Existing/moved message copies,
+   echoes, reads, reactions and self-events cannot confirm them. Typing stops
+   in the topic where its run began.
+
+A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
 takes (a deleted id can no longer be fetched). History and backscroll

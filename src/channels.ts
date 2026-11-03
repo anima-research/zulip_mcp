@@ -24,7 +24,7 @@ import type {
 } from '@animalabs/mcpl-core';
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
+import type { MessageChangeEvent, MoveEcho, PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
@@ -108,8 +108,18 @@ export class ChannelManager {
   private lastIncoming = new Map<string, {
     hints: RoutingHints;
     from?: number;
+    epoch: number;
+    /** One causal echo exemption, not a permanent exemption for this id. */
+    expectedEcho?: MoveEcho;
+    /** At most one early echo can be attributed to a pending result. A
+     * second invalidation/replacement destroys that causal connection. */
+    lastEcho?: { beforeEpoch: number; shape: MoveEcho };
+    refusalAfter?: number;
     movedTo?: { channelId: string | null; topic: string | null; streamId?: number };
   }>();
+  private routingEpoch = 0;
+  private highestKnownMessageId = 0;
+
   /** Per-channel topic the current typing run started in, so a refresh that
    *  moves to a newer topic, and the final stop, cancel it there. */
   private typingTopic = new Map<string, string | undefined>();
@@ -507,13 +517,58 @@ export class ChannelManager {
     const meta = isRecord(message.metadata) ? message.metadata : undefined;
     if (meta?.reaction === true || typeof meta?.change === 'string') return false;
     const id = Number(message.messageId);
-    const from = this.lastIncoming.get(channelId)?.from;
+    this.observeMessageId(id);
+    const reference = this.lastIncoming.get(channelId);
+    if ((reference?.movedTo || (reference?.from !== undefined && id <= reference.from)) &&
+        (meta?.backscroll === true || meta?.recovered === true)) return false;
+    if (reference?.movedTo && (!Number.isFinite(id) || id <= (reference.refusalAfter ?? reference.from ?? 0) ||
+        String(message.author?.id) === String(this.adapters.get(channelId.split(':')[0])?.selfUserId))) {
+      reference.epoch = ++this.routingEpoch;
+      reference.lastEcho = undefined;
+      reference.expectedEcho = undefined;
+      return false;
+    }
+    const from = reference?.from;
     if (Number.isFinite(id) && from !== undefined && id < from) return false;
+    // A real message can reset proof while older cross-channel references live.
+    // None of those references may authorize an old echo after cache eviction.
+    for (const [otherChannel, reference] of this.lastIncoming) {
+      if (otherChannel !== channelId && otherChannel.split(':')[0] === channelId.split(':')[0] && reference.from === id) {
+        reference.expectedEcho = undefined;
+        reference.lastEcho = undefined;
+        reference.epoch = ++this.routingEpoch;
+        reference.refusalAfter = this.refusalFloor(otherChannel, id);
+        reference.movedTo = { channelId: null, topic: null };
+      }
+    }
     this.lastIncoming.set(channelId, {
+      epoch: ++this.routingEpoch,
       hints: { threadId: message.threadId, metadata: meta },
       ...(Number.isFinite(id) ? { from: id } : {}),
     });
     return true;
+  }
+
+  observeMessageId(id: number): void {
+    if (Number.isFinite(id)) this.highestKnownMessageId = Math.max(this.highestKnownMessageId, id);
+  }
+
+  captureMoveEpochs(messageId: number): ReadonlyMap<string, number> {
+    this.observeMessageId(messageId);
+    return new Map([...this.lastIncoming].map(([channelId, reference]) => [channelId, reference.epoch]));
+  }
+
+  private refusalFloor(channelId: string, ...ids: number[]): number {
+    return Math.max(this.highestKnownMessageId, this.adapters.get(channelId.split(':')[0])?.highestMessageId ?? 0,
+      ...[...this.lastIncoming.values()].map(r => r.from ?? 0), ...ids);
+  }
+
+  private sameEcho(a: MoveEcho | undefined, b: MoveEcho | undefined): boolean {
+    return !!a && !!b && a.messageId === b.messageId && a.channelId === b.channelId &&
+      a.previousTopic === b.previousTopic && a.topic === b.topic &&
+      a.newStreamId === b.newStreamId && a.propagateMode === b.propagateMode &&
+      (a.destinationChannelId === null || b.destinationChannelId === null ||
+        a.destinationChannelId === b.destinationChannelId);
   }
 
   /**
@@ -523,53 +578,71 @@ export class ChannelManager {
    * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
-    if (change.confirmationOnly) return;
-    if (change.invalidatePlacement) {
-      // An ambiguous echo's origin need not be where a current reply route
-      // lives. Invalidate only exact-message references, across channels.
-      const ids = new Set(change.messageIds);
-      for (const [channelId, source] of this.lastIncoming) {
-        if (source.from !== undefined && ids.has(String(source.from))) {
-          this.lastIncoming.set(channelId, { ...source, movedTo: { channelId: null, topic: null } });
+    if (change.previousTopic === null && change.movedToChannelId === null &&
+        change.newStreamId == null && !change.routingUncertain && !change.moveScope && change.kind !== 'delete') return;
+    const scope = change.moveScope;
+    const destination = change.movedToChannelId ?? (change.newStreamId == null && change.channelId !== 'zulip:unknown' ? change.channelId : null);
+    for (const [channelId, reference] of [...this.lastIncoming]) {
+      if (reference.from === undefined || channelId.split(':')[0] !== change.channelId.split(':')[0]) continue;
+      if (!scope) {
+        // Echoes never re-seat or confirm. Already-refused references retain
+        // the latest tool destination as a hint, not historical echo placement.
+        if (!change.messageIds.includes(String(reference.from))) continue;
+        if (this.sameEcho(reference.expectedEcho, change.selfEcho)) {
+          reference.expectedEcho = undefined; // exactly one matching own echo
+          continue;
+        }
+        this.lastIncoming.set(channelId, { ...reference, epoch: ++this.routingEpoch,
+          expectedEcho: undefined,
+          lastEcho: change.selfEcho ? { beforeEpoch: reference.epoch, shape: change.selfEcho } : undefined,
+          refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
+          movedTo: reference.movedTo ?? {
+            channelId: change.newStreamId == null && change.channelId !== 'zulip:unknown' ? change.channelId : null,
+            topic: null,
+          } });
+        continue;
+      }
+      const exact = reference.from === Number(change.messageId);
+      const currentChannel = reference.movedTo?.channelId ?? channelId;
+      const currentTopic = reference.movedTo ? reference.movedTo.topic : reference.hints.threadId;
+      const inScope = (scope.topic === null || ((reference.movedTo?.channelId === null || currentChannel === change.channelId) &&
+        (currentTopic == null || currentTopic.toLowerCase() === scope.topic.toLowerCase()))) &&
+        (scope.propagateMode === 'change_all' ||
+          (scope.propagateMode === 'change_later' && reference.from >= Number(change.messageId)));
+      if (!exact && !inScope) continue;
+      const expectedEcho: MoveEcho = { messageId: change.messageId, channelId: change.channelId,
+        previousTopic: scope.topic, topic: change.topic, newStreamId: change.newStreamId ?? null,
+        propagateMode: scope.propagateMode, destinationChannelId: destination };
+      const started = change.moveEpochs?.get(channelId);
+      // The single matching early echo is our own observation, not an
+      // intervening invalidation. Any other event/replacement changes the epoch.
+      const earlyEcho = started !== undefined && reference.lastEcho?.beforeEpoch === started &&
+        this.sameEcho(reference.lastEcho.shape, expectedEcho);
+      const stale = change.moveEpochs !== undefined && started !== reference.epoch && !earlyEcho;
+      const uncertain = !exact || stale || change.routingUncertain || destination === null;
+      const source = { ...reference, epoch: ++this.routingEpoch, lastEcho: undefined,
+        expectedEcho: !uncertain && !earlyEcho ? expectedEcho : undefined,
+        refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)) };
+      if (uncertain || destination !== channelId) {
+        this.lastIncoming.set(channelId, { ...source, movedTo: {
+          channelId: destination, topic: uncertain ? null : change.topic,
+          ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
+        } });
+      } else {
+        const { movedTo: _movedTo, ...current } = source;
+        this.lastIncoming.set(channelId, { ...current, hints: { ...current.hints,
+          threadId: change.topic, metadata: { ...current.hints.metadata, topic: change.topic } } });
+      }
+      if (destination !== null && destination !== channelId) {
+        const existing = this.lastIncoming.get(destination);
+        if (existing?.from === undefined || source.from! >= existing.from) {
+          const { movedTo: _movedTo, ...current } = source;
+          this.lastIncoming.set(destination, uncertain ? { ...current,
+            movedTo: { channelId: destination, topic: null } } : { ...current,
+            hints: { ...current.hints, threadId: change.topic,
+              metadata: { ...current.hints.metadata, topic: change.topic } } });
         }
       }
-      return;
-    }
-    if (change.previousTopic === null && change.movedToChannelId === null &&
-        change.newStreamId == null && !change.routingUncertain) return;
-    const source = this.lastIncoming.get(change.channelId);
-    if (source?.from === undefined) return;
-    const scope = change.moveScope;
-    const inScope = scope && !source.movedTo && source.hints.threadId === scope.topic &&
-      (scope.propagateMode === 'change_all' ||
-        (scope.propagateMode === 'change_later' && source.from >= Number(change.messageId)));
-    if (!change.messageIds.includes(String(source.from)) && !inScope) return;
-    if ((change.newStreamId != null && change.movedToChannelId === null) || change.routingUncertain) {
-      this.lastIncoming.set(change.channelId, { ...source, movedTo: {
-        channelId: change.movedToChannelId,
-        topic: change.routingUncertain ? null : change.topic,
-        ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
-      } });
-      return;
-    }
-    const { movedTo: _movedTo, ...current } = source;
-    const updated = {
-      ...current,
-      hints: {
-        ...source.hints,
-        threadId: change.topic,
-        metadata: { ...source.hints.metadata, topic: change.topic },
-      },
-    };
-    const destination = change.movedToChannelId ?? change.channelId;
-    if (destination === change.channelId) {
-      this.lastIncoming.set(destination, updated);
-    } else {
-      this.lastIncoming.set(change.channelId, { ...source, movedTo: { channelId: destination, topic: change.topic } });
-      // Keep the source typing run so a channel-only stop cancels it
-      // in the topic where it started, even after reply hints move away.
-      const existing = this.lastIncoming.get(destination);
-      if (existing?.from === undefined || source.from >= existing.from) this.lastIncoming.set(destination, updated);
     }
   }
 
@@ -621,7 +694,7 @@ export class ChannelManager {
     const movedTo = this.lastIncoming.get(channelId)?.movedTo;
     if (movedTo) {
       throw new McplRpcError(-32602,
-        `Conversation moved to ${movedTo.channelId ?? `stream ${movedTo.streamId ?? 'unknown'}`} > ${movedTo.topic ?? '(unconfirmed topic)'}; confirm with send_message using the destination stream and topic.`,
+        `${movedTo.topic === null ? 'Conversation placement unconfirmed; destination hint:' : 'Conversation moved to'} ${movedTo.channelId ?? `stream unknown${movedTo.streamId == null ? '' : ` (stream ${movedTo.streamId})`}`} > ${movedTo.topic ?? '(unconfirmed topic)'}; confirm with send_message using an explicit stream and topic (check list_streams/get_stream_topics if unconfirmed).`,
         { channelId, movedTo });
     }
     return adapter.publish(

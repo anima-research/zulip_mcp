@@ -225,7 +225,10 @@ export class ZulipMcplServer {
       excludeChannel: (channelId) => this.isMuted(channelId) || !this.isAllowed(channelId),
     });
     // Sends made through the tool surface are part of the rollback record.
-    this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    this.tools.onSent = (sent) => {
+      this.channelManager.observeMessageId(Number(sent.messageId));
+      this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    };
     // A stream `listen` just subscribed the bot to is registered at once, so
     // the host can open it without waiting for a message or a refresh (#20).
     // Only those streams: a realm enumeration here would cost a full stream
@@ -235,7 +238,8 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
-    this.tools.onMoveStarted = (move) => this.adapter.trackSelfMove?.(move);
+    this.tools.onMessageObserved = (id) => this.channelManager.observeMessageId(id);
+    this.tools.onMoveStarted = (id) => this.channelManager.captureMoveEpochs(id);
     this.tools.onMoved = (move) => this.adapter.noteSelfMoved?.(move);
     this.adapter.onSelfChanged = (change) => this.channelManager.reconcileSelfChange(change);
   }
@@ -1702,6 +1706,8 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+    if (ev.kind === 'move' || ev.kind === 'delete' || ev.previousTopic !== null ||
+        ev.newStreamId != null || ev.movedToChannelId !== null) this.channelManager.reconcileSelfChange(ev);
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM;

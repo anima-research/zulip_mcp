@@ -93,8 +93,21 @@ export interface ReactionEvent {
 
 export type OnReaction = (event: ReactionEvent) => void;
 
+/** Exact own-echo shape, used only for one-shot anchor suppression. */
+export interface MoveEcho {
+  messageId: string;
+  channelId: string;
+  previousTopic: string | null;
+  topic: string | null;
+  newStreamId: number | null;
+  propagateMode: string | null;
+  destinationChannelId: string | null;
+}
+
 /** Tool success and anchor placement, independent of its event echo. */
 export interface SelfMove {
+  /** Conversation epochs captured before the first placement read. */
+  moveEpochs?: ReadonlyMap<string, number>;
   messageId: number;
   source: { channelId: string; topic: string } | null;
   propagateMode: 'change_one' | 'change_later' | 'change_all';
@@ -102,8 +115,6 @@ export interface SelfMove {
   destinationChannelId: string | null;
   /** Null if the stored topic could not be confirmed. */
   topic: string | null;
-  /** Captured co-moved IDs whose placement the anchor read cannot prove. */
-  unconfirmedRange?: number[];
 }
 
 /**
@@ -135,14 +146,13 @@ export interface MessageChangeEvent {
   movedToChannelId: string | null;
   /** Retained even when the destination name cannot be resolved. */
   newStreamId?: number | null;
+  /** Raw own echo shape: used once for anchor suppression, never confirmation. */
+  selfEcho?: MoveEcho;
+  moveEpochs?: ReadonlyMap<string, number>;
   /** Tool success can cover uncached conversation sources by original topic. */
-  moveScope?: { topic: string; propagateMode: SelfMove['propagateMode'] };
+  moveScope?: { topic: string | null; propagateMode: SelfMove['propagateMode'] };
   /** Placement is unconfirmed; refuse automatic reply routing. */
   routingUncertain?: boolean;
-  /** An echo of an already reconciled tool operation, not a new placement. */
-  confirmationOnly?: boolean;
-  /** Exact-message route invalidation across channels, without placement reads. */
-  invalidatePlacement?: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -194,6 +204,9 @@ export interface ChannelHistoryPage {
 export interface PlatformAdapter {
   /** Channel ID prefix and ChannelDescriptor.type, e.g. 'zulip'. */
   readonly type: string;
+  readonly selfUserId?: number | null;
+  /** High-water id of all observed messages, including filtered/own traffic. */
+  readonly highestMessageId?: number;
 
   /** Discover all channels visible to this connection. */
   discoverChannels(): Promise<ChannelDescriptor[]>;
@@ -267,9 +280,7 @@ export interface PlatformAdapter {
   onSelfChanged?: OnMessageChange;
   /** Reconcile a successful tool move before returning its result. */
   noteSelfMoved?(move: SelfMove): void;
-  /** Track the write before dispatch, including echoes preceding its result.
-   *  Complete with the stored placement on success, or null on failure. */
-  trackSelfMove?(move: SelfMove): (confirmed: SelfMove | null) => void;
+
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

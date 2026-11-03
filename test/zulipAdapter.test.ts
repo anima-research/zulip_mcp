@@ -510,7 +510,7 @@ test('a message from a stream created after startup carries its descriptor, with
   ]);
 });
 
-test('self moves re-seat all cached messages before later reactions and edits are filtered', async () => {
+test('self echoes invalidate cache and later independent reads apply destination filtering', async () => {
   for (const restricted of [false, true]) {
     const events = [
       { id: 1, type: 'message', flags: [], message: raw(20) },
@@ -528,7 +528,7 @@ test('self moves re-seat all cached messages before later reactions and edits ar
       streams: { retrieve: async () => ({ result: 'success', streams: [
         { name: 'general', stream_id: 7 }, { name: 'archive', stream_id: 8 },
       ] }) },
-      messages: { getById: async () => { throw new Error('placement must come from the cache'); } },
+      messages: { getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'archive', stream_id: 8, subject: 'archive' }) }) },
       queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
       events: { retrieve: async () => {
         if (++polls === 1) return { events };
@@ -548,7 +548,7 @@ test('self moves re-seat all cached messages before later reactions and edits ar
       await new Promise(r => setTimeout(r, 60));
       assert.deepEqual(reactions, restricted ? [] : ['zulip:archive']);
       assert.deepEqual(changes.map(c => [c.kind, c.channelId, c.topic]), restricted ? [] : [
-        ['edit', 'zulip:archive', 'archive'], ['delete', 'zulip:archive', 'archive'],
+        ['edit', 'zulip:archive', 'archive'], ['delete', 'zulip:archive', ''],
       ]);
     } finally { adapter.stopEvents(); }
   }

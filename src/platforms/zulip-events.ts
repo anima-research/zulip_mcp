@@ -125,6 +125,7 @@ export type ZulipMessageChange =
       topic: string | null;
       /** The topic before any move (topic or stream); null for a content edit. */
       origTopic: string | null;
+      propagateMode: string | null;
       streamId: number | null;
       /** Set when the message moved to another stream. */
       newStreamId: number | null;
@@ -294,6 +295,7 @@ export class ZulipEventLoop {
       apply_markdown: 'false',
       client_capabilities: JSON.stringify({ notification_settings_null: false, bulk_message_deletion: true }),
     });
+    if (this.stopped) return;
 
     // A refused registration comes back as a value, not a throw. Without
     // this check the loop went on polling queue "undefined" and logged only
@@ -412,6 +414,7 @@ export class ZulipEventLoop {
                 try {
                   onChange({
                     kind: 'edit',
+                  propagateMode: typeof event.propagate_mode === 'string' ? event.propagate_mode : null,
                     messageId: event.message_id,
                     messageIds: Array.isArray(event.message_ids) && event.message_ids.length > 0
                       ? event.message_ids.filter((id): id is number => typeof id === 'number')

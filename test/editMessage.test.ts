@@ -192,7 +192,7 @@ for (const { label, fields } of edits) {
     try {
       assert.deepEqual(await f.tools.handleToolCall('move_messages', {
         message_id: 42, ...fields, extra: 'not sent',
-      }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
+      }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', stream: 'archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
       if ('stream_id' in fields) {
         assert.equal(f.lookups.length, 2, 'all moves read original and resulting placement');
         assert.ok(f.lookups.every(path => path.startsWith('/api/v1/messages/')), 'readable destinations need no stream enumeration');
@@ -350,7 +350,7 @@ test('move_messages resolves destination names only as a fallback after losing v
     const f = await fixture({ result: 'success', msg: '' }, 200, true);
     try {
       const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic, propagate_mode: 'change_all' });
-      assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: topic === undefined ? 'deploys' : null });
+      assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', stream: 'archive', topic: topic === undefined ? 'deploys' : null });
       assert.equal(f.calls.length, 1);
       assert.equal(f.lookups.length, 3, 'pre-move, post-move, and fallback stream lookup');
       assert.ok(f.lookups.at(-1)!.startsWith('/api/v1/streams'), 'stream names are requested only after the placement read fails');
@@ -378,7 +378,7 @@ test('successful moves remain successful when destination lookups are unavailabl
   try {
     const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17 });
     assert.equal(result.result, 'success');
-    assert.deepEqual(result.moved_to, { channelId: null, topic: null });
+    assert.deepEqual(result.moved_to, { channelId: null, stream: null, topic: null });
     assert.match(result.routing_note, /Move succeeded.*before publishing/);
     assert.equal(f.calls.length, 1, 'the move is not retried or reported as a failure');
   } finally { await f.close(); }
@@ -421,32 +421,25 @@ test('a requested topic is unconfirmed when post-move placement cannot be read',
   const f = await fixture({ result: 'success', msg: '' }, 200, true);
   try {
     const result = await f.tools.handleToolCall('move_messages', { message_id: 42, stream_id: 17, topic: '  deploys ' });
-    assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', topic: null });
+    assert.deepEqual(result.moved_to, { channelId: 'zulip:archive', stream: 'archive', topic: null });
     assert.match(result.routing_note, /Move succeeded.*before publishing/);
   } finally { await f.close(); }
 });
 
 for (const success of [false, true]) {
-  test(`move tracking completes exactly once on ${success ? 'success with stored placement' : 'failure'}`, async () => {
+  test(`move result confirms placement ${success ? 'once on success' : 'never on failure'}`, async () => {
     const f = await fixture(success ? { result: 'success', msg: '' } : { result: 'error', msg: 'Permission denied' }, success ? 200 : 400);
-    const starts: any[] = [];
     const completions: any[] = [];
-    f.tools.onMoveStarted = move => {
-      assert.equal(f.calls.length, 0, 'tracking must start before PATCH');
-      starts.push(move);
-      return completed => { completions.push(completed); };
-    };
+    f.tools.onMoved = completed => { completions.push(completed); };
     try {
       const call = f.tools.handleToolCall('move_messages', { message_id: 42, topic: ' normalized ', propagate_mode: 'change_all' });
       if (success) await call;
       else await assert.rejects(call, /Permission denied/);
-      assert.equal(starts.length, 1);
-      assert.deepEqual(starts[0].source, { channelId: 'zulip:general', topic: 'deploys' });
-      assert.equal(completions.length, 1);
+      assert.equal(completions.length, success ? 1 : 0);
       if (success) {
         assert.equal(completions[0].topic, 'normalized');
         assert.equal(completions[0].destinationChannelId, 'zulip:general');
-      } else assert.equal(completions[0], null, 'failed writes cannot remain paired to future changes');
+      } // Failed writes emit no placement confirmation.
     } finally { await f.close(); }
   });
 }

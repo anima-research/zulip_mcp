@@ -233,8 +233,8 @@ export class ZulipToolRuntime {
   onSent: ((sent: SentRecord) => void) | null = null;
   /** Successful moves reconcile routing/cache without waiting for an echo. */
   onMoved: ((move: SelfMove) => void) | null = null;
-  /** Register before PATCH: an echo may precede the response/readback. */
-  onMoveStarted: ((move: SelfMove) => ((confirmed: SelfMove | null) => void) | undefined) | null = null;
+  onMoveStarted: ((messageId: number) => ReadonlyMap<string, number>) | null = null;
+  onMessageObserved: ((messageId: number) => void) | null = null;
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
@@ -351,6 +351,7 @@ export class ZulipToolRuntime {
               num_after: 0,
               narrow: [["stream", channelName]],
             });
+            for (const message of messages.messages ?? []) this.onMessageObserved?.(message.id);
 
             const lastMessageId = messages.messages.length > 0
               ? messages.messages[0].id
@@ -517,6 +518,7 @@ export class ZulipToolRuntime {
           num_after: 0,
           narrow: narrow,
         });
+        for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
         // Filter by date range
         const filteredMessages = result.messages.filter((msg: any) => {
@@ -598,6 +600,7 @@ export class ZulipToolRuntime {
               num_after: 0,
               narrow: [["stream", channelName]],
             });
+            for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
             const unreadMessages = result.messages.filter((msg: any) =>
               msg.id > state.lastReadMessageId
@@ -738,10 +741,12 @@ export class ZulipToolRuntime {
         }
         // The original placement decides the propagation range even when the
         // acted-on message is not the current conversation's source.
+        const moveEpochs = moving ? this.onMoveStarted?.(args.message_id) : undefined;
         let original: any = null;
         if (moving) {
           try {
             const before = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
+            this.onMessageObserved?.(before.message?.id);
             if (before?.result === "success") original = before.message;
           } catch { /* Cache/event reconciliation remains available. */ }
         }
@@ -749,7 +754,7 @@ export class ZulipToolRuntime {
           ? { channelId: `zulip:${original.display_recipient}`, topic: original.subject } : null;
         const newStreamId = moving && args.stream_id !== undefined && args.stream_id !== original?.stream_id
           ? args.stream_id : null;
-        let movedTo: { channelId: string | null; topic: string | null } | undefined;
+        let movedTo: { channelId: string | null; stream?: string | null; topic: string | null } | undefined;
         if (moving && args.stream_id !== undefined) {
           movedTo = { channelId: null, topic: args.topic === undefined ? source?.topic ?? null : null };
         }
@@ -758,13 +763,6 @@ export class ZulipToolRuntime {
         for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
           if (args[field] !== undefined) editFields.set(field, String(args[field]));
         }
-        let confirmedMove: SelfMove | null = null;
-        let finishMove = moving ? this.onMoveStarted?.({
-          messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
-          newStreamId, destinationChannelId: newStreamId === null ? source?.channelId ?? null : null,
-          topic: args.topic ?? source?.topic ?? null,
-        }) : undefined;
-        try {
           const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
             method: "PATCH",
             headers: { Authorization: this.session.authHeader },
@@ -809,13 +807,11 @@ export class ZulipToolRuntime {
             // confirm a requested (possibly normalized/truncated) topic.
             let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
             let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
-            let readPlacementConfirmed = false;
             try {
               const placed = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
+              this.onMessageObserved?.(placed.message?.id);
               if (placed?.result === "success" &&
                   (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
-                readPlacementConfirmed = typeof placed.message?.display_recipient === "string" &&
-                  typeof placed.message?.subject === "string";
                 if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
                 if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
               }
@@ -827,20 +823,13 @@ export class ZulipToolRuntime {
                 if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
               } catch { /* Preserve the successful move even if lookup fails. */ }
             }
-            confirmedMove = {
-              messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
+            const confirmedMove: SelfMove = {
+              moveEpochs, messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
               newStreamId, destinationChannelId, topic: storedTopic,
-              ...(!readPlacementConfirmed && ["change_all", "change_later"].includes(args.propagate_mode)
-                ? { unconfirmedRange: [] } : {}),
             };
-            // Validate the operation's range provenance before applying the
-            // anchor read as placement. Completion still runs exactly once.
-            const finish = finishMove;
-            finishMove = undefined;
-            finish?.(confirmedMove);
             this.onMoved?.(confirmedMove);
             if (movedTo) {
-              movedTo = { channelId: destinationChannelId, topic: storedTopic };
+              movedTo = { channelId: destinationChannelId, stream: destinationChannelId?.replace(/^zulip:/, "") ?? null, topic: storedTopic };
               return {
                 ...result,
                 moved_to: movedTo,
@@ -851,9 +840,6 @@ export class ZulipToolRuntime {
             }
           }
           return result;
-        } finally {
-          finishMove?.(confirmedMove);
-        }
       }
 
       case "delete_message": {
@@ -1022,6 +1008,7 @@ export class ZulipToolRuntime {
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
+        for (const message of page.messages) this.onMessageObserved?.(message.id);
         return {
           channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
           channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
@@ -1040,6 +1027,7 @@ export class ZulipToolRuntime {
         if (messageId === undefined) throw new Error("message_id must be a number");
         const limit = clampInt(args.limit, 50, 1, 200);
         const page = await fetchAround(zulipClient, messageId, limit);
+        for (const message of page.messages) this.onMessageObserved?.(message.id);
         const anchor = page.messages.find((m) => m.id === messageId);
         return {
           message_id: messageId,
@@ -1180,6 +1168,7 @@ export class ZulipToolRuntime {
             num_after: 0,
             narrow: [["stream", channelName]],
           });
+          for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
           const unread = result.messages.filter((msg: any) => msg.id > state.lastReadMessageId);
           totalUnread += unread.length;
@@ -1230,6 +1219,7 @@ export class ZulipToolRuntime {
           num_after: 0,
           narrow: [["stream", channelName]],
         });
+        for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
         const unread = result.messages.filter((msg: any) => msg.id > state.lastReadMessageId);
         const count = unread.length;
