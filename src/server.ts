@@ -404,25 +404,28 @@ export class ZulipMcplServer {
       boundary.set(channelId, Math.max(boundary.get(channelId) ?? 0, through));
     }
     while (this.preLive.length > 0) {
-      const held = this.preLive;
-      this.preLive = [];
-      for (const { message, newChannel } of held) {
-        const watermark = boundary.get(message.channelId);
-        const id = Number(message.messageId);
-        if (watermark !== undefined && Number.isFinite(id) && id <= watermark) {
-          const replyToSelf = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true;
-          // A scan can advance over an ambient history row even though the
-          // buffered live event verified a reply. Only an accepted delivery
-          // (or the connection's original watermark) can deduplicate it.
-          const pendingReply = replyToSelf && this.pendingReplies.get(message.channelId)?.has(id);
-          if (!pendingReply || id <= (this.sweepAnchors.get(message.channelId) ?? 0)) continue;
-        }
-        try {
-          await this.route(message, newChannel);
-        } catch (err) {
-          console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
+      // Keep even the currently routing message visible until route settles:
+      // shutdown can commit the staged scan while attachment/push work waits.
+      const { message, newChannel } = this.preLive[0];
+      const watermark = boundary.get(message.channelId);
+      const id = Number(message.messageId);
+      if (watermark !== undefined && Number.isFinite(id) && id <= watermark) {
+        const replyToSelf = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true;
+        // Only acceptance (or the original watermark) deduplicates a
+        // live-verified reply that history could not verify.
+        const pendingReply = replyToSelf && this.pendingReplies.get(message.channelId)?.has(id);
+        if (!pendingReply || id <= (this.sweepAnchors.get(message.channelId) ?? 0)) {
+          this.preLive.shift();
+          continue;
         }
       }
+      try {
+        await this.route(message, newChannel);
+      } catch (err) {
+        console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
+      }
+      // The bounded buffer may have evicted this entry while route waited.
+      if (this.preLive[0]?.message === message) this.preLive.shift();
     }
     this.commitScannedCatchUp();
     this.delivery.save();
@@ -926,7 +929,8 @@ export class ZulipMcplServer {
    */
   private async onIncoming(message: IncomingChannelMessage, newChannel?: ChannelDescriptor): Promise<void> {
     const id = numericId(message);
-    if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null && this.mayDeliver(message)) {
+    if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null &&
+        !this.isMuted(message.channelId) && this.isAllowed(message.channelId, message)) {
       let pending = this.pendingReplies.get(message.channelId);
       if (!pending) this.pendingReplies.set(message.channelId, pending = new Set());
       if (!pending.has(id) && pending.size >= PRE_LIVE_BUFFER_CAP) {

@@ -3040,3 +3040,74 @@ test('R2-7: closed-channel catch-up forgets a held reply missing from history', 
     assert.equal(pending.get('zulip:general')?.has(5) ?? false, false);
   } finally { await h.close(); }
 });
+
+for (const beforeGrant of [false, true]) {
+  test(`R3-1: ${beforeGrant ? 'a reply emitted before featureSets/update is delivered' : 'shutdown during an earlier buffered route preserves the unoffered reply'}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
+    let second: Harness | undefined;
+    let releaseSweep = () => {};
+    let releaseFetch = () => {};
+    try {
+      const first = harness({ stateDir: dir, sessionId: 'r3' });
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
+      await first.close();
+      let fetching = false;
+      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
+      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+      second = harness({
+        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
+        attachments: {
+          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
+          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+        },
+      });
+      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+      let reads = 0;
+      second.adapter.fetchHistory = async (channelId, query) => {
+        if (beforeGrant || ++reads === 2) await sweepGate;
+        return realFetch(channelId, query);
+      };
+      await initialize(second, true);
+      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
+      if (beforeGrant) {
+        await until(() => second!.adapter.emit !== null, 'events started before grant');
+        second.adapter.emit!(reply);
+      }
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(second, false);
+      if (!beforeGrant) {
+        await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
+        second.adapter.emit!({
+          ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
+          metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
+        }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+        second.adapter.emit!(reply);
+      }
+      releaseSweep();
+      if (beforeGrant) {
+        await until(() => second!.server.isLive, 'go-live complete');
+        assert.equal(second.pushed.length, 1, 'the pre-grant reply must not be deduplicated as ambient');
+        assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+      } else {
+        await until(() => fetching, 'earlier buffered route waits on attachment');
+        assert.equal(second.pushed.length, 0);
+        await second.server.shutdown();
+        const persisted = JSON.parse(readFileSync(join(dir, 'r3.delivery.json'), 'utf8'));
+        assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must cap below the unoffered reply during drain');
+      }
+    } finally {
+      releaseSweep();
+      releaseFetch();
+      if (second) await until(() => second!.server.isLive, 'released drain completes');
+      await second?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
