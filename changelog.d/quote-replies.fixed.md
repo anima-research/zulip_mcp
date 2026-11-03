@@ -48,9 +48,5 @@
   delivery and history: burst 30, refilling at 30 per minute. Exhaustion is
   budget-skipped, not a negative-cache entry; cached authors remain usable.
   Ordinary sends and reaction/edit placement do not spend quote tokens.
-  Closed-DM catch-up now carries `chat:dm` and `chat:private`, rather than a
-  synthesized `chat:mention`; unmentioned DMs have `mentioned: false` and
-  `origin.isMention: false`. Mention-only policies must match DM/private tags
-  to keep receiving DM catch-up.
   Catch-up can emit multiple `<missed>` blocks per channel when deferred
   quote verification splits an accepted prefix from the retry block.

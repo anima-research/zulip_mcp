@@ -1176,8 +1176,9 @@ export class ZulipMcplServer {
   /**
    * On (re)connect, deliver what arrived while the server was offline.
    * Channels the host had open get their full missed backscroll; every other
-   * watermarked channel gets each mention with its vicinity. One `<missed>`
-   * block per channel, as a push event. Runs at most once per process.
+   * watermarked channel gets each addressed message with its vicinity. Deferred
+   * quote verification can split a channel into multiple `<missed>` pushes.
+   * Runs at most once per connection.
    */
   private async runReconnectSweep(): Promise<void> {
     if (this.sweepDone) return;
@@ -1267,7 +1268,7 @@ export class ZulipMcplServer {
   /**
    * Deliver what a closed (or not-yet-reopened) channel accumulated past its
    * watermark as `<missed>` push events: the full backscroll when
-   * `keepAll` (the host had it open, or it is a DM), else each mention with
+   * `keepAll` (the host had it open, or it is a DM), else each addressed message with
    * its vicinity. Advances the watermark past everything scanned once the
    * host has accepted the push. Returns true when something was delivered.
    */

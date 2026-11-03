@@ -17,7 +17,7 @@
  *   lastOpen     channels the host had open at last sight. The reconnect
  *                sweep delivers their full missed backscroll (the host will
  *                reopen them); every other watermarked channel gets only its
- *                mentions, with vicinity.
+ *                addressed messages, with vicinity.
  *
  * File: `<stateDir>/<session>.delivery.json`, alongside the tool layer's
  * monitoring state. Best-effort: a failed save is logged, never fatal.
