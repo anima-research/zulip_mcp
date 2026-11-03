@@ -700,3 +700,24 @@ test('R3-4: channel messages expose umbrella and specific addressing metadata', 
   assert.equal(page.messages[1].metadata?.isExplicitMention, true);
   assert.equal(page.messages[1].metadata?.isReplyToBot, false, 'explicit mentions do not infer quote addressing');
 });
+
+for (const malformed of ['wrong id', 'missing sender'] as const) {
+  test(`R3-2 follow-up: a target response with ${malformed} is uncached and retry-eligible`, async () => {
+    let gets = 0;
+    const adapter = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [raw(300, quote())], found_newest: true }),
+      getById: async () => {
+        if (++gets === 1) return { message: raw(malformed === 'wrong id' ? 9999 : QUOTED, 'original',
+          { sender_id: malformed === 'missing sender' ? undefined : SELF }) };
+        return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
+      },
+    } }, SELF, 'session');
+    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.deepEqual(first.unverifiedMessageIds, ['300']);
+    // Invalid target objects must not enter either cache, including the wrong id.
+    assert.equal((adapter as unknown as { seen: Map<number, unknown> }).seen.has(9999), false);
+    const second = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.equal(second.messages[0].metadata?.replyToSelf, true);
+    assert.equal(gets, 2, 'retry performs a fresh target GET');
+  });
+}

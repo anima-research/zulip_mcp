@@ -73,10 +73,13 @@ Discord and Slack adapters that once lived here moved to those servers.
   closed, allowing the backlog to proceed without another gap or reconnect.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
-  retries even when history cannot verify it again. Failed lookups
-  for missing or inaccessible messages (Zulip's invalid-message-id error)
-  are cached for three minutes; rate limits, malformed/non-JSON responses,
-  transport errors and timeouts are uncached and eligible for the retry pass.
+  retries even when history cannot verify it again. Only API errors with
+  `result: "error"` and `msg: "Invalid message(s)"` are cached for three
+  minutes. Other API errors, missing message objects, mismatched message ids,
+  absent/invalid numeric sender ids, non-JSON responses, transport errors and
+  timeouts are uncached and eligible for the retry pass. This is not full
+  response-schema validation; inaccessible-stream error wording has not been
+  independently verified locally.
   The wait budget does not cancel the GET or bound history-page HTTP latency.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.

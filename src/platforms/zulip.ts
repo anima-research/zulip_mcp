@@ -420,12 +420,14 @@ export class ZulipAdapter implements PlatformAdapter {
         timeoutMs,
         `GET message ${messageId}`,
       );
-      // Zulip deliberately uses the same invalid-id response for a missing
-      // message and one this user cannot access. Only that is a cached miss.
+      // Only this exact invalid-id response is a cached miss. Other API
+      // errors, including different visibility errors, stay retry-eligible.
       if (quoteLookup && result?.result === 'error' && result.msg === 'Invalid message(s)') return null;
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
       if (!raw) throw new Error('response contained no message');
+      if (raw.id !== messageId) throw new Error('response contained a different message id');
+      if (!Number.isSafeInteger(raw.sender_id) || raw.sender_id <= 0) throw new Error('response contained no valid sender_id');
       const m = normalizeMessage(raw);
       const channelId = channelIdOf(m, this.identity.selfUserId);
       this.remember(channelId, m);
@@ -437,7 +439,7 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  /** Cache inaccessible/missing messages only; transient failures must get
+  /** Cache explicit invalid-id errors only; transient failures must get
    *  a fresh chance in the deferred pass. */
   private async resolveQuoteTarget(id: number, remainingMs: number): Promise<QuoteLookup> {
     if (!ZulipAdapter.takeQuoteToken()) return 'budget-skipped';
