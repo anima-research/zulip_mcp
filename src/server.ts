@@ -1060,13 +1060,16 @@ export class ZulipMcplServer {
         if (ids.length === 0) continue;
         // Not now, not never: tried again once the host enables it.
         if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) continue;
-        this.delivery.markReplayed(channelId, ids);
         try {
           if (this.channelManager.isOpen(channelId)) {
+            this.delivery.markReplayed(channelId, ids);
             await this.replayHeld(channelId, ids);
           } else {
             const watermark = this.delivery.watermark(channelId);
-            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), watermark ?? ids[0] - 1);
+            // this.healing reserves the fetch; only an actual push attempt
+            // consumes eligibility, and only for the ids that block covers.
+            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), watermark ?? ids[0] - 1,
+              undefined, (through) => this.delivery.markReplayed(channelId, ids.filter((id) => id <= through)));
           }
         } catch (err) {
           console.error(`[zulip-mcp] replay of undelivered messages on ${channelId} failed:`, (err as Error).message);
@@ -1126,7 +1129,7 @@ export class ZulipMcplServer {
    * the missed-ambient tally, so the host's closed-channel invitation can
    * show what staying out has cost.
    */
-  private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}): Promise<boolean> {
+  private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}, beforeOffer?: () => void): Promise<boolean> {
     const conn = this.conn;
     if (!conn || !this.mcplActive) return false;
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
@@ -1165,6 +1168,9 @@ export class ZulipMcplServer {
       payload: { content: message.content },
     };
     try {
+      // Local policy exits above are not offers. Once attempted, a refusal
+      // or ambiguous transport failure must still consume the replay.
+      beforeOffer?.();
       const result = (await conn.sendRequest(method.PUSH_EVENT, params)) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
@@ -1281,6 +1287,7 @@ export class ZulipMcplServer {
     keepAllHint: boolean,
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
+    onOffer?: (through: number) => void,
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
@@ -1314,7 +1321,7 @@ export class ZulipMcplServer {
     let newestId = Math.min(fetched.scannedThrough, window.through);
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
-    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window);
+    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window, onOffer);
     if (blocked !== undefined) {
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
@@ -1366,7 +1373,7 @@ export class ZulipMcplServer {
       reason,
       messages: kept.length,
       ...(fetched.truncated || blocked !== undefined ? { truncated: true } : {}),
-    });
+    }, () => onOffer?.(newestId));
     if (ok) {
       for (const view of kept) this.forgetPendingReply(channelId, view.id);
       // Advance past everything scanned, not just what was delivered, so a

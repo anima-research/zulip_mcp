@@ -51,3 +51,6 @@
   Ordinary sends and reaction/edit placement do not spend quote tokens.
   Catch-up can emit multiple `<missed>` blocks per channel when deferred
   quote verification splits an accepted prefix from the retry block.
+  Closed-channel healing consumes a live replay attempt only when a push
+  is attempted. A local policy abort stays eligible after re-enable;
+  actual refusals and ambiguous request failures still consume the attempt.

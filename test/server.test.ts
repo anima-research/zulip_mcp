@@ -3255,3 +3255,127 @@ for (const failure of ['messaging disable', 'attributed exception'] as const) {
     }
   });
 }
+
+for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'request-error'] as const) {
+  test(`R3-1 healing: ${mode}`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
+    let second: Harness | undefined;
+    let releaseSweep = () => {};
+    let releaseFetch = () => {};
+    let releaseHeal = () => {};
+    try {
+      const first = harness({ stateDir: dir, sessionId: 'r3' });
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
+      await first.close();
+      let fetching = false;
+      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
+      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+      second = harness({
+        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
+        attachments: {
+          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
+          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+        },
+      });
+      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+      let reads = 0;
+      second.adapter.fetchHistory = async (channelId, query) => {
+        if (++reads === 2) await sweepGate;
+        return realFetch(channelId, query);
+      };
+      await initialize(second, true);
+      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(second, false);
+      await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
+      second.adapter.emit!({
+        ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
+        metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
+      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+      second.adapter.emit!(reply);
+      releaseSweep();
+      await until(() => fetching, 'earlier buffered route waits on attachment');
+      assert.equal(second.pushed.length, 0);
+
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+        effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
+      });
+      releaseFetch();
+      await until(() => second!.server.isLive, 'settled route leaves the drain');
+      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
+
+      assert.equal(second.server.delivery.watermark('zulip:general'), 4);
+      assert.ok(second.server.delivery.heldIds('zulip:general', { replayable: true }).includes(5));
+      let healReads = 0;
+      const healGate = new Promise<void>((r) => { releaseHeal = r; });
+      const originalHistory = second.adapter.fetchHistory!.bind(second.adapter);
+      second.adapter.fetchHistory = async (channel, query) => {
+        if (channel === 'zulip:general') {
+          healReads++;
+          await healGate;
+        }
+        return originalHistory(channel, query);
+      };
+      if (mode === 'host-refusal') second.policy.rejectPushes.add('5');
+      if (mode === 'request-error') {
+        const respond = second.host.sendResponse.bind(second.host);
+        t.mock.method(second.host, 'sendResponse', (...args: Parameters<typeof second.host.sendResponse>) => {
+          if ((args[1] as { accepted?: boolean })?.accepted === true) {
+            second!.host.sendError(args[0], -32603, 'replay outcome unknown');
+            return;
+          }
+          return respond(...args);
+        });
+      }
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await until(() => healReads === 1, 'healing awaits history');
+      // Repeated policy requests while history is pending must not start
+      // overlapping heals, even though the hold has not been offered yet.
+      for (let i = 0; i < 3; i++) {
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      }
+      assert.equal(healReads, 1, 'one in-flight healing reservation');
+      if (mode === 'disable-during-heal') {
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+          effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
+        });
+      }
+      releaseHeal();
+      const healing = () => (second!.server as unknown as { healing: boolean }).healing;
+      await until(() => !healing(), 'first healing settles');
+      if (mode === 'disable-during-heal') {
+        assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 0, 'local policy refusal sends nothing');
+        assert.ok(second.server.delivery.heldIds('zulip:general', { replayable: true }).includes(5),
+          'a never-offered reply must remain replayable');
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await until(() => !healing(), 'reenabled healing settles');
+      }
+      const accepted = mode === 'disable-during-heal' || mode === 'no-duplicate';
+      assert.equal(second.server.delivery.watermark('zulip:general'), accepted ? 5 : 4);
+      assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1, 'exactly one actual reply offer');
+      assert.deepEqual(second.server.delivery.heldIds('zulip:general'), accepted ? [] : [5]);
+      assert.deepEqual(second.server.delivery.heldIds('zulip:general', { replayable: true }), []);
+      for (let i = 0; i < 3; i++) {
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      }
+      await until(() => !healing(), 'repeated grants settle');
+      assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1,
+        'accepted, refused and ambiguous offers must not loop');
+    } finally {
+      releaseHeal();
+      releaseSweep();
+      releaseFetch();
+      if (second) await until(() => second!.server.isLive, 'released drain completes');
+      if (second) await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'released healing completes');
+      await second?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
