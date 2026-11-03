@@ -423,6 +423,13 @@ export class ZulipMcplServer {
         await this.route(message, newChannel);
       } catch (err) {
         console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
+      } finally {
+        // A policy return or construction error may settle without queueing.
+        // Transfer any still-pending reply to existing replay ownership.
+        if (this.pendingReplies.get(message.channelId)?.has(id) &&
+            !this.delivery.heldIds(message.channelId).includes(id)) {
+          this.delivery.hold(message.channelId, id, 'failed');
+        }
       }
       // The bounded buffer may have evicted this entry while route waited.
       if (this.preLive[0]?.message === message) this.preLive.shift();
@@ -439,14 +446,11 @@ export class ZulipMcplServer {
 
   private commitScannedCatchUp(): void {
     for (const [channelId, scannedThrough] of this.preLiveScanned) {
-      // Shutdown/reset can precede go-live: a buffered, live-verified reply
-      // has not been offered yet and therefore has no delivery hold. Keep
-      // it inside the next sweep rather than committing an ambient scan over it.
+      // Pending verdicts outlive buffer membership: routing can settle
+      // without acceptance (temporary policy disable or an early error).
       let through = scannedThrough;
-      for (const { message } of this.preLive) {
-        if (message.channelId !== channelId) continue;
-        const id = Number(message.messageId);
-        if (this.pendingReplies.get(channelId)?.has(id)) through = Math.min(through, id - 1);
+      for (const id of this.pendingReplies.get(channelId) ?? []) {
+        through = Math.min(through, id - 1);
       }
       // A refused buffered reply must keep its hold below the scanned range.
       for (const id of this.delivery.heldIds(channelId)) {

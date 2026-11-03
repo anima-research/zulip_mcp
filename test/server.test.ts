@@ -3154,3 +3154,105 @@ for (const slowPart of ['history HTTP', 'prefix acceptance'] as const) {
     } finally { await h.close(); }
   });
 }
+
+for (const failure of ['messaging disable', 'attributed exception'] as const) {
+  test(`R3-1 follow-up: ${failure} during drain preserves persistence and later delivery`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
+    let second: Harness | undefined;
+    let releaseSweep = () => {};
+    let releaseFetch = () => {};
+    try {
+      const first = harness({ stateDir: dir, sessionId: 'r3' });
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
+      await first.close();
+      let fetching = false;
+      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
+      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+      second = harness({
+        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
+        attachments: {
+          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
+          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+        },
+      });
+      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+      let reads = 0;
+      second.adapter.fetchHistory = async (channelId, query) => {
+        if (++reads === 2) await sweepGate;
+        return realFetch(channelId, query);
+      };
+      await initialize(second, true);
+      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
+      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(second, false);
+      await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
+      second.adapter.emit!({
+        ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
+        metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
+      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+      second.adapter.emit!(reply);
+      releaseSweep();
+      await until(() => fetching, 'earlier buffered route waits on attachment');
+      assert.equal(second.pushed.length, 0);
+
+      if (failure === 'messaging disable') {
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+          effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
+        });
+      } else {
+        const internal = second.server as unknown as {
+          attributed(message: IncomingChannelMessage): IncomingChannelMessage;
+        };
+        const original = internal.attributed.bind(internal);
+        internal.attributed = (message) => {
+          if (message.messageId === '5') throw new Error('injected attribution failure before route hold');
+          return original(message);
+        };
+        // Any automatic healing attempt is refused until persistence is checked.
+        second.policy.rejectPushes.add('5');
+      }
+      releaseFetch();
+      await until(() => second!.server.isLive, 'settled route leaves the drain');
+      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
+      await second.server.shutdown();
+      const persisted = JSON.parse(readFileSync(join(dir, 'r3.delivery.json'), 'utf8'));
+      assert.ok(persisted.watermarks['zulip:general'] < 5, 'settled but unaccepted reply must remain below the persisted watermark');
+      assert.ok(second.server.delivery.heldIds('zulip:general', { replayable: failure === 'messaging disable' }).includes(5),
+        'dequeued reply retains existing hold ownership for recovery');
+      if (failure === 'messaging disable') {
+        // History still says ambient. Only the retained pending verdict plus
+        // replayable hold can deliver it on the same connection.
+        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await until(() => second!.server.delivery.watermark('zulip:general') === 5, 'reenabling messaging delivers the pending reply');
+        assert.ok(second.pushed.some((push) => push.tags?.includes('chat:reply')));
+      } else {
+        await second.close();
+        second = undefined;
+        const restarted = harness({ stateDir: dir, sessionId: 'r3' });
+        try {
+          const history = quoteHistory();
+          restarted.adapter.fetchHistory = history.fetchHistory.bind(history);
+          await initialize(restarted, true);
+          await settled(restarted);
+          assert.equal(restarted.pushed.length, 1, 'the next startup sweep redelivers the unaccepted reply');
+          assert.ok(restarted.pushed[0].tags?.includes('chat:reply'));
+          assert.equal(restarted.server.delivery.watermark('zulip:general'), 5);
+        } finally { await restarted.close(); }
+      }
+    } finally {
+      releaseSweep();
+      releaseFetch();
+      if (second) await until(() => second!.server.isLive, 'released drain completes');
+      await second?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
