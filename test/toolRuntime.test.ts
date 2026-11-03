@@ -289,8 +289,6 @@ test('delete_message notes the id before the call and un-notes it when the call 
   assert.deepEqual(failed, ['7'], 'only the refused one is un-noted');
 });
 
-// ── Replies derive their destination before any outbound side effect ──
-
 const replyStream = { type: 'stream', stream_id: 12, display_recipient: 'General', subject: 'Deploy status' };
 const replyParticipants = [
   { id: 790, email: 'bot@example.com', full_name: 'Bot' },

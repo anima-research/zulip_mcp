@@ -238,15 +238,12 @@ export class ZulipToolRuntime {
     this.reactionPolicy = policy;
   }
 
-  /** Resolve and check a reply before uploading files or sending any chunks. */
   private async replyDestination(args: Record<string, any>) {
     const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
     if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
     const result = await this.zulipClient.messages.getById({ message_id: id });
     if (result?.result === "error") {
-      // Keep the API code as well as its wording: missing/deleted/inaccessible
-      // messages must never fall back to a caller-supplied destination.
       throw new Error(`Zulip refused reply_to ${id}${result.code ? ` (${result.code})` : ""}: ${result.msg ?? "unknown error"}`);
     }
     const message = result?.message;
