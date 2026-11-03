@@ -3379,3 +3379,54 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
     }
   });
 }
+
+for (const outcome of ['refusal', 'RPC error'] as const) {
+  for (const acceptTail of [false, true]) {
+    test(`R3-1 ceiling: ${outcome}, tail ${acceptTail ? 'accepted' : 'refused'}`, async (t) => {
+      const h = harness({ history: Array.from({ length: 101 }, (_, i) => streamMsg(i + 5)) });
+      const healing = () => (h.server as unknown as { healing: boolean }).healing;
+      try {
+        await initialize(h, true);
+        await settled(h);
+        h.adapter.emit!(streamMsg(1, { mentioned: true }));
+        await until(() => h.server.delivery.watermark('zulip:general') === 1, 'seed acceptance');
+        for (const id of ['5', '104', '105']) h.policy.rejectPushes.add(id);
+        for (const id of [5, 105]) {
+          h.adapter.emit!(streamMsg(id, {
+            metadata: { replyToSelf: true, mentioned: false, isDM: false }, tags: ['chat:reply'],
+          }));
+        }
+        await until(() => h.server.delivery.heldIds('zulip:general', { replayable: true }).length === 2, 'two refused live replies');
+        h.pushed.length = 0;
+        if (acceptTail) h.policy.rejectPushes.delete('105');
+        if (outcome === 'RPC error') {
+          const respond = h.host.sendResponse.bind(h.host);
+          t.mock.method(h.host, 'sendResponse', (...args: Parameters<typeof h.host.sendResponse>) => {
+            if ((args[1] as { accepted?: boolean })?.accepted === false) {
+              h.host.sendError(args[0], -32603, 'unknown healing outcome');
+              return;
+            }
+            return respond(...args);
+          });
+        }
+        await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await until(() => !healing(), 'prefix offer settles');
+        assert.deepEqual(h.server.delivery.heldIds('zulip:general'), [5, 105], 'unaccepted prefix and uncovered tail retain ownership');
+        assert.deepEqual(h.server.delivery.heldIds('zulip:general', { replayable: true }), [105], 'only uncovered tail stays eligible');
+        for (let i = 0; i < 3; i++) {
+          await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+          await until(() => !healing(), 'subsequent grant settles');
+        }
+        const offers = h.pushed.map((push) => (push.origin as { messageId: string }).messageId);
+        assert.equal(offers.filter((id) => id === '104').length, 1, 'consumed healing prefix is never re-offered on later grants');
+        assert.equal(offers.filter((id) => id === '105').length, 1, 'eligible tail gets one offer');
+        assert.deepEqual(h.server.delivery.heldIds('zulip:general'), acceptTail ? [5] : [5, 105]);
+        assert.deepEqual(h.server.delivery.heldIds('zulip:general', { replayable: true }), []);
+        assert.ok(h.server.delivery.watermark('zulip:general')! < 5, 'accepting the tail must not erase the refused prefix floor');
+        const pending = (h.server as unknown as { pendingReplies: Map<string, Set<number>> }).pendingReplies;
+        assert.equal(pending.get('zulip:general')?.has(5), true, 'unaccepted prefix verdict remains owned');
+        assert.equal(pending.get('zulip:general')?.has(105) ?? false, !acceptTail);
+      } finally { await h.close(); }
+    });
+  }
+}

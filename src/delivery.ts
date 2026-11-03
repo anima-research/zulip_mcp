@@ -149,14 +149,14 @@ export class DeliveryState {
   }
 
   /**
-   * Everything at or below `messageId` has been delivered (a catch-up block
-   * scanned and pushed the whole range): release the holds in it and
+   * The range (afterId, messageId] has been delivered (a catch-up block
+   * scanned and pushed that range): release only the holds in it and
    * advance. Returns true if the watermark moved.
    */
-  advanceThrough(channelId: string, messageId: number): boolean {
+  advanceThrough(channelId: string, messageId: number, afterId = 0): boolean {
     const held = this.held.get(channelId);
     if (held) {
-      for (const id of held.keys()) if (id <= messageId) held.delete(id);
+      for (const id of held.keys()) if (id > afterId && id <= messageId) held.delete(id);
       if (held.size === 0) this.held.delete(channelId);
     }
     return this.advance(channelId, messageId);

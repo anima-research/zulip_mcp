@@ -1066,9 +1066,10 @@ export class ZulipMcplServer {
             await this.replayHeld(channelId, ids);
           } else {
             const watermark = this.delivery.watermark(channelId);
-            // this.healing reserves the fetch; only an actual push attempt
-            // consumes eligibility, and only for the ids that block covers.
-            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), watermark ?? ids[0] - 1,
+            // An earlier non-replayable hold owns the skipped prefix. Offer
+            // only the eligible suffix without releasing that earlier floor.
+            const after = (this.delivery.floor(channelId) ?? ids[0]) < ids[0] ? ids[0] - 1 : watermark ?? ids[0] - 1;
+            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), after,
               undefined, (through) => this.delivery.markReplayed(channelId, ids.filter((id) => id <= through)));
           }
         } catch (err) {
@@ -1265,13 +1266,13 @@ export class ZulipMcplServer {
     return { messages: out, truncated: !complete, complete, scannedThrough: cursor > afterId ? cursor : null, unverifiedMessageIds: [...unverified].sort((a, b) => a - b) };
   }
 
-  private advanceCatchUp(channelId: string, through: number): void {
+  private advanceCatchUp(channelId: string, through: number, after: number): void {
     // An accepted/empty catch-up scan releases every hold in its range,
     // including ids deleted from history. Their pending verdicts go too.
     for (const id of this.delivery.heldIds(channelId)) {
-      if (id <= through) this.forgetPendingReply(channelId, id);
+      if (id > after && id <= through) this.forgetPendingReply(channelId, id);
     }
-    if (this.live) this.delivery.advanceThrough(channelId, through);
+    if (this.live) this.delivery.advanceThrough(channelId, through, after);
     else this.preLiveScanned.set(channelId, Math.max(this.preLiveScanned.get(channelId) ?? 0, through));
   }
 
@@ -1332,7 +1333,7 @@ export class ZulipMcplServer {
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
       // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
-      this.advanceCatchUp(channelId, newestId);
+      this.advanceCatchUp(channelId, newestId, after);
       return blocked !== undefined ? retry(newestId) : false;
     }
     const addressedCount = views.filter(isAddressed).length;
@@ -1379,7 +1380,7 @@ export class ZulipMcplServer {
       // Advance past everything scanned, not just what was delivered, so a
       // mention-only channel does not re-surface its non-mention tail; the
       // block covered every held id in the range, so their holds go too.
-      this.advanceCatchUp(channelId, newestId);
+      this.advanceCatchUp(channelId, newestId, after);
       // The agent answers the block through channels/publish too, so the
       // conversation is where its newest message that addresses the agent
       // is (in a backscroll, its newest message), as live pushes or an open
