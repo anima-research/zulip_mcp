@@ -25,9 +25,10 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Every stream and DM conversation the bot can see is a channel the host can
   open and close. Opening a channel subscribes the bot to the stream first
-  (Zulip only delivers events to subscribers) — a stream the bot cannot
-  subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically.
+  (without a subscription, Zulip sends the bot no private stream's messages,
+  and a public stream's only without their flags, if at all) — a stream the
+  bot cannot subscribe to fails the open rather than opening onto silence —
+  and can return backscroll atomically.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions and DMs on closed channels** arrive as `push/event` so they always
   reach the agent; ambient traffic on closed channels is dropped and counted
@@ -433,14 +434,21 @@ environment). Under connectome-host, point it into the data volume, e.g.
 
 ## Notes for operators
 
-- **Subscription is not optional.** Zulip delivers stream events only to
-  subscribers, even with `all_public_streams` on the event queue. Opening a
-  channel subscribes the bot (and fails if it cannot — a private stream the
-  bot was not invited to answers `success` with the stream under
-  `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`
-  and `listen` do it explicitly. `listen` alone leaves the channel *closed*:
-  ambient is tallied and mentions become push events — the host must open
-  the channel to receive its traffic.
+- **Subscription is not optional.** Even with `all_public_streams` on the
+  event queue, Zulip sends a private stream's messages only to its
+  subscribers. A public stream's reach an unsubscribed bot without their
+  flags, so without `mentioned`, and a guest bot's not at all unless the
+  stream is web-public
+  ([`all_public_streams`](https://zulip.com/api/register-queue#parameter-all_public_streams),
+  [`event_queue.py`](https://github.com/zulip/zulip/blob/d2b2ae092eae963522efd9a754688c5b45131bf1/zerver/tornado/event_queue.py#L1108-L1123)).
+  A message's edits and reactions go only to its recipients
+  ([`update_message`](https://zulip.com/api/get-events#update_message),
+  [`reaction`](https://zulip.com/api/get-events#reaction-add)). Opening a
+  channel subscribes the bot (and fails if it cannot: Zulip answers a
+  private stream the bot was not invited to with an error);
+  `ZULIP_SUBSCRIBE` and `listen` do it explicitly. `listen` alone leaves
+  the channel *closed*: ambient is tallied and mentions become push
+  events — the host must open the channel to receive its traffic.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
