@@ -663,8 +663,8 @@ export class ZulipAdapter implements PlatformAdapter {
    * Zulip sends a private stream's messages only to its subscribers. A public
    * stream's reach an unsubscribed bot's `all_public_streams` queue without
    * their flags, so without `mentioned`, and a guest bot's not at all unless
-   * the stream is web-public. A message's edits and reactions go only to those
-   * who received it. So opening a channel subscribes the bot. The call answers
+   * the stream is web-public. A message's edits and reactions go only to its
+   * recipients. So opening a channel subscribes the bot. The call answers
    * `already_subscribed` when there is nothing to do.
    */
   async ensureSubscribed(channelId: string): Promise<void> {
