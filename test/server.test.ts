@@ -3522,3 +3522,27 @@ for (const outcome of ['empty', 'error', 'ambient'] as const) {
   });
 }
 
+for (const kind of ['edit', 'move', 'delete'] as const) {
+  test(`R4-5: open-channel ${kind} exposes address flags`, async () => {
+    const h = harness();
+    try {
+      await initialize(h, true);
+      await settled(h);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      h.adapter.change!({
+        kind, channelId: 'zulip:general', messageId: '10', messageIds: ['10'],
+        authorId: '101', authorName: 'User', authorEmail: 'user@example.invalid', actorId: '101',
+        topic: 'answers', previousTopic: null, movedToChannelId: null,
+        content: 'corrected reply', previousContent: 'reply', replyToSelf: true,
+        previouslyReplyToSelf: true, mentioned: false, previouslyMentioned: false,
+        vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(),
+      });
+      await until(() => h.incoming.some((m) => m.metadata?.change === kind), 'change line');
+      const metadata = h.incoming.find((m) => m.metadata?.change === kind)!.metadata;
+      assert.equal(metadata?.isMention, true);
+      assert.equal(metadata?.isExplicitMention, false);
+      assert.equal(metadata?.isReplyToBot, true);
+    } finally { await h.close(); }
+  });
+}
+
