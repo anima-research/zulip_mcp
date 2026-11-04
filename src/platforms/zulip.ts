@@ -420,9 +420,10 @@ export class ZulipAdapter implements PlatformAdapter {
         timeoutMs,
         `GET message ${messageId}`,
       );
-      // Only this exact invalid-id response is a cached miss. Other API
-      // errors, including different visibility errors, stay retry-eligible.
-      if (quoteLookup && result?.result === 'error' && result.msg === 'Invalid message(s)') return null;
+      // This endpoint uses BAD_REQUEST for both missing and inaccessible ids.
+      // Older (pre-5.0) servers omit code; only then use the legacy text.
+      if (quoteLookup && result?.result === 'error' &&
+          (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
       if (!raw) throw new Error('response contained no message');
@@ -927,7 +928,8 @@ export class ZulipAdapter implements PlatformAdapter {
     for (const m of page.messages) {
       if (!this.allowed(m)) continue;
       const verdict = await this.classifyQuoteReply(m, resolve, Infinity);
-      m.replyToSelf = verdict === 'reply';
+      m.replyToSelf = verdict === 'reply' ||
+        ((verdict === 'budget-skipped' || verdict === 'unverified') && this.seen.get(m.id)?.replyToSelf === true);
       if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }
     for (const m of page.messages) this.remember(channelId, m);

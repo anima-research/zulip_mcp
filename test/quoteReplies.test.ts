@@ -721,3 +721,38 @@ for (const malformed of ['wrong id', 'missing sender'] as const) {
     assert.equal(gets, 2, 'retry performs a fresh target GET');
   });
 }
+
+test('R4-4: translated BAD_REQUEST is a cached definite miss', async () => {
+  let gets = 0;
+  const adapter = new ZulipAdapter({ messages: {
+    retrieve: async () => ({ messages: [raw(300, quote())], found_newest: true }),
+    getById: async () => { gets++; return { result: 'error', code: 'BAD_REQUEST', msg: 'Ungültige Nachricht(en)' }; },
+  } }, SELF, 'session');
+  for (let i = 0; i < 2; i++) {
+    const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.deepEqual(page.unverifiedMessageIds ?? [], []);
+    assert.equal(page.messages[0].metadata?.replyToSelf, false);
+  }
+  assert.equal(gets, 1);
+});
+
+for (const outcome of ['budget-skipped', 'unverified'] as const) {
+  test(`R4-6: history keeps a seen reply verdict when ${outcome}`, async () => {
+    let content = quote();
+    const adapter = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [raw(300, content)], found_newest: true }),
+      getById: async (params: { message_id: number }) => params.message_id === QUOTED
+        ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
+        : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' },
+    } }, SELF, 'session');
+    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    assert.equal(first.messages[0].metadata?.replyToSelf, true);
+    content = quote(201); // This target is not in the author cache.
+    const page = await adapter.fetchHistory('zulip:general', {
+      limit: 100, ...(outcome === 'budget-skipped' ? { quoteLookupBudget: { remainingMs: 0 } } : {}),
+    });
+    const internal = adapter as unknown as { seen: Map<number, { replyToSelf?: boolean }> };
+    assert.equal(internal.seen.get(300)?.replyToSelf, true, 'last confident verdict survives');
+    assert.equal(page.messages[0].metadata?.replyToSelf, true);
+  });
+}
