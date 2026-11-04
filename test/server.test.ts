@@ -3457,44 +3457,55 @@ test('R4-1: a held buffered reply preserves scanned progress through 20 across r
 });
 
 test('R4-2: concurrent connection drains route buffered 20 once', async () => {
-  const h = harness();
   let next: Harness | undefined;
   let releaseOld = () => {};
   let releaseNew = () => {};
+  const oldGate = new Promise<void>((r) => { releaseOld = r; });
+  const newGate = new Promise<void>((r) => { releaseNew = r; });
+  let oldWaiting = false;
+  let newWaiting = false;
+  let fetches20 = 0;
+  const h = harness({
+    attachments: {
+      source: { async fetch(path) {
+        if (path.includes('old.log')) { oldWaiting = true; await oldGate; }
+        else { fetches20++; newWaiting = true; await newGate; }
+        return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false };
+      } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  const attached = (id: number, name: string) => streamMsg(id, {
+    mentioned: true,
+    metadata: { mentioned: true, isDM: false, attachments: [
+      { path: `/user_uploads/1/a/${name}.log`, name: `${name}.log`, mimeType: 'text/plain', isImage: false },
+    ] },
+  });
   try {
     await initialize(h, true);
     await settled(h);
-    const internal = h.server as unknown as { live: boolean; goLive(): Promise<void>; route(m: IncomingChannelMessage, c?: ChannelDescriptor): Promise<void> };
-    const route = internal.route.bind(h.server);
-    const oldGate = new Promise<void>((r) => { releaseOld = r; });
-    const newGate = new Promise<void>((r) => { releaseNew = r; });
-    let oldWaiting = false;
-    let newWaiting = false;
-    let routes20 = 0;
-    internal.route = async (m, c) => {
-      if (m.messageId === '10') { oldWaiting = true; await oldGate; return; }
-      if (m.messageId === '20') { routes20++; newWaiting = true; await newGate; }
-      await route(m, c);
-    };
+    const internal = h.server as unknown as { live: boolean; goLive(): Promise<void> };
     internal.live = false;
-    h.adapter.emit!(streamMsg(10, { mentioned: true }));
+    h.adapter.emit!(attached(10, 'old'));
     const oldDrain = internal.goLive();
-    await until(() => oldWaiting, 'old route');
+    await until(() => oldWaiting, 'old attachment fetch');
     await h.close();
     next = harness({ reuse: { server: h.server, adapter: h.adapter } });
     await initialize(next, true);
     await until(() => next!.adapter.emit !== null, 'new events');
-    next.adapter.emit!(streamMsg(20, { mentioned: true }));
+    next.adapter.emit!(attached(20, 'new'));
     await next.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    await until(() => newWaiting, 'new drain');
+    await until(() => newWaiting, 'new attachment fetch');
     releaseOld();
+    // Let the old route finish while the new drain is still suspended.
+    await until(() => next!.pushed.some((p) => p.origin.messageId === '10'), 'old route settles on new connection (#40)');
     await new Promise((r) => setTimeout(r, 30));
     releaseNew();
     await oldDrain;
-    await until(() => next!.pushed.length >= 1, '20 pushed');
+    await until(() => next!.pushed.some((p) => p.origin.messageId === '20'), '20 pushed');
     await new Promise((r) => setTimeout(r, 30));
-    assert.equal(routes20, 1);
-    assert.equal(next.pushed.length, 1);
+    assert.equal(fetches20, 1);
+    assert.equal(next.pushed.filter((p) => p.origin.messageId === '20').length, 1);
   } finally { releaseOld(); releaseNew(); if (next) await next.close(); else await h.close(); }
 });
 
