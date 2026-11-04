@@ -1284,7 +1284,7 @@ export class ZulipMcplServer {
     keepAllHint: boolean,
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
-    onOffer?: (through: number) => void,
+    onAttempt?: (through: number) => void,
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
@@ -1302,11 +1302,15 @@ export class ZulipMcplServer {
       fetched = await this.fetchAfter(channelId, after, retryWindow?.through, passBudget);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
+      onAttempt?.(Infinity); // A history failure consumes the heal attempt, unlike a local policy abort.
       return false;
     } finally {
       budget.remainingMs -= startedWith - passBudget.remainingMs;
     }
-    if (fetched.scannedThrough === null) return false;
+    if (fetched.scannedThrough === null) {
+      onAttempt?.(Infinity);
+      return false;
+    }
     // The one retry stays inside the first walk's ceiling. Any quote still
     // unverified on that pass fails closed rather than starting another walk.
     const window = retryWindow ?? {
@@ -1318,7 +1322,7 @@ export class ZulipMcplServer {
     let newestId = Math.min(fetched.scannedThrough, window.through);
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
-    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window, onOffer);
+    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window, onAttempt);
     if (blocked !== undefined) {
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
@@ -1328,6 +1332,7 @@ export class ZulipMcplServer {
     const keepAll = keepAllHint || isDmChannelId(channelId);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
+      onAttempt?.(Infinity);
       // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
       this.advanceCatchUp(channelId, newestId, after);
       return blocked !== undefined ? retry(newestId) : false;
@@ -1370,7 +1375,7 @@ export class ZulipMcplServer {
       reason,
       messages: kept.length,
       ...(fetched.truncated || blocked !== undefined ? { truncated: true } : {}),
-    }, () => onOffer?.(newestId));
+    }, () => onAttempt?.(newestId));
     if (ok) {
       for (const view of kept) this.forgetPendingReply(channelId, view.id);
       // Advance past everything scanned, not just what was delivered, so a

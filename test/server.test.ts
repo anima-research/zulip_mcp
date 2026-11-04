@@ -3497,3 +3497,28 @@ test('R4-2: concurrent connection drains route buffered 20 once', async () => {
     assert.equal(next.pushed.length, 1);
   } finally { releaseOld(); releaseNew(); if (next) await next.close(); else await h.close(); }
 });
+
+for (const outcome of ['empty', 'error', 'ambient'] as const) {
+  test(`R4-3: closed heal consumes one history attempt on ${outcome}`, async () => {
+    const h = harness();
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.policy.rejectPushes.add('5');
+      h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+      await until(() => h.server.delivery.heldIds('zulip:general').includes(5), 'refused reply');
+      let reads = 0;
+      h.adapter.fetchHistory = async () => {
+        reads++;
+        if (outcome === 'error') throw new Error('history unavailable');
+        return { messages: outcome === 'ambient' ? [streamMsg(4)] : [], scannedThrough: outcome === 'ambient' ? 4 : null, reachedNewest: true };
+      };
+      for (let i = 0; i < 5; i++) {
+        await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.equal(reads, 1);
+    } finally { await h.close(); }
+  });
+}
+
