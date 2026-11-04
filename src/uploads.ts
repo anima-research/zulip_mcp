@@ -294,6 +294,10 @@ async function prepareFile(arg: AttachmentArg, policy: UploadPolicy): Promise<Pr
   const name = (typeof arg.name === 'string' && arg.name.trim()) || basename(canonical);
   const mimeType = mimeFromArg(arg, file) ?? guessMimeType(name);
 
+  // Open once, fstat that handle, and read from the same handle later: the
+  // size check and the read cannot be split by a rename. O_NOFOLLOW guards
+  // the final component against a symlink swapped in after realpath;
+  // verifyOpenedInsideRoot guards the rest of the path.
   let handle: FileHandle;
   try {
     handle = await open(canonical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
