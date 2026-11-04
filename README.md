@@ -74,12 +74,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   Unreadable targets or an unknown bot identity fail closed. An unaccepted
   live-verified reply keeps its verdict through sweep deduplication and
   retries even when history cannot verify it again. Only API errors with
-  `result: "error"` and `msg: "Invalid message(s)"` are cached for three
-  minutes. Other API errors, missing message objects, mismatched message ids,
+  `result: "error"` and `code: "BAD_REQUEST"` (missing or inaccessible targets)
+  are cached for three minutes. On pre-5.0 servers without a code, the legacy
+  `msg: "Invalid message(s)"` is used instead. Other API errors, missing message objects, mismatched message ids,
   absent/invalid numeric sender ids, non-JSON responses, transport errors and
   timeouts are uncached and eligible for the retry pass. This is not full
-  response-schema validation; inaccessible-stream error wording has not been
-  independently verified locally.
+  response-schema validation.
   The wait budget does not cancel the GET or bound history-page HTTP latency.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
@@ -90,7 +90,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   buffered live replies are reconciled; it is committed at go-live, graceful
   shutdown, or before a new connection resets the staged state, preserving
   accepted catch-up progress while refused replies retain their holds and
-  unoffered buffered replies cap the committed scan below their ids. It
+  pending replies without a delivery hold cap the committed scan below their
+  ids; held replies preserve the scanned target while flooring the watermark. It
   never advances past a message the host was offered but did not
   accept — a refusal, a batch lost to a transport failure — which is
   replayed from history once the host answers again. On the next connection
@@ -513,7 +514,7 @@ environment). Under connectome-host, point it into the data volume, e.g.
   bot was not invited to answers `success` with the stream under
   `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`
   and `listen` do it explicitly. `listen` alone leaves the channel *closed*:
-  ambient is tallied and mentions become push events — the host must open
+  ambient is tallied and addressed messages become push events — the host must open
   the channel to receive its traffic.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first

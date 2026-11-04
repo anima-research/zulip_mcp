@@ -84,7 +84,7 @@ const ANNOUNCE_TIMEOUT_MS = 5_000;
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const FALLBACK_MCP_PROTOCOL_VERSION = '2024-11-05';
 
-/** Messages kept around each mention in a catch-up block for a closed channel. */
+/** Messages kept around each addressed message in a catch-up block for a closed channel. */
 const MISSED_VICINITY = 7;
 /** Hard ceiling on what one channel's catch-up fetches. */
 const CATCHUP_HARD_CAP = 10_000;
@@ -1414,7 +1414,7 @@ export class ZulipMcplServer {
       }
       if (fetched.scannedThrough === null) continue;
       const views = fetched.messages.map(viewOf);
-      // Only ambient counts as missed: mentions are delivered by the sweep.
+      // Only ambient counts as missed: addressed messages are delivered by the sweep.
       const ambient = views.filter((v) => !isAddressed(v));
       this.delivery.backfillMissed(channelId, ambient, fetched.scannedThrough);
     }
@@ -1425,7 +1425,7 @@ export class ZulipMcplServer {
    * the gap from history (watermark → now) before the gap marker itself is
    * delivered, so the agent gets the messages, not advice to go looking for
    * them: open channels are replayed through channels/incoming; every other
-   * watermarked channel gets its mentions as a `<missed>` push, exactly as
+   * watermarked channel gets its addressed messages as a `<missed>` push, exactly as
    * after a restart.
    */
   private async onSystemEvent(event: PlatformSystemEvent): Promise<void> {
@@ -1698,7 +1698,7 @@ export class ZulipMcplServer {
           mutedStreams: result.filters.mutedStreams ?? [],
           note: mute
             ? 'Nothing from this stream reaches you now — not even mentions — and nothing is tallied. Persisted; reverse with unmute_channel.'
-            : 'Messages from this stream reach you again by the usual rules (mentions always; ambient when the channel is open).',
+            : 'Messages from this stream reach you again by the usual rules (addressed messages always; ambient when the channel is open).',
         };
       }
       case 'set_reaction_visibility': {
