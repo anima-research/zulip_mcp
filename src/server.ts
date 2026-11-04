@@ -404,9 +404,7 @@ export class ZulipMcplServer {
       boundary.set(channelId, Math.max(boundary.get(channelId) ?? 0, through));
     }
     while (this.preLive.length > 0) {
-      // Keep even the currently routing message visible until route settles:
-      // shutdown can commit the staged scan while attachment/push work waits.
-      const { message, newChannel } = this.preLive[0];
+      const { message, newChannel } = this.preLive.shift()!;
       const watermark = boundary.get(message.channelId);
       const id = Number(message.messageId);
       if (watermark !== undefined && Number.isFinite(id) && id <= watermark) {
@@ -415,7 +413,6 @@ export class ZulipMcplServer {
         // live-verified reply that history could not verify.
         const pendingReply = replyToSelf && this.pendingReplies.get(message.channelId)?.has(id);
         if (!pendingReply || id <= (this.sweepAnchors.get(message.channelId) ?? 0)) {
-          this.preLive.shift();
           continue;
         }
       }
@@ -431,8 +428,6 @@ export class ZulipMcplServer {
           this.delivery.hold(message.channelId, id, 'failed');
         }
       }
-      // The bounded buffer may have evicted this entry while route waited.
-      if (this.preLive[0]?.message === message) this.preLive.shift();
     }
     this.commitScannedCatchUp();
     this.delivery.save();
@@ -449,11 +444,12 @@ export class ZulipMcplServer {
       // Pending verdicts outlive buffer membership: routing can settle
       // without acceptance (temporary policy disable or an early error).
       let through = scannedThrough;
+      const held = new Set(this.delivery.heldIds(channelId));
       for (const id of this.pendingReplies.get(channelId) ?? []) {
-        through = Math.min(through, id - 1);
+        if (!held.has(id)) through = Math.min(through, id - 1);
       }
       // A refused buffered reply must keep its hold below the scanned range.
-      for (const id of this.delivery.heldIds(channelId)) {
+      for (const id of held) {
         if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) {
           this.delivery.release(channelId, id);
         }

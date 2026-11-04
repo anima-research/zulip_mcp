@@ -3430,3 +3430,70 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
     });
   }
 }
+test('R4-1: a held buffered reply preserves scanned progress through 20 across restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-r4-progress-'));
+  const h = harness({ stateDir: dir, sessionId: 'r4' });
+  let next: Harness | undefined;
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.server.delivery.advance('zulip:general', 1);
+    const internal = h.server as unknown as { live: boolean; catchUpClosedChannel(c: string, all: boolean): Promise<boolean>; goLive(): Promise<void> };
+    internal.live = false;
+    h.adapter.history = [streamMsg(5), streamMsg(20, { mentioned: true })];
+    await internal.catchUpClosedChannel('zulip:general', false);
+    h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await internal.goLive();
+    await until(() => h.incoming.some((m) => m.messageId === '5'), 'accepted buffered reply');
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(h.server.delivery.watermark('zulip:general'), 20);
+    await h.close();
+    next = harness({ stateDir: dir, sessionId: 'r4', history: h.adapter.history });
+    await initialize(next, true);
+    await settled(next);
+    assert.equal(next.pushed.length, 0, '20 must not be redelivered');
+  } finally { if (next) await next.close(); else await h.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('R4-2: concurrent connection drains route buffered 20 once', async () => {
+  const h = harness();
+  let next: Harness | undefined;
+  let releaseOld = () => {};
+  let releaseNew = () => {};
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const internal = h.server as unknown as { live: boolean; goLive(): Promise<void>; route(m: IncomingChannelMessage, c?: ChannelDescriptor): Promise<void> };
+    const route = internal.route.bind(h.server);
+    const oldGate = new Promise<void>((r) => { releaseOld = r; });
+    const newGate = new Promise<void>((r) => { releaseNew = r; });
+    let oldWaiting = false;
+    let newWaiting = false;
+    let routes20 = 0;
+    internal.route = async (m, c) => {
+      if (m.messageId === '10') { oldWaiting = true; await oldGate; return; }
+      if (m.messageId === '20') { routes20++; newWaiting = true; await newGate; }
+      await route(m, c);
+    };
+    internal.live = false;
+    h.adapter.emit!(streamMsg(10, { mentioned: true }));
+    const oldDrain = internal.goLive();
+    await until(() => oldWaiting, 'old route');
+    await h.close();
+    next = harness({ reuse: { server: h.server, adapter: h.adapter } });
+    await initialize(next, true);
+    await until(() => next!.adapter.emit !== null, 'new events');
+    next.adapter.emit!(streamMsg(20, { mentioned: true }));
+    await next.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => newWaiting, 'new drain');
+    releaseOld();
+    await new Promise((r) => setTimeout(r, 30));
+    releaseNew();
+    await oldDrain;
+    await until(() => next!.pushed.length >= 1, '20 pushed');
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(routes20, 1);
+    assert.equal(next.pushed.length, 1);
+  } finally { releaseOld(); releaseNew(); if (next) await next.close(); else await h.close(); }
+});
