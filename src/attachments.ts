@@ -66,8 +66,9 @@ async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | n
       return { data: buf.toString('base64'), mimeType: `image/${meta.format}` };
     }
 
-    // resize() with withoutEnlargement is a no-op when the image is already
-    // within bounds.
+    // Fresh pipeline per encode (sharp instances aren't safely reusable across
+    // multiple toBuffer() calls). resize() with withoutEnlargement is a no-op
+    // when the image is already within bounds.
     const resizeOpts = { width: IMAGE_LONG_EDGE_MAX, height: IMAGE_LONG_EDGE_MAX, fit: 'inside' as const, withoutEnlargement: true };
     const base = () => sharp(buf, sharpOpts).resize(resizeOpts);
 
