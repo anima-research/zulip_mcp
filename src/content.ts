@@ -17,8 +17,10 @@ export function isMainModule(importMetaUrl: string, argv1: string | undefined): 
   }
 }
 
-// Anthropic refuses images larger than this; mirror their cap server-side
-// so an over-eager fetch can't poison the agent's next turn.
+// Anthropic refuses an image over 10 MB of base64 on the Claude API, and over
+// 5 MB on Amazon Bedrock (https://platform.claude.com/docs/en/build-with-claude/vision).
+// A fetched image goes out as fetched, and base64 adds a third, so one at this
+// cap is within the first limit and over the second.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
