@@ -107,7 +107,7 @@ interface SeenMessage {
 
 /** How long a GET placing a change may take before the change is dropped
  *  rather than wedging every change behind it. */
-const LOCATE_TIMEOUT_MS = 15_000;
+export const LOCATE_TIMEOUT_MS = 15_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -116,7 +116,7 @@ const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
@@ -409,13 +409,17 @@ export class ZulipAdapter implements PlatformAdapter {
    * uncertainty, never for re-seating another message or conversation. */
   noteSelfMoved(move: SelfMove): void {
     this.highestMessageId = Math.max(this.highestMessageId, move.messageId);
-    const source = move.source;
+    const cached = this.seen.get(move.messageId);
+    const source = move.source ?? (cached && !cached.isDm && !cached.placementUnknown
+      ? { channelId: cached.channelId, topic: cached.topic } : null);
+    const sourceChannel = source?.channelId ??
+      (move.newStreamId === null ? move.destinationChannelId : null);
     if (move.newStreamId !== null && move.destinationChannelId !== null) {
       this.streamNamesById.set(move.newStreamId, streamNameOf(move.destinationChannelId));
     }
     for (const [id, at] of this.seen) {
-      const inScope = !source || (at.channelId === source.channelId &&
-        at.topic.toLowerCase() === source.topic.toLowerCase());
+      const inScope = !at.isDm && (sourceChannel === null || at.channelId === sourceChannel) &&
+        (!source || at.topic.toLowerCase() === source.topic.toLowerCase());
       const exact = id === move.messageId;
       if (!exact && !(inScope && (move.propagateMode === 'change_all' ||
           (move.propagateMode === 'change_later' && id >= move.messageId)))) continue;
@@ -423,7 +427,7 @@ export class ZulipAdapter implements PlatformAdapter {
       this.seen.set(id, { ...at, placementUnknown: !confirmed,
         ...(confirmed ? { channelId: move.destinationChannelId!, topic: move.topic! } : {}) });
     }
-    this.emitSelfMove(move.messageId, [move.messageId], source?.channelId ?? 'zulip:unknown',
+    this.emitSelfMove(move.messageId, [move.messageId], sourceChannel ?? 'zulip:unknown',
       source?.topic ?? null, move.destinationChannelId, move.topic, move.topic === null,
       { moveEpochs: move.moveEpochs, newStreamId: move.newStreamId, moveScope: { topic: source?.topic ?? null,
         propagateMode: move.propagateMode } });

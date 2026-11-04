@@ -414,7 +414,7 @@ export class ZulipEventLoop {
                 try {
                   onChange({
                     kind: 'edit',
-                  propagateMode: typeof event.propagate_mode === 'string' ? event.propagate_mode : null,
+                    propagateMode: typeof event.propagate_mode === 'string' ? event.propagate_mode : null,
                     messageId: event.message_id,
                     messageIds: Array.isArray(event.message_ids) && event.message_ids.length > 0
                       ? event.message_ids.filter((id): id is number => typeof id === 'number')

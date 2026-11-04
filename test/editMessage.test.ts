@@ -192,7 +192,7 @@ for (const { label, fields } of edits) {
     try {
       assert.deepEqual(await f.tools.handleToolCall('move_messages', {
         message_id: 42, ...fields, extra: 'not sent',
-      }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', stream: 'archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : response);
+      }), 'stream_id' in fields ? { ...response, moved_to: { channelId: 'zulip:archive', stream: 'archive', topic: 'topic' in fields ? fields.topic.trim() : 'deploys' } } : { ...response, moved_to: { channelId: 'zulip:general', stream: 'general', topic: 'topic' in fields ? fields.topic : 'deploys' } });
       if ('stream_id' in fields) {
         assert.equal(f.lookups.length, 2, 'all moves read original and resulting placement');
         assert.ok(f.lookups.every(path => path.startsWith('/api/v1/messages/')), 'readable destinations need no stream enumeration');

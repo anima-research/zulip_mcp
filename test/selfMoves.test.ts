@@ -573,7 +573,7 @@ for (const actor of [SELF, 7]) {
       move([21, 30], { message_id: 21, orig_subject: 'first', subject: 'second' }));
     await until(() => f.reconciled.length >= beforeEchoes + 2, 'old operations fail closed');
     assert.equal(f.reconciled.at(-1).routingUncertain, true);
-    await assert.rejects(f.publish(), /unconfirmed topic/);
+    await assert.rejects(f.publish(), /placement unconfirmed/);
     f.feed({ type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
       edit_timestamp: 1_700_002_000, content: 'edited again', orig_content: 'old', flags: ['mentioned'] });
     await until(() => f.incoming.filter(m => m.metadata?.change === 'edit').length === 2, 'later edit placed');
@@ -1441,7 +1441,7 @@ for (const observation of ['history', 'context', 'delivery', 'move-anchor', 'mov
     } else if (observation === 'delivery') {
       f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'external') });
       await until(() => f.cachedPlacement(30)?.topic === 'external', 'real refresh');
-      await assert.rejects(f.publish(), /unconfirmed topic/, 'same-id delivery is not a new message');
+      await assert.rejects(f.publish(), /placement unconfirmed/, 'same-id delivery is not a new message');
     } else {
       const anchor = observation === 'move-anchor' ? 30 : 20;
       f.placements.set(anchor, raw(anchor, 'external'));
@@ -1451,7 +1451,7 @@ for (const observation of ['history', 'context', 'delivery', 'move-anchor', 'mov
     const before = f.reconciled.length;
     f.feed(echo);
     await until(() => f.reconciled.length > before, 'historical echo');
-    await assert.rejects(f.publish(), /unconfirmed topic/);
+    await assert.rejects(f.publish(), /placement unconfirmed/);
     assert.equal(f.sent.length, 0);
     assert.equal(f.cachedPlacement(30).topic, 'external');
   });
@@ -1580,95 +1580,132 @@ for (const mode of ['change_later', 'change_all'] as const) {
 }
 
 for (const cross of [false, true]) {
-test(`OWN anchor later genuine self move must invalidate (${cross})`, async t => {
- const f = await fixture(); t.after(() => f.close());
- f.feed({type:'message',flags:['mentioned'],message:raw(21)});
- await until(()=>f.server.delivery.watermark(GENERAL)===21,'hint');
- await f.callMove({message_id:21,topic:'first'});
- f.placements.set(21,{...raw(21,'external'),...(cross?{stream_id:8,display_recipient:'archive'}:{})});
- const before=f.reconciled.length;
- f.feed(move([21],{message_id:21,orig_subject:'first',subject:'external',...(cross?{new_stream_id:8}:{})}));
- await until(()=>f.reconciled.length>before,'genuine same-identity move');
- let refused=false;try{await f.publish();}catch{refused=true;}
- console.log('OBSERVED anchor later self move',cross,JSON.stringify(f.sent), 'actual',f.placements.get(21).subject);
- assert.equal(refused,true,'must not send to obsolete first');
-});
+  test(`anchor later genuine self move must invalidate (${cross})`, async (t) => {
+    const f = await fixture();
+    t.after(() => f.close());
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 21, 'hint');
+    await f.callMove({ message_id: 21, topic: 'first' });
+    f.placements.set(21, { ...raw(21, 'external'), ...(cross ? { stream_id: 8, display_recipient: 'archive' } : {}) });
+    const before = f.reconciled.length;
+    f.feed(move([21], { message_id: 21, orig_subject: 'first', subject: 'external', ...(cross ? { new_stream_id: 8 } : {}) }));
+    await until(() => f.reconciled.length > before, 'genuine same-identity move');
+    let refused = false;
+    try {
+      await f.publish();
+    }
+    catch {
+      refused = true;
+    }
+    console.log('OBSERVED anchor later self move', cross, JSON.stringify(f.sent), 'actual', f.placements.get(21).subject);
+    assert.equal(refused, true, 'must not send to obsolete first');
+  });
 }
-
-test('OWN delayed anchor read must not undo newer co-range refusal',async t=>{
- const f=await fixture();t.after(()=>f.close());
- await f.open();
- f.feed({type:'message',flags:['mentioned'],message:raw(30)});
- await until(()=>f.server.delivery.watermark(GENERAL)===30,'hint');
- let release!:()=>void; const held=new Promise<void>(r=>release=r);let captured=false;
- f.readPlacementWith(async id=>{
-   const snapshot={...(f.placements.get(id)??raw(id))};
-   if(id===30 && snapshot.subject==='first' && !captured){captured=true;await held;}
-   return {result:'success',message:snapshot};
- });
- // First tool moves all messages to first; its anchor result is delayed after reading first.
- const pending=f.tools.handleToolCall('move_messages',{message_id:30,topic:'first',propagate_mode:'change_all'});
- try {
-   await until(()=>captured,'old post-PATCH read captured');
-   const before=f.reconciled.length;
-   // A later move by the same bot identity uses a different anchor and co-moves 30.
-   f.placements.set(30,raw(30,'second'));
-   f.feed(move([21,30],{message_id:21,orig_subject:'first',subject:'second',propagate_mode:'change_later'}));
-   await until(()=>f.reconciled.length>before,'newer co-range self event');
-   await assert.rejects(f.publish(),/unconfirmed/i);
- } finally {release();await pending;}
- let refused=false;try{await f.publish();}catch{refused=true;}
- console.log('OBSERVED delayed result',JSON.stringify(f.sent),'actual',f.placements.get(30).subject);
- assert.equal(refused,true,'older completion must not re-confirm a co-moved reference');
+test('delayed anchor read must not undo newer co-range refusal', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'hint');
+  let release!: () => void;
+  const held = new Promise<void>(r => release = r);
+  let captured = false;
+  f.readPlacementWith(async (id) => {
+    const snapshot = { ...(f.placements.get(id) ?? raw(id)) };
+    if (id === 30 && snapshot.subject === 'first' && !captured) {
+      captured = true;
+      await held;
+    }
+    return { result: 'success', message: snapshot };
+  });
+  // First tool moves all messages to first; its anchor result is delayed after reading first.
+  const pending = f.tools.handleToolCall('move_messages', { message_id: 30, topic: 'first', propagate_mode: 'change_all' });
+  try {
+    await until(() => captured, 'old post-PATCH read captured');
+    const before = f.reconciled.length;
+    // A later move by the same bot identity uses a different anchor and co-moves 30.
+    f.placements.set(30, raw(30, 'second'));
+    f.feed(move([21, 30], { message_id: 21, orig_subject: 'first', subject: 'second', propagate_mode: 'change_later' }));
+    await until(() => f.reconciled.length > before, 'newer co-range self event');
+    await assert.rejects(f.publish(), /unconfirmed/i);
+  }
+  finally {
+    release();
+    await pending;
+  }
+  let refused = false;
+  try {
+    await f.publish();
+  }
+  catch {
+    refused = true;
+  }
+  console.log('OBSERVED delayed result', JSON.stringify(f.sent), 'actual', f.placements.get(30).subject);
+  assert.equal(refused, true, 'older completion must not re-confirm a co-moved reference');
 });
-
-for(const cross of [false,true]){
-test(`OWN moved copy cannot count as new message (${cross})`,async t=>{
- const f=await fixture();t.after(()=>f.close());await f.open(); if(cross)await f.open(ARCHIVE);
- f.feed({type:'message',flags:['mentioned'],message:raw(30)});
- await until(()=>f.server.delivery.watermark(GENERAL)===30,'hint');
- await f.callMove({message_id:21,topic:'first',propagate_mode:'change_all',...(cross?{stream_id:8}:{})});
- const ch=cross?ARCHIVE:GENERAL;
- await assert.rejects(f.publish(ch),/unconfirmed/i);
- const before=f.incoming.length;
- f.feed({type:'message',flags:['mentioned'],message:f.placements.get(30)});
- await until(()=>f.incoming.length>before,'old moved message delivered');
- let refused=false;try{await f.publish(ch);}catch{refused=true;}
- console.log('OBSERVED moved copy',cross,JSON.stringify(f.sent),'id 30 is pre-existing');
- assert.equal(refused,true,'moved copy is not a new real message');
-});
+for (const cross of [false, true]) {
+  test(`moved copy cannot count as new message (${cross})`, async (t) => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    if (cross)
+      await f.open(ARCHIVE);
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'hint');
+    await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all', ...(cross ? { stream_id: 8 } : {}) });
+    const ch = cross ? ARCHIVE : GENERAL;
+    await assert.rejects(f.publish(ch), /unconfirmed/i);
+    const before = f.incoming.length;
+    f.feed({ type: 'message', flags: ['mentioned'], message: f.placements.get(30) });
+    await until(() => f.incoming.length > before, 'old moved message delivered');
+    let refused = false;
+    try {
+      await f.publish(ch);
+    }
+    catch {
+      refused = true;
+    }
+    console.log('OBSERVED moved copy', cross, JSON.stringify(f.sent), 'id 30 is pre-existing');
+    assert.equal(refused, true, 'moved copy is not a new real message');
+  });
 }
-
-test('OWN sender self echo does not clear refusal, new user message does',async t=>{
- const f=await fixture();t.after(()=>f.close());await f.open();
- f.feed({type:'message',flags:['mentioned'],message:raw(30)});
- await until(()=>f.server.delivery.watermark(GENERAL)===30,'hint');
- await f.callMove({message_id:21,topic:'first',propagate_mode:'change_all'});
- f.feed({type:'message',flags:['mentioned'],message:{...raw(31,'first'),sender_id:SELF}});
- await new Promise(r=>setTimeout(r,35));
- await assert.rejects(f.publish(),/unconfirmed/i);
- f.feed({type:'message',flags:['mentioned'],message:raw(32,'first')});
- await until(()=>f.server.delivery.watermark(GENERAL)===32,'fresh user message');
- await f.publish();assert.equal(f.sent.at(-1).topic,'first');
+test('sender self echo does not clear refusal, new user message does', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'hint');
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  f.feed({ type: 'message', flags: ['mentioned'], message: { ...raw(31, 'first'), sender_id: SELF } });
+  await new Promise(r => setTimeout(r, 35));
+  await assert.rejects(f.publish(), /unconfirmed/i);
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(32, 'first') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 32, 'fresh user message');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'first');
+});
+test('deletion and eviction cannot clear co refusal', async (t) => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'hint');
+  let echo: any;
+  f.onPatch(async (e) => { echo = e; });
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  f.forgetPlacement(30);
+  f.feed({ type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 7, topic: 'first' });
+  await until(() => f.incoming.some(m => m.metadata?.change === 'delete'), 'deletion');
+  await assert.rejects(f.publish(), /unconfirmed/i);
+  const before = f.reconciled.length;
+  f.feed(echo);
+  await until(() => f.reconciled.length > before, 'old echo');
+  await assert.rejects(f.publish(), /unconfirmed/i);
 });
 
-test('OWN deletion and eviction cannot clear co refusal',async t=>{
- const f=await fixture();t.after(()=>f.close());await f.open();
- f.feed({type:'message',flags:['mentioned'],message:raw(30)});
- await until(()=>f.server.delivery.watermark(GENERAL)===30,'hint');
- let echo:any; f.onPatch(async e=>{echo=e;});
- await f.callMove({message_id:21,topic:'first',propagate_mode:'change_all'});
- f.forgetPlacement(30);
- f.feed({type:'delete_message',message_ids:[30],message_type:'stream',stream_id:7,topic:'first'});
- await until(()=>f.incoming.some(m=>m.metadata?.change==='delete'),'deletion');
- await assert.rejects(f.publish(),/unconfirmed/i);
- const before=f.reconciled.length;f.feed(echo);
- await until(()=>f.reconciled.length>before,'old echo');
- await assert.rejects(f.publish(),/unconfirmed/i);
-});
 
 for (const early of [false, true]) {
-  test(`R8 anchor exemption consumes only one exact ${early ? 'early' : 'late'} echo`, async t => {
+  test(`anchor exemption consumes only one exact ${early ? 'early' : 'late'} echo`, async t => {
     const f = await fixture();
     t.after(() => f.close());
     f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
@@ -1699,7 +1736,7 @@ for (const early of [false, true]) {
 }
 
 for (const change of ['ordinary move', 'deletion'] as const) {
-  test(`R8 delayed anchor result cannot clear a newer ${change}`, async t => {
+  test(`delayed anchor result respects newer ${change} routing policy`, async t => {
     const f = await fixture();
     t.after(() => f.close());
     await f.open();
@@ -1721,14 +1758,20 @@ for (const change of ['ordinary move', 'deletion'] as const) {
         ? move([30], { message_id: 30, user_id: 7, orig_subject: 'first', subject: 'external', content: 'edited too', orig_content: 'old' })
         : { type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 7, topic: 'first' });
       await until(() => f.incoming.some(m => m.metadata?.change), 'independent invalidation');
-      await assert.rejects(f.publish(), /unconfirmed topic/);
+      if (change === 'deletion') await f.publish();
+      else await assert.rejects(f.publish(), /placement unconfirmed/);
     } finally { release(); await pending; }
-    await assert.rejects(f.publish(), /unconfirmed topic/);
-    assert.equal(f.sent.length, 0);
+    if (change === 'deletion') {
+      await f.publish();
+      assert.deepEqual(f.sent.map(s => s.topic), ['deploys', 'first']);
+    } else {
+      await assert.rejects(f.publish(), /placement unconfirmed/);
+      assert.equal(f.sent.length, 0);
+    }
   });
 }
 
-test('R8 refusal floor includes known public, own, history and tool-read ids above the hint', async t => {
+test('refusal floor includes known public, own, history and tool-read ids above the hint', async t => {
   const f = await fixture();
   t.after(() => f.close());
   await f.open();
@@ -1757,7 +1800,7 @@ test('R8 refusal floor includes known public, own, history and tool-read ids abo
 });
 
 for (const mismatch of ['anchor', 'origin stream', 'origin topic', 'destination stream', 'destination topic', 'mode'] as const) {
-  test(`R8 anchor ignores only the expected echo shape: mismatched ${mismatch}`, async t => {
+  test(`anchor ignores only the expected echo shape: mismatched ${mismatch}`, async t => {
     const f = await fixture();
     t.after(() => f.close());
     f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
@@ -1777,7 +1820,7 @@ for (const mismatch of ['anchor', 'origin stream', 'origin topic', 'destination 
   });
 }
 
-test('R8 expected echo destination agrees with the actual result, not only requested fields', async t => {
+test('expected echo destination agrees with the actual result, not only requested fields', async t => {
   const f = await fixture();
   t.after(() => f.close());
   f.feed({ type: 'message', flags: ['mentioned'], message: raw(21) });
@@ -1794,4 +1837,102 @@ test('R8 expected echo destination agrees with the actual result, not only reque
   await until(() => f.reconciled.length > before, 'echo with a different destination than the result');
   await assert.rejects(f.publish(ARCHIVE), /unconfirmed topic/);
   assert.equal(f.sent.length, 0);
+});
+
+for (const cached of [false, true]) {
+  test(`failed pre-move read scopes range uncertainty without poisoning foreign references (cached=${cached})`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    await f.open(ARCHIVE);
+    f.feed(
+      { type: 'message', flags: ['mentioned'], message: raw(21) },
+      { type: 'message', flags: ['mentioned'], message: { ...raw(40, 'other'), stream_id: 8, display_recipient: 'archive' } },
+      { type: 'message', flags: [], message: { ...raw(41), type: 'private', display_recipient: [
+        { id: 7, email: 'ann@example.com', full_name: 'Ann' }, { id: SELF, email: 'bot@example.com', full_name: 'Bot' },
+      ] } },
+    );
+    await until(() => f.server.delivery.watermark('zulip:dm:7') === 41, 'DM reference');
+    await until(() => f.server.delivery.watermark(ARCHIVE) === 40, 'archive reference');
+    if (!cached) f.forgetPlacement(21);
+    let reads = 0;
+    f.readPlacementWith(async id => {
+      if (++reads === 1) throw new Error('transient pre-move failure');
+      return { result: 'success', message: f.placements.get(id) ?? raw(id) };
+    });
+    await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+    await f.publish('zulip:dm:7');
+    await f.publish(ARCHIVE);
+    await f.publish();
+    assert.equal(f.sent.at(-1).topic, 'first');
+    assert.equal(f.cachedPlacement(41).placementUnknown, undefined);
+    assert.equal(f.cachedPlacement(40).placementUnknown, undefined);
+  });
+}
+
+for (const kind of ['deletion', 'rename', 'stream move']) {
+  test(`third-party ${kind} preserves safe routing with authoritative hints`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'reference');
+    f.feed(kind === 'deletion'
+      ? { type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 7, topic: 'deploys', user_id: 7 }
+      : move([30], { message_id: 30, user_id: 7, subject: 'ops', propagate_mode: 'change_all',
+        ...(kind === 'stream move' ? { new_stream_id: 8 } : {}) }));
+    await until(() => f.incoming.some(m => m.metadata?.change === (kind === 'deletion' ? 'delete' : 'move')), 'change marker');
+    if (kind === 'deletion') {
+      await f.publish();
+      assert.equal(f.sent.at(-1).topic, 'deploys');
+    } else {
+      await assert.rejects(f.publish(), error => {
+        const e = error as any;
+        assert.match(e.message, /Nothing was posted\./);
+        assert.match(e.message, /send_message\(\{reply_to: 30\}\)/);
+        assert.match(e.message, /> ops/);
+        assert.equal(e.data.messageId, 30);
+        assert.equal(e.data.stream, kind === 'stream move' ? 'archive' : 'general');
+        return true;
+      });
+    }
+  });
+}
+
+test('same-stream co-move refusal carries anchor likely topic and recovery data', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'reference');
+  const result = await f.tools.handleToolCall('move_messages', { message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  assert.equal(result.moved_to.stream, 'general');
+  assert.equal(result.moved_to.topic, 'first');
+  await assert.rejects(f.publish(), (e: any) => {
+    assert.match(e.message, /Nothing was posted\..*likely first/);
+    assert.equal(e.data.messageId, 30);
+    assert.equal(e.data.stream, 'general');
+    return true;
+  });
+});
+
+test('stalled post-move placement read cannot fail a successful move', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  let reads = 0;
+  let release: (() => void) | undefined;
+  f.readPlacementWith(async id => {
+    if (++reads === 1) return { result: 'success', message: raw(id) };
+    return new Promise(resolve => { release = () => resolve({ result: 'success', message: raw(id, 'first') }); });
+  });
+  const start = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      f.callMove({ message_id: 21, topic: 'first' }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('move stalled after success')), 18_000); }),
+    ]);
+  } finally { clearTimeout(timer); release?.(); }
+  assert.ok(Date.now() - start < 18_000, 'follow-up read must be bounded');
+  assert.equal(f.reconciled.length, 1);
 });

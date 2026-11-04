@@ -182,21 +182,29 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
 `previouslyMentioned` (absent when only the post-change state could be
-read). A change line never sets `threadId` and never moves this server's
-reply routing: a moderator archiving an old message does not retarget the
-reply the agent is composing. The bot's own moves emit no change marker. For host integrations:
+read). A change line never sets `threadId`. Third-party deletions leave
+reply routing unchanged. A third-party move of a conversation's source message
+refuses channel-only replies, with the event's stream/topic as its destination
+hint; it does not silently retarget the reply. The bot's own moves emit no change
+marker. For host integrations:
 
-1. A tool result confirms the anchor unless intervening movement has invalidated
+1. A tool result confirms the anchor unless intervening movement invalidated
    that reference. A channel-only publish follows it or refuses. Other references
-   a range move may have touched become unconfirmed, with the anchor destination
-   as a hint.
-2. On refusal, use `send_message` with an explicit bare stream name and topic.
-   `moved_to.stream` is the bare stream; `moved_to.channelId` is for channel
-   operations. Inspect `list_streams` / `get_stream_topics` if anything is unknown.
-3. Co-moved conversations wait for a new message from someone other than the
-   bot in that channel to re-establish routing. Existing/moved message copies,
-   echoes, reads, reactions and self-events cannot confirm them. Typing stops
-   in the topic where its run began.
+   a range move may have touched become unconfirmed, with the anchor's stored
+   destination topic labelled **likely**, not confirmed.
+2. Refusals say **Nothing was posted** and include `messageId` and a bare
+   `stream`. On upstream main (#39), use `send_message({reply_to: <messageId>})`
+   to resolve the message's current placement. Otherwise use an explicit bare
+   stream and topic (check `list_streams` / `get_stream_topics` if unknown).
+   Never use a stream fallback for a DM; use its private recipient.
+   Same-stream and cross-stream tool results include
+   `moved_to: {channelId, stream, topic}`; unknown fields are null.
+3. On an open channel, a non-bot message **above the refusal's message-id floor**,
+   in **any topic of that stream**, clears refusal and routes replies to that
+   message's topic. On a closed channel, only such a message accepted as a push
+   does so. Existing/moved copies, bot messages, echoes, reads, reactions and
+   edit markers do not clear refusal. Explicit sends bypass it for one reply;
+   they do not clear it. Typing stops in the topic where its run began.
 
 A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the

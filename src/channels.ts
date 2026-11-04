@@ -115,7 +115,7 @@ export class ChannelManager {
      * second invalidation/replacement destroys that causal connection. */
     lastEcho?: { beforeEpoch: number; shape: MoveEcho };
     refusalAfter?: number;
-    movedTo?: { channelId: string | null; topic: string | null; streamId?: number };
+    movedTo?: { channelId: string | null; topic: string | null; streamId?: number; likelyTopic?: string };
   }>();
   private routingEpoch = 0;
   private highestKnownMessageId = 0;
@@ -578,8 +578,9 @@ export class ChannelManager {
    * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
+    if (change.kind === 'delete') return;
     if (change.previousTopic === null && change.movedToChannelId === null &&
-        change.newStreamId == null && !change.routingUncertain && !change.moveScope && change.kind !== 'delete') return;
+        change.newStreamId == null && !change.routingUncertain && !change.moveScope) return;
     const scope = change.moveScope;
     const destination = change.movedToChannelId ?? (change.newStreamId == null && change.channelId !== 'zulip:unknown' ? change.channelId : null);
     for (const [channelId, reference] of [...this.lastIncoming]) {
@@ -596,16 +597,19 @@ export class ChannelManager {
           expectedEcho: undefined,
           lastEcho: change.selfEcho ? { beforeEpoch: reference.epoch, shape: change.selfEcho } : undefined,
           refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
-          movedTo: reference.movedTo ?? {
-            channelId: change.newStreamId == null && change.channelId !== 'zulip:unknown' ? change.channelId : null,
-            topic: null,
+          movedTo: (change.selfEcho ? reference.movedTo : undefined) ?? {
+            channelId: destination,
+            topic: change.selfEcho ? null : change.topic,
+            likelyTopic: change.selfEcho ? change.topic || undefined : undefined,
           } });
         continue;
       }
       const exact = reference.from === Number(change.messageId);
       const currentChannel = reference.movedTo?.channelId ?? channelId;
       const currentTopic = reference.movedTo ? reference.movedTo.topic : reference.hints.threadId;
-      const inScope = (scope.topic === null || ((reference.movedTo?.channelId === null || currentChannel === change.channelId) &&
+      const inScope = !channelId.startsWith('zulip:dm:') &&
+        (change.channelId === 'zulip:unknown' || currentChannel === change.channelId || reference.movedTo?.channelId === null) &&
+        (scope.topic === null || ((reference.movedTo?.channelId === null || currentChannel === change.channelId) &&
         (currentTopic == null || currentTopic.toLowerCase() === scope.topic.toLowerCase()))) &&
         (scope.propagateMode === 'change_all' ||
           (scope.propagateMode === 'change_later' && reference.from >= Number(change.messageId)));
@@ -626,6 +630,7 @@ export class ChannelManager {
       if (uncertain || destination !== channelId) {
         this.lastIncoming.set(channelId, { ...source, movedTo: {
           channelId: destination, topic: uncertain ? null : change.topic,
+          likelyTopic: uncertain ? change.topic : undefined,
           ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
         } });
       } else {
@@ -633,12 +638,13 @@ export class ChannelManager {
         this.lastIncoming.set(channelId, { ...current, hints: { ...current.hints,
           threadId: change.topic, metadata: { ...current.hints.metadata, topic: change.topic } } });
       }
-      if (destination !== null && destination !== channelId) {
+      if (change.channelId !== 'zulip:unknown' && channelId === change.channelId &&
+          destination !== null && destination !== channelId) {
         const existing = this.lastIncoming.get(destination);
         if (existing?.from === undefined || source.from! >= existing.from) {
           const { movedTo: _movedTo, ...current } = source;
           this.lastIncoming.set(destination, uncertain ? { ...current,
-            movedTo: { channelId: destination, topic: null } } : { ...current,
+            movedTo: { channelId: destination, topic: null, likelyTopic: change.topic } } : { ...current,
             hints: { ...current.hints, threadId: change.topic,
               metadata: { ...current.hints.metadata, topic: change.topic } } });
         }
@@ -691,11 +697,20 @@ export class ChannelManager {
       throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel format: ${channelId}`, { channelId });
     }
 
-    const movedTo = this.lastIncoming.get(channelId)?.movedTo;
+    const reference = this.lastIncoming.get(channelId);
+    const movedTo = reference?.movedTo;
     if (movedTo) {
+      const messageId = reference.from;
+      const isDM = channelId.startsWith('zulip:dm:');
+      const stream = !isDM ? movedTo.channelId?.replace(/^zulip:/, '') ?? null : null;
+      const topic = movedTo.topic ?? movedTo.likelyTopic;
+      const hint = isDM ? 'private conversation' :
+        `${movedTo.channelId ?? 'stream unknown'} > ${movedTo.topic ?? `(unconfirmed topic)${topic ? `; likely ${topic}` : ''}`}`;
+      const fallback = isDM ? 'use an explicit private recipient' :
+        `use send_message({type: "stream", to: ${JSON.stringify(stream)}, topic: ${JSON.stringify(topic ?? null)}, content: ...}) after checking list_streams/get_stream_topics if unknown`;
       throw new McplRpcError(-32602,
-        `${movedTo.topic === null ? 'Conversation placement unconfirmed; destination hint:' : 'Conversation moved to'} ${movedTo.channelId ?? `stream unknown${movedTo.streamId == null ? '' : ` (stream ${movedTo.streamId})`}`} > ${movedTo.topic ?? '(unconfirmed topic)'}; confirm with send_message using an explicit stream and topic (check list_streams/get_stream_topics if unconfirmed).`,
-        { channelId, movedTo });
+        `Nothing was posted. Conversation placement unconfirmed; destination hint: ${hint}. Reply with send_message({reply_to: ${messageId}}); alternatively ${fallback}.`,
+        { channelId, messageId, stream, movedTo });
     }
     return adapter.publish(
       channelId,

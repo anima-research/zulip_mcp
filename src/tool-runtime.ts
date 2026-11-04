@@ -7,6 +7,7 @@
  * are the plain-MCP surface every client gets.
  */
 
+import { LOCATE_TIMEOUT_MS, withTimeout } from "./platforms/zulip.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -745,7 +746,7 @@ export class ZulipToolRuntime {
         let original: any = null;
         if (moving) {
           try {
-            const before = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
+            const before = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), LOCATE_TIMEOUT_MS, "before move placement");
             this.onMessageObserved?.(before.message?.id);
             if (before?.result === "success") original = before.message;
           } catch { /* Cache/event reconciliation remains available. */ }
@@ -755,7 +756,7 @@ export class ZulipToolRuntime {
         const newStreamId = moving && args.stream_id !== undefined && args.stream_id !== original?.stream_id
           ? args.stream_id : null;
         let movedTo: { channelId: string | null; stream?: string | null; topic: string | null } | undefined;
-        if (moving && args.stream_id !== undefined) {
+        if (moving) {
           movedTo = { channelId: null, topic: args.topic === undefined ? source?.topic ?? null : null };
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
@@ -763,83 +764,83 @@ export class ZulipToolRuntime {
         for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
           if (args[field] !== undefined) editFields.set(field, String(args[field]));
         }
-          const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
-            method: "PATCH",
-            headers: { Authorization: this.session.authHeader },
-            body: editFields,
+        const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
+          method: "PATCH",
+          headers: { Authorization: this.session.authHeader },
+          body: editFields,
+        });
+        const body = await response.text();
+        let result: any = null;
+        try {
+          result = JSON.parse(body);
+        } catch {
+          // Proxies can return HTML or an empty body; preserve the HTTP status.
+        }
+        if (!response.ok || result?.result === "error") {
+          let detail = typeof result?.msg === "string" ? result.msg : body;
+          detail = detail.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+          const encodedAuth = this.session.authHeader.replace(/^Basic\s+/i, "");
+          const credentials = [this.session.authHeader, encodedAuth, ...Buffer.from(encodedAuth, "base64").toString().split(":")];
+          for (const credential of credentials.filter(Boolean)) detail = detail.replaceAll(credential, "[redacted]");
+          detail = detail.slice(0, 160);
+          const fields = ["code", "first_message_id_allowed_to_move", "total_messages_in_topic", "total_messages_allowed_to_move"];
+          const structured = fields.flatMap((field) => {
+            const value = result?.[field];
+            if (field === "code" ? typeof value !== "string" : value !== null && (typeof value !== "number" || !Number.isFinite(value))) return [];
+            let safe = String(value).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+            for (const credential of credentials.filter(Boolean)) safe = safe.replaceAll(credential, "[redacted]");
+            return [`${field}=${safe.slice(0, 160)}`];
           });
-          const body = await response.text();
-          let result: any = null;
+          if (structured.length) detail += ` (${structured.join(", ")})`;
+          const diagnostic = [response.ok ? "" : `HTTP ${response.status}`, detail].filter(Boolean).join(": ");
+          throw new Error(`Zulip refused ${operation}${diagnostic ? `: ${diagnostic}` : ""}`);
+        }
+        assertApiSuccess(result, operation);
+        if (result?.result !== "success") {
+          throw new Error(`Zulip refused ${operation}: HTTP ${response.status}`);
+        }
+        if (result.ignored_parameters_unsupported?.length) {
+          throw new Error(`Zulip refused ${operation}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
+        }
+        if (moving) {
+          // Never report a failed follow-up read as a failed move: retrying
+          // would repeat an already successful write. Only stored subjects
+          // confirm a requested (possibly normalized/truncated) topic.
+          let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
+          let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
           try {
-            result = JSON.parse(body);
-          } catch {
-            // Proxies can return HTML or an empty body; preserve the HTTP status.
-          }
-          if (!response.ok || result?.result === "error") {
-            let detail = typeof result?.msg === "string" ? result.msg : body;
-            detail = detail.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-            const encodedAuth = this.session.authHeader.replace(/^Basic\s+/i, "");
-            const credentials = [this.session.authHeader, encodedAuth, ...Buffer.from(encodedAuth, "base64").toString().split(":")];
-            for (const credential of credentials.filter(Boolean)) detail = detail.replaceAll(credential, "[redacted]");
-            detail = detail.slice(0, 160);
-            const fields = ["code", "first_message_id_allowed_to_move", "total_messages_in_topic", "total_messages_allowed_to_move"];
-            const structured = fields.flatMap((field) => {
-              const value = result?.[field];
-              if (field === "code" ? typeof value !== "string" : value !== null && (typeof value !== "number" || !Number.isFinite(value))) return [];
-              let safe = String(value).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-              for (const credential of credentials.filter(Boolean)) safe = safe.replaceAll(credential, "[redacted]");
-              return [`${field}=${safe.slice(0, 160)}`];
-            });
-            if (structured.length) detail += ` (${structured.join(", ")})`;
-            const diagnostic = [response.ok ? "" : `HTTP ${response.status}`, detail].filter(Boolean).join(": ");
-            throw new Error(`Zulip refused ${operation}${diagnostic ? `: ${diagnostic}` : ""}`);
-          }
-          assertApiSuccess(result, operation);
-          if (result?.result !== "success") {
-            throw new Error(`Zulip refused ${operation}: HTTP ${response.status}`);
-          }
-          if (result.ignored_parameters_unsupported?.length) {
-            throw new Error(`Zulip refused ${operation}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
-          }
-          if (moving) {
-            // Never report a failed follow-up read as a failed move: retrying
-            // would repeat an already successful write. Only stored subjects
-            // confirm a requested (possibly normalized/truncated) topic.
-            let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
-            let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
+            const placed = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), LOCATE_TIMEOUT_MS, "placed move placement");
+            this.onMessageObserved?.(placed.message?.id);
+            if (placed?.result === "success" &&
+                (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
+              if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
+              if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
+            }
+          } catch { /* The bot may have lost visibility after moving. */ }
+          if (movedTo && destinationChannelId === null) {
             try {
-              const placed = await zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false });
-              this.onMessageObserved?.(placed.message?.id);
-              if (placed?.result === "success" &&
-                  (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
-                if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
-                if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
-              }
-            } catch { /* The bot may have lost visibility after moving. */ }
-            if (movedTo && destinationChannelId === null) {
-              try {
-                const streams = await zulipClient.streams.retrieve({ include_public: true, include_subscribed: true });
-                const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
-                if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
-              } catch { /* Preserve the successful move even if lookup fails. */ }
-            }
-            const confirmedMove: SelfMove = {
-              moveEpochs, messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
-              newStreamId, destinationChannelId, topic: storedTopic,
-            };
-            this.onMoved?.(confirmedMove);
-            if (movedTo) {
-              movedTo = { channelId: destinationChannelId, stream: destinationChannelId?.replace(/^zulip:/, "") ?? null, topic: storedTopic };
-              return {
-                ...result,
-                moved_to: movedTo,
-                ...(movedTo.channelId === null || movedTo.topic === null
-                  ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
-                  : {}),
-              };
-            }
+              const streams = await withTimeout<any>(zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }), LOCATE_TIMEOUT_MS, "streams move placement");
+              const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
+              if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
+            } catch { /* Preserve the successful move even if lookup fails. */ }
           }
-          return result;
+          const confirmedMove: SelfMove = {
+            moveEpochs, messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
+            newStreamId, destinationChannelId, topic: storedTopic,
+          };
+          this.onMoved?.(confirmedMove);
+          if (movedTo) {
+            movedTo = { channelId: destinationChannelId, stream: destinationChannelId?.replace(/^zulip:/, "") ?? null, topic: storedTopic };
+            return {
+              ...result,
+              moved_to: movedTo,
+              ...(movedTo.channelId === null || movedTo.topic === null
+                ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
+                : {}),
+            };
+          }
+        }
+        return result;
       }
 
       case "delete_message": {
