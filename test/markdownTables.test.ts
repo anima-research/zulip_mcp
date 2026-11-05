@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeMarkdownTables } from '../src/markdown-tables.ts';
+import { inlineTableCases } from './markdownTableInlineCases.ts';
 import { reviewTableCases } from './markdownTableCases.ts';
 
 const table = '| Name | Value |\n|---|:--:|\n| a | b |';
 const cases: [string, string, string][] = [
   ...reviewTableCases,
+  ...inlineTableCases,
   ['experiment: missing before', `Intro\n${table}\n\nAfter`, `Intro\n\n${table}\n\nAfter`],
   ['experiment: missing after', `Intro\n\n${table}\nAfter`, `Intro\n\n${table}\n\nAfter`],
   ['experiment: correct on both sides', `Intro\n\n${table}\n\nAfter`, `Intro\n\n${table}\n\nAfter`],

@@ -1,5 +1,5 @@
 /** Escaped pipes and backslash pairs follow Python-Markdown TableProcessor._split.
- * Backticks outside complete fences are refused before this is used.
+ * Backticks in table paragraphs are refused before insertion.
  */
 function tablePipes(row: string): number[] {
   const pipes: number[] = [];
@@ -64,7 +64,7 @@ export function normalizeMarkdownTables(content: string): string {
     } else {
       if (marker) return content; // Zulip only opens/closes fences at column zero.
       protectedLines[i] = false;
-      if (/[`\[<]|\$\$/.test(line) || /^[ \t]*>/.test(line)) return content;
+      if (/<|\$\$/.test(line) || /^[ \t]*>/.test(line)) return content;
     }
   }
   if (fence) return content;
@@ -119,12 +119,15 @@ export function normalizeMarkdownTables(content: string): string {
     if (uncertain) continue;
     blocks.push({ start: i, end });
     for (let j = i; j < end; j++) {
-      if (competingBlock(text[j]) || !balancedRow(text[j])) return content;
+      if (/[`\[]/.test(text[j]) || competingBlock(text[j]) || !balancedRow(text[j])) return content;
       tableRows[j] = 1;
     }
     i = end - 1;
   }
   if (!blocks.length) return content;
+  // Zulip parses inline spans per blank-separated block; complete fences also
+  // split blocks. Thus even unmatched/multiline code and links in OTHER runs
+  // cannot reach a table. Keep refusing them on table rows and surrounding prose.
   // Classify each maximal nonblank run ONCE, not once per candidate. Remote
   // list/indent lines are just as unsafe as immediate neighbors (lazy lists).
   for (let i = 0; i < text.length;) {

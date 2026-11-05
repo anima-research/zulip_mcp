@@ -488,8 +488,13 @@ and exact run length, with only spaces/tabs afterward. Indented markers,
 unsupported info strings, unclosed fences, or other marker-like lines inside
 a fence refuse the **whole message**. This intentionally accepts a subset of
 Zulip's fence syntax; container-prefixed markers cannot close top-level fences.
-Outside fences, any backtick, `[`, `$$`, `<`, or blockquote line also refuses
-the whole message. A table candidate touching a list or nonblank indented line
+Outside fences, any `$$`, `<`, or blockquote line still refuses the whole
+message. Backticks and `[` refuse only in a table candidate’s own maximal
+nonblank paragraph (including its rows and insertion boundaries). Inline code,
+links and resolved message links in other paragraphs are allowed when separated
+from every candidate by an ASCII blank line or a complete fence. Zulip parses
+inline spans within blocks: even multiline or unmatched delimiters in those
+separate paragraphs cannot reach the table. A table candidate touching a list or nonblank indented line
 (before, within, or directly after it) refuses too.
 
 The maximal nonblank run containing a candidate, stopping at fences, is checked
@@ -520,8 +525,8 @@ still eligible.
 On every table row (header, separator and body), exact runs of `*`, `_`,
 backticks, and `~~` must each occur an even number of times **on that line**.
 Mixed run lengths do not pair; tilde runs other than `~~`, or any backslash on
-a row containing inline delimiter runs, refuse as ambiguous. Backticks are
-already refused by the global gate. All candidates are classified before
+a row containing inline delimiter runs, refuse as ambiguous. Backticks and `[` on candidate rows
+are always refused, even when balanced. All candidates are classified before
 checking non-table lines, so adjacent tables can still be separated. Syntax
 in other blank-separated paragraphs is unaffected by the paragraph gate.
 
@@ -540,7 +545,7 @@ start/end. The spacing step is idempotent. This is not a full Markdown parser
 or a guarantee of rendering for every Zulip syntax.
 
 The rule was validated offline against Zulip 12.3's real Markdown renderer on
-~16.7k messages with zero rendering differences outside the tables. The oracle
+19,166 messages (including 2,304 new generated inline-context messages) with zero rendering differences outside the tables. The oracle
 tooling and corpora are on branch
 [`fix/markdown-table-cautious` of `theaspirational/zulip_mcp`](https://github.com/theaspirational/zulip_mcp/tree/fix/markdown-table-cautious/scripts/zulip-oracle)
 (`scripts/zulip-oracle/`).

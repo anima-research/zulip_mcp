@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import zulipInit from 'zulip-js';
+import { inlineTableCases } from './markdownTableInlineCases.ts';
 import { reviewTableCases } from './markdownTableCases.ts';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 
@@ -101,8 +102,21 @@ for (const tool of ['send_message', 'edit_message']) {
       'Intro\n\na|' + f.link('stream/1-a.7Cb/topic/x.7Cy/near/106') + '\n-|-\n\nAfter');
   });
 
+  for (const ending of ['\n', '\r\n']) {
+    test(`${tool}: separate code and resolved message link paragraphs ${ending.length}`, async (t) => {
+      const f = await fixture(t);
+      const content = 'See [[msg:101]] and `npm test`\n\nResults:\na|b\n-|-\nc|d\nDone.\n\n[docs](https://example.invalid)';
+      await f.tools.handleToolCall(tool, { ...args, content: content.replaceAll('\n', ending) });
+      const expected = content.replace('[[msg:101]]', f.link(streamPath))
+        .replace('Results:\n', 'Results:\n\n').replace('\nDone.', '\n\nDone.');
+      assert.deepEqual(f.requests.map(r => r.method), ['GET', tool === 'send_message' ? 'POST' : 'PATCH']);
+      assert.equal(f.requests.at(-1)!.content, expected.replaceAll('\n', ending));
+    });
+  }
+
   for (const [label, content, expected] of [
     ...reviewTableCases,
+    ...inlineTableCases,
     ['missing before', 'Intro\n| a | b |\n|---|---|\n| c | d |\n\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],
     ['missing after', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],
     ['already correct', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],

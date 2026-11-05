@@ -1,0 +1,1 @@
+Allow table spacing normalization when inline code or links occur in separate blank- or fence-delimited paragraphs. Keep refusing inline syntax in the table paragraph and preserve all other conservative safety checks.

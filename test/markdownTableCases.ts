@@ -89,7 +89,12 @@ const cautiousRefusals = [
     `Intro\n${table}\nAfter\n\n~~~\n${close}\n~~~`),
 ];
 for (const input of cautiousRefusals.slice()) cautiousRefusals.push(input.replaceAll('\n', '\r\n'));
-for (const input of cautiousRefusals) reviewTableCases.push(['cautious gate byte identity', input, input]);
+for (const input of cautiousRefusals) {
+  const separateInline = ['`literal`', '\\`', '[ordinary', String.raw`\[escaped`].some(prefix => input.startsWith(prefix));
+  const ending = input.includes('\r\n') ? '\r\n' : '\n';
+  reviewTableCases.push([separateInline ? 'separate inline paragraph now eligible' : 'cautious gate byte identity', input,
+    separateInline ? input.replace(`Intro${ending}`, `Intro${ending}${ending}`).replace(`${ending}After`, `${ending}${ending}After`) : input]);
+}
 
 const report = `# Report\n\nSummary\n${table}\nDone\n\n- Separate bullet\n\n\`\`\`text\n\` [ $$ < >\n${table}\n\`\`\``;
 reviewTableCases.push(['typical agent report with separate bullets and fence', report,
