@@ -21,11 +21,20 @@
   and npm skips an optional package whose declared Node range doesn't match,
   so on 32-bit Windows with Node 21 or later it isn't installed. On such a
   host, unless sharp's WebAssembly build is installed, sharp fails to load.
+- **Hosts installed with npm 10 where sharp's native binary can't load:**
+  npm 10, which Node 22 and Node 20 from 20.10 ship, installs sharp's
+  WebAssembly build alongside sharp 0.35 (observed on Linux x64), and npm
+  11, which Node 24 ships, doesn't. Where that build is installed and the
+  native binary can't load, sharp loads the WebAssembly build without saying
+  so, and the server starts and inlines images on it, more slowly and with
+  more memory.
 - **Where sharp can't load,** the server now says so at start. When images
   may be inlined, as by default (`ZULIP_INLINE_IMAGES` isn't `false` and
   `ZULIP_INLINE_IMAGES_MAX` is above 0), it exits, printing sharp's error,
   that loading sharp needs Node 20.10 or later, and the two ways through:
   set `ZULIP_INLINE_IMAGES=false`, or install sharp's WebAssembly build
-  where the server is installed, for which it prints the versioned `npm
-  install` command and the directory to run it in. Otherwise the server
-  doesn't load sharp.
+  where the server is installed, for which it prints the `npm install
+  --no-save` command and where to run it. Otherwise the server doesn't load
+  sharp. The command leaves `package.json` and `package-lock.json`
+  unchanged, and with npm 11 a later `npm install` or `npm ci` removes the
+  build again.

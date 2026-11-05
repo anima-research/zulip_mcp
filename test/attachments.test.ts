@@ -95,7 +95,7 @@ test('with image inlining on, a server whose sharp cannot load exits at start, n
   assert.match(run.stderr, /sharp refused by this test/);
   const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
   const { version } = JSON.parse(readFileSync(new URL('../node_modules/sharp/package.json', import.meta.url), 'utf8')) as { version: string };
-  assert.ok(run.stderr.includes(`by running npm install @img/sharp-wasm32@${version} in this directory:\n${root}\n`), run.stderr);
+  assert.ok(run.stderr.includes(`by running npm install --no-save @img/sharp-wasm32@${version} in this directory:\n${root}\n`), run.stderr);
   assert.match(run.stderr, /ZULIP_INLINE_IMAGES=false/);
   assert.doesNotMatch(run.stderr, /ZULIP_REALM must be set/);
 });

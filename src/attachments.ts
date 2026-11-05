@@ -89,12 +89,13 @@ function loadSharp(): Promise<typeof sharpModule> {
 }
 
 function wasmInstall(): { command: string; dir?: string } {
+  const command = 'npm install --no-save @img/sharp-wasm32';
   try {
     const sharpDir = dirname(dirname(createRequire(import.meta.url).resolve('sharp')));
     const { version } = JSON.parse(readFileSync(join(sharpDir, 'package.json'), 'utf8')) as { version: string };
-    return { command: `npm install @img/sharp-wasm32@${version}`, dir: dirname(dirname(sharpDir)) };
+    return { command: `${command}@${version}`, dir: dirname(dirname(sharpDir)) };
   } catch {
-    return { command: 'npm install @img/sharp-wasm32' };
+    return { command };
   }
 }
 

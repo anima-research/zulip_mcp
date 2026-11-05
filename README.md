@@ -64,7 +64,7 @@ npm install
 npm run build
 ```
 
-Requires Node 20.10 or later. Image inlining uses sharp: where it can't load and images may be inlined, the server exits at start, naming the two ways through, installing sharp's WebAssembly build where the server is installed or setting `ZULIP_INLINE_IMAGES=false`. `npm test` runs the suite (`node --test`, no network).
+Requires Node 20.10 or later. Image inlining uses sharp. Where its native binary can't load, sharp runs on its WebAssembly build if that's installed, more slowly and without saying so. On Linux x64 at least, npm 10, which Node 22 and Node 20 from 20.10 ship, installs that build with the rest, and npm 11, which Node 24 ships, doesn't. Where sharp can't load and images may be inlined, the server exits at start, naming the two ways through: setting `ZULIP_INLINE_IMAGES=false`, or installing sharp's WebAssembly build with the `npm install --no-save` command it prints, run where it says. With npm 11, a later `npm install` or `npm ci` removes that build again, so run the command again after one. `npm test` runs the suite (`node --test`, no network).
 
 ## Configuration
 

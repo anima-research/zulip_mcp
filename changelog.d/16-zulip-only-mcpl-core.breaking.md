@@ -9,7 +9,7 @@
   `zulip.context`; grant semantics follow the core (`*` matches one segment,
   a malformed policy fails closed, a `featureSets/update` Notification never
   rewrites the grant, `enabled: []` is empty). `pushEvents` is declared and
-  used. Requires Node 20+.
+  used.
 - **Operators:** the persistent-state session id defaults to the bot email
   whichever way the credentials arrived (zuliprc-only deployments were keyed
   `default`); set `ZULIP_SESSION_ID` to keep existing state-file names.
