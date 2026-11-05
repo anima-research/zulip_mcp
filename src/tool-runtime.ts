@@ -21,6 +21,7 @@ import {
 import type { SelfMove } from "./platforms/adapter.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { resolveMessageLinks } from "./message-links.js";
+import { normalizeMarkdownTables } from "./markdown-tables.js";
 import { assertApiSuccess, dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
@@ -697,7 +698,7 @@ export class ZulipToolRuntime {
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
-        const resolvedContent = hasText ? await resolveMessageLinks(args.content, this.session) : "";
+        const resolvedContent = hasText ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session)) : "";
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
         const uploaded = await this.uploadFor(args);
@@ -808,7 +809,7 @@ export class ZulipToolRuntime {
         const editFields = new URLSearchParams();
         for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
           if (args[field] !== undefined) editFields.set(field, field === "content"
-            ? await resolveMessageLinks(args.content, this.session) : String(args[field]));
+            ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session)) : String(args[field]));
         }
         const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
           method: "PATCH",

@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import zulipInit from 'zulip-js';
+import { reviewTableCases } from './markdownTableCases.ts';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 
 const stream = { id: 101, type: 'stream', stream_id: 12,
@@ -18,6 +19,7 @@ const messages: Record<number, unknown> = {
   103: { id: 103, type: 'private', display_recipient: [{ id: 790 }, { id: 42 }, { id: 7 }] },
   104: { id: 104, type: 'private', display_recipient: [{ id: 790 }] },
   105: { id: 105, type: 'stream', stream_id: 12, display_recipient: 'general', subject: '' },
+  106: { id: 106, type: 'stream', stream_id: 1, display_recipient: 'a|b', subject: 'x|y' },
   996: { id: 996, type: 'stream' },
 };
 
@@ -29,8 +31,13 @@ async function fixture(t: TestContext) {
     req.on('end', () => {
       const url = new URL(req.url!, 'http://127.0.0.1');
       const body = Buffer.concat(chunks).toString();
+      // Only the actual multipart boundary ends a field, not a CRLF '---'
+      // setext underline inside content.
+      const boundary = req.headers['content-type']?.match(/boundary=(?:"([^"]+)"|([^;]+))/);
+      const contentPart = boundary ? body.split('\r\n--' + (boundary[1] ?? boundary[2]))
+        .find(part => part.includes('name="content"\r\n\r\n')) : undefined;
       const content = req.method === 'POST'
-        ? body.match(/name="content"\r\n\r\n([\s\S]*?)\r\n--/)?.[1] ?? null
+        ? contentPart?.match(/name="content"\r\n\r\n([\s\S]*)$/)?.[1] ?? null
         : new URLSearchParams(body).get('content');
       requests.push({ method: req.method, url, content });
       res.setHeader('content-type', 'application/json');
@@ -73,6 +80,40 @@ for (const tool of ['send_message', 'edit_message']) {
       await f.tools.handleToolCall(tool, { ...args, content: `See [[msg:${id}]]!` });
       assert.deepEqual(f.requests.map((r) => r.method), ['GET', tool === 'send_message' ? 'POST' : 'PATCH']);
       assert.equal(f.requests[1].content, `See ${f.link(path)}!`);
+    });
+  }
+
+  test(`${tool}: table spacing after token resolution reaches the loopback API`, async (t) => {
+    const f = await fixture(t);
+    const content = 'Intro\n| Message | Value |\n|---|:--:|\n| [[msg:101]] | value |\nAfter';
+    const argsWithContent = { ...args, content };
+    await f.tools.handleToolCall(tool, argsWithContent);
+    assert.deepEqual(f.requests.map((r) => r.method), ['GET', tool === 'send_message' ? 'POST' : 'PATCH']);
+    assert.equal(f.requests.at(-1)!.content,
+      'Intro\n\n| Message | Value |\n|---|:--:|\n| ' + f.link(streamPath) + ' | value |\n\nAfter');
+    assert.equal(argsWithContent.content, content, 'caller input is unchanged');
+  });
+
+  test(`${tool}: pipes in resolved stream/topic do not change table column counts`, async (t) => {
+    const f = await fixture(t);
+    await f.tools.handleToolCall(tool, { ...args, content: 'Intro\na|[[msg:106]]\n-|-\nAfter' });
+    assert.equal(f.requests.at(-1)!.content,
+      'Intro\n\na|' + f.link('stream/1-a.7Cb/topic/x.7Cy/near/106') + '\n-|-\n\nAfter');
+  });
+
+  for (const [label, content, expected] of [
+    ...reviewTableCases,
+    ['missing before', 'Intro\n| a | b |\n|---|---|\n| c | d |\n\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],
+    ['missing after', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],
+    ['already correct', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter', 'Intro\n\n| a | b |\n|---|---|\n| c | d |\n\nAfter'],
+    ['CRLF', 'Intro\r\n| a | b |\r\n|---|---|\r\nAfter', 'Intro\r\n\r\n| a | b |\r\n|---|---|\r\n\r\nAfter'],
+    ['fenced table', '~~~md\nIntro\n| a | b |\n|---|---|\nAfter\n~~~', '~~~md\nIntro\n| a | b |\n|---|---|\nAfter\n~~~'],
+  ]) {
+    test(`${tool}: ${label} table content on the wire`, async (t) => {
+      const f = await fixture(t);
+      await f.tools.handleToolCall(tool, { ...args, content });
+      assert.equal(f.requests.length, 1, 'no message lookups without tokens');
+      assert.equal(f.requests[0].content, expected);
     });
   }
 

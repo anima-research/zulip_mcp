@@ -472,8 +472,78 @@ In JSON tool arguments, encode that backslash as `\\`, for example
 Token lookup errors use fixed descriptions and allowlisted API codes, never
 response bodies or raw client exceptions. Any `reply_to` lookup failure also
 uses a fixed sanitized error, without API body text or client exception details.
-Bare numbers and all other text are untouched: this is opt-in, not a number
-detector.
+Token resolution leaves bare numbers and other non-token text untouched: it
+is opt-in, not a number detector.
+
+After token resolution, `send_message` and `edit_message` insert missing
+boundary blank lines around recognizable, unindented top-level pipe tables
+**only in simple messages**. Agents should still add blank lines before and
+after tables themselves; normalization deliberately does not repair complex
+Markdown.
+
+Complete column-zero backtick/tilde fences are excluded. Openers must have
+no info string or just a simple ASCII alphanumeric language (starting with a
+letter), optionally surrounded by spaces. Closers must use the same character
+and exact run length, with only spaces/tabs afterward. Indented markers,
+unsupported info strings, unclosed fences, or other marker-like lines inside
+a fence refuse the **whole message**. This intentionally accepts a subset of
+Zulip's fence syntax; container-prefixed markers cannot close top-level fences.
+Outside fences, any backtick, `[`, `$$`, `<`, or blockquote line also refuses
+the whole message. A table candidate touching a list or nonblank indented line
+(before, within, or directly after it) refuses too.
+
+The maximal nonblank run containing a candidate, stopping at fences, is checked
+once. Every non-table line in that run must lack all of
+``* _ ~ ` [ ] ( ) < > $ \ | ! &``, list/indent prefixes, hash-heading prefixes,
+a hyphen-only horizontal rule (three or more hyphens), and trailing spaces/tabs.
+Remote list prefixes are rejected too, to preserve lazy list continuations.
+A hazard returns the **whole message** byte-for-byte, including any earlier
+eligible tables; message-link resolution still applies before normalization.
+Blank-separated lists and ordinary punctuation such as the colon in `Results:`
+remain eligible. Zulip disables setext headings: `Heading` followed by `===`
+is plain text, not a heading. A `---` line can still be a horizontal rule and
+is conservatively refused in surrounding prose. Trailing-two-space boundaries
+are refused rather than guessing whether a break was intended.
+
+Competing block prefixes (headings, lists, quotes, rules and fence markers)
+are refused on candidate rows too, not just in surrounding prose. A pipe in a
+heading such as `# a|b` does not make it a table header.
+
+Blank lines contain only ASCII spaces/tabs after removing LF/CRLF. This
+matches Python-Markdown's tab expansion and space-only-line normalization
+before splitting blocks on `\n\n`; JavaScript `trim()` is not used. Any
+non-ASCII whitespace, other ASCII/C1 control character, or bare CR refuses the
+whole message, including when found in a cell or separate paragraph/fence.
+CR-only line endings are deliberately unsupported; ordinary Unicode text is
+still eligible.
+
+On every table row (header, separator and body), exact runs of `*`, `_`,
+backticks, and `~~` must each occur an even number of times **on that line**.
+Mixed run lengths do not pair; tilde runs other than `~~`, or any backslash on
+a row containing inline delimiter runs, refuse as ambiguous. Backticks are
+already refused by the global gate. All candidates are classified before
+checking non-table lines, so adjacent tables can still be separated. Syntax
+in other blank-separated paragraphs is unaffected by the paragraph gate.
+
+In simple messages, headers need an unescaped pipe and header/separator cell
+counts must match. Detection follows [Python-Markdown's tables extension](https://github.com/Python-Markdown/markdown/blob/3.10.3/markdown/extensions/tables.py),
+not GFM: separator cells may contain only pipes, colons, hyphens and spaces;
+colon-only cells, empty cells and internal spaces are allowed. Outer separator
+pipes are optional only when the header has an outer pipe. Single-column tables
+require an outer pipe on each table row. Nonblank rows with unescaped pipes
+continue the table; adjacent recognized tables are separated too. Ambiguous
+single-column bodies are left alone.
+
+Only missing boundary newline bytes are added, never inside fences. Existing
+bytes and LF/CRLF endings are preserved; no blank is added at the message's
+start/end. The spacing step is idempotent. This is not a full Markdown parser
+or a guarantee of rendering for every Zulip syntax.
+
+The rule was validated offline against Zulip 12.3's real Markdown renderer on
+~16.7k messages with zero rendering differences outside the tables. The oracle
+tooling and corpora are on branch
+[`fix/markdown-table-cautious` of `theaspirational/zulip_mcp`](https://github.com/theaspirational/zulip_mcp/tree/fix/markdown-table-cautious/scripts/zulip-oracle)
+(`scripts/zulip-oracle/`).
 
 The replacement is a plain absolute URL, the form Zulip's **Copy link to
 message** produces, so Zulip can render its native message-link chip rather
