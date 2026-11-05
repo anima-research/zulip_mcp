@@ -115,6 +115,8 @@ export class ChannelManager {
      * second invalidation/replacement destroys that causal connection. */
     lastEcho?: { beforeEpoch: number; shape: MoveEcho };
     refusalAfter?: number;
+    leftTopic?: { channelId: string; topic: string };
+    deletedOrHidden?: boolean;
     movedTo?: { channelId: string | null; topic: string | null; streamId?: number; likelyTopic?: string };
   }>();
   private routingEpoch = 0;
@@ -522,7 +524,9 @@ export class ChannelManager {
     if ((reference?.movedTo || (reference?.from !== undefined && id <= reference.from)) &&
         (meta?.backscroll === true || meta?.recovered === true)) return false;
     if (reference?.movedTo && (!Number.isFinite(id) || id <= (reference.refusalAfter ?? reference.from ?? 0) ||
-        String(message.author?.id) === String(this.adapters.get(channelId.split(':')[0])?.selfUserId))) {
+        String(message.author?.id) === String(this.adapters.get(channelId.split(':')[0])?.selfUserId) ||
+        (reference.leftTopic?.channelId === channelId &&
+          reference.leftTopic.topic.toLowerCase() === message.threadId?.toLowerCase()))) {
       reference.epoch = ++this.routingEpoch;
       reference.lastEcho = undefined;
       reference.expectedEcho = undefined;
@@ -565,7 +569,7 @@ export class ChannelManager {
 
   private sameEcho(a: MoveEcho | undefined, b: MoveEcho | undefined): boolean {
     return !!a && !!b && a.messageId === b.messageId && a.channelId === b.channelId &&
-      a.previousTopic === b.previousTopic && a.topic === b.topic &&
+      (a.previousTopic === null || b.previousTopic === null || a.previousTopic === b.previousTopic) && a.topic === b.topic &&
       a.newStreamId === b.newStreamId && a.propagateMode === b.propagateMode &&
       (a.destinationChannelId === null || b.destinationChannelId === null ||
         a.destinationChannelId === b.destinationChannelId);
@@ -578,7 +582,18 @@ export class ChannelManager {
    * safely name the moved topic, especially on a busy destination channel.
    */
   reconcileSelfChange(change: MessageChangeEvent): void {
-    if (change.kind === 'delete') return;
+    if (change.kind === 'delete') {
+      if (change.isDM || !change.topicEmpty) return;
+      const reference = this.lastIncoming.get(change.channelId);
+      if (reference?.from !== undefined && change.messageIds.includes(String(reference.from))) {
+        this.lastIncoming.set(change.channelId, { ...reference, epoch: ++this.routingEpoch,
+          expectedEcho: undefined, lastEcho: undefined, deletedOrHidden: true,
+          leftTopic: { channelId: change.channelId, topic: change.topic },
+          refusalAfter: this.refusalFloor(change.channelId, ...change.messageIds.map(Number)),
+          movedTo: { channelId: null, topic: null } });
+      }
+      return;
+    }
     if (change.previousTopic === null && change.movedToChannelId === null &&
         change.newStreamId == null && !change.routingUncertain && !change.moveScope) return;
     const scope = change.moveScope;
@@ -595,12 +610,15 @@ export class ChannelManager {
         }
         this.lastIncoming.set(channelId, { ...reference, epoch: ++this.routingEpoch,
           expectedEcho: undefined,
+          leftTopic: change.selfEcho && reference.leftTopic ? reference.leftTopic
+            : { channelId: change.channelId, topic: change.previousTopic ?? reference.hints.threadId ?? '' },
           lastEcho: change.selfEcho ? { beforeEpoch: reference.epoch, shape: change.selfEcho } : undefined,
           refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
           movedTo: (change.selfEcho ? reference.movedTo : undefined) ?? {
             channelId: destination,
             topic: change.selfEcho ? null : change.topic,
-            likelyTopic: change.selfEcho ? change.topic || undefined : undefined,
+            likelyTopic: change.selfEcho ? change.selfEcho.topic ?? undefined : undefined,
+            ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
           } });
         continue;
       }
@@ -627,24 +645,32 @@ export class ChannelManager {
       const source = { ...reference, epoch: ++this.routingEpoch, lastEcho: undefined,
         expectedEcho: !uncertain && !earlyEcho ? expectedEcho : undefined,
         refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)) };
+      const knownSource = scope.topic !== null &&
+        (currentChannel === change.channelId || channelId === change.channelId) &&
+        (currentTopic ?? reference.hints.threadId)?.toLowerCase() === scope.topic.toLowerCase();
+      const hasDestinationHint = exact || knownSource;
       if (uncertain || destination !== channelId) {
-        this.lastIncoming.set(channelId, { ...source, movedTo: {
-          channelId: destination, topic: uncertain ? null : change.topic,
-          likelyTopic: uncertain ? change.topic : undefined,
-          ...(change.newStreamId != null ? { streamId: change.newStreamId } : {}),
-        } });
+        this.lastIncoming.set(channelId, { ...source,
+          leftTopic: scope.topic !== null && hasDestinationHint
+            ? { channelId: change.channelId, topic: scope.topic } : reference.leftTopic,
+          movedTo: {
+            channelId: hasDestinationHint ? destination : null,
+            topic: hasDestinationHint && !uncertain ? change.topic : null,
+            ...(hasDestinationHint && uncertain ? { likelyTopic: (change.likelyTopic ?? change.topic) || undefined } : {}),
+            ...(hasDestinationHint && change.newStreamId != null ? { streamId: change.newStreamId } : {}),
+          } });
       } else {
         const { movedTo: _movedTo, ...current } = source;
         this.lastIncoming.set(channelId, { ...current, hints: { ...current.hints,
           threadId: change.topic, metadata: { ...current.hints.metadata, topic: change.topic } } });
       }
-      if (change.channelId !== 'zulip:unknown' && channelId === change.channelId &&
+      if (exact && change.channelId !== 'zulip:unknown' && channelId === change.channelId &&
           destination !== null && destination !== channelId) {
         const existing = this.lastIncoming.get(destination);
         if (existing?.from === undefined || source.from! >= existing.from) {
           const { movedTo: _movedTo, ...current } = source;
           this.lastIncoming.set(destination, uncertain ? { ...current,
-            movedTo: { channelId: destination, topic: null, likelyTopic: change.topic } } : { ...current,
+            movedTo: { channelId: destination, topic: null, likelyTopic: change.likelyTopic ?? change.topic } } : { ...current,
             hints: { ...current.hints, threadId: change.topic,
               metadata: { ...current.hints.metadata, topic: change.topic } } });
         }
@@ -704,13 +730,23 @@ export class ChannelManager {
       const isDM = channelId.startsWith('zulip:dm:');
       const stream = !isDM ? movedTo.channelId?.replace(/^zulip:/, '') ?? null : null;
       const topic = movedTo.topic ?? movedTo.likelyTopic;
+      const recovery = `send_message({reply_to: ${messageId}, content})`;
+      const data = { channelId, messageId, stream, movedTo };
+      if (reference.deletedOrHidden) {
+        throw new McplRpcError(-32602,
+          `Nothing was posted: the messages this conversation followed were deleted or moved where this bot can't see them; reply with ${recovery}.`, data);
+      }
+      if (!isDM && movedTo.channelId === null && movedTo.streamId === undefined && topic == null) {
+        throw new McplRpcError(-32602,
+          `Nothing was posted: this conversation may have moved; reply with ${recovery}.`, data);
+      }
       const hint = isDM ? 'private conversation' :
-        `${movedTo.channelId ?? 'stream unknown'} > ${movedTo.topic ?? `(unconfirmed topic)${topic ? `; likely ${topic}` : ''}`}`;
+        `${movedTo.channelId ?? `stream unknown${movedTo.streamId !== undefined ? ` (stream ${movedTo.streamId})` : ''}`} > ${movedTo.topic ?? `(unconfirmed topic)${topic ? `; likely ${topic}` : ''}`}`;
       const fallback = isDM ? 'use an explicit private recipient' :
         `use send_message({type: "stream", to: ${JSON.stringify(stream)}, topic: ${JSON.stringify(topic ?? null)}, content: ...}) after checking list_streams/get_stream_topics if unknown`;
       throw new McplRpcError(-32602,
-        `Nothing was posted. Conversation placement unconfirmed; destination hint: ${hint}. Reply with send_message({reply_to: ${messageId}}); alternatively ${fallback}.`,
-        { channelId, messageId, stream, movedTo });
+        `Nothing was posted. ${movedTo.topic !== null ? `Conversation moved to ${hint}` : `Conversation placement unconfirmed; destination hint: ${hint}`}. Reply with ${recovery}; alternatively ${fallback}.`,
+        data);
     }
     return adapter.publish(
       channelId,

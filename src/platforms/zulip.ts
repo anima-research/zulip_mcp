@@ -396,7 +396,7 @@ export class ZulipAdapter implements PlatformAdapter {
       authorId: at ? String(at.authorId) : null, authorName: at?.authorName ?? null,
       authorEmail: at?.authorEmail ?? null,
       actorId: this.identity.selfUserId === null ? null : String(this.identity.selfUserId),
-      topic: topic ?? previousTopic ?? '', previousTopic,
+      topic: topic ?? '', previousTopic,
       movedToChannelId: destination === channelId ? null : destination,
       routingUncertain: uncertain, content: null, previousContent: null,
       mentioned: at?.mentioned ?? false, previouslyMentioned: at?.mentioned ?? null,
@@ -410,8 +410,11 @@ export class ZulipAdapter implements PlatformAdapter {
   noteSelfMoved(move: SelfMove): void {
     this.highestMessageId = Math.max(this.highestMessageId, move.messageId);
     const cached = this.seen.get(move.messageId);
-    const source = move.source ?? (cached && !cached.isDm && !cached.placementUnknown
+    let source = move.source ?? (cached && !cached.isDm && !cached.placementUnknown
       ? { channelId: cached.channelId, topic: cached.topic } : null);
+    // A topic-only PATCH cannot cross streams: this cache entry is stale.
+    if (move.source === null && move.newStreamId === null && move.destinationChannelId !== null &&
+        source?.channelId !== move.destinationChannelId) source = null;
     const sourceChannel = source?.channelId ??
       (move.newStreamId === null ? move.destinationChannelId : null);
     if (move.newStreamId !== null && move.destinationChannelId !== null) {
@@ -429,7 +432,7 @@ export class ZulipAdapter implements PlatformAdapter {
     }
     this.emitSelfMove(move.messageId, [move.messageId], sourceChannel ?? 'zulip:unknown',
       source?.topic ?? null, move.destinationChannelId, move.topic, move.topic === null,
-      { moveEpochs: move.moveEpochs, newStreamId: move.newStreamId, moveScope: { topic: source?.topic ?? null,
+      { likelyTopic: move.topic ?? move.likelyTopic, moveEpochs: move.moveEpochs, newStreamId: move.newStreamId, moveScope: { topic: source?.topic ?? null,
         propagateMode: move.propagateMode } });
   }
 
@@ -625,7 +628,12 @@ export class ZulipAdapter implements PlatformAdapter {
         timestamp: new Date(),
       };
     }
-    if (event) emit(event);
+    if (event) {
+      const { channelId, topic } = event;
+      event.topicEmpty = ![...this.seen.values()].some(at => !at.isDm &&
+        at.channelId === channelId && at.topic.toLowerCase() === topic.toLowerCase());
+      emit(event);
+    }
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */

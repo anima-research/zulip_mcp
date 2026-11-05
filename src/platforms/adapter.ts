@@ -113,6 +113,8 @@ export interface SelfMove {
   propagateMode: 'change_one' | 'change_later' | 'change_all';
   newStreamId: number | null;
   destinationChannelId: string | null;
+  /** Requested destination, a hint only if the stored topic is unknown. */
+  likelyTopic?: string;
   /** Null if the stored topic could not be confirmed. */
   topic: string | null;
 }
@@ -151,6 +153,10 @@ export interface MessageChangeEvent {
   moveEpochs?: ReadonlyMap<string, number>;
   /** Tool success can cover uncached conversation sources by original topic. */
   moveScope?: { topic: string | null; propagateMode: SelfMove['propagateMode'] };
+  /** Destination hint, never the previous topic. */
+  likelyTopic?: string;
+  /** No cached messages remain in this deletion's stream and topic. */
+  topicEmpty?: boolean;
   /** Placement is unconfirmed; refuse automatic reply routing. */
   routingUncertain?: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a

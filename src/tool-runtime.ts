@@ -251,14 +251,17 @@ export class ZulipToolRuntime {
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
+  /** Placement reads remain bounded; tests may use a shorter deadline. */
+  private readonly moveReadTimeoutMs: number;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
   private readonly formatTime: (d: Date) => string;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string; moveReadTimeoutMs?: number } = {},
   ) {
+    this.moveReadTimeoutMs = options.moveReadTimeoutMs ?? LOCATE_TIMEOUT_MS;
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
@@ -783,7 +786,7 @@ export class ZulipToolRuntime {
         let original: any = null;
         if (moving) {
           try {
-            const before = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), LOCATE_TIMEOUT_MS, "before move placement");
+            const before = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), this.moveReadTimeoutMs, "before move placement");
             this.onMessageObserved?.(before.message?.id);
             if (before?.result === "success") original = before.message;
           } catch { /* Cache/event reconciliation remains available. */ }
@@ -846,7 +849,7 @@ export class ZulipToolRuntime {
           let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
           let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
           try {
-            const placed = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), LOCATE_TIMEOUT_MS, "placed move placement");
+            const placed = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), this.moveReadTimeoutMs, "placed move placement");
             this.onMessageObserved?.(placed.message?.id);
             if (placed?.result === "success" &&
                 (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
@@ -854,16 +857,16 @@ export class ZulipToolRuntime {
               if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
             }
           } catch { /* The bot may have lost visibility after moving. */ }
-          if (movedTo && destinationChannelId === null) {
+          if (movedTo && destinationChannelId === null && args.stream_id !== undefined) {
             try {
-              const streams = await withTimeout<any>(zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }), LOCATE_TIMEOUT_MS, "streams move placement");
+              const streams = await withTimeout<any>(zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }), this.moveReadTimeoutMs, "streams move placement");
               const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
               if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
             } catch { /* Preserve the successful move even if lookup fails. */ }
           }
           const confirmedMove: SelfMove = {
             moveEpochs, messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
-            newStreamId, destinationChannelId, topic: storedTopic,
+            newStreamId, destinationChannelId, topic: storedTopic, likelyTopic: args.topic,
           };
           this.onMoved?.(confirmedMove);
           if (movedTo) {

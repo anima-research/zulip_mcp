@@ -182,33 +182,46 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
 `previouslyMentioned` (absent when only the post-change state could be
-read). A change line never sets `threadId`. Third-party deletions leave
-reply routing unchanged. A third-party move of a conversation's source message
+read). A change line never sets `threadId`. A deletion leaves reply routing
+unchanged unless it removes the conversation's source message and no cached
+message remains in that stream and topic. Then channel-only replies refuse:
+"the messages this conversation followed were deleted or moved where this bot
+can't see them". A visible third-party move of a conversation's source message
 refuses channel-only replies, with the event's stream/topic as its destination
 hint; it does not silently retarget the reply. The bot's own moves emit no change
 marker. For host integrations:
 
 1. A tool result confirms the anchor unless intervening movement invalidated
    that reference. A channel-only publish follows it or refuses. Other references
-   a range move may have touched become unconfirmed, with the anchor's stored
-   destination topic labelled **likely**, not confirmed.
+   a range move may have touched become unconfirmed, never confirmed by echoes.
+   Only the exact anchor or a reference matching a known source topic gets a
+   destination hint: the stored topic (or requested topic if the read failed)
+   is labelled **likely**, not confirmed. Others refuse without a stream/topic
+   fallback; use their own `messageId` with `reply_to`. Only an exact anchor
+   may seed a destination channel's conversation slot, never a co-moved hint.
 2. Refusals say **Nothing was posted** and include `messageId` and a bare
-   `stream`. On upstream main (#39), use `send_message({reply_to: <messageId>})`
-   to resolve the message's current placement. Otherwise use an explicit bare
-   stream and topic (check `list_streams` / `get_stream_topics` if unknown).
+   `stream`. If a later channel publish is refused, nothing was posted: reply with
+   `send_message({reply_to: <messageId>, content})` to resolve the message's current
+   placement. Alternatively use an explicit bare stream and topic only when
+   known (check `list_streams` / `get_stream_topics` if unknown).
    Never use a stream fallback for a DM; use its private recipient.
    Same-stream and cross-stream tool results include
    `moved_to: {channelId, stream, topic}`; unknown fields are null.
-3. On an open channel, a non-bot message **above the refusal's message-id floor**,
-   in **any topic of that stream**, clears refusal and routes replies to that
-   message's topic. On a closed channel, only such a message accepted as a push
-   does so. Existing/moved copies, bot messages, echoes, reads, reactions and
+3. On an open channel, a new message (but not this bot's own messages)
+   **above the refusal's message-id floor** clears refusal and routes replies
+   to that message's topic, except in the stream/topic the conversation left.
+   A Notification Bot notice in the old topic does not clear refusal; a new
+   destination breadcrumb can. On a closed channel, only such a message accepted
+   as a push does so. Existing/moved copies, this bot's own messages, echoes,
+   reads, reactions and
    edit markers do not clear refusal. Explicit sends bypass it for one reply;
    they do not clear it. Typing stops in the topic where its run began.
 
 A move into a stream the bot cannot see
-arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
-delivery watermark; the message's own id in the line is what `fetch_around`
+arrives from Zulip as an ordinary deletion, indistinguishable from deleting
+the messages. The empty-cached-topic rule above refuses replies when the
+followed message disappears with the last cached message of its topic.
+Synthetic ids (`edit:77:…`) never advance the delivery watermark; the message's own id in the line is what `fetch_around`
 takes (a deleted id can no longer be fetched). History and backscroll
 render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
 `movedAt`.

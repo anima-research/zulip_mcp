@@ -1706,7 +1706,7 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
-    if (ev.kind === 'move' || ev.previousTopic !== null ||
+    if (ev.kind === 'delete' || ev.kind === 'move' || ev.previousTopic !== null ||
         ev.newStreamId != null || ev.movedToChannelId !== null) this.channelManager.reconcileSelfChange(ev);
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;

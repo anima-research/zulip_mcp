@@ -3,18 +3,26 @@
   content-only `edit_message`. Zulip enforces permissions and move limits;
   errors include partial-move retry fields.
 - Tool success confirms only an anchor not invalidated during the call. Other
-  references a range move may have touched are refused with the anchor's stored
-  destination topic labelled likely, never confirmed by echoes.
-- Third-party deletions leave routing unchanged. Third-party moves refuse replies
-  following affected message IDs, with the event's destination stream/topic hint.
+  references a range move may have touched are refused, never confirmed by
+  echoes. Only the exact anchor or a known-source topic match gets a destination
+  hint, with the stored (or, after a failed read, requested) topic labelled likely.
+  Unknown-source conversations get only their own reply_to recovery, no fallback.
+- A deletion of the followed message refuses replies if no cached message
+  remains in that stream/topic: the messages were deleted or moved where this
+  bot can't see them. Other deletions leave routing unchanged. Visible third-party
+  moves refuse replies following affected IDs, with the event's destination hint.
+  Moves out of visibility arrive as ordinary deletions, not a distinct notice.
 - Refusals say Nothing was posted and include messageId and a bare stream.
-  On upstream main (#39), recover with `send_message({reply_to: <messageId>})`;
-  otherwise use an explicit bare stream/topic, or private recipient for DMs.
+  If a later channel publish is refused, nothing was posted: reply with
+  `send_message({reply_to: <messageId>, content})`; alternatively use a known
+  explicit bare stream/topic, or private recipient for DMs.
   Same-stream and cross-stream results include `moved_to: {channelId, stream, topic}`;
   unknown fields are null. Check list_streams/get_stream_topics if needed.
-- Only a non-bot message above the refusal's message-id floor clears refusal:
-  in any topic of an open stream, or accepted as a push on a closed channel.
-  Routing then follows that message's topic. Existing/moved copies, echoes, reads,
-  reactions, edit markers and bot messages cannot clear it. Explicit sends bypass
-  refusal one reply at a time, not clear it. The bot's own moves emit no notice;
+- Only a new message (but not this bot's own messages) above the refusal's
+  message-id floor clears refusal: in any topic of an open stream, or accepted as a push on a closed channel.
+  The stream/topic the conversation left cannot clear it (including old-topic
+  Notification Bot notices); destination breadcrumbs can. Routing then follows
+  that message's topic. Existing/moved copies, echoes, reads,
+  reactions, edit markers and this bot's own messages cannot clear it. Explicit
+  sends bypass refusal one reply at a time, not clear it. The bot's own moves emit no change marker;
   typing stops where its run began.
