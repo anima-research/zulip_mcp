@@ -47,6 +47,7 @@ import {
   editedTrailer,
   fetchHistory,
   normalizeMessage,
+  looksLikeBotEmail,
   parseDmChannelId,
   toIncoming,
   type ZulipIdentity,
@@ -89,6 +90,36 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
+/** Only a link immediately heading a quote fence is a reply target.
+ *  Ignore fenced examples; keep only the first two distinct targets. */
+function quotedMessageIds(content: string): Set<number> {
+  const ids = new Set<number>();
+  let pending: number | null = null;
+  let fence: string | null = null;
+  for (const line of content.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence !== null) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      continue;
+    }
+    if (marker) {
+      if (pending !== null && marker[2].trim() === 'quote') ids.add(pending);
+      if (ids.size === 2) return ids;
+      fence = marker[1];
+      pending = null;
+      continue;
+    }
+    if (!line.trim()) continue;
+    const header = /^(?:@_\*\*[^\r\n]*\*\* )?\[[^\]\n]*\]\s*\([^\s)]*\/near\/([1-9]\d*)\)\s*[:：][ \t]*$/.exec(line);
+    const id = header ? Number(header[1]) : NaN;
+    pending = Number.isSafeInteger(id) ? id : null;
+  }
+  return ids;
+}
+
+type QuoteLookup = { authorId: number } | null | 'budget-skipped';
+type QuoteVerdict = 'reply' | 'not-reply' | 'ineligible' | 'unverified' | 'budget-skipped';
+
 /** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
@@ -101,13 +132,21 @@ interface SeenMessage {
   isDm: boolean;
   topic: string;
   snippet: string | null;
-  /** Zulip's mention verdict as the message last read. */
+  /** Zulip's mention verdict. */
   mentioned: boolean;
+  replyToSelf: boolean;
+  quoteTargets: ReadonlySet<number>;
 }
 
 /** How long a GET placing a change may take before the change is dropped
  *  rather than wedging every change behind it. */
 export const LOCATE_TIMEOUT_MS = 15_000;
+/** Wait budget for one incoming stream message's quote targets. */
+const QUOTE_TIMEOUT_MS = 3_000;
+/** Maximum uncached quote-target GETs shared by a history page. */
+const HISTORY_QUOTE_GET_CAP = 8;
+/** Avoid repeatedly GETting inaccessible/deleted targets; retry after three minutes. */
+const FAILED_LOOKUP_TTL_MS = 3 * 60_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
@@ -116,10 +155,19 @@ const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
 
+/** Process-wide quote-only bucket: burst 30, sustained 30 GETs/minute.
+ *  Sends, reactions and edit placement do not spend these tokens. */
+const QUOTE_GET_BURST = 30;
+const QUOTE_GET_REFILL_PER_MS = 30 / 60_000;
+
+class LookupTimeoutError extends Error {}
+
+/** Bound the wait only: zulip-js does not pass an AbortSignal to fetch, so
+ *  the underlying request can outlive this timer. */
 export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+    timer = setTimeout(() => reject(new LookupTimeoutError(`${what} timed out after ${ms}ms`)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
 }
@@ -176,6 +224,20 @@ export class ZulipAdapter implements PlatformAdapter {
    *  evicted. A deletion can only be placed from here — the message is gone. */
   private seen = new Map<number, SeenMessage>();
   private static readonly SEEN_CAP = 2000;
+  private static quoteBudget = { tokens: QUOTE_GET_BURST, updatedAt: performance.now() };
+
+  private static takeQuoteToken(): boolean {
+    const budget = ZulipAdapter.quoteBudget;
+    const now = performance.now();
+    budget.tokens = Math.min(QUOTE_GET_BURST, budget.tokens + Math.max(0, now - budget.updatedAt) * QUOTE_GET_REFILL_PER_MS);
+    budget.updatedAt = now;
+    if (budget.tokens < 1) return false;
+    budget.tokens--;
+    return true;
+  }
+
+  /** Failed quote-target GETs only; id → retry-after timestamp. Bounded like seen. */
+  private failedQuoteLookups = new Map<number, number>();
   /** Stream names by id, from discovery (refreshed on a miss): how a
    *  deletion or a cross-stream move names a stream the cache does not know. */
   private streamNamesById = new Map<number, string>();
@@ -322,6 +384,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   private remember(channelId: string, m: ZulipMessage): void {
+    this.failedQuoteLookups.delete(m.id);
     this.highestMessageId = Math.max(this.highestMessageId, m.id);
     if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
@@ -336,23 +399,46 @@ export class ZulipAdapter implements PlatformAdapter {
       topic: m.topic,
       snippet: snippetOf(m.cleanContent),
       mentioned: m.mentioned,
+      replyToSelf: m.replyToSelf,
+      quoteTargets: quotedMessageIds(m.rawContent),
     });
   }
 
+  private quoteLookupFailed(messageId: number): boolean {
+    const retryAfter = this.failedQuoteLookups.get(messageId);
+    if (retryAfter !== undefined && Date.now() < retryAfter) return true;
+    this.failedQuoteLookups.delete(messageId);
+    return false;
+  }
+
+  private rememberFailedQuoteLookup(messageId: number): void {
+    if (this.failedQuoteLookups.size >= ZulipAdapter.SEEN_CAP) {
+      const oldest = this.failedQuoteLookups.keys().next().value;
+      if (oldest !== undefined) this.failedQuoteLookups.delete(oldest);
+    }
+    this.failedQuoteLookups.set(messageId, Date.now() + FAILED_LOOKUP_TTL_MS);
+  }
+
   /** Where a message lives — from the recent-messages cache, else one GET. */
-  private async locate(messageId: number, purpose = 'a reaction'): Promise<SeenMessage | null> {
+  private async locate(messageId: number, purpose = 'a reaction', timeoutMs = LOCATE_TIMEOUT_MS, quoteLookup = false): Promise<SeenMessage | null> {
     const cached = this.seen.get(messageId);
     if (cached && !cached.placementUnknown) return cached;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result = await withTimeout<any>(
         this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false }),
-        LOCATE_TIMEOUT_MS,
+        timeoutMs,
         `GET message ${messageId}`,
       );
+      // This endpoint uses BAD_REQUEST for both missing and inaccessible ids.
+      // Older (pre-5.0) servers omit code; only then use the legacy text.
+      if (quoteLookup && result?.result === 'error' &&
+          (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
       assertApiSuccess(result, `message ${messageId}`);
       const raw = result?.message as ZulipRawMessage | undefined;
-      if (!raw) return null;
+      if (!raw) throw new Error('response contained no message');
+      if (raw.id !== messageId) throw new Error('response contained a different message id');
+      if (!Number.isSafeInteger(raw.sender_id) || raw.sender_id <= 0) throw new Error('response contained no valid sender_id');
       const m = normalizeMessage(raw);
       const channelId = channelIdOf(m, this.identity.selfUserId);
       this.remember(channelId, m);
@@ -360,8 +446,57 @@ export class ZulipAdapter implements PlatformAdapter {
       return this.seen.get(messageId) ?? null;
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
+      if (quoteLookup) throw err;
       return null;
     }
+  }
+
+  /** Cache explicit invalid-id errors only; transient failures must get
+   *  a fresh chance in the deferred pass. */
+  private async resolveQuoteTarget(id: number, remainingMs: number): Promise<QuoteLookup> {
+    if (!ZulipAdapter.takeQuoteToken()) return 'budget-skipped';
+    try {
+      const quoted = await this.locate(id, 'a quote reply', remainingMs, true);
+      if (!quoted) this.rememberFailedQuoteLookup(id);
+      return quoted;
+    } catch {
+      return 'budget-skipped';
+    }
+  }
+
+  /** Verify at most two quote targets; all readers use the same classifier.
+   *  Cached authors remain usable even after the lookup budget is exhausted. */
+  private async classifyQuoteReply(
+    m: Pick<ZulipMessage, 'mentioned' | 'isDm' | 'authorId' | 'authorEmail' | 'rawContent'>,
+    resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
+      const known = this.seen.get(id);
+      if (known) return known;
+      if (this.quoteLookupFailed(id)) return null;
+      if (remainingMs <= 0) return 'budget-skipped';
+      return this.resolveQuoteTarget(id, remainingMs);
+    },
+    deadline = performance.now() + QUOTE_TIMEOUT_MS,
+  ): Promise<QuoteVerdict> {
+    const targets = quotedMessageIds(m.rawContent);
+    if (targets.size === 0) return 'not-reply';
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'ineligible';
+    let verdict: QuoteVerdict = 'not-reply';
+    for (const id of targets) {
+      const quoted = await resolve(id, deadline - performance.now());
+      if (quoted === 'budget-skipped') verdict = 'budget-skipped';
+      else if (quoted === null) {
+        if (verdict !== 'budget-skipped') verdict = 'unverified';
+      } else if (quoted.authorId === this.identity.selfUserId) return 'reply';
+    }
+    return verdict;
+  }
+
+  /** Only an unresolved lookup of the same targets can retain a verified
+   *  reply. Ineligible messages and confident negatives always clear it. */
+  private replyToSelfForVerdict(verdict: QuoteVerdict, targets: ReadonlySet<number>, previous: SeenMessage | null | undefined): boolean {
+    return verdict === 'reply' ||
+      ((verdict === 'budget-skipped' || verdict === 'unverified') && previous?.replyToSelf === true &&
+        targets.size === previous.quoteTargets.size && [...targets].every((id) => previous.quoteTargets.has(id)));
   }
 
   /** Self-move events only invalidate; they never confirm placement or start GETs. */
@@ -497,6 +632,11 @@ export class ZulipAdapter implements PlatformAdapter {
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
       const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
+      const replyVerdict = change.content !== null
+        ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned })
+        : null;
+      const quoteTargets = change.content !== null ? quotedMessageIds(change.content) : where.quoteTargets;
+      const replyToSelf = replyVerdict !== null ? this.replyToSelfForVerdict(replyVerdict, quoteTargets, where) : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
@@ -505,6 +645,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic,
         placementUnknown: crossStream && movedToChannelId === null,
         mentioned,
+        replyToSelf,
+        quoteTargets,
         ...(content !== null ? { snippet: snippetOf(content) } : {}),
         ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}),
       });
@@ -545,6 +687,9 @@ export class ZulipAdapter implements PlatformAdapter {
         content,
         previousContent,
         mentioned,
+        replyToSelf,
+        ...(replyVerdict !== null ? { replyToSelfVerified: replyVerdict === 'reply' || replyVerdict === 'not-reply' } : {}),
+        previouslyReplyToSelf: cached ? cached.replyToSelf : null,
         // The cache holds the pre-change verdict; a GET only the post-change one.
         previouslyMentioned: cached ? cached.mentioned : null,
         vanished: false,
@@ -597,6 +742,8 @@ export class ZulipAdapter implements PlatformAdapter {
         previousContent: cached.snippet,
         // A deleted mention is the one the agent was about to answer.
         mentioned: cached.mentioned,
+        replyToSelf: cached.replyToSelf,
+        previouslyReplyToSelf: cached.replyToSelf,
         previouslyMentioned: cached.mentioned,
         vanished,
         isDM: cached.isDm,
@@ -880,6 +1027,36 @@ export class ZulipAdapter implements PlatformAdapter {
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
     });
+    // Page authors take precedence over older cached rows, including targets
+    // later in the page and pages larger than the seen cache. Uncached targets
+    // share a page GET cap and wait budget, within the process-wide quote
+    // bucket and any shared quote-wait allowance supplied by the server.
+    const pageById = new Map(page.messages.map((m) => [m.id, m]));
+    let getsLeft = HISTORY_QUOTE_GET_CAP;
+    let pageRemainingMs = QUOTE_TIMEOUT_MS;
+    const unverifiedMessageIds: string[] = [];
+    const resolve = async (id: number, remainingMs: number): Promise<QuoteLookup> => {
+      const known = pageById.get(id) ?? this.seen.get(id);
+      if (known) return known;
+      if (this.quoteLookupFailed(id)) return null;
+      remainingMs = Math.min(remainingMs, pageRemainingMs, query.quoteLookupBudget?.remainingMs ?? Infinity);
+      if (getsLeft <= 0 || remainingMs <= 0) return 'budget-skipped';
+      getsLeft--;
+      const started = performance.now();
+      try {
+        return await this.resolveQuoteTarget(id, remainingMs);
+      } finally {
+        const waited = Math.max(0, performance.now() - started);
+        pageRemainingMs = Math.max(0, pageRemainingMs - waited);
+        if (query.quoteLookupBudget) query.quoteLookupBudget.remainingMs = Math.max(0, query.quoteLookupBudget.remainingMs - waited);
+      }
+    };
+    for (const m of page.messages) {
+      if (!this.allowed(m)) continue;
+      const verdict = await this.classifyQuoteReply(m, resolve, Infinity);
+      m.replyToSelf = this.replyToSelfForVerdict(verdict, quotedMessageIds(m.rawContent), this.seen.get(m.id));
+      if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
+    }
     for (const m of page.messages) this.remember(channelId, m);
     const messages = page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
@@ -889,6 +1066,7 @@ export class ZulipAdapter implements PlatformAdapter {
       messages,
       scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
       reachedNewest: page.foundNewest,
+      ...(unverifiedMessageIds.length > 0 ? { unverifiedMessageIds } : {}),
     };
   }
 
@@ -929,7 +1107,7 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
-    this.eventLoop = new ZulipEventLoop();
+    const loop = this.eventLoop = new ZulipEventLoop();
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
     // same message reads backwards otherwise. Reactions await the earlier
@@ -940,7 +1118,12 @@ export class ZulipAdapter implements PlatformAdapter {
     const changeHandler = onMessageChange || this.onSelfChanged
       ? (change: ZulipMessageChange) => {
           changeChain = changeChain
-            .then(() => this.onZulipChange(change, onMessageChange ?? (() => {})))
+            .then(() => {
+              if (this.eventLoop !== loop) return;
+              return this.onZulipChange(change, (event) => {
+                if (this.eventLoop === loop) onMessageChange?.(event);
+              });
+            })
             .catch((err) => {
               console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
             });
@@ -953,7 +1136,7 @@ export class ZulipAdapter implements PlatformAdapter {
           const tail = changeChain;
           void tail.then(async () => {
             const where = await this.locate(ev.message_id);
-            if (!where) return;
+            if (!where || this.eventLoop !== loop) return;
             if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
             onReaction({
               action: ev.op,
@@ -973,7 +1156,7 @@ export class ZulipAdapter implements PlatformAdapter {
           });
         }
       : undefined;
-    this.eventLoop.start(this.zulipClient, (_streamName, msg, flags) => {
+    loop.start(this.zulipClient, async (_streamName, msg, flags) => {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
@@ -989,6 +1172,10 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
+      m.replyToSelf = await this.classifyQuoteReply(m) === 'reply';
+      if (this.eventLoop !== loop) return;
+      const cached = this.seen.get(m.id);
+      if (cached) cached.replyToSelf = m.replyToSelf;
       // A stream the bot joined after startup is unknown to the host; the
       // message proves it is reachable, so it travels with its descriptor
       // (#20). Sent with EVERY message, never suppressed as "already
