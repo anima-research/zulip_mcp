@@ -155,23 +155,26 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a message to a stream or as a direct message. For streams, provide 'stream' and 'topic'. For DMs, provide 'to' as user email(s). " +
-      "Pass 'attachments' to send files (root-relative paths under a configured upload root, or base64) with the message.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
     inputSchema: {
       type: "object",
       properties: {
         type: {
           type: "string",
           enum: ["stream", "private"],
-          description: "Type of message: 'stream' for stream messages, 'private' for direct messages",
+          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
         },
         to: {
           type: "string",
-          description: "For stream: stream name. For private: comma-separated email addresses",
+          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.",
         },
         topic: {
           type: "string",
-          description: "Topic for stream messages (required for type='stream')",
+          description: "Required for streams without reply_to. Omit with reply_to.",
+        },
+        reply_to: {
+          type: "integer",
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -195,7 +198,6 @@ export const toolDefinitions: ToolDefinition[] = [
           },
         },
       },
-      required: ["type", "to"],
     },
   },
   {
