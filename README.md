@@ -307,8 +307,50 @@ file, or remove it to re-seed from the environment.
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
 Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
-Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends.
 Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
+
+`send_message` and `edit_message` resolve exact `[[msg:ID]]` tokens in
+`content`, for example `{"reply_to":12345,"content":"See [[msg:67890]]"}`.
+Each decimal ID is read through the bot's Zulip API access before any uploads,
+content chunking, sends or edits. If any lookup fails (missing message, no
+access, API/transport error), the entire call fails naming the token; nothing
+is sent or edited. There are at most **20 unescaped token occurrences** per call,
+including duplicates; duplicate IDs are fetched once per call, never cached
+across calls. IDs must be positive safe integers (leading zeroes are accepted).
+Every `[[msg:ID]]` is resolved wherever it appears: prose, inline code, fences,
+spoiler/quote blocks, blockquotes and tables. There is no Markdown parsing.
+To send a literal token, write `\[[msg:ID]]`: the immediately preceding
+backslash is removed, `[[msg:ID]]` is sent unchanged, and no lookup occurs.
+Escaped tokens do not count toward the cap or undergo ID validation. If more
+backslashes precede a token, only the one immediately before it is removed.
+In JSON tool arguments, encode that backslash as `\\`, for example
+`{"content":"\\[[msg:123]]"}` sends the literal `[[msg:123]]`.
+Token lookup errors use fixed descriptions and allowlisted API codes, never
+response bodies or raw client exceptions. Any `reply_to` lookup failure also
+uses a fixed sanitized error, without API body text or client exception details.
+Bare numbers and all other text are untouched: this is opt-in, not a number
+detector.
+
+The replacement is a plain absolute URL, the form Zulip's **Copy link to
+message** produces, so Zulip can render its native message-link chip rather
+than a server-invented markdown label. Stream links have the form
+`<realm>/#narrow/stream/<stream-operand>/topic/<encoded-topic>/near/<message-id>`;
+DM links use `#narrow/pm-with/<sorted-participant-ids>-dm/near/<message-id>`
+(or `-group` for three or more participants, including the bot). Names/topics
+use [Zulip's hash encoding](https://zulip.com/api/zulip-urls), including UTF-8
+`.XX` escapes and spaces replaced by hyphens in the stream-name slug only.
+The stream operand is normally `<id>-<slug>`, but Zulip omits the name when
+encoding the full operand adds more than 10 characters or exceeds 1.5 times
+its original length. For example, stream 12 named `general` uses
+`stream/12-general/topic/links/near/101`; named `R&D / café. (test)!*'`
+it uses `stream/12/topic/links/near/101`.
+The legacy `stream` and `pm-with` operators work on older servers and remain
+accepted by newer clients as aliases for `channel` and `dm`; this server does
+not retain a server feature level, so it does not guess a version threshold.
+On edits, only tokens in the supplied replacement content are resolved;
+existing links are left as supplied (the old message body is not fetched or
+merged). `send_dm` and MCPL publishes do not expand this syntax.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes

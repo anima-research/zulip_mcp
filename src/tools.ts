@@ -178,7 +178,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The message content (supports Markdown). May be empty when attachments are given.",
+          description: "The message content (supports Markdown). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
         },
         attachments: {
           type: "array",
@@ -263,7 +263,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The new message content (supports Markdown, replaces the old content entirely)",
+          description: "The new message content (supports Markdown, replaces the old content entirely). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
         },
       },
       required: ["message_id", "content"],

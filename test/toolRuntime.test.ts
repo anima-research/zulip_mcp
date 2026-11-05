@@ -379,14 +379,14 @@ for (const [label, message, destination] of [
   });
 }
 
-for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
-  test(`send_message reply_to preserves API error code ${code} for missing/deleted/inaccessible ids`, async () => {
+for (const code of ['BAD_REQUEST', 'UNAUTHORIZED', 'PRIVATE_BODY_MARKER']) {
+  test(`send_message reply_to sanitizes API error code ${code} for missing/deleted/inaccessible ids`, async () => {
     const { tools, dir, gets, sends, uploaded } = replyRuntime({}, { result: 'error', code, msg: 'Invalid message(s)' });
     try {
       await assert.rejects(tools.handleToolCall('send_message', {
         type: 'stream', reply_to: 999, content: 'reply',
         attachments: [{ data: 'aGk=', name: 'hi.txt' }],
-      }), (err: Error) => err.message.includes(code) && err.message.includes('Invalid message(s)'));
+      }), { message: 'Cannot resolve reply_to 999: message not found or not accessible' });
       assert.deepEqual(gets, [{ message_id: 999 }]);
       assert.deepEqual(sends, []);
       assert.deepEqual(uploaded, []);
@@ -442,7 +442,7 @@ test('send_message reply_to requires an integer id and a readable message destin
       }), /reply_to.*integer/);
     }
     assert.deepEqual(gets, []);
-    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), /reply_to.*destination/);
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), /Cannot resolve reply_to/);
     assert.deepEqual(sends, []);
     assert.deepEqual(uploaded, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -491,7 +491,7 @@ test('send_message reply_to supports a canonical stream name fallback and an emp
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message reply_to uses the real client with numeric strings and aliases before POST and propagates HTTP API errors', async () => {
+test('send_message reply_to uses the real client with numeric strings and aliases before POST and sanitizes HTTP API errors', async () => {
   const requests: { method?: string; url?: string; body: string }[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -525,7 +525,7 @@ test('send_message reply_to uses the real client with numeric strings and aliase
     assert.match(requests[1].body, /name="to"\r\n\r\n12\r\n/);
     assert.match(requests[1].body, /name="topic"\r\n\r\nDeploy status\r\n/);
     assert.doesNotMatch(requests[1].body, /name="reply_to"/);
-    await assert.rejects(state.tools.handleToolCall('send_message', { type: 'stream', reply_to: 999, content: 'reply' }), /BAD_REQUEST.*Invalid message/);
+    await assert.rejects(state.tools.handleToolCall('send_message', { type: 'stream', reply_to: 999, content: 'reply' }), { message: 'Cannot resolve reply_to 999: message not found or not accessible' });
     assert.equal(requests.length, 3, 'the failed lookup never posts');
   } finally {
     if (dir) rmSync(dir, { recursive: true, force: true });
