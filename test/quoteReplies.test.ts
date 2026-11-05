@@ -737,22 +737,96 @@ test('R4-4: translated BAD_REQUEST is a cached definite miss', async () => {
 });
 
 for (const outcome of ['budget-skipped', 'unverified'] as const) {
-  test(`R4-6: history keeps a seen reply verdict when ${outcome}`, async () => {
+  test(`R4-6/R5-1: history keeps a seen reply only for unchanged targets when ${outcome}`, async () => {
     let content = quote();
+    let initial = true;
     const adapter = new ZulipAdapter({ messages: {
       retrieve: async () => ({ messages: [raw(300, content)], found_newest: true }),
-      getById: async (params: { message_id: number }) => params.message_id === QUOTED
+      getById: async (params: { message_id: number }) => initial && params.message_id === QUOTED
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
         : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' },
     } }, SELF, 'session');
     const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
     assert.equal(first.messages[0].metadata?.replyToSelf, true);
-    content = quote(201); // This target is not in the author cache.
-    const page = await adapter.fetchHistory('zulip:general', {
-      limit: 100, ...(outcome === 'budget-skipped' ? { quoteLookupBudget: { remainingMs: 0 } } : {}),
-    });
+    initial = false;
     const internal = adapter as unknown as { seen: Map<number, { replyToSelf?: boolean }> };
-    assert.equal(internal.seen.get(300)?.replyToSelf, true, 'last confident verdict survives');
-    assert.equal(page.messages[0].metadata?.replyToSelf, true);
+    internal.seen.delete(QUOTED); // Lose the target author, not the verified reply.
+    content = quote().replace('reply', 'corrected reply');
+    // A typo edit missed during a gap keeps the same quote target.
+    const query = { limit: 100, ...(outcome === 'budget-skipped' ? { quoteLookupBudget: { remainingMs: 0 } } : {}) };
+    const unchanged = await adapter.fetchHistory('zulip:general', query);
+    assert.equal(unchanged.messages[0].metadata?.replyToSelf, true, 'unchanged targets retain the confident verdict');
+    content = quote(201); // A different, unresolved target is not a verified reply.
+    const page = await adapter.fetchHistory('zulip:general', query);
+    assert.equal(internal.seen.get(300)?.replyToSelf, false, 'changed targets invalidate the cached verdict');
+    assert.equal(page.messages[0].metadata?.replyToSelf, false);
+  });
+}
+
+for (const kind of ['explicit mention', 'DM', 'self author', 'bot author'] as const) {
+  test(`R5-1: history clears a seen reply after the message changes to ${kind}`, async () => {
+    let row = raw(300, quote());
+    let gets = 0;
+    const adapter = new ZulipAdapter({ messages: {
+      retrieve: async () => ({ messages: [row], found_newest: true }),
+      getById: async () => { gets++; return { message: raw(QUOTED, 'original', { sender_id: SELF }) }; },
+    } }, SELF, 'session');
+    assert.equal((await adapter.fetchHistory('zulip:general', { limit: 100 })).messages[0].metadata?.replyToSelf, true);
+    const overrides: Partial<ZulipRawMessage> = kind === 'explicit mention' ? { flags: ['mentioned'] }
+      : kind === 'DM' ? { type: 'private', display_recipient: [SELF, 101].map((id) => ({ id, full_name: 'User', email: `${id}@example.invalid` })) }
+      : kind === 'self author' ? { sender_id: SELF }
+      : { sender_email: 'other-bot@example.invalid' };
+    row = raw(300, quote(), overrides);
+    const page = await adapter.fetchHistory(kind === 'DM' ? 'zulip:dm:101' : 'zulip:general', { limit: 100 });
+    assert.equal((adapter as unknown as { seen: Map<number, { replyToSelf: boolean }> }).seen.get(300)?.replyToSelf, false);
+    if (kind === 'self author') assert.equal(page.messages.length, 0);
+    else {
+      assert.equal(page.messages[0].metadata?.isReplyToBot, false);
+      assert.equal(page.messages[0].metadata?.isExplicitMention, kind === 'explicit mention');
+    }
+    assert.equal(gets, 1, 'ineligible messages do not look up quote targets');
+  });
+}
+
+for (const outcome of ['budget-skipped', 'unverified'] as const) {
+  test(`R5-1: ${outcome} typo edit keeps the verified reply for its deletion`, { timeout: 2000 }, async (t) => {
+    t.mock.method(performance, 'now', () => 0);
+    const changes: MessageChangeEvent[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    let served = false;
+    let gets = 0;
+    const adapter = new ZulipAdapter({
+      messages: { getById: async () => { gets++; return { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }; } },
+      queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+      events: { retrieve: async () => {
+        if (served) return new Promise(() => {});
+        served = true;
+        return { events: [
+          { id: 1, type: 'message', message: raw(QUOTED, 'original', { sender_id: SELF }), flags: [] },
+          { id: 2, type: 'message', message: raw(300, quote()), flags: [] },
+          { id: 3, type: 'update_message', message_id: 300, user_id: 101, orig_content: quote(), content: quote() + ' typo fixed', flags: [] },
+          { id: 4, type: 'delete_message', message_ids: [300], message_type: 'stream', stream_id: 1 },
+        ] };
+      } },
+    }, SELF, 'session');
+    adapter.startEvents((message) => {
+      assert.equal(message.metadata?.replyToSelf, true);
+      (adapter as unknown as { seen: Map<number, unknown> }).seen.delete(QUOTED);
+      if (outcome === 'budget-skipped') {
+        (ZulipAdapter as unknown as { quoteBudget: { tokens: number; updatedAt: number } }).quoteBudget = { tokens: 0, updatedAt: 0 };
+      }
+    }, undefined, undefined, (change) => {
+      changes.push(change);
+      if (changes.length === 2) finish();
+    });
+    try {
+      await finished;
+      assert.deepEqual(changes.map((change) => change.kind), ['edit', 'delete']);
+      assert.equal(changes[0].replyToSelf, true, 'the typo edit retains the verified unchanged target');
+      assert.equal(changes[0].replyToSelfVerified, false, 'no fresh verification was possible');
+      assert.equal(changes[1].replyToSelf, true, 'deletion reads the retained cache verdict');
+      assert.equal(gets, outcome === 'budget-skipped' ? 0 : 1);
+    } finally { adapter.stopEvents(); }
   });
 }

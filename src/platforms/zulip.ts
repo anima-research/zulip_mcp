@@ -117,7 +117,7 @@ function quotedMessageIds(content: string): Set<number> {
 }
 
 type QuoteLookup = { authorId: number } | null | 'budget-skipped';
-type QuoteVerdict = 'reply' | 'not-reply' | 'unverified' | 'budget-skipped';
+type QuoteVerdict = 'reply' | 'not-reply' | 'ineligible' | 'unverified' | 'budget-skipped';
 
 /** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
@@ -131,6 +131,7 @@ interface SeenMessage {
   /** Zulip's mention verdict. */
   mentioned: boolean;
   replyToSelf: boolean;
+  quoteTargets: ReadonlySet<number>;
 }
 
 /** How long a GET placing a change may take before the change is dropped
@@ -391,6 +392,7 @@ export class ZulipAdapter implements PlatformAdapter {
       snippet: snippetOf(m.cleanContent),
       mentioned: m.mentioned,
       replyToSelf: m.replyToSelf,
+      quoteTargets: quotedMessageIds(m.rawContent),
     });
   }
 
@@ -468,7 +470,7 @@ export class ZulipAdapter implements PlatformAdapter {
   ): Promise<QuoteVerdict> {
     const targets = quotedMessageIds(m.rawContent);
     if (targets.size === 0) return 'not-reply';
-    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'unverified';
+    if (m.mentioned || m.isDm || this.identity.selfUserId === null || m.authorId === this.identity.selfUserId || looksLikeBotEmail(m.authorEmail)) return 'ineligible';
     let verdict: QuoteVerdict = 'not-reply';
     for (const id of targets) {
       const quoted = await resolve(id, deadline - performance.now());
@@ -478,6 +480,14 @@ export class ZulipAdapter implements PlatformAdapter {
       } else if (quoted.authorId === this.identity.selfUserId) return 'reply';
     }
     return verdict;
+  }
+
+  /** Only an unresolved lookup of the same targets can retain a verified
+   *  reply. Ineligible messages and confident negatives always clear it. */
+  private replyToSelfForVerdict(verdict: QuoteVerdict, targets: ReadonlySet<number>, previous: SeenMessage | null | undefined): boolean {
+    return verdict === 'reply' ||
+      ((verdict === 'budget-skipped' || verdict === 'unverified') && previous?.replyToSelf === true &&
+        targets.size === previous.quoteTargets.size && [...targets].every((id) => previous.quoteTargets.has(id)));
   }
 
   /**
@@ -538,7 +548,8 @@ export class ZulipAdapter implements PlatformAdapter {
       const replyVerdict = change.content !== null
         ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned })
         : null;
-      const replyToSelf = replyVerdict !== null ? replyVerdict === 'reply' : where.replyToSelf;
+      const quoteTargets = change.content !== null ? quotedMessageIds(change.content) : where.quoteTargets;
+      const replyToSelf = replyVerdict !== null ? this.replyToSelfForVerdict(replyVerdict, quoteTargets, where) : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
@@ -547,6 +558,7 @@ export class ZulipAdapter implements PlatformAdapter {
         topic,
         mentioned,
         replyToSelf,
+        quoteTargets,
         ...(content !== null ? { snippet: snippetOf(content) } : {}),
         ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}),
       });
@@ -928,8 +940,7 @@ export class ZulipAdapter implements PlatformAdapter {
     for (const m of page.messages) {
       if (!this.allowed(m)) continue;
       const verdict = await this.classifyQuoteReply(m, resolve, Infinity);
-      m.replyToSelf = verdict === 'reply' ||
-        ((verdict === 'budget-skipped' || verdict === 'unverified') && this.seen.get(m.id)?.replyToSelf === true);
+      m.replyToSelf = this.replyToSelfForVerdict(verdict, quotedMessageIds(m.rawContent), this.seen.get(m.id));
       if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }
     for (const m of page.messages) this.remember(channelId, m);

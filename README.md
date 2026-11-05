@@ -31,7 +31,10 @@ Discord and Slack adapters that once lived here moved to those servers.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
-  (`channel_missed`).
+  (`channel_missed`). Message events are handled in order, and a quote lookup
+  delays later events in the same batch by up to three seconds per message.
+  Stopping delivery mid-batch drops the rest of that batch, and the next sweep
+  recovers what it can.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -46,7 +49,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   do not count. The same rule applies to live delivery, content edits, and
   channel history used by backscroll, refused-push healing, reconnect sweeps
   and queue-gap recovery. Removing the quote removes reply addressing;
-  moves and deletions retain the last known verdict. Only the first two
+  moves and deletions retain the current cached verdict. Inconclusive history
+  reads and content edits retain a cached verified reply only when the quote
+  targets are unchanged and the message remains eligible (not an explicit
+  mention, DM, self-authored or bot-authored message). Only the first two
   distinct quote targets are checked; page/cache authors are preferred,
   otherwise live messages/edits share a three-second wait budget each and
   history reads share eight target GETs and a three-second wait budget per
@@ -69,11 +75,13 @@ Discord and Slack adapters that once lived here moved to those servers.
   may revisit them). Cached targets and explicit mentions remain usable.
   A budget-starved quote row stops the
   initial catch-up block short of that row; the single retry stays within
-  the original catch-up ceiling. Any rows still unverified on retry fail
-  closed, allowing the backlog to proceed without another gap or reconnect.
-  Unreadable targets or an unknown bot identity fail closed. An unaccepted
-  live-verified reply keeps its verdict through sweep deduplication and
-  retries even when history cannot verify it again. Only API errors with
+  the original catch-up ceiling. Rows still unverified on retry without a
+  retained verified verdict fail closed, allowing the backlog to proceed
+  without another gap or reconnect. An unknown bot identity fails closed;
+  unreadable targets fail closed except for the unchanged-target cached
+  verdict described above. An unaccepted live-verified
+  reply keeps its verdict through sweep deduplication and retries even when
+  history cannot verify it again. Only API errors with
   `result: "error"` and `code: "BAD_REQUEST"` (missing or inaccessible targets)
   are cached for three minutes. On pre-5.0 servers without a code, the legacy
   `msg: "Invalid message(s)"` is used instead. Other API errors, missing message objects, mismatched message ids,
