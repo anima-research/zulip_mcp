@@ -2371,3 +2371,22 @@ for (const bulk of [false, true]) {
     await assert.rejects(f.publish(), /deleted or moved where/);
   });
 }
+
+test('N1 unknown channel cannot use the original channel as source proof', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'reference');
+  f.placements.set(30, { ...raw(30), stream_id: 9, display_recipient: 'unresolved' });
+  f.feed(move([30], { message_id: 30, user_id: 7, new_stream_id: 9, subject: 'deploys' }));
+  await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'unresolved stream move');
+  assert.equal(f.routingReference().movedTo.channelId, null);
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  await assert.rejects(f.publish(), (e: any) => {
+    assert.match(e.message, /this conversation may have moved/);
+    assert.doesNotMatch(e.message, /likely|alternatively|topic:/);
+    assert.deepEqual(e.data.movedTo, { channelId: null, topic: null });
+    return true;
+  });
+});

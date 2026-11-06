@@ -4,8 +4,8 @@
   errors include partial-move retry fields.
 - Tool success confirms only an anchor not invalidated during the call. Other
   references a range move may have touched are refused, never confirmed by
-  echoes. Only the exact anchor or a known-source topic match gets a destination
-  hint, with the stored (or, after a failed read, requested) topic labelled likely.
+  echoes. Only the exact anchor or a non-stale, known-placement source-topic
+  match gets a destination hint, with the stored (or, after a failed read, requested) topic labelled likely.
   Unknown-source conversations get only their own reply_to recovery, no fallback.
 - A deletion of the followed message refuses replies if no cached message
   remains in that stream/topic: the messages were deleted or moved where this

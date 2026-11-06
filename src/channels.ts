@@ -629,7 +629,7 @@ export class ChannelManager {
         continue;
       }
       const exact = reference.from === Number(change.messageId);
-      const currentChannel = reference.movedTo?.channelId ?? channelId;
+      const currentChannel = reference.movedTo ? reference.movedTo.channelId : channelId;
       const currentTopic = reference.movedTo ? reference.movedTo.topic : reference.hints.threadId;
       const inScope = !channelId.startsWith('zulip:dm:') &&
         (change.channelId === 'zulip:unknown' || currentChannel === change.channelId || reference.movedTo?.channelId === null) &&
@@ -651,9 +651,9 @@ export class ChannelManager {
       const source = { ...reference, epoch: ++this.routingEpoch, lastEcho: undefined,
         expectedEcho: !uncertain && !earlyEcho ? expectedEcho : undefined,
         refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)) };
-      const knownSource = scope.topic !== null &&
-        (currentChannel === change.channelId || channelId === change.channelId) &&
-        (currentTopic ?? reference.hints.threadId)?.toLowerCase() === scope.topic.toLowerCase();
+      const knownSource = !stale && scope.topic !== null &&
+        currentChannel === change.channelId &&
+        currentTopic?.toLowerCase() === scope.topic.toLowerCase();
       const hasDestinationHint = exact || knownSource;
       if (uncertain || destination !== channelId) {
         this.lastIncoming.set(channelId, { ...source,

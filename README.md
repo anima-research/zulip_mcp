@@ -283,8 +283,8 @@ marker. For host integrations:
 1. A tool result confirms the anchor unless intervening movement invalidated
    that reference. A channel-only publish follows it or refuses. Other references
    a range move may have touched become unconfirmed, never confirmed by echoes.
-   Only the exact anchor or a reference matching a known source topic gets a
-   destination hint: the stored topic (or requested topic if the read failed)
+   Only the exact anchor or a non-stale reference with known placement
+   matching the source topic gets a destination hint: the stored topic (or requested topic if the read failed)
    is labelled **likely**, not confirmed. Others refuse without a stream/topic
    fallback; use their own `messageId` with `reply_to`. Only an exact anchor
    may seed a destination channel's conversation slot, never a co-moved hint.
