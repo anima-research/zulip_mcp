@@ -426,6 +426,14 @@ test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing 
       assert.deepEqual(rest, toolDefinitions.find((t) => t.name === tool.name), tool.name);
     }
     assert.deepEqual(tools.find((t) => t.name === 'send_message')?._meta, { 'mcpl/class': ['comms', 'files'] });
+    // The wire snapshot must retain JSON Schema nullable type unions (plain MCP and MCPL).
+    for (const [name, fields] of [['send_message', ['type', 'to', 'topic', 'reply_to']], ['move_messages', ['topic', 'stream_id']]] as const) {
+      const definition = tools.find(t => t.name === name) as unknown as { inputSchema: { properties: Record<string, { type: string[]; enum?: unknown[] }> } };
+      for (const field of fields) {
+        assert.deepEqual(definition.inputSchema.properties[field].type, [field === 'reply_to' || field === 'stream_id' ? 'integer' : 'string', 'null']);
+      }
+      if (name === 'send_message') assert.deepEqual(definition.inputSchema.properties.type.enum, ['stream', 'private', '', null]);
+    }
     await h.close();
   }
 });

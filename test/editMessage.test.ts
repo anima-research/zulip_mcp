@@ -10,6 +10,7 @@ import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { featureSetForTool } from '../src/feature-sets.ts';
 import { toolDefinitions } from '../src/tools.ts';
+import { assertStrictArguments } from './strictArguments.ts';
 
 /** Exercise the real client and runtime against a local HTTP stand-in. */
 async function fixture(response: unknown, status = 200, loseVisibility = false, routingUnavailable = false) {
@@ -226,9 +227,9 @@ test('move_messages requires a topic or stream_id without making a request', asy
 for (const { field, invalid, error } of [
   { field: 'propagate_mode', invalid: ['all', 'CHANGE_ALL', '', null, 1, false, {}],
     error: /^Error: propagate_mode must be change_one, change_later, or change_all$/ },
-  { field: 'stream_id', invalid: [null, 0, -1, 1.5, '17', false, NaN, Infinity, {}],
+  { field: 'stream_id', invalid: [0, -1, 1.5, '17', false, NaN, Infinity, {}],
     error: /^Error: stream_id must be a positive integer$/ },
-  { field: 'topic', invalid: [null, 1, false, {}], error: /^Error: topic must be a string$/ },
+  { field: 'topic', invalid: [1, false, {}], error: /^Error: topic must be a string$/ },
 ]) {
   test(`move_messages rejects invalid ${field} without making a request`, async () => {
     const f = await fixture({ result: 'success', msg: '' });
@@ -262,8 +263,8 @@ test('move_messages schema exposes optional topic, propagation, and stream field
   assert.deepEqual(schema.required, ['message_id']);
   const properties = schema.properties as Record<string, Record<string, unknown>>;
   assert.equal(properties.content, undefined);
-  assert.equal(properties.topic.type, 'string');
-  assert.equal(properties.stream_id.type, 'integer');
+  assert.deepEqual(properties.topic.type, ['string', 'null']);
+  assert.deepEqual(properties.stream_id.type, ['integer', 'null']);
   assert.equal(properties.stream_id.minimum, 1);
   assert.deepEqual(properties.propagate_mode.enum, ['change_one', 'change_later', 'change_all']);
   assert.equal(properties.propagate_mode.default, undefined, 'Zulip chooses the default');
@@ -443,3 +444,29 @@ for (const success of [false, true]) {
     } finally { await f.close(); }
   });
 }
+
+for (const fields of [{ topic: 'Next' }, { stream_id: 17 }, { topic: 'Next', stream_id: 17 }]) {
+  test(`strict move_messages accepts unused null destination: ${JSON.stringify(fields)}`, async () => {
+    const f = await fixture({ result: 'success' });
+    try {
+      const args = { message_id: 42, topic: null, stream_id: null, propagate_mode: 'change_one', ...fields };
+      const before = structuredClone(args);
+      assertStrictArguments('move_messages', args);
+      await f.tools.handleToolCall('move_messages', args);
+      assert.deepEqual(args, before, 'normalization must not mutate the caller');
+      assert.deepEqual(Object.fromEntries(new URLSearchParams(f.calls[0].body)), {
+        propagate_mode: 'change_one', ...Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, String(v)])),
+      });
+    } finally { await f.close(); }
+  });
+}
+
+test('move_messages treats null destinations as absent before requests', async () => {
+  const f = await fixture({ result: 'success' });
+  try {
+    await assert.rejects(f.tools.handleToolCall('move_messages', {
+      message_id: 42, topic: null, stream_id: null, propagate_mode: 'change_one',
+    }), /^Error: topic or stream_id is required$/);
+    assert.deepEqual(f.calls, []); assert.deepEqual(f.lookups, []);
+  } finally { await f.close(); }
+});

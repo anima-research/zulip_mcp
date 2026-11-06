@@ -330,7 +330,7 @@ test('send_message reply_to derives the current stream and topic', async () => {
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
   try {
-    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), result);
+    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), { ...result, type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
     assert.deepEqual(gets, [{ message_id: 123 }]);
     assert.deepEqual(sends, [{ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }]);
     assert.deepEqual(sent[0], { messageId: '501', channelId: 'zulip:General', content: 'reply' });
@@ -357,12 +357,9 @@ for (const [label, message, destination] of [
   ['numeric-string stream ID', replyStream, { to: '12' }],
   ['matching stream name', replyStream, { to: 'general' }],
   ['different stream', replyStream, { to: 'Other' }],
-  ['matching topic', replyStream, { topic: 'Deploy status' }],
-  ['different topic', replyStream, { topic: 'Other' }],
   ['matching DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [790, 42, 7] }],
   ['partial DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [42] }],
   ['DM email', { type: 'private', display_recipient: replyParticipants }, { to: 'bo@example.com' }],
-  ['empty DM topic', { type: 'private', display_recipient: replyParticipants }, { topic: '' }],
   ['empty self-DM recipients', { type: 'private', display_recipient: [replyParticipants[0]] }, { to: [] }],
 ] as const) {
   test(`send_message reply_to refuses supplied ${label} before lookups, uploads or sends`, async () => {
@@ -436,7 +433,7 @@ for (const [alias, message] of [
 test('send_message reply_to requires an integer id and a readable message destination', async () => {
   const { tools, dir, gets, sends, uploaded } = replyRuntime({});
   try {
-    for (const reply_to of ['', ' ', 'abc', '123.5', 'Infinity', '9007199254740992', 1.5, NaN, Infinity, 9007199254740992, true, {}, []]) {
+    for (const reply_to of [' ', 'abc', '123.5', 'Infinity', '9007199254740992', 1.5, NaN, Infinity, 9007199254740992, true, {}, []]) {
       await assert.rejects(tools.handleToolCall('send_message', {
         type: 'stream', reply_to, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
       }), /reply_to.*integer/);
@@ -448,14 +445,19 @@ test('send_message reply_to requires an integer id and a readable message destin
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message without reply_to keeps the exact payload, response and callbacks without fetching', async () => {
+test('send_message without reply_to keeps the exact payload and callbacks without fetching, enriching the response', async () => {
   const { tools, dir, gets, sends, result } = replyRuntime(replyStream);
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
   try {
     const stream = { type: 'stream', to: ' general ', topic: ' topic ', content: ' original\n' };
     const dm = { type: 'private', to: 'bo@example.com,ann@example.com', topic: undefined, content: 'DM' };
-    for (const args of [stream, dm]) assert.deepEqual(await tools.handleToolCall('send_message', args), result);
+    assert.deepEqual(await tools.handleToolCall('send_message', stream), {
+      ...result, type: 'stream', stream: stream.to, topic: stream.topic, channelId: 'zulip: general ',
+    });
+    assert.deepEqual(await tools.handleToolCall('send_message', dm), {
+      ...result, type: 'private', recipients: ['bo@example.com', 'ann@example.com'], channelId: 'zulip:bo@example.com,ann@example.com',
+    });
     assert.deepEqual(gets, []);
     assert.deepEqual(sends, [stream, dm]);
     assert.deepEqual(sent, [
@@ -469,8 +471,8 @@ test('send_message schema advertises string destinations and DM email addresses'
   const schema = toolDefinitions.find((t) => t.name === 'send_message')!.inputSchema;
   const properties = schema.properties as Record<string, any>;
   assert.deepEqual(properties.to, {
-    type: 'string',
-    description: 'For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.',
+    type: ['string', 'null'],
+    description: 'For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to. Null or empty string means absent.',
   });
 });
 
@@ -479,8 +481,8 @@ test('send_message schema leaves destination requirements to the runtime', () =>
   assert.equal(schema.required, undefined);
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
-  assert.equal(properties.reply_to.type, 'integer');
-  assert.match(properties.reply_to.description, /Omit to\/topic/);
+  assert.deepEqual(properties.reply_to.type, ['integer', 'null']);
+  assert.match(properties.reply_to.description, /Omit to;/);
 });
 
 test('send_message reply_to supports a canonical stream name fallback and an empty topic', async () => {
@@ -637,10 +639,10 @@ test('send_message treats a null reply_to and topic as absent on a plain send', 
   try {
     assert.deepEqual(await tools.handleToolCall('send_message', {
       type: 'stream', to: 'General', topic: 'Deploy status', reply_to: null, content: 'stream',
-    }), result);
+    }), { ...result, type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
     assert.deepEqual(await tools.handleToolCall('send_message', {
       type: 'private', to: [42], topic: null, reply_to: null, content: 'DM',
-    }), result);
+    }), { ...result, type: 'private', recipients: [42], channelId: 'zulip:dm:42' });
     assert.deepEqual(gets, []);
     assert.deepEqual(sends, [
       { type: 'stream', to: 'General', topic: 'Deploy status', content: 'stream' },

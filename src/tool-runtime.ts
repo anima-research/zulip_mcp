@@ -294,7 +294,7 @@ export class ZulipToolRuntime {
   private async replyDestination(args: Record<string, any>) {
     const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
-    if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
+    if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
     const unreadable = () => new Error(`Cannot resolve reply_to ${id}: message not found or not accessible`);
     let result;
     try {
@@ -314,9 +314,10 @@ export class ZulipToolRuntime {
     if (message.type === "stream") {
       const name = message.display_recipient;
       if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
-      return { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: `zulip:${name}` };
+      return { type: message.type, to: message.stream_id ?? name, topic: args.topic ?? message.subject, channelId: `zulip:${name}` };
     }
 
+    if (args.topic !== undefined) throw new Error("topic is not allowed with a private reply_to");
     const recipients: ZulipRecipient[] = message.display_recipient;
     if (!Array.isArray(recipients) || recipients.length === 0 || recipients.some((r) => !Number.isSafeInteger(r?.id))) {
       throw unreadable();
@@ -692,8 +693,15 @@ export class ZulipToolRuntime {
       }
 
       case "send_message": {
-        args = { ...args, reply_to: args.reply_to ?? undefined, to: args.to ?? undefined,
-          topic: args.topic ?? undefined, type: args.type ?? undefined };
+        // Strict-schema callers include unused fields as null, empty strings or reply_to: 0.
+        // A standalone stream's explicitly empty topic is still invalid.
+        const absent = (value: unknown) => value === "" ? undefined : value ?? undefined;
+        args = { ...args, reply_to: args.reply_to === 0 ? undefined : absent(args.reply_to), to: absent(args.to), type: absent(args.type),
+          topic: args.topic ?? undefined };
+        if (args.topic === "" && args.reply_to === undefined && ["stream", "channel"].includes(args.type)) {
+          throw new Error("topic must not be empty for a stream send");
+        }
+        if (args.topic === "") args.topic = undefined;
         if (args.reply_to === undefined && (args.to === undefined || args.type === undefined)) throw new Error("type and to are required without reply_to");
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
@@ -716,6 +724,11 @@ export class ZulipToolRuntime {
         }
         return {
           ...last,
+          type: args.type,
+          channelId,
+          ...(args.type === "stream"
+            ? { stream: reply ? channelId.slice("zulip:".length) : args.to, topic: args.topic }
+            : { recipients: Array.isArray(args.to) ? args.to : String(args.to).split(",").map((to) => to.trim()) }),
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(ids.length > 1 ? { ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : {}),
         };
@@ -742,6 +755,9 @@ export class ZulipToolRuntime {
         return {
           ...result,
           to_user_ids: ids,
+          type: "private",
+          recipients: ids,
+          channelId,
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}),
         };
@@ -762,6 +778,8 @@ export class ZulipToolRuntime {
       case "edit_message":
       case "move_messages": {
         const moving = name === "move_messages";
+        // Null is an unused strict-schema destination; an empty move topic remains meaningful.
+        if (moving) args = { ...args, topic: args.topic ?? undefined, stream_id: args.stream_id ?? undefined };
         if (!Number.isInteger(args.message_id) || args.message_id <= 0) throw new Error("message_id is required");
         const operation = `${moving ? "moving" : "editing"} message ${args.message_id}`;
         if (!moving) {

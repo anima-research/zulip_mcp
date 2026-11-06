@@ -449,9 +449,31 @@ file, or remove it to re-seed from the environment.
 
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
-Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
-Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends.
+Omit `to`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
+For stream replies, optionally provide `topic` to send in a different topic **in the referenced stream**:
+`{"reply_to":12345,"topic":"Follow-up","content":"Thanks!"}`. Without it, the current topic is unchanged.
+A topic on a private reply, supplied `to`, conflicting types, or unreadable IDs fail before uploads or sends.
 Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
+Strict-schema callers may include every property: unused `type`, `to`, `topic`, and `reply_to`
+can be `null` or `""` (both mean absent); `reply_to: 0` also means absent. The published
+destination schemas allow `null`. An explicitly empty topic on a stream send **without**
+`reply_to` remains an error; use `[]` for unused attachments.
+For `move_messages`, unused `topic` or `stream_id` may be `null`; an empty topic still
+means move to the unnamed topic. Strict clients can use `propagate_mode: "change_one"`
+for the default single-message move. `send_dm` requires recipients, and `edit_message`
+has no optional destination fields.
+
+| Send tool | Destination fields in every successful receipt (in addition to existing fields) |
+| --- | --- |
+| `send_message` (stream, including replies) | `type: "stream"`, `stream` (name, not numeric ID), `topic`, `channelId` |
+| `send_message` (DM, including replies) | `type: "private"`, `recipients` (email addresses for email sends; user IDs for ID sends/replies), `channelId` |
+| `send_dm` | `type: "private"`, `recipients` (resolved user IDs), `channelId`; existing `to_user_ids` is retained |
+
+Receipts describe the selected send destination, including any reply topic override, also for
+attachments or chunked messages. `channelId` matches the existing send callback: `zulip:<stream>`
+for streams, `zulip:dm:<sorted IDs>` for ID-based DMs (reply IDs exclude the bot except self-DMs),
+and `zulip:<email destination>` for raw email sends. No extra directory/placement lookup is made.
+MCPL `channels/publish` retains its existing protocol receipt.
 
 `send_message` and `edit_message` resolve exact `[[msg:ID]]` tokens in
 `content`, for example `{"reply_to":12345,"content":"See [[msg:67890]]"}`.

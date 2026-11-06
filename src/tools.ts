@@ -155,26 +155,26 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination (optionally choose a new topic for a stream reply). Returns the sent type, channelId, and stream/topic or DM recipients alongside message IDs. Supports attachments.",
     inputSchema: {
       type: "object",
       properties: {
         type: {
-          type: "string",
-          enum: ["stream", "private"],
-          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
+          type: ["string", "null"],
+          enum: ["stream", "private", "", null],
+          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied. Null or empty string means absent.",
         },
         to: {
-          type: "string",
-          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.",
+          type: ["string", "null"],
+          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to. Null or empty string means absent.",
         },
         topic: {
-          type: "string",
-          description: "Required for streams without reply_to. Omit with reply_to.",
+          type: ["string", "null"],
+          description: "Required for streams without reply_to. With a stream reply_to, overrides only the topic; refused for a private reply_to. Null or empty string means absent, except an explicitly empty topic on a stream send without reply_to is an error.",
         },
         reply_to: {
-          type: "integer",
-          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
+          type: ["integer", "null"],
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; topic may override a stream reply's topic only. Conflicting types, supplied to, private-reply topics or unreadable IDs fail before uploads or sends. Null or empty string means absent; 0 also means absent. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -206,7 +206,7 @@ export const toolDefinitions: ToolDefinition[] = [
       "Send a direct message to a Zulip user, identified by full name, email, or numeric user id. To reply " +
       "to a DM you received, pass the sender's name or id (both are in the message metadata). Names are " +
       "matched exactly (case-insensitive); an ambiguous name errors and lists the candidates with their " +
-      "ids, which are always a valid address. For group DMs pass several recipients.",
+      "ids, which are always a valid address. For group DMs pass several recipients. Returns type, recipients (user IDs), and channelId alongside the existing receipt fields.",
     inputSchema: {
       type: "object",
       properties: {
@@ -276,8 +276,8 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         message_id: { type: "number", description: "ID of the message to move" },
-        topic: { type: "string", description: "New topic name" },
-        stream_id: { type: "integer", minimum: 1, description: "Destination stream ID" },
+        topic: { type: ["string", "null"], description: "New topic name" },
+        stream_id: { type: ["integer", "null"], minimum: 1, description: "Destination stream ID" },
         propagate_mode: {
           type: "string",
           enum: ["change_one", "change_later", "change_all"],
