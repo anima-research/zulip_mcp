@@ -273,11 +273,11 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 quote addressing (previous verdicts are absent when only the post-change
 state could be read). A change line never sets `threadId`. A deletion leaves reply routing
 unchanged unless it removes the conversation's source message (including a
-reference in another stream after a move) and no cached
-message remains in that stream and topic. Then channel-only replies refuse:
+reference in another stream after a move) and no cached message remains in
+that stream and topic. Then channel-only replies refuse:
 "the message this conversation followed was deleted or moved where this bot
-can't see it, so it can't be replied to". A visible third-party move of a conversation's source message
-refuses channel-only replies, with the event's stream/topic as its destination
+can't see it, so it can't be replied to". A visible third-party move of a
+conversation's source message refuses channel-only replies, with the event's stream/topic as its destination
 hint; it does not silently retarget the reply. The bot's own moves emit no change
 marker. For host integrations:
 
@@ -285,8 +285,8 @@ marker. For host integrations:
    that reference. A channel-only publish follows it or refuses. Other references
    a range move may have touched become unconfirmed, never confirmed by echoes.
    Only the exact anchor or a non-stale reference with known placement
-   matching the source topic gets a destination hint: the stored topic (or requested topic if the read failed)
-   is labelled **likely**, not confirmed. Others refuse without a stream/topic
+   matching the source topic gets a destination hint: the stored topic (or
+   requested topic if the read failed) is labelled **likely**, not confirmed. Others refuse without a stream/topic
    fallback; use their own `messageId` with `reply_to`. Only an exact anchor
    may seed a destination channel's conversation slot, never a co-moved hint.
 2. Refusals say **Nothing was posted** and include `messageId` and a bare

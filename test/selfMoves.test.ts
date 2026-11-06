@@ -373,7 +373,8 @@ for (const mode of ['change_one', 'change_later', 'change_all'] as const) {
       else { await f.publish(); assert.equal(f.sent.pop().topic, message.subject, 'unaffected/anchor route is direct'); }
       await f.tools.handleToolCall('move_messages', { message_id: 21, topic: '  renamed ', propagate_mode: mode });
       if (mode === 'change_all' && hintId === 20) {
-        await assert.rejects(f.publish(), /unconfirmed topic/);
+        // N1: the first result already made this non-exact placement unknown.
+        await assert.rejects(f.publish(), /this conversation may have moved/);
         return;
       }
       await f.publish();
@@ -493,7 +494,9 @@ for (const firstMode of modes) for (const secondMode of modes) {
       const hintMove = firstMode === 'change_one' ? 0 : secondMode === 'change_one' ? 1 : 2;
       const assertRouting = async () => {
         if (hintMove) {
-          if (firstMode !== 'change_one' && secondMode !== 'change_one') {
+          // N1: an early range echo loses placement; a second range cannot
+          // infer a destination from an already-unknown non-exact reference.
+          if (secondMode !== 'change_one' || order === 'early' || order === 'first-early') {
             await assert.rejects(f.publish(), (e: any) => {
               assert.match(e.message, /this conversation may have moved; reply with send_message/);
               assert.equal(e.data.stream, null);
@@ -1002,7 +1005,7 @@ for (const activity of ['message', 'reaction'] as const) for (const echoFirst of
       await new Promise(r => setTimeout(r, 20));
     });
     await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
-    await assert.rejects(f.publish(), /zulip:general.*unconfirmed topic/);
+    await assert.rejects(f.publish(), /this conversation may have moved/);
     assert.equal(f.sent.length, 0);
     assert.equal(f.cachedPlacement(30).placementUnknown, true);
   });
@@ -1147,7 +1150,7 @@ test('R3-2 an early echo into an undiscovered stream needs an explicit send', as
   });
   const result = await f.tools.handleToolCall('move_messages', { message_id: 21, topic: 'first', stream_id: 9, propagate_mode: 'change_all' });
   assert.equal(f.cachedPlacement(30).placementUnknown, true);
-  await assert.rejects(f.publish(), /unconfirmed topic.*list_streams.*get_stream_topics/);
+  await assert.rejects(f.publish(), /this conversation may have moved/);
   assert.equal(f.sent.length, 0);
   await f.tools.handleToolCall('send_message', { type: 'stream', to: result.moved_to.stream, topic: result.moved_to.topic, content: 'Done' });
   assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['new-stream', 'first']);
@@ -1167,7 +1170,7 @@ for (const hintId of [21, 30]) {
       f.failReads(true);
     });
     await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
-    await assert.rejects(f.publish(), /unconfirmed topic/);
+    await assert.rejects(f.publish(), hintId === 21 ? /unconfirmed topic/ : /this conversation may have moved/);
     assert.equal(f.sent.length, 0);
     assert.equal(f.cachedPlacement(hintId).placementUnknown, true);
   });
@@ -1182,8 +1185,8 @@ for (const destination of ['rename', 'third'] as const) {
     await until(() => f.server.delivery.watermark(GENERAL) === 30, 'co-moved hint');
     await f.callMove({ message_id: 21, stream_id: 8, propagate_mode: 'change_all' });
     await f.callMove({ message_id: 21, topic: 'final', ...(destination === 'third' ? { stream_id: 9 } : {}), propagate_mode: 'change_all' });
-    const refusal = destination === 'third' ? /zulip:new-stream.*unconfirmed topic/ : /zulip:archive.*unconfirmed topic/;
-    await assert.rejects(f.publish(), refusal);
+    // N1: the first move left this non-exact reference's placement unknown.
+    await assert.rejects(f.publish(), /this conversation may have moved/);
     assert.equal(f.hasReference(ARCHIVE), false);
     assert.equal(f.hasReference('zulip:new-stream'), false);
     assert.equal(f.sent.length, 0);
@@ -1256,7 +1259,7 @@ for (const loss of ['cap', 'ttl', 'mode'] as const) {
     const before = f.reconciled.length;
     f.feed({ ...echoes[0], ...(loss === 'mode' ? { propagate_mode: 'change_one' } : {}) });
     await until(() => f.reconciled.length > before, 'unmatched old echo');
-    await assert.rejects(f.publish(), /zulip:new-stream.*unconfirmed topic/);
+    await assert.rejects(f.publish(), /this conversation may have moved/);
     assert.equal(f.hasReference(ARCHIVE), false);
     assert.equal(f.hasReference('zulip:new-stream'), false);
     assert.equal(f.sent.length, 0);
@@ -1377,7 +1380,7 @@ test('R3-fix3 early unknown-stream co-move stays unconfirmed after anchor discov
   await f.callMove({ message_id: 21, stream_id: 9, topic: 'first', propagate_mode: 'change_all' });
   assert.equal(f.cachedPlacement(30).placementUnknown, true);
   assert.deepEqual([f.cachedPlacement(21).channelId, f.cachedPlacement(21).topic], ['zulip:new-stream', 'first'], 'anchor result still confirms');
-  await assert.rejects(f.publish(), /unconfirmed topic.*list_streams.*get_stream_topics/);
+  await assert.rejects(f.publish(), /this conversation may have moved/);
   assert.equal(f.sent.length, 0);
   f.feed({ type: 'message', flags: ['mentioned'], message: raw(31, 'next') });
   await until(() => f.server.delivery.watermark(GENERAL) === 31, 'real message clears refusal');
@@ -1414,7 +1417,7 @@ test('R3-fix4 older unknown-stream completion cannot certify an interleaved spli
     assert.deepEqual([f.placements.get(20).display_recipient, f.placements.get(20).subject], ['new-stream', 'first']);
   } finally { release(); await first; }
   assert.equal(f.cachedPlacement(30).placementUnknown, true, 'completion cannot certify historical co-placement');
-  await assert.rejects(f.publish(), /unconfirmed topic.*list_streams.*get_stream_topics/);
+  await assert.rejects(f.publish(), /this conversation may have moved/);
   await f.publish('zulip:new-stream');
   assert.ok(!f.sent.some(s => s.to === 'new-stream' && s.topic === 'first'), 'never send to emptied historical co-placement');
 });
