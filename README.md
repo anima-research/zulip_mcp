@@ -166,6 +166,7 @@ are likely to touch:
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
+| `ZULIP_ACTIVE_TOPICS` | 6 | Recent topics in live incoming stream events; `0` disables, maximum 50. Cached for 60s; cold events never wait for the API. |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
@@ -673,6 +674,50 @@ ambiguously to a regex. The backscroll returned on `channels/open` is not
 prefixed: the host hands it to the agent as the `channel_open` tool result,
 JSON that already shows each message's author and topic. The legacy
 `get_channel_history` / `get_unread_messages` formats are unchanged.
+
+**Active topics in stream events.** Live `channels/incoming` messages carry
+`metadata.activeTopics`; closed-channel `push/event` carries the same list in
+`origin.activeTopics`. Every warm stream event carries this metadata. Each
+entry has `name` and `current` (boolean); `lastMessageTime` (ISO UTC) is optional,
+only present when cheaply known from live events. A short text block follows
+the message body, before any attachment note, for hosts that read only content:
+
+```text
+[active topics] *"deploys" (0s); "planning"; "support"
+```
+
+`*` marks the current topic. Ages are approximate at delivery and omitted when
+unknown. Names are folded onto one line, JSON-quoted (quotes and backslashes
+escaped), and clipped to 60 Unicode code points including an ellipsis; metadata
+retains the full folded names. The text is emitted at most once per stream per
+TTL window, unless the ordered name list changed since last shown. Timestamp
+or current-marker changes alone do not repeat it; metadata stays up to date.
+These are hints, not reply-routing instructions: publishing still uses the
+conversation topic. DMs are unchanged. `ZULIP_ACTIVE_TOPICS=0` restores the
+original event bytes; `ZULIP_ATTRIBUTE_DELIVERY=false` controls attribution only,
+not this hint. For six short ASCII names with one known timestamp, a
+representative hint adds 401 UTF-8 JSON bytes when text is shown (127 for the
+text block, 274 for metadata), or 274 on unchanged events. Cost varies with
+names and known timestamps. Cold-cache and disabled events add zero bytes.
+
+Topics are ranked by latest message id using the same API as `get_stream_topics`.
+Each refresh costs **one topics GET**, with **no message GETs** for timestamps:
+message ids suffice for ordering, so ages never justify extra API traffic.
+A cold cache delivers without a hint and warms asynchronously; an expired cache
+serves its old list while refreshing. `ZULIP_ACTIVE_TOPICS_TTL_MS` controls both
+refresh and text-repeat windows (default 60000; nonpositive values use the
+default). Live stream events, including the bot's own messages, immediately
+update cached topics. Refreshes snapshot known times at start and merge only
+live events arriving during the fetch, not earlier names absent from its result.
+Move, rename/resolve and delete events invalidate affected streams and pending
+snapshots; a missing source stream id conservatively invalidates all lists.
+API failures are silent, with retries after the TTL. Rate-limit responses and
+thrown HTTP 429 errors establish a **shared cooldown across streams**, honoring
+`retry_after` in seconds (TTL fallback for 429 without it). No refresh starts
+during cooldown. Memory is bounded by 128 LRU streams and 50 topics per list;
+at most four API requests are in flight for this feature. A stuck API may occupy
+those slots but never holds up an event. Hints are not added to historical
+backscroll, catch-up blocks, reactions or edits.
 
 **Hosts that render provenance themselves.** A prefixed message is stamped
 `attributed: true` with `attributionHeader` (the exact prefix added) in its

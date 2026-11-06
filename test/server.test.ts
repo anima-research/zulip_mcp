@@ -3588,3 +3588,30 @@ for (const kind of ['edit', 'move', 'delete'] as const) {
   });
 }
 
+
+
+test('active topic metadata and text survive channels/incoming and push/event wire delivery', async () => {
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const activeTopics = [{ name: 'deploys', lastMessageTime: '2023-11-14T22:13:50.000Z', current: true }];
+    const hint = { type: 'text' as const, text: '[active topics] *"deploys" (0s)' };
+    const event = (id: number) => streamMsg(id, {
+      mentioned: true,
+      metadata: { topic: 'deploys', mentioned: true, isDM: false, activeTopics },
+      content: [{ type: 'text', text: 'hello' }, hint],
+    });
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(event(30));
+    await until(() => h.incoming.length === 1, 'hint on incoming');
+    assert.deepEqual((h.incoming[0].metadata as any).activeTopics, activeTopics);
+    assert.deepEqual(h.incoming[0].content[1], hint);
+    assert.match((h.incoming[0].content[0] as any).text, /\[#general > deploys\]/);
+    await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    h.adapter.emit!(event(31));
+    await until(() => h.pushed.length === 1, 'hint on push');
+    assert.deepEqual((h.pushed[0].origin as any).activeTopics, activeTopics);
+    assert.deepEqual(h.pushed[0].payload.content[1], hint);
+  } finally { await h.close(); }
+});

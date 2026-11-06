@@ -1154,6 +1154,7 @@ export class ZulipMcplServer {
           ? message.channelId.slice('zulip:'.length)
           : undefined,
         topic: meta.topic,
+        ...(Array.isArray(meta.activeTopics) ? { activeTopics: meta.activeTopics } : {}),
         authorId: message.author.id,
         authorName: message.author.name,
         isMention: meta.mentioned === true || meta.replyToSelf === true,

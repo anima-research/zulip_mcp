@@ -16,6 +16,7 @@
  *                                                 (default ~/.zulip_mcp_state)
  *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
  *                                                 catch-up sweep and gap recovery (3000)
+ *   ZULIP_ACTIVE_TOPICS                        - recent topics in stream events (6; 0 disables, max 50)
  *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
  *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
  *   ZULIP_FILTERS_FILE                          - the filters plane file (default
@@ -47,6 +48,7 @@ import { isMainModule } from './content.js';
 import { fetchCapped, resolveInlineOptions } from './attachments.js';
 import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
+import { DEFAULT_ACTIVE_TOPICS, DEFAULT_ACTIVE_TOPICS_TTL_MS } from './active-topics.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
@@ -116,6 +118,8 @@ async function main(): Promise<void> {
     formatTime,
     uploader,
     uploadPolicy,
+    activeTopics: intEnv('ZULIP_ACTIVE_TOPICS', DEFAULT_ACTIVE_TOPICS),
+    activeTopicsTtlMs: intEnv('ZULIP_ACTIVE_TOPICS_TTL_MS', DEFAULT_ACTIVE_TOPICS_TTL_MS),
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,

@@ -37,6 +37,7 @@ import type {
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
+import { ActiveTopicsCache } from '../active-topics.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
 import {
@@ -181,6 +182,10 @@ export interface FilterView {
 const ALLOW_ALL: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
 
 export interface ZulipAdapterOptions {
+  /** Active topics per incoming stream event; 0 disables (default 6, max 50). */
+  activeTopics?: number;
+  /** Refresh and text-repeat window in milliseconds (default 60000). */
+  activeTopicsTtlMs?: number;
   /** Backscroll cap advertised per channel and enforced on channels/open. */
   backscrollDefault?: number;
   /** Per-stream overrides of the backscroll cap. */
@@ -208,6 +213,7 @@ export class ZulipAdapter implements PlatformAdapter {
   onSelfChanged?: OnMessageChange;
 
   private eventLoop: ZulipEventLoop | null = null;
+  private readonly activeTopics: ActiveTopicsCache;
   private readonly identity: ZulipIdentity;
   private readonly backscrollDefault: number;
   private readonly backscrollLimits: ReadonlyMap<string, number>;
@@ -262,6 +268,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.identity = { selfUserId, sessionId };
     this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
     this.backscrollLimits = options.backscrollLimits ?? new Map();
+    this.activeTopics = new ActiveTopicsCache(zulipClient, options.activeTopics, Date.now, options.activeTopicsTtlMs);
     this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
     this.maxMessageLength = options.maxMessageLength;
@@ -1117,20 +1124,25 @@ export class ZulipAdapter implements PlatformAdapter {
     // reaction lookups stay parallel and cannot delay later changes.
     // Every placement lookup is bounded by LOCATE_TIMEOUT_MS.
     let changeChain: Promise<void> = Promise.resolve();
-    const changeHandler = onMessageChange || this.onSelfChanged
-      ? (change: ZulipMessageChange) => {
-          changeChain = changeChain
-            .then(() => {
-              if (this.eventLoop !== loop) return;
-              return this.onZulipChange(change, (event) => {
-                if (this.eventLoop === loop) onMessageChange?.(event);
-              });
-            })
-            .catch((err) => {
-              console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
-            });
-        }
-      : undefined;
+    const changeHandler = (change: ZulipMessageChange) => {
+      // Invalidate synchronously, even without an edits subscriber. A pending
+      // placement lookup must not leave old topic names on incoming events.
+      if (change.kind === 'delete' ? change.messageType === 'stream' : change.topic !== null || change.newStreamId !== null) {
+        this.activeTopics.invalidate(change.streamId);
+        if (change.kind === 'edit' && change.newStreamId !== null) this.activeTopics.invalidate(change.newStreamId);
+      }
+      if (!onMessageChange && !this.onSelfChanged) return;
+      changeChain = changeChain
+        .then(() => {
+          if (this.eventLoop !== loop) return;
+          return this.onZulipChange(change, (event) => {
+            if (this.eventLoop === loop) onMessageChange?.(event);
+          });
+        })
+        .catch((err) => {
+          console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
+        });
+    };
     const reactionHandler = onReaction
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
           // The bot's own reactions are its own doing; only others' are news.
@@ -1163,6 +1175,9 @@ export class ZulipAdapter implements PlatformAdapter {
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
       this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
+      if (!m.isDm && typeof msg.stream_id === 'number' && m.streamName !== null && this.filters.streamAllowed(m.streamName)) {
+        this.activeTopics.observe(msg.stream_id, m.topic, m.id, m.timestamp.toISOString());
+      }
       if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       if (m.isDm) {
         if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail })) {
@@ -1190,7 +1205,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // Remembered so a later reaction or edit on this stream can be placed.
       if (m.streamName !== null && streamId !== undefined) this.streamNamesById.set(streamId, m.streamName);
       const descriptor = m.streamName !== null ? this.streamDescriptor(m.streamName, streamId) : undefined;
-      onMessage(toIncoming(channelId, m, this.identity), descriptor);
+      onMessage(this.activeTopics.decorate(toIncoming(channelId, m, this.identity), streamId), descriptor);
     }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
