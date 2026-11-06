@@ -329,6 +329,9 @@ render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
   or inaccessible id cannot be used with `reply_to`: use a newer readable
   message's id, or choose an explicit destination. Explicit sends bypass
   refusal for that reply but do not clear it.
+- Reply routing and refusals live in memory; they do not survive a reconnect
+  or restart. Routing re-seeds from the next incoming message or history on
+  channel open, or falls back to topic `mcpl` when neither supplies a topic.
 
 ## Channels
 
