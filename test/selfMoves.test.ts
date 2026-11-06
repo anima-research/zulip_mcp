@@ -2065,7 +2065,7 @@ test('deletion of followed message refuses only when cached topic is empty', asy
       assert.equal(f.sent.at(-1).topic, 'deploys');
     } else {
       await assert.rejects(f.publish(), (e: any) => {
-        assert.match(e.message, /Nothing was posted.*the messages this conversation followed were deleted or moved where this bot can't see them/);
+        assert.match(e.message, /Nothing was posted.*the message this conversation followed was deleted or moved where this bot can't see it/);
         assert.equal(e.data.messageId, 30);
         assert.equal(e.data.stream, null);
         assert.doesNotMatch(e.message, /alternatively|topic:|destination hint/);

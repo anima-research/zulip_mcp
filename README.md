@@ -274,8 +274,8 @@ quote addressing (previous verdicts are absent when only the post-change
 state could be read). A change line never sets `threadId`. A deletion leaves reply routing
 unchanged unless it removes the conversation's source message and no cached
 message remains in that stream and topic. Then channel-only replies refuse:
-"the messages this conversation followed were deleted or moved where this bot
-can't see them". A visible third-party move of a conversation's source message
+"the message this conversation followed was deleted or moved where this bot
+can't see it, so it can't be replied to". A visible third-party move of a conversation's source message
 refuses channel-only replies, with the event's stream/topic as its destination
 hint; it does not silently retarget the reply. The bot's own moves emit no change
 marker. For host integrations:
@@ -289,16 +289,20 @@ marker. For host integrations:
    fallback; use their own `messageId` with `reply_to`. Only an exact anchor
    may seed a destination channel's conversation slot, never a co-moved hint.
 2. Refusals say **Nothing was posted** and include `messageId` and a bare
-   `stream`. If a later channel publish is refused, nothing was posted: reply with
+   `stream`. For a move refusal, use
    `send_message({reply_to: <messageId>, content})` to resolve the message's current
-   placement. Alternatively use an explicit bare stream and topic only when
-   known (check `list_streams` / `get_stream_topics` if unknown).
+   placement. A deletion/hidden-move refusal means that message cannot be replied
+   to: to answer a newer message use `send_message({reply_to: <its id>, content})`;
+   otherwise choose an explicit destination. Use an explicit bare stream and
+   topic only when known (check `list_streams` / `get_stream_topics` if unknown).
    Never use a stream fallback for a DM; use its private recipient.
    Same-stream and cross-stream tool results include
    `moved_to: {channelId, stream, topic}`; unknown fields are null.
 3. On an open channel, a new message (but not this bot's own messages)
    **above the refusal's message-id floor** clears refusal and routes replies
-   to that message's topic, except in the stream/topic the conversation left.
+   to that message's topic. In the stream/topic the conversation left, only
+   bot senders (identified by `looksLikeBotEmail`) are ignored: a person's new
+   message there, including a delete-and-repost, clears refusal.
    A Notification Bot notice in the old topic does not clear refusal; a new
    destination breadcrumb can. On a closed channel, only such a message accepted
    as a push does so. Existing/moved copies, this bot's own messages, echoes,
@@ -314,6 +318,16 @@ Synthetic ids (`edit:77:…`) never advance the delivery watermark; the message'
 takes (a deleted id can no longer be fetched). History and backscroll
 render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
 `movedAt`.
+
+### Known limitations of move reconciliation
+
+- Deletions and moves out of visibility are indistinguishable. Refusal depends
+  on the followed message disappearing with the last cached message in its
+  topic, not proof that the whole topic was deleted. A newer human message in
+  that same topic clears refusal; an old-topic bot notice does not. A deleted
+  or inaccessible id cannot be used with `reply_to`: use a newer readable
+  message's id, or choose an explicit destination. Explicit sends bypass
+  refusal for that reply but do not clear it.
 
 ## Channels
 

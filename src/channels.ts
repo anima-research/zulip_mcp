@@ -24,6 +24,7 @@ import type {
 } from '@animalabs/mcpl-core';
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
+import { looksLikeBotEmail } from './history.js';
 import type { MessageChangeEvent, MoveEcho, PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
@@ -525,7 +526,8 @@ export class ChannelManager {
         (meta?.backscroll === true || meta?.recovered === true)) return false;
     if (reference?.movedTo && (!Number.isFinite(id) || id <= (reference.refusalAfter ?? reference.from ?? 0) ||
         String(message.author?.id) === String(this.adapters.get(channelId.split(':')[0])?.selfUserId) ||
-        (reference.leftTopic?.channelId === channelId &&
+        (looksLikeBotEmail(typeof meta?.senderEmail === 'string' ? meta.senderEmail : '') &&
+          reference.leftTopic?.channelId === channelId &&
           reference.leftTopic.topic.toLowerCase() === message.threadId?.toLowerCase()))) {
       reference.epoch = ++this.routingEpoch;
       reference.lastEcho = undefined;
@@ -734,7 +736,7 @@ export class ChannelManager {
       const data = { channelId, messageId, stream, movedTo };
       if (reference.deletedOrHidden) {
         throw new McplRpcError(-32602,
-          `Nothing was posted: the messages this conversation followed were deleted or moved where this bot can't see them; reply with ${recovery}.`, data);
+          `Nothing was posted: the message this conversation followed was deleted or moved where this bot can't see it, so it can't be replied to. To answer a newer message use send_message({reply_to: <its id>, content}); otherwise choose an explicit destination.`, data);
       }
       if (!isDM && movedTo.channelId === null && movedTo.streamId === undefined && topic == null) {
         throw new McplRpcError(-32602,
