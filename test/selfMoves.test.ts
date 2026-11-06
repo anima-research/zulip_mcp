@@ -51,6 +51,7 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false, 
   const sent: any[] = [];
   const typing: any[] = [];
   const placements = new Map<number, any>();
+  const deletedIds = new Set<number>();
   let patchHook: ((event: any) => Promise<void>) | undefined;
   const api = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -97,10 +98,16 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false, 
       getById: async ({ message_id }: any) => {
         placementReads.push(message_id);
         if (placementReader) return placementReader(message_id);
+        if (deletedIds.has(message_id)) return { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
         if (failReads) return { result: 'error', msg: 'Placement unavailable' };
         const message = placements.get(message_id) ?? raw(message_id);
         if (invisibleDestination && message.stream_id !== 7) return { result: 'error', msg: 'Not visible' };
         return { result: 'success', message };
+      },
+      deleteById: async ({ message_id }: any) => {
+        deletedIds.add(message_id);
+        placements.delete(message_id);
+        return { result: 'success' };
       },
       send: async (args: any) => { sent.push(args); return { result: 'success', id: 1000 + sent.length }; },
     },
@@ -160,6 +167,8 @@ async function fixture(policy: ZulipFilters = {}, invisibleDestination = false, 
     host, server, tools, sent, typing, incoming, pushes, reconciled, placements,
     outstandingMoves() { assert.equal('selfMoves' in adapter, false); return 0; },
     hasReference(channelId: string) { return (server as any).channelManager.lastIncoming.has(channelId); },
+    routingReference(channelId = GENERAL) { return (server as any).channelManager.lastIncoming.get(channelId); },
+    markDeleted(id: number) { deletedIds.add(id); placements.delete(id); },
     cachedPlacement(id: number) { return (adapter as any).seen.get(id); },
     forgetPlacement(id: number) { (adapter as any).seen.delete(id); },
     registrations() { return registrations; },
@@ -2173,3 +2182,192 @@ test('unknown previous topic is wildcard for otherwise matching own anchor echo'
   await f.publish();
   assert.equal(f.sent.at(-1).topic, 'first');
 });
+
+for (const opened of [true, false]) {
+  test(`R6-1 delete and repost in a fresh topic resumes replies (${opened ? 'open' : 'closed'})`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    if (opened) await f.open();
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'help') });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'original question');
+    f.markDeleted(30);
+    f.feed({ type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 7, topic: 'help' });
+    await until(() => f.routingReference()?.deletedOrHidden, 'deletion refusal');
+    await assert.rejects(f.publish(), /deleted or moved where/);
+    for (const id of [31, 32]) {
+      f.feed({ type: 'message', flags: ['mentioned'], message: raw(id, 'help') });
+      await until(() => f.server.delivery.watermark(GENERAL) === id, 'reposted question');
+      await f.publish();
+      assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['general', 'help']);
+      assert.equal(f.routingReference().from, id);
+    }
+  });
+}
+
+test('R6-1 deletion refusal directs reply_to to a newer id, never the gone id', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'help') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'question');
+  f.markDeleted(30);
+  f.feed({ type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 7, topic: 'help' });
+  await until(() => f.routingReference()?.deletedOrHidden, 'deletion refusal');
+  // The replacement exists on Zulip, but has not reached this event queue.
+  f.placements.set(31, raw(31, 'help'));
+  const gone = await f.host.sendRequest('tools/call', { name: 'send_message', arguments: { reply_to: 30, content: 'Done' } }) as any;
+  assert.equal(gone.isError, true);
+  assert.match(gone.content[0].text, /Zulip refused reply_to 30 \(BAD_REQUEST\): Invalid message\(s\)/);
+  await assert.rejects(f.publish(), (e: any) => {
+    assert.equal(e.message, "RPC error -32602: Nothing was posted: the message this conversation followed was deleted or moved where this bot can't see it, so it can't be replied to. To answer a newer message use send_message({reply_to: <its id>, content}); otherwise choose an explicit destination.");
+    assert.doesNotMatch(e.message, /reply_to: 30/);
+    return true;
+  });
+  assert.equal(f.sent.length, 0);
+  const reply = await f.host.sendRequest('tools/call', { name: 'send_message', arguments: { reply_to: 31, content: 'Done' } }) as any;
+  assert.notEqual(reply.isError, true);
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], [7, 'help']);
+  await assert.rejects(f.publish(), /deleted or moved where/, 'explicit reply bypasses, not clears, refusal');
+});
+
+test('R6-2 a person reusing a renamed topic starts a new conversation there', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'standup') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'old standup');
+  f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'standup', subject: 'standup 11-05', propagate_mode: 'change_all' }));
+  await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'rename');
+  await assert.rejects(f.publish(), /Conversation moved to zulip:general > standup 11-05/);
+  f.feed({ type: 'message', flags: ['mentioned'], message: { ...raw(31, 'standup'), sender_id: 8, sender_full_name: 'Bob', sender_email: 'bob@example.com' } });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'new standup');
+  await f.publish();
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['general', 'standup']);
+});
+
+for (const path of ['tool', 'third-party']) for (const sender of ['human', 'bot']) {
+  test(`R6-2 case-only ${path} rename records no departure and follows later ${sender} traffic`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'question');
+    if (path === 'tool') {
+      await f.callMove({ message_id: 21, topic: 'Deploys', propagate_mode: 'change_all' });
+      await assert.rejects(f.publish(), /unconfirmed topic/);
+    } else {
+      f.feed(move([30], { message_id: 30, user_id: 7, subject: 'Deploys', propagate_mode: 'change_all' }));
+      await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'case-only rename');
+      await assert.rejects(f.publish(), /Conversation moved to zulip:general > Deploys/);
+    }
+    assert.equal(f.routingReference().leftTopic, undefined);
+    f.feed({ type: 'message', flags: [], message: { ...raw(31, 'Deploys'), flags: [],
+      ...(sender === 'bot' ? { sender_id: 100, sender_email: 'notification-bot@example.com' } : {}) } });
+    await until(() => f.server.delivery.watermark(GENERAL) === 31, 'later message');
+    await f.publish();
+    assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['general', 'Deploys']);
+  });
+}
+
+test('R6-2 uncertain move back A to B to A replaces the older departed topic', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.placements.set(21, raw(21, 'A'));
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'A') });
+  f.placements.set(30, raw(30, 'A'));
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
+  await f.callMove({ message_id: 21, topic: 'B', propagate_mode: 'change_all' });
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
+  await assert.rejects(f.publish(), /unconfirmed topic/);
+  await f.callMove({ message_id: 21, topic: 'A', propagate_mode: 'change_all' });
+  assert.equal(f.routingReference().leftTopic, undefined, 'unknown placement cannot carry an older departure forward');
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(31, 'A') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'back in A');
+  await f.publish();
+  assert.equal(f.sent.at(-1).topic, 'A');
+});
+
+test('N1 a reference arriving during PATCH gets no non-exact destination hint', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'initial reference');
+  f.onPatch(async () => {
+    f.feed({ type: 'message', flags: ['mentioned'], message: raw(31) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 31, 'reference arriving after PATCH applied');
+  });
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  await assert.rejects(f.publish(), (e: any) => {
+    assert.match(e.message, /this conversation may have moved; reply with send_message\(\{reply_to: 31, content\}\)/);
+    assert.doesNotMatch(e.message, /likely|alternatively|topic:/);
+    assert.deepEqual(e.data.movedTo, { channelId: null, topic: null });
+    return true;
+  });
+});
+
+test('N1 already-unknown placement cannot use its original hints as source proof', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'reference');
+  await f.callMove({ message_id: 21, topic: 'first', propagate_mode: 'change_all' });
+  await assert.rejects(f.publish(), /likely first/);
+  // Another anchor is in the original topic; 30's placement is already unknown.
+  f.placements.set(21, raw(21));
+  await f.callMove({ message_id: 21, topic: 'second', propagate_mode: 'change_all' });
+  await assert.rejects(f.publish(), (e: any) => {
+    assert.match(e.message, /this conversation may have moved/);
+    assert.doesNotMatch(e.message, /likely|alternatively|topic:/);
+    assert.deepEqual(e.data.movedTo, { channelId: null, topic: null });
+    return true;
+  });
+});
+
+test('N2 deletion at destination revokes cross-channel references to that conversation', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  await f.open(ARCHIVE);
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30) });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'source');
+  await f.callMove({ message_id: 30, stream_id: 8 });
+  await assert.rejects(f.publish(), /Conversation moved to zulip:archive > deploys/);
+  f.markDeleted(30);
+  f.feed({ type: 'delete_message', message_ids: [30], message_type: 'stream', stream_id: 8, topic: 'deploys' });
+  await until(() => f.incoming.some(m => m.channelId === ARCHIVE && m.metadata?.change === 'delete'), 'destination deletion');
+  for (const channel of [GENERAL, ARCHIVE]) {
+    await assert.rejects(f.publish(channel), (e: any) => {
+      assert.match(e.message, /deleted or moved where/);
+      assert.doesNotMatch(e.message, /reply_to: 30|alternatively|topic:/);
+      assert.equal(e.data.stream, null);
+      assert.deepEqual(e.data.movedTo, { channelId: null, topic: null });
+      return true;
+    });
+  }
+  assert.equal(f.sent.length, 0);
+});
+
+for (const bulk of [false, true]) {
+  test(`N2 own deletion removes cached ids without surfacing its echo (bulk=${bulk})`, async t => {
+    const f = await fixture();
+    t.after(() => f.close());
+    await f.open();
+    f.feed({ type: 'message', flags: [], message: { ...raw(20), sender_id: SELF, flags: [] } },
+      { type: 'message', flags: ['mentioned'], message: raw(30) });
+    await until(() => f.server.delivery.watermark(GENERAL) === 30, 'question and cached own reply');
+    assert.ok(f.cachedPlacement(20));
+    const result = await f.host.sendRequest('tools/call', { name: 'delete_message', arguments: { message_id: 20 } }) as any;
+    assert.notEqual(result.isError, true);
+    if (!bulk) f.feed({ type: 'delete_message', message_ids: [20], message_type: 'stream', stream_id: 7, topic: 'deploys' });
+    f.feed({ type: 'delete_message', message_ids: bulk ? [20, 30] : [30], message_type: 'stream', stream_id: 7, topic: 'deploys' });
+    await until(() => f.incoming.some(m => m.metadata?.change === 'delete'), 'human deletion after self echo');
+    assert.equal(f.cachedPlacement(20), undefined, 'self-deleted id must not keep the topic nonempty');
+    const changes = f.incoming.filter(m => m.metadata?.change === 'delete');
+    assert.equal(changes.length, 1, 'own delete remains silent as on main');
+    assert.deepEqual(changes[0].metadata?.targetMessageIds, ['30']);
+    await assert.rejects(f.publish(), /deleted or moved where/);
+  });
+}
