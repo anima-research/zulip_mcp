@@ -586,12 +586,14 @@ export class ChannelManager {
   reconcileSelfChange(change: MessageChangeEvent): void {
     if (change.kind === 'delete') {
       if (change.isDM || !change.topicEmpty) return;
-      const reference = this.lastIncoming.get(change.channelId);
-      if (reference?.from !== undefined && change.messageIds.includes(String(reference.from))) {
-        this.lastIncoming.set(change.channelId, { ...reference, epoch: ++this.routingEpoch,
+      // A source channel can still follow this id after it moved elsewhere.
+      for (const [channelId, reference] of this.lastIncoming) {
+        if (channelId.split(':')[0] !== change.channelId.split(':')[0] || reference.from === undefined ||
+            !change.messageIds.includes(String(reference.from))) continue;
+        this.lastIncoming.set(channelId, { ...reference, epoch: ++this.routingEpoch,
           expectedEcho: undefined, lastEcho: undefined, deletedOrHidden: true,
           leftTopic: { channelId: change.channelId, topic: change.topic },
-          refusalAfter: this.refusalFloor(change.channelId, ...change.messageIds.map(Number)),
+          refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
           movedTo: { channelId: null, topic: null } });
       }
       return;

@@ -272,7 +272,8 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `previouslyMentioned`, plus `replyToSelf` and `previouslyReplyToSelf` for
 quote addressing (previous verdicts are absent when only the post-change
 state could be read). A change line never sets `threadId`. A deletion leaves reply routing
-unchanged unless it removes the conversation's source message and no cached
+unchanged unless it removes the conversation's source message (including a
+reference in another stream after a move) and no cached
 message remains in that stream and topic. Then channel-only replies refuse:
 "the message this conversation followed was deleted or moved where this bot
 can't see it, so it can't be replied to". A visible third-party move of a conversation's source message

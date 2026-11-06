@@ -705,9 +705,11 @@ export class ZulipAdapter implements PlatformAdapter {
       return;
     }
 
-    // The bot's own deletions (rollback, the delete tool) echo back without
-    // an actor: drop what this adapter deleted itself.
-    const ids = change.messageIds.filter((id) => !this.wasSelfDeleted(id));
+    // Own deletions remain silent, but must leave the placement cache before
+    // the self-filter: otherwise a later deletion sees a phantom topic-mate.
+    const selfDeleted = new Set(change.messageIds.filter((id) => this.wasSelfDeleted(id)));
+    for (const id of selfDeleted) { this.seen.delete(id); this.movedAway.delete(id); }
+    const ids = change.messageIds.filter((id) => !selfDeleted.has(id));
     if (ids.length === 0) return;
     // A bulk deletion is reported under an id the cache can vouch for, so the
     // line never shows one message's id with another's author and quote.

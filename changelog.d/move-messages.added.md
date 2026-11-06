@@ -9,7 +9,9 @@
   Unknown-source conversations get only their own reply_to recovery, no fallback.
 - A deletion of the followed message refuses replies if no cached message
   remains in that stream/topic: the messages were deleted or moved where this
-  bot can't see them. Other deletions leave routing unchanged. Visible third-party
+  bot can't see them. This also revokes references in other streams that follow
+  those deleted ids. Own-deletion echoes remain silent but evict cached ids.
+  Other deletions leave routing unchanged. Visible third-party
   moves refuse replies following affected IDs, with the event's destination hint.
   Moves out of visibility arrive as ordinary deletions, not a distinct notice.
 - Refusals say Nothing was posted and include messageId and a bare stream.
