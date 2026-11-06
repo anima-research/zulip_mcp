@@ -600,6 +600,10 @@ export class ChannelManager {
         change.newStreamId == null && !change.routingUncertain && !change.moveScope) return;
     const scope = change.moveScope;
     const destination = change.movedToChannelId ?? (change.newStreamId == null && change.channelId !== 'zulip:unknown' ? change.channelId : null);
+    // A trivial/case-only rename leaves the conversation in the same place.
+    const departure = (topic: string | null | undefined, destination: string | null, newTopic: string | null) =>
+      topic != null && !(destination === change.channelId && topic.toLowerCase() === newTopic?.toLowerCase())
+        ? { channelId: change.channelId, topic } : undefined;
     for (const [channelId, reference] of [...this.lastIncoming]) {
       if (reference.from === undefined || channelId.split(':')[0] !== change.channelId.split(':')[0]) continue;
       if (!scope) {
@@ -612,8 +616,8 @@ export class ChannelManager {
         }
         this.lastIncoming.set(channelId, { ...reference, epoch: ++this.routingEpoch,
           expectedEcho: undefined,
-          leftTopic: change.selfEcho && reference.leftTopic ? reference.leftTopic
-            : { channelId: change.channelId, topic: change.previousTopic ?? reference.hints.threadId ?? '' },
+          leftTopic: departure(change.previousTopic ?? reference.hints.threadId,
+            change.selfEcho?.destinationChannelId ?? destination, change.selfEcho?.topic ?? change.topic),
           lastEcho: change.selfEcho ? { beforeEpoch: reference.epoch, shape: change.selfEcho } : undefined,
           refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
           movedTo: (change.selfEcho ? reference.movedTo : undefined) ?? {
@@ -653,8 +657,7 @@ export class ChannelManager {
       const hasDestinationHint = exact || knownSource;
       if (uncertain || destination !== channelId) {
         this.lastIncoming.set(channelId, { ...source,
-          leftTopic: scope.topic !== null && hasDestinationHint
-            ? { channelId: change.channelId, topic: scope.topic } : reference.leftTopic,
+          leftTopic: hasDestinationHint ? departure(scope.topic, destination, change.topic) : undefined,
           movedTo: {
             channelId: hasDestinationHint ? destination : null,
             topic: hasDestinationHint && !uncertain ? change.topic : null,
