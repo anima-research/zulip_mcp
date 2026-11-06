@@ -53,7 +53,7 @@ import {
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { ContextProvider } from './context.js';
-import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
@@ -84,7 +84,7 @@ const ANNOUNCE_TIMEOUT_MS = 5_000;
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const FALLBACK_MCP_PROTOCOL_VERSION = '2024-11-05';
 
-/** Messages kept around each mention in a catch-up block for a closed channel. */
+/** Messages kept around each addressed message in a catch-up block for a closed channel. */
 const MISSED_VICINITY = 7;
 /** Hard ceiling on what one channel's catch-up fetches. */
 const CATCHUP_HARD_CAP = 10_000;
@@ -148,6 +148,12 @@ export class ZulipMcplServer {
   private live = false;
   private preLive: { message: IncomingChannelMessage; newChannel?: ChannelDescriptor }[] = [];
   private preLiveDropped = 0;
+  /** Live-verified replies not yet accepted: history can fail closed under a
+   *  tighter/shared lookup budget without erasing the verdict held for retry.
+   *  Oldest-first eviction, capped per channel like the pre-live buffer. */
+  private pendingReplies = new Map<string, Set<number>>();
+  /** Commit scan-only advancement after buffered live verdicts are reconciled. */
+  private preLiveScanned = new Map<string, number>();
   /** Watermarks as they stood when the connection began: what the sweep
    *  catches up from, whatever moves them meanwhile (a channel_open with
    *  backscroll in the first seconds must not hide the offline gap). */
@@ -225,7 +231,10 @@ export class ZulipMcplServer {
       excludeChannel: (channelId) => this.isMuted(channelId) || !this.isAllowed(channelId),
     });
     // Sends made through the tool surface are part of the rollback record.
-    this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    this.tools.onSent = (sent) => {
+      this.channelManager.observeMessageId(Number(sent.messageId));
+      this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    };
     // A stream `listen` just subscribed the bot to is registered at once, so
     // the host can open it without waiting for a message or a refresh (#20).
     // Only those streams: a realm enumeration here would cost a full stream
@@ -235,6 +244,10 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.tools.onMessageObserved = (id) => this.channelManager.observeMessageId(id);
+    this.tools.onMoveStarted = (id) => this.channelManager.captureMoveEpochs(id);
+    this.tools.onMoved = (move) => this.adapter.noteSelfMoved?.(move);
+    this.adapter.onSelfChanged = (change) => this.channelManager.reconcileSelfChange(change);
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -277,12 +290,15 @@ export class ZulipMcplServer {
    * peer's grant, registration or sweep carries over.
    */
   private beginConnection(): void {
+    this.commitScannedCatchUp();
     this.grant.reset();
     this.channelManager.reset();
     this.live = false;
     this.sweepDone = false;
     this.preLive = [];
     this.preLiveDropped = 0;
+    this.pendingReplies.clear();
+    this.preLiveScanned.clear();
     this.sweepAnchors = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
   }
 
@@ -373,14 +389,16 @@ export class ZulipMcplServer {
       console.error('[zulip-mcp] final flush failed:', (error as Error).message ?? error);
     }
     this.channelManager.destroy();
+    this.commitScannedCatchUp();
     this.delivery.save();
   }
 
   /**
    * Release the pre-live buffer through the normal routing, then open live
    * delivery. Held messages the sweep already covered — id at or below the
-   * channel's watermark as it stood when the sweep finished — are skipped;
-   * that boundary is taken once, before draining, because draining itself
+   * channel's accepted/scanned boundary when the sweep finished — are skipped
+   * unless their buffered reply verdict still awaits acceptance;
+   * the boundary is taken once, before draining, because draining itself
    * moves watermarks. Delivery stays gated until the buffer is empty, so a
    * live message arriving mid-drain (while a held one waits on an
    * attachment fetch) joins the queue behind the held ones instead of
@@ -389,26 +407,63 @@ export class ZulipMcplServer {
   private async goLive(): Promise<void> {
     if (this.live) return;
     const boundary = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
+    for (const [channelId, through] of this.preLiveScanned) {
+      boundary.set(channelId, Math.max(boundary.get(channelId) ?? 0, through));
+    }
     while (this.preLive.length > 0) {
-      const held = this.preLive;
-      this.preLive = [];
-      for (const { message, newChannel } of held) {
-        const watermark = boundary.get(message.channelId);
-        const id = Number(message.messageId);
-        if (watermark !== undefined && Number.isFinite(id) && id <= watermark) continue;
-        try {
-          await this.route(message, newChannel);
-        } catch (err) {
-          console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
+      const { message, newChannel } = this.preLive.shift()!;
+      const watermark = boundary.get(message.channelId);
+      const id = Number(message.messageId);
+      if (watermark !== undefined && Number.isFinite(id) && id <= watermark) {
+        const replyToSelf = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true;
+        // Only acceptance (or the original watermark) deduplicates a
+        // live-verified reply that history could not verify.
+        const pendingReply = replyToSelf && this.pendingReplies.get(message.channelId)?.has(id);
+        if (!pendingReply || id <= (this.sweepAnchors.get(message.channelId) ?? 0)) {
+          continue;
+        }
+      }
+      try {
+        await this.route(message, newChannel);
+      } catch (err) {
+        console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
+      } finally {
+        // A policy return or construction error may settle without queueing.
+        // Transfer any still-pending reply to existing replay ownership.
+        if (this.pendingReplies.get(message.channelId)?.has(id) &&
+            !this.delivery.heldIds(message.channelId).includes(id)) {
+          this.delivery.hold(message.channelId, id, 'failed');
         }
       }
     }
+    this.commitScannedCatchUp();
+    this.delivery.save();
     this.live = true;
     if (this.preLiveDropped > 0) {
       console.error(`[zulip-mcp] ${this.preLiveDropped} live message(s) exceeded the pre-live buffer; held below the watermark for replay`);
       this.preLiveDropped = 0;
     }
     void this.healUndelivered();
+  }
+
+  private commitScannedCatchUp(): void {
+    for (const [channelId, scannedThrough] of this.preLiveScanned) {
+      // Pending verdicts outlive buffer membership: routing can settle
+      // without acceptance (temporary policy disable or an early error).
+      let through = scannedThrough;
+      const held = new Set(this.delivery.heldIds(channelId));
+      for (const id of this.pendingReplies.get(channelId) ?? []) {
+        if (!held.has(id)) through = Math.min(through, id - 1);
+      }
+      // A refused buffered reply must keep its hold below the scanned range.
+      for (const id of held) {
+        if (id <= through && !this.pendingReplies.get(channelId)?.has(id)) {
+          this.delivery.release(channelId, id);
+        }
+      }
+      this.delivery.advance(channelId, through);
+    }
+    this.preLiveScanned.clear();
   }
 
   // ── Handshake ──
@@ -798,9 +853,16 @@ export class ZulipMcplServer {
     return !this.isMuted(message.channelId) && this.isAllowed(message.channelId, message);
   }
 
+  private forgetPendingReply(channelId: string, id: number): void {
+    const pending = this.pendingReplies.get(channelId);
+    pending?.delete(id);
+    if (pending?.size === 0) this.pendingReplies.delete(channelId);
+  }
+
   /** The host accepted (or was handed) a message: its hold is released and the watermark may advance. */
   private accepted(channelId: string, id: number): boolean {
     if (!Number.isFinite(id) || id <= 0) return false;
+    this.forgetPendingReply(channelId, id);
     const released = this.delivery.release(channelId, id);
     return this.delivery.advance(channelId, id) || released;
   }
@@ -818,6 +880,7 @@ export class ZulipMcplServer {
     for (const m of accepted) {
       const id = numericId(m);
       if (id === null) continue;
+      this.forgetPendingReply(channelId, id);
       moved = this.delivery.release(channelId, id) || moved;
       high = Math.max(high, id);
     }
@@ -848,8 +911,10 @@ export class ZulipMcplServer {
     for (const m of messages) {
       const id = numericId(m);
       if (id === null) continue;
-      if (this.isMuted(channelId) || !this.isAllowed(channelId, m)) moved = this.delivery.release(channelId, id) || moved;
-      else this.delivery.hold(channelId, id, 'failed');
+      if (this.isMuted(channelId) || !this.isAllowed(channelId, m)) {
+        this.forgetPendingReply(channelId, id);
+        moved = this.delivery.release(channelId, id) || moved;
+      } else this.delivery.hold(channelId, id, 'failed');
     }
     if (moved) this.delivery.save();
   }
@@ -870,6 +935,17 @@ export class ZulipMcplServer {
    * replay after go-live fetches them back. Live, it is routed at once.
    */
   private async onIncoming(message: IncomingChannelMessage, newChannel?: ChannelDescriptor): Promise<void> {
+    const id = numericId(message);
+    if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null &&
+        !this.isMuted(message.channelId) && this.isAllowed(message.channelId, message)) {
+      let pending = this.pendingReplies.get(message.channelId);
+      if (!pending) this.pendingReplies.set(message.channelId, pending = new Set());
+      if (!pending.has(id) && pending.size >= PRE_LIVE_BUFFER_CAP) {
+        const oldest = pending.values().next().value;
+        if (oldest !== undefined) pending.delete(oldest);
+      }
+      pending.add(id);
+    }
     if (!this.live) {
       if (this.preLive.length >= PRE_LIVE_BUFFER_CAP) {
         const dropped = this.preLive.shift()!;
@@ -893,7 +969,7 @@ export class ZulipMcplServer {
     const channelId = message.channelId;
     const id = Number(message.messageId);
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
-    const addressed = meta.mentioned === true || meta.isDM === true;
+    const addressed = meta.mentioned === true || meta.isDM === true || meta.replyToSelf === true;
 
     // Muted stream, or outside the allowlist: nothing reaches the agent —
     // ambient AND mentions — and nothing is tallied, before any other
@@ -979,6 +1055,7 @@ export class ZulipMcplServer {
     try {
       for (const channelId of channels) {
         if (this.isMuted(channelId) || !this.isAllowed(channelId)) {
+          for (const id of this.pendingReplies.get(channelId) ?? []) this.forgetPendingReply(channelId, id);
           this.delivery.releaseAll(channelId);
           continue;
         }
@@ -986,13 +1063,17 @@ export class ZulipMcplServer {
         if (ids.length === 0) continue;
         // Not now, not never: tried again once the host enables it.
         if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) continue;
-        this.delivery.markReplayed(channelId, ids);
         try {
           if (this.channelManager.isOpen(channelId)) {
+            this.delivery.markReplayed(channelId, ids);
             await this.replayHeld(channelId, ids);
           } else {
             const watermark = this.delivery.watermark(channelId);
-            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), watermark ?? ids[0] - 1);
+            // An earlier non-replayable hold owns the skipped prefix. Offer
+            // only the eligible suffix without releasing that earlier floor.
+            const after = (this.delivery.floor(channelId) ?? ids[0]) < ids[0] ? ids[0] - 1 : watermark ?? ids[0] - 1;
+            await this.catchUpClosedChannel(channelId, this.delivery.wasOpen(channelId), after,
+              undefined, (through) => this.delivery.markReplayed(channelId, ids.filter((id) => id <= through)));
           }
         } catch (err) {
           console.error(`[zulip-mcp] replay of undelivered messages on ${channelId} failed:`, (err as Error).message);
@@ -1020,7 +1101,12 @@ export class ZulipMcplServer {
     // A held id the scan covered but did not find is gone from history (or
     // no longer visible to the agent): nothing left to deliver.
     const scanned = fetched.scannedThrough ?? 0;
-    for (const id of ids) if (!found.has(id) && (id <= scanned || fetched.complete)) this.delivery.release(channelId, id);
+    for (const id of ids) {
+      if (!found.has(id) && (id <= scanned || fetched.complete)) {
+        this.forgetPendingReply(channelId, id);
+        this.delivery.release(channelId, id);
+      }
+    }
     if (replayed > 0) console.error(`[zulip-mcp] ${channelId}: replaying ${replayed} undelivered message(s) from history`);
   }
 
@@ -1047,7 +1133,7 @@ export class ZulipMcplServer {
    * the missed-ambient tally, so the host's closed-channel invitation can
    * show what staying out has cost.
    */
-  private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}): Promise<boolean> {
+  private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}, beforeOffer?: () => void): Promise<boolean> {
     const conn = this.conn;
     if (!conn || !this.mcplActive) return false;
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
@@ -1070,7 +1156,9 @@ export class ZulipMcplServer {
         topic: meta.topic,
         authorId: message.author.id,
         authorName: message.author.name,
-        isMention: meta.mentioned === true,
+        isMention: meta.mentioned === true || meta.replyToSelf === true,
+        isExplicitMention: meta.mentioned === true,
+        isReplyToBot: meta.replyToSelf === true,
         isDM: meta.isDM === true,
         // agent-framework stores `origin` (not message metadata) as the
         // stored message's metadata on this path, so the attribution stamp
@@ -1084,6 +1172,9 @@ export class ZulipMcplServer {
       payload: { content: message.content },
     };
     try {
+      // Local policy exits above are not offers. Once attempted, a refusal
+      // or ambiguous transport failure must still consume the replay.
+      beforeOffer?.();
       const result = (await conn.sendRequest(method.PUSH_EVENT, params)) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
@@ -1099,8 +1190,9 @@ export class ZulipMcplServer {
   /**
    * On (re)connect, deliver what arrived while the server was offline.
    * Channels the host had open get their full missed backscroll; every other
-   * watermarked channel gets each mention with its vicinity. One `<missed>`
-   * block per channel, as a push event. Runs at most once per process.
+   * watermarked channel gets each addressed message with its vicinity. Deferred
+   * quote verification can split a channel into multiple `<missed>` pushes.
+   * Runs at most once per connection.
    */
   private async runReconnectSweep(): Promise<void> {
     if (this.sweepDone) return;
@@ -1141,18 +1233,31 @@ export class ZulipMcplServer {
     channelId: string,
     afterId: number,
     throughId?: number,
-  ): Promise<{ messages: IncomingChannelMessage[]; truncated: boolean; complete: boolean; scannedThrough: number | null }> {
+    quoteLookupBudget?: { remainingMs: number },
+  ): Promise<{ messages: IncomingChannelMessage[]; truncated: boolean; complete: boolean; scannedThrough: number | null; unverifiedMessageIds: number[] }> {
     const out: IncomingChannelMessage[] = [];
+    const unverified = new Set<number>();
     let cursor = afterId;
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor) });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget });
       if (page.scannedThrough === null) {
         complete = true;
         break;
       }
-      out.push(...page.messages);
+      for (const id of page.unverifiedMessageIds ?? []) {
+        const numeric = Number(id);
+        if (Number.isFinite(numeric) && !this.pendingReplies.get(channelId)?.has(numeric)) unverified.add(numeric);
+      }
+      out.push(...page.messages.map((message) => {
+        if (!this.pendingReplies.get(channelId)?.has(Number(message.messageId))) return message;
+        return {
+          ...message,
+          tags: [...new Set([...(message.tags ?? []).filter((tag) => tag !== CHAT_TAGS.ambient), CHAT_TAGS.reply])],
+          metadata: { ...(message.metadata as Record<string, unknown>), replyToSelf: true, isMention: true, isReplyToBot: true },
+        };
+      }));
       if (page.scannedThrough <= cursor) break;
       cursor = page.scannedThrough;
       if (page.reachedNewest || (throughId !== undefined && cursor >= throughId)) {
@@ -1161,53 +1266,99 @@ export class ZulipMcplServer {
       }
     }
     // Not complete: the ceiling (or a bound) stopped the walk with more beyond the newest id scanned.
-    return { messages: out, truncated: !complete, complete, scannedThrough: cursor > afterId ? cursor : null };
+    return { messages: out, truncated: !complete, complete, scannedThrough: cursor > afterId ? cursor : null, unverifiedMessageIds: [...unverified].sort((a, b) => a - b) };
+  }
+
+  private advanceCatchUp(channelId: string, through: number, after: number): void {
+    // An accepted/empty catch-up scan releases every hold in its range,
+    // including ids deleted from history. Their pending verdicts go too.
+    for (const id of this.delivery.heldIds(channelId)) {
+      if (id > after && id <= through) this.forgetPendingReply(channelId, id);
+    }
+    if (this.live) this.delivery.advanceThrough(channelId, through, after);
+    else this.preLiveScanned.set(channelId, Math.max(this.preLiveScanned.get(channelId) ?? 0, through));
   }
 
   /**
    * Deliver what a closed (or not-yet-reopened) channel accumulated past its
-   * watermark as one `<missed>` push event: the full backscroll when
-   * `keepAll` (the host had it open, or it is a DM), else each mention with
+   * watermark as `<missed>` push events: the full backscroll when
+   * `keepAll` (the host had it open, or it is a DM), else each addressed message with
    * its vicinity. Advances the watermark past everything scanned once the
    * host has accepted the push. Returns true when something was delivered.
    */
-  private async catchUpClosedChannel(channelId: string, keepAllHint: boolean, afterId?: number): Promise<boolean> {
+  private async catchUpClosedChannel(
+    channelId: string,
+    keepAllHint: boolean,
+    afterId?: number,
+    retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
+    onAttempt?: (through: number) => void,
+  ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (!this.channelManager.getChannel(channelId)) return false;
     if (this.isMuted(channelId) || !this.isAllowed(channelId)) return false;
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return false;
     const after = afterId ?? this.delivery.watermark(channelId);
     if (after === undefined) return false;
+    // At most two quote-wait allowances for the entire call, not per row or
+    // page. Reserve the second allowance for one pass over ALL deferred rows.
+    const budget = retryWindow?.budget ?? { remainingMs: 6_000 };
+    const passBudget = { remainingMs: retryWindow ? budget.remainingMs : Math.min(budget.remainingMs, 3_000) };
+    const startedWith = passBudget.remainingMs;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
-      fetched = await this.fetchAfter(channelId, after);
+      fetched = await this.fetchAfter(channelId, after, retryWindow?.through, passBudget);
     } catch (err) {
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${channelId}:`, (err as Error).message);
+      onAttempt?.(Infinity); // A history failure consumes the heal attempt, unlike a local policy abort.
+      return false;
+    } finally {
+      budget.remainingMs -= startedWith - passBudget.remainingMs;
+    }
+    if (fetched.scannedThrough === null) {
+      onAttempt?.(Infinity);
       return false;
     }
-    if (fetched.scannedThrough === null) return false;
-    const newestId = fetched.scannedThrough;
-    const msgs = fetched.messages;
+    // The one retry stays inside the first walk's ceiling. Any quote still
+    // unverified on that pass fails closed rather than starting another walk.
+    const window = retryWindow ?? {
+      through: fetched.scannedThrough,
+      truncated: fetched.truncated,
+      budget,
+    };
+    fetched.truncated ||= window.truncated;
+    let newestId = Math.min(fetched.scannedThrough, window.through);
+    let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
+    const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
+    const retry = (cursor: number) => this.catchUpClosedChannel(channelId, keepAllHint, cursor, window, onAttempt);
+    if (blocked !== undefined) {
+      newestId = Math.min(newestId, blocked - 1);
+      msgs = msgs.filter((message) => Number(message.messageId) < blocked);
+      if (newestId <= after) return retry(after);
+    }
     const views = msgs.map(viewOf);
     const keepAll = keepAllHint || isDmChannelId(channelId);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
-      // Nothing to deliver, but advance the anchor so these are not re-scanned.
-      this.delivery.advanceThrough(channelId, newestId);
-      return false;
+      onAttempt?.(Infinity);
+      // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
+      this.advanceCatchUp(channelId, newestId, after);
+      return blocked !== undefined ? retry(newestId) : false;
     }
+    const addressedCount = views.filter(isAddressed).length;
     const mentionCount = views.filter((v) => v.mentioned).length;
+    const replyCount = views.filter((v) => v.replyToSelf).length;
+    const reason = keepAll ? 'backscroll' : addressedCount === mentionCount ? 'mention' : 'addressed';
     const streamName = isDmChannelId(channelId)
       ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
       : channelId.slice('zulip:'.length);
     const block = renderMissedBlock(kept, {
       streamName,
       channelId,
-      reason: keepAll ? 'backscroll' : 'mention',
-      count: keepAll ? kept.length : mentionCount,
+      reason,
+      count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
-      moreBeyond: fetched.truncated,
+      moreBeyond: fetched.truncated || blocked !== undefined,
       newestScannedId: newestId,
     });
     const synthetic: IncomingChannelMessage = {
@@ -1216,28 +1367,41 @@ export class ZulipMcplServer {
       author: { id: 'system', name: 'zulip catch-up' },
       timestamp: new Date().toISOString(),
       content: [{ type: 'text', text: block } satisfies TextContent],
-      tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : ['chat:ambient'])],
-      metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, isDM: isDmChannelId(channelId) },
+      tags: [
+        'zulip:missed',
+        ...(isDmChannelId(channelId) ? [CHAT_TAGS.dm, CHAT_TAGS.private] : [
+          ...(mentionCount > 0 ? [CHAT_TAGS.mention] : []),
+          ...(replyCount > 0 ? [CHAT_TAGS.reply] : []),
+          ...(addressedCount === 0 ? [CHAT_TAGS.ambient] : []),
+        ]),
+      ],
+      metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, replyToSelf: replyCount > 0, isDM: isDmChannelId(channelId) },
     };
     const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
-      reason: keepAll ? 'backscroll' : 'mention',
+      reason,
       messages: kept.length,
-      ...(fetched.truncated ? { truncated: true } : {}),
-    });
+      ...(fetched.truncated || blocked !== undefined ? { truncated: true } : {}),
+    }, () => onAttempt?.(newestId));
     if (ok) {
+      for (const view of kept) this.forgetPendingReply(channelId, view.id);
       // Advance past everything scanned, not just what was delivered, so a
       // mention-only channel does not re-surface its non-mention tail; the
       // block covered every held id in the range, so their holds go too.
-      this.delivery.advanceThrough(channelId, newestId);
+      this.advanceCatchUp(channelId, newestId, after);
       // The agent answers the block through channels/publish too, so the
       // conversation is where its newest message that addresses the agent
       // is (in a backscroll, its newest message), as live pushes or an open
       // channel's deliveries would have left it.
       for (let i = msgs.length - 1; i >= 0; i--) {
-        if (!keepAll && !views[i].mentioned) continue;
+        if (!keepAll && !isAddressed(views[i])) continue;
         if (this.channelManager.noteConversation(channelId, msgs[i])) break;
       }
+    }
+    if (blocked !== undefined) {
+      // A refused prefix must be re-offered too; an accepted prefix need not.
+      const retried = await retry(ok ? newestId : after);
+      return ok || retried;
     }
     return ok;
   }
@@ -1257,8 +1421,8 @@ export class ZulipMcplServer {
       }
       if (fetched.scannedThrough === null) continue;
       const views = fetched.messages.map(viewOf);
-      // Only ambient counts as missed: mentions are delivered by the sweep.
-      const ambient = views.filter((v) => !v.mentioned);
+      // Only ambient counts as missed: addressed messages are delivered by the sweep.
+      const ambient = views.filter((v) => !isAddressed(v));
       this.delivery.backfillMissed(channelId, ambient, fetched.scannedThrough);
     }
   }
@@ -1268,7 +1432,7 @@ export class ZulipMcplServer {
    * the gap from history (watermark → now) before the gap marker itself is
    * delivered, so the agent gets the messages, not advice to go looking for
    * them: open channels are replayed through channels/incoming; every other
-   * watermarked channel gets its mentions as a `<missed>` push, exactly as
+   * watermarked channel gets its addressed messages as a `<missed>` push, exactly as
    * after a restart.
    */
   private async onSystemEvent(event: PlatformSystemEvent): Promise<void> {
@@ -1296,7 +1460,7 @@ export class ZulipMcplServer {
     }
     const notes = [
       recovered > 0 ? `${recovered} message(s) on open channels were recovered from history and delivered above.` : null,
-      closedCaughtUp > 0 ? `Mentions on ${closedCaughtUp} closed channel(s) were delivered as catch-up events.` : null,
+      closedCaughtUp > 0 ? `Addressed messages on ${closedCaughtUp} closed channel(s) were delivered as catch-up events.` : null,
     ].filter(Boolean);
     const text = notes.length > 0 ? `${event.text} ${notes.join(' ')}` : event.text;
     this.channelManager.broadcastSystemEvent(this.adapter.type, {
@@ -1541,7 +1705,7 @@ export class ZulipMcplServer {
           mutedStreams: result.filters.mutedStreams ?? [],
           note: mute
             ? 'Nothing from this stream reaches you now — not even mentions — and nothing is tallied. Persisted; reverse with unmute_channel.'
-            : 'Messages from this stream reach you again by the usual rules (mentions always; ambient when the channel is open).',
+            : 'Messages from this stream reach you again by the usual rules (addressed messages always; ambient when the channel is open).',
         };
       }
       case 'set_reaction_visibility': {
@@ -1699,9 +1863,12 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.forgetPendingReply(ev.channelId, Number(ev.messageId));
+    if (ev.kind === 'delete' || ev.kind === 'move' || ev.previousTopic !== null ||
+        ev.newStreamId != null || ev.movedToChannelId !== null) this.channelManager.reconcileSelfChange(ev);
     if (this.isMuted(ev.channelId) || !this.isAllowed(ev.channelId)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
-    const addressed = ev.mentioned || ev.isDM;
+    const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a
     // stream the bot was added to after startup — a message edited into a
     // mention, say. Register the channel from it for the same reason a
@@ -1758,11 +1925,11 @@ export class ZulipMcplServer {
       content: [{ type: 'text', text: line }],
       // The same addressing tag a message carries, so a debounced or
       // tag-keyed policy sees an ambient change as ambient; the host folds
-      // chat:mention / chat:dm into chat:addressed.
+      // chat:mention / chat:reply / chat:dm into chat:addressed.
       tags: [
         tag,
         ...(ev.kind === 'move' ? ['zulip:moved'] : []),
-        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : [CHAT_TAGS.ambient]),
+        ...(ev.isDM ? [CHAT_TAGS.dm, CHAT_TAGS.private] : ev.mentioned ? [CHAT_TAGS.mention] : ev.replyToSelf ? [CHAT_TAGS.reply] : [CHAT_TAGS.ambient]),
       ],
       metadata: {
         change: ev.kind,
@@ -1775,6 +1942,11 @@ export class ZulipMcplServer {
         ...(ev.movedToChannelId !== null ? { movedToChannelId: ev.movedToChannelId } : {}),
         ...(ev.previousContent !== null ? { previousContent: ev.previousContent } : {}),
         mentioned: ev.mentioned,
+        replyToSelf: ev.replyToSelf === true,
+        isMention: ev.mentioned || ev.replyToSelf === true,
+        isExplicitMention: ev.mentioned,
+        isReplyToBot: ev.replyToSelf === true,
+        ...(ev.previouslyReplyToSelf != null ? { previouslyReplyToSelf: ev.previouslyReplyToSelf } : {}),
         ...(ev.previouslyMentioned !== null ? { previouslyMentioned: ev.previouslyMentioned } : {}),
         ...(ev.vanished ? { vanished: true } : {}),
         isDM: ev.isDM,

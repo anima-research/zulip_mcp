@@ -35,7 +35,7 @@ async function fixture(t: TestContext) {
       const body = Buffer.concat(chunks).toString();
       const content = req.method === 'POST'
         ? body.match(/name="content"\r\n\r\n([\s\S]*?)\r\n--/)?.[1] ?? null
-        : url.searchParams.get('content');
+        : new URLSearchParams(body).get('content');
       requests.push({ method: req.method, url, content });
       res.setHeader('content-type', 'application/json');
       if (req.method === 'GET') {
@@ -63,7 +63,7 @@ async function fixture(t: TestContext) {
   });
   const client = await zulipInit({ realm, username: 'bot@example.com', apiKey: 'test-only' });
   let uploads = 0;
-  const tools = new ZulipToolRuntime({ client, selfUserId: 790, realm, authHeader: '', sessionId: 'test' }, dir, {
+  const tools = new ZulipToolRuntime({ client, selfUserId: 790, realm, authHeader: 'Basic dGVzdDpvbmx5', sessionId: 'test' }, dir, {
     uploader: { async upload({ name }) { uploads++; return { name, path: '/user_uploads/1/a/file', url: `${realm}/user_uploads/1/a/file` }; } },
   });
   return { tools, requests, realm, uploads: () => uploads,

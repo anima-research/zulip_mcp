@@ -222,11 +222,14 @@ test('a descriptor built from an event without a stream_id still addresses the s
 
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
   const events = [
+    { id: 0, type: 'message', flags: [], message: raw(50, {
+      sender_id: SELF, sender_full_name: 'Bot', sender_email: 'bot@example.com', content: 'x',
+    }) },
     // Ann's message arrives live (cached), then she edits it to mention the bot.
     { id: 1, type: 'message', flags: [], message: { ...raw(5), content: 'first draft' } },
     { id: 2, type: 'update_message', message_id: 5, message_ids: [5], user_id: 7, edit_timestamp: 1_700_000_900, orig_content: 'first draft', content: 'second draft @**Bot**', flags: ['mentioned'], stream_id: 7 },
-    // The bot's own edit is its own doing.
-    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
+    // The bot edits its own message: reconcile the cache without a marker.
+    { id: 3, type: 'update_message', message_id: 50, message_ids: [50], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'x', content: 'y', flags: [], stream_id: 7 },
     // A message the cache never saw: one GET places it.
     { id: 4, type: 'update_message', message_id: 6, message_ids: [6], user_id: 7, edit_timestamp: 1_700_000_902, orig_content: 'm6', content: 'm6 fixed', flags: [], stream_id: 7 },
     // A moderator moves Ann's message to another topic.
@@ -243,6 +246,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
     { id: 8, type: 'delete_message', message_id: 902, message_type: 'private' },
     // A stream outside the allowlist: nothing.
     { id: 9, type: 'delete_message', message_ids: [903], message_type: 'stream', stream_id: 8, topic: 't' },
+    { id: 10, type: 'reaction', message_id: 50, user_id: 7, op: 'add', emoji_name: 'thumbs_up' },
   ];
   let polls = 0;
   const getById: number[] = [];
@@ -273,17 +277,19 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   await adapter.discoverChannels();
   const delivered: string[] = [];
   const changes: MessageChangeEvent[] = [];
+  const reactions: { onOwnMessage: boolean; messageSnippet: string | null }[] = [];
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, (r) => { reactions.push(r); }, (c) => { changes.push(c); });
     const deadline = Date.now() + 2000;
-    while (changes.length < 6 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while ((changes.length < 6 || reactions.length < 1) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
   }
   assert.deepEqual(delivered, ['5'], 'the live message still reaches onMessage');
+  assert.deepEqual(reactions.map(r => [r.onOwnMessage, r.messageSnippet]), [[true, 'y']], 'self content edits refresh the bot-authored message snippet without emitting an edit');
   assert.deepEqual(getById, [6, 700], 'only the uncached messages cost a GET');
   const view = changes.map((c) => ({
     kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
@@ -502,4 +508,185 @@ test('a message from a stream created after startup carries its descriptor, with
     { id: '11', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
     { id: '12', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
   ]);
+});
+
+test('self echoes invalidate cache and later independent reads apply destination filtering', async () => {
+  for (const restricted of [false, true]) {
+    const events = [
+      { id: 1, type: 'message', flags: [], message: raw(20) },
+      { id: 2, type: 'message', flags: [], message: raw(21) },
+      { id: 3, type: 'update_message', message_id: 20, message_ids: [20, 21], user_id: SELF,
+        edit_timestamp: 1_700_002_000, stream_id: 7, new_stream_id: 8, orig_subject: 'deploys', subject: 'archive' },
+      { id: 4, type: 'reaction', op: 'add', message_id: 21, user_id: 7,
+        emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji' },
+      { id: 5, type: 'update_message', message_id: 21, message_ids: [21], user_id: 7,
+        edit_timestamp: 1_700_002_001, content: 'updated', orig_content: 'm21', flags: [], stream_id: 8 },
+      { id: 6, type: 'delete_message', message_ids: [20], message_type: 'stream', stream_id: 8 },
+    ];
+    let polls = 0;
+    const client = {
+      streams: { retrieve: async () => ({ result: 'success', streams: [
+        { name: 'general', stream_id: 7 }, { name: 'archive', stream_id: 8 },
+      ] }) },
+      messages: { getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'archive', stream_id: 8, subject: 'archive' }) }) },
+      queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+      events: { retrieve: async () => {
+        if (++polls === 1) return { events };
+        await new Promise(r => setTimeout(r, 5));
+        return { events: [] };
+      } },
+    };
+    const adapter = new ZulipAdapter(client, SELF, 's', {
+      dmDiscoveryLimit: 0,
+      filters: { streamAllowed: s => !restricted || s === 'general', dmAllowed: () => true },
+    });
+    await adapter.discoverChannels();
+    const reactions: string[] = [];
+    const changes: MessageChangeEvent[] = [];
+    try {
+      adapter.startEvents(() => {}, undefined, r => reactions.push(r.channelId), c => changes.push(c));
+      await new Promise(r => setTimeout(r, 60));
+      assert.deepEqual(reactions, restricted ? [] : ['zulip:archive']);
+      assert.deepEqual(changes.map(c => [c.kind, c.channelId, c.topic]), restricted ? [] : [
+        ['edit', 'zulip:archive', 'archive'], ['delete', 'zulip:archive', ''],
+      ]);
+    } finally { adapter.stopEvents(); }
+  }
+});
+
+test('a self move to an inaccessible stream explains the following deletion', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20) },
+    { id: 2, type: 'update_message', message_id: 20, message_ids: [20], user_id: SELF,
+      edit_timestamp: 1_700_002_000, stream_id: 7, new_stream_id: 999 },
+    { id: 3, type: 'delete_message', message_ids: [20], message_type: 'stream', stream_id: 7 },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }) },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (++polls === 1) return { events };
+      await new Promise(r => setTimeout(r, 5)); return { events: [] };
+    } },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const changes: MessageChangeEvent[] = [];
+  try {
+    adapter.startEvents(() => {}, undefined, undefined, c => changes.push(c));
+    await new Promise(r => setTimeout(r, 60));
+    assert.deepEqual(changes.map(c => [c.kind, c.vanished]), [['delete', true]]);
+  } finally { adapter.stopEvents(); }
+});
+
+test('reactions wait for earlier moves but stay parallel and do not block later changes', async () => {
+  let releaseMove!: () => void;
+  const moveReady = new Promise<void>(resolve => { releaseMove = resolve; });
+  let releaseReactions!: () => void;
+  const reactionsReady = new Promise<void>(resolve => { releaseReactions = resolve; });
+  let streamCalls = 0;
+  const lookups: number[] = [];
+  const changes: MessageChangeEvent[] = [];
+  const reactions: { channelId: string; messageSnippet: string | null }[] = [];
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20) },
+    { id: 2, type: 'update_message', message_id: 20, message_ids: [20], user_id: 12,
+      stream_id: 7, new_stream_id: 8, orig_subject: 'deploys' },
+    ...[20, 99, 100].map((message_id, index) => ({
+      id: 3 + index, type: 'reaction', message_id, user_id: 7, op: 'add', emoji_name: 'thumbs_up',
+    })),
+    { id: 6, type: 'update_message', message_id: 20, message_ids: [20], user_id: 7,
+      stream_id: 8, orig_content: 'm20', content: 'updated', flags: [] },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => {
+      if (++streamCalls === 1) return { result: 'success', streams: [{ name: 'general', stream_id: 7 }] };
+      await moveReady;
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'archive', stream_id: 8 }] };
+    } },
+    messages: { getById: async ({ message_id }: { message_id: number }) => {
+      lookups.push(message_id);
+      await reactionsReady;
+      return { result: 'success', message: raw(message_id, { display_recipient: 'archive', stream_id: 8 }) };
+    } },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (++polls === 1) return { events };
+      await new Promise(resolve => setTimeout(resolve, 5)); return { events: [] };
+    } },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const until = async (predicate: () => boolean) => {
+    const deadline = Date.now() + 2000;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, 'event handling completed before the deadline');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  };
+  try {
+    await adapter.discoverChannels();
+    adapter.startEvents(() => {}, undefined, r => reactions.push(r), c => changes.push(c));
+    await until(() => streamCalls === 2);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(reactions, [], 'no reaction overtakes the blocked move');
+    assert.deepEqual(lookups, [], 'even uncached reaction lookups wait for the earlier move');
+    releaseMove();
+    await until(() => lookups.length === 2 && changes.length === 2);
+    assert.deepEqual(lookups, [99, 100], 'both uncached reactions start before either lookup completes');
+    assert.equal(changes[1].kind, 'edit', 'the later edit is not blocked by reaction lookups');
+    assert.equal(changes[1].channelId, 'zulip:archive');
+    releaseReactions();
+    await until(() => reactions.length === 3);
+    assert.deepEqual(reactions.map(r => r.channelId), ['zulip:archive', 'zulip:archive', 'zulip:archive']);
+  } finally {
+    releaseMove();
+    releaseReactions();
+    adapter.stopEvents();
+  }
+});
+
+test('moves from filtered streams re-seat cached messages for later destination activity', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(20, { display_recipient: 'secret', stream_id: 9 }) },
+    { id: 2, type: 'message', flags: [], message: raw(21, { display_recipient: 'secret', stream_id: 9 }) },
+    { id: 3, type: 'update_message', message_id: 20, message_ids: [20, 21], user_id: 12,
+      stream_id: 9, new_stream_id: 7, orig_subject: 'deploys', subject: 'public' },
+    { id: 4, type: 'reaction', message_id: 21, user_id: 7, op: 'add', emoji_name: 'thumbs_up' },
+    { id: 5, type: 'update_message', message_id: 21, message_ids: [21], user_id: 7, stream_id: 7,
+      orig_content: 'm21', content: 'updated in public', flags: [] },
+    { id: 6, type: 'delete_message', message_ids: [20], message_type: 'stream', stream_id: 7 },
+  ];
+  let polls = 0;
+  const client = {
+    streams: { retrieve: async () => ({ result: 'success', streams: [
+      { name: 'secret', stream_id: 9 }, { name: 'general', stream_id: 7 },
+    ] }) },
+    messages: { getById: async () => { throw new Error('placement must use the re-seated cache'); } },
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => {
+      if (++polls === 1) return { events };
+      await new Promise(resolve => setTimeout(resolve, 5)); return { events: [] };
+    } },
+  };
+  const adapter = new ZulipAdapter(client, SELF, 's', {
+    dmDiscoveryLimit: 0, filters: { streamAllowed: s => s === 'general', dmAllowed: () => true },
+  });
+  const delivered: string[] = [];
+  const reactions: { channelId: string; messageSnippet: string | null }[] = [];
+  const changes: MessageChangeEvent[] = [];
+  try {
+    await adapter.discoverChannels();
+    adapter.startEvents(m => delivered.push(m.messageId), undefined, r => reactions.push(r), c => changes.push(c));
+    const deadline = Date.now() + 2000;
+    while ((reactions.length < 1 || changes.length < 2) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(delivered, [], 'messages in the filtered source are not delivered');
+    assert.deepEqual(reactions.map(r => [r.channelId, r.messageSnippet]), [['zulip:general', 'm21']]);
+    assert.deepEqual(changes.map(c => [c.kind, c.channelId, c.topic, c.previousContent]), [
+      ['edit', 'zulip:general', 'public', 'm21'],
+      ['delete', 'zulip:general', 'public', 'm20'],
+    ], 'the source move marker is withheld, but later activity belongs to the allowed destination');
+  } finally { adapter.stopEvents(); }
 });

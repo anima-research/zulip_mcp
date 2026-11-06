@@ -430,9 +430,9 @@ test('edits, topic moves and deletions reach onChange; re-renders and unchanged 
   await loop.start(zulipClient, (_s, m) => { messages.push(m); }, undefined, undefined, (c) => { changes.push(c); });
   assert.deepEqual(messages, [], 'changes never reach onMessage');
   assert.deepEqual(changes, [
-    { kind: 'edit', messageId: 77, messageIds: [77], actorId: 9, editedAt: 1_710_000_100, content: 'new @**bot**', origContent: 'old', topic: null, origTopic: null, streamId: 7, newStreamId: null, flags: ['mentioned'] },
-    { kind: 'edit', messageId: 79, messageIds: [79, 80, 81], actorId: 12, editedAt: 1_710_000_102, content: null, origContent: null, topic: 'new topic', origTopic: 'old topic', streamId: 7, newStreamId: null, flags: [] },
-    { kind: 'edit', messageId: 82, messageIds: [82], actorId: 12, editedAt: 1_710_000_103, content: null, origContent: null, topic: null, origTopic: 'same', streamId: 7, newStreamId: 8, flags: [] },
+    { kind: 'edit', propagateMode: null, messageId: 77, messageIds: [77], actorId: 9, editedAt: 1_710_000_100, content: 'new @**bot**', origContent: 'old', topic: null, origTopic: null, streamId: 7, newStreamId: null, flags: ['mentioned'] },
+    { kind: 'edit', propagateMode: 'change_all', messageId: 79, messageIds: [79, 80, 81], actorId: 12, editedAt: 1_710_000_102, content: null, origContent: null, topic: 'new topic', origTopic: 'old topic', streamId: 7, newStreamId: null, flags: [] },
+    { kind: 'edit', propagateMode: null, messageId: 82, messageIds: [82], actorId: 12, editedAt: 1_710_000_103, content: null, origContent: null, topic: null, origTopic: 'same', streamId: 7, newStreamId: 8, flags: [] },
     { kind: 'delete', messageIds: [84, 85], messageType: 'stream', streamId: 7, topic: 'deploys' },
     { kind: 'delete', messageIds: [86], messageType: 'private', streamId: null, topic: null },
   ]);
@@ -510,4 +510,58 @@ test('a refused queue registration is surfaced and retried, never polled as queu
   assert.ok(logged.some((l) => /registration failed: client_capabilities\["notification_settings_null"\] field is missing.*BAD_REQUEST/.test(l)), 'Zulip\'s reason is logged');
   assert.ok(!logged.some((l) => /no events array/.test(l)), 'not misreported as a malformed poll');
   assert.deepEqual(pauses, [5000], 'the outer loop pauses before retrying');
+});
+
+test('a long poll completed after stop delivers none of its events', async () => {
+  const loop = new ZulipEventLoop();
+  let release!: (response: unknown) => void;
+  let polling!: () => void;
+  const polled = new Promise<void>((resolve) => { polling = resolve; });
+  const seen: string[] = [];
+  const running = loop.start({
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: () => new Promise((resolve) => { release = resolve; polling(); }) },
+  }, () => { seen.push('message'); }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
+  await polled;
+  loop.stop();
+  release({ events: [
+    { id: 1, type: 'reaction', message_id: 1, user_id: 101 },
+    { id: 2, type: 'delete_message', message_ids: [1], message_type: 'stream', stream_id: 7 },
+  ] });
+  await running;
+  assert.deepEqual(seen, []);
+});
+
+test('stopping in an awaited message handler drops all subsequent events in its batch', async () => {
+  const loop = new ZulipEventLoop();
+  const seen: string[] = [];
+  await loop.start({
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => ({ events: [
+      { id: 1, type: 'message', message: { id: 1, type: 'stream', display_recipient: 'general', timestamp: 1 } },
+      { id: 2, type: 'reaction', message_id: 1, user_id: 101 },
+      { id: 3, type: 'delete_message', message_ids: [1], message_type: 'stream', stream_id: 7 },
+    ] }) },
+  }, async () => {
+    seen.push('message');
+    await Promise.resolve();
+    loop.stop();
+  }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
+  assert.deepEqual(seen, ['message']);
+});
+
+test('R2-7 stopped registration cannot clear the replacement loop state', async () => {
+  const loop = new ZulipEventLoop();
+  let release!: (value: any) => void;
+  let registered = 0, polls = 0;
+  const registration = new Promise(resolve => { release = resolve; });
+  const started = loop.start({ queues: { register: () => registration },
+    events: { retrieve: async () => { polls++; loop.stop(); return { events: [] }; } } },
+    () => {}, undefined, undefined, undefined, () => registered++);
+  await Promise.resolve();
+  loop.stop();
+  release({ queue_id: 'stale', last_event_id: -1 });
+  await started;
+  assert.equal(registered, 0);
+  assert.equal(polls, 0);
 });

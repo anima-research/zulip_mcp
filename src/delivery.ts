@@ -17,7 +17,7 @@
  *   lastOpen     channels the host had open at last sight. The reconnect
  *                sweep delivers their full missed backscroll (the host will
  *                reopen them); every other watermarked channel gets only its
- *                mentions, with vicinity.
+ *                addressed messages, with vicinity.
  *
  * File: `<stateDir>/<session>.delivery.json`, alongside the tool layer's
  * monitoring state. Best-effort: a failed save is logged, never fatal.
@@ -149,14 +149,14 @@ export class DeliveryState {
   }
 
   /**
-   * Everything at or below `messageId` has been delivered (a catch-up block
-   * scanned and pushed the whole range): release the holds in it and
+   * The range (afterId, messageId] has been delivered (a catch-up block
+   * scanned and pushed that range): release only the holds in it and
    * advance. Returns true if the watermark moved.
    */
-  advanceThrough(channelId: string, messageId: number): boolean {
+  advanceThrough(channelId: string, messageId: number, afterId = 0): boolean {
     const held = this.held.get(channelId);
     if (held) {
-      for (const id of held.keys()) if (id <= messageId) held.delete(id);
+      for (const id of held.keys()) if (id > afterId && id <= messageId) held.delete(id);
       if (held.size === 0) this.held.delete(channelId);
     }
     return this.advance(channelId, messageId);
@@ -315,6 +315,8 @@ function num(v: unknown): number {
 export interface MissedView {
   id: number;
   mentioned: boolean;
+  replyToSelf?: boolean;
+  isDM?: boolean;
   topic: string;
   authorName: string;
   text: string;
@@ -332,7 +334,9 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
     .join('\n');
   return {
     id: Number(m.messageId),
-    mentioned: meta.mentioned === true || meta.isDM === true,
+    mentioned: meta.mentioned === true,
+    replyToSelf: meta.replyToSelf === true,
+    isDM: meta.isDM === true,
     topic: typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? ''),
     authorName: m.author.name,
     text,
@@ -376,15 +380,20 @@ export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date
   return { ...m, content, metadata: { ...meta, attributed: true, attributionHeader: prefix } };
 }
 
-/** Messages around each mention, ±`vicinity` by count (robust to channel pace). */
-export function selectMissed<T extends { mentioned: boolean }>(
+/** Addressing includes explicit mentions, verified replies, and DMs. */
+export function isAddressed(m: { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }): boolean {
+  return m.mentioned || m.replyToSelf === true || m.isDM === true;
+}
+
+/** Messages around each addressed message, ±`vicinity` by count. */
+export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }>(
   msgs: T[],
   opts: { keepAll: boolean; vicinity: number },
 ): T[] {
   if (opts.keepAll) return msgs;
   const keep = new Set<number>();
   for (let i = 0; i < msgs.length; i++) {
-    if (!msgs[i].mentioned) continue;
+    if (!isAddressed(msgs[i])) continue;
     for (let j = Math.max(0, i - opts.vicinity); j <= Math.min(msgs.length - 1, i + opts.vicinity); j++) keep.add(j);
   }
   return [...keep].sort((a, b) => a - b).map((i) => msgs[i]);
@@ -396,8 +405,8 @@ export const DEFAULT_MISSED_BLOCK_MAX_CHARS = 40_000;
 export interface MissedBlockOptions {
   streamName: string;
   channelId: string;
-  reason: 'backscroll' | 'mention';
-  /** Number of actual mentions (for the mention reason); total lines otherwise. */
+  reason: 'backscroll' | 'mention' | 'addressed';
+  /** Selected addressed-message count for mention/addressed; total lines for backscroll. */
   count: number;
   formatTime: (d: Date) => string;
   /** Character budget for the block; the OLDEST lines are elided first. */
@@ -444,7 +453,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
 
   const assemble = (elided: number, cut: string | null): string => {
     const attrs = [`stream="#${opts.streamName}"`, `channelId="${opts.channelId}"`, `count="${opts.count}"`];
-    if (opts.reason === 'mention') attrs.push(`lines="${msgs.length}"`);
+    if (opts.reason !== 'backscroll') attrs.push(`lines="${msgs.length}"`);
     attrs.push(`reason="${opts.reason}"`);
     const head: string[] = [];
     const tail: string[] = [];

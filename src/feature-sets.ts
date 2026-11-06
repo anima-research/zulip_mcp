@@ -66,7 +66,7 @@ export interface FeatureSetOptions {
  */
 export const ZULIP_TAG_ONTOLOGY: TagOntology = {
   coreTags: [
-    'chat:addressed', 'chat:mention', 'chat:dm', 'chat:private', 'chat:ambient',
+    'chat:addressed', 'chat:mention', 'chat:reply', 'chat:dm', 'chat:private', 'chat:ambient',
     'chat:from-human', 'chat:from-bot',
     'chat:reaction', 'chat:reaction-remove',
     'chat:edited', 'chat:deleted',
@@ -160,6 +160,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'send_dm':
     case 'upload_file':
     case 'edit_message':
+    case 'move_messages':
     case 'delete_message':
     case 'add_reaction':
     case 'remove_reaction':

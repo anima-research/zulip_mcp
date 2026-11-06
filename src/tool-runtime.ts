@@ -7,6 +7,7 @@
  * are the plain-MCP surface every client gets.
  */
 
+import { LOCATE_TIMEOUT_MS, withTimeout } from "./platforms/zulip.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -17,6 +18,7 @@ import {
   parseZulipAttachmentUrl,
   toFetchResult,
 } from "./content.js";
+import type { SelfMove } from "./platforms/adapter.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { resolveMessageLinks } from "./message-links.js";
 import { assertApiSuccess, dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
@@ -231,6 +233,10 @@ export class ZulipToolRuntime {
   /** Set by the MCPL server: every message sent by a tool is reported here
    *  so a rollback checkpoint can undo it. */
   onSent: ((sent: SentRecord) => void) | null = null;
+  /** Successful moves reconcile routing/cache without waiting for an echo. */
+  onMoved: ((move: SelfMove) => void) | null = null;
+  onMoveStarted: ((messageId: number) => ReadonlyMap<string, number>) | null = null;
+  onMessageObserved: ((messageId: number) => void) | null = null;
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
@@ -246,14 +252,17 @@ export class ZulipToolRuntime {
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
+  /** Placement reads remain bounded; tests may use a shorter deadline. */
+  private readonly moveReadTimeoutMs: number;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
   private readonly formatTime: (d: Date) => string;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string; moveReadTimeoutMs?: number } = {},
   ) {
+    this.moveReadTimeoutMs = options.moveReadTimeoutMs ?? LOCATE_TIMEOUT_MS;
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
@@ -382,6 +391,7 @@ export class ZulipToolRuntime {
               num_after: 0,
               narrow: [["stream", channelName]],
             });
+            for (const message of messages.messages ?? []) this.onMessageObserved?.(message.id);
 
             const lastMessageId = messages.messages.length > 0
               ? messages.messages[0].id
@@ -548,6 +558,7 @@ export class ZulipToolRuntime {
           num_after: 0,
           narrow: narrow,
         });
+        for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
         // Filter by date range
         const filteredMessages = result.messages.filter((msg: any) => {
@@ -629,6 +640,7 @@ export class ZulipToolRuntime {
               num_after: 0,
               narrow: [["stream", channelName]],
             });
+            for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
             const unreadMessages = result.messages.filter((msg: any) =>
               msg.id > state.lastReadMessageId
@@ -746,13 +758,134 @@ export class ZulipToolRuntime {
         }
       }
 
-      case "edit_message": {
-        const content = typeof args.content === "string" ? await resolveMessageLinks(args.content, this.session) : args.content;
-        const result = await zulipClient.messages.update({
-          message_id: args.message_id,
-          content,
+      case "edit_message":
+      case "move_messages": {
+        const moving = name === "move_messages";
+        if (!Number.isInteger(args.message_id) || args.message_id <= 0) throw new Error("message_id is required");
+        const operation = `${moving ? "moving" : "editing"} message ${args.message_id}`;
+        if (!moving) {
+          if (typeof args.content !== "string") throw new Error("content must be a string");
+          if (args.topic !== undefined || args.stream_id !== undefined) throw new Error("use move_messages for topic or stream moves");
+          if (args.propagate_mode !== undefined && args.propagate_mode !== "change_one") {
+            throw new Error("propagate_mode requires topic or stream_id; use move_messages");
+          }
+        } else {
+          if (args.content !== undefined) throw new Error("use edit_message for content edits");
+          if (args.topic !== undefined && typeof args.topic !== "string") throw new Error("topic must be a string");
+          if (args.stream_id !== undefined && (!Number.isInteger(args.stream_id) || args.stream_id <= 0)) {
+            throw new Error("stream_id must be a positive integer");
+          }
+          if (args.propagate_mode !== undefined && !["change_one", "change_later", "change_all"].includes(args.propagate_mode)) {
+            throw new Error("propagate_mode must be change_one, change_later, or change_all");
+          }
+          if (args.topic === undefined && args.stream_id === undefined) throw new Error("topic or stream_id is required");
+        }
+        // zulip-js includes message_id in the query and sends no PATCH body.
+        // Keep the id only in the path, with the exposed edit fields in the body.
+        if (!this.session.realm || !this.session.authHeader) {
+          throw new Error(`Cannot ${moving ? "move" : "edit"} messages: realm or bot credentials are unknown`);
+        }
+        // The original placement decides the propagation range even when the
+        // acted-on message is not the current conversation's source.
+        const moveEpochs = moving ? this.onMoveStarted?.(args.message_id) : undefined;
+        let original: any = null;
+        if (moving) {
+          try {
+            const before = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), this.moveReadTimeoutMs, "before move placement");
+            this.onMessageObserved?.(before.message?.id);
+            if (before?.result === "success") original = before.message;
+          } catch { /* Cache/event reconciliation remains available. */ }
+        }
+        const source = typeof original?.display_recipient === "string" && typeof original?.subject === "string"
+          ? { channelId: `zulip:${original.display_recipient}`, topic: original.subject } : null;
+        const newStreamId = moving && args.stream_id !== undefined && args.stream_id !== original?.stream_id
+          ? args.stream_id : null;
+        let movedTo: { channelId: string | null; stream?: string | null; topic: string | null } | undefined;
+        if (moving) {
+          movedTo = { channelId: null, topic: args.topic === undefined ? source?.topic ?? null : null };
+        }
+        const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
+        const editFields = new URLSearchParams();
+        for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
+          if (args[field] !== undefined) editFields.set(field, field === "content"
+            ? await resolveMessageLinks(args.content, this.session) : String(args[field]));
+        }
+        const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
+          method: "PATCH",
+          headers: { Authorization: this.session.authHeader },
+          body: editFields,
         });
-        assertApiSuccess(result, `editing message ${args.message_id}`);
+        const body = await response.text();
+        let result: any = null;
+        try {
+          result = JSON.parse(body);
+        } catch {
+          // Proxies can return HTML or an empty body; preserve the HTTP status.
+        }
+        if (!response.ok || result?.result === "error") {
+          let detail = typeof result?.msg === "string" ? result.msg : body;
+          detail = detail.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+          const encodedAuth = this.session.authHeader.replace(/^Basic\s+/i, "");
+          const credentials = [this.session.authHeader, encodedAuth, ...Buffer.from(encodedAuth, "base64").toString().split(":")];
+          for (const credential of credentials.filter(Boolean)) detail = detail.replaceAll(credential, "[redacted]");
+          detail = detail.slice(0, 160);
+          const fields = ["code", "first_message_id_allowed_to_move", "total_messages_in_topic", "total_messages_allowed_to_move"];
+          const structured = fields.flatMap((field) => {
+            const value = result?.[field];
+            if (field === "code" ? typeof value !== "string" : value !== null && (typeof value !== "number" || !Number.isFinite(value))) return [];
+            let safe = String(value).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+            for (const credential of credentials.filter(Boolean)) safe = safe.replaceAll(credential, "[redacted]");
+            return [`${field}=${safe.slice(0, 160)}`];
+          });
+          if (structured.length) detail += ` (${structured.join(", ")})`;
+          const diagnostic = [response.ok ? "" : `HTTP ${response.status}`, detail].filter(Boolean).join(": ");
+          throw new Error(`Zulip refused ${operation}${diagnostic ? `: ${diagnostic}` : ""}`);
+        }
+        assertApiSuccess(result, operation);
+        if (result?.result !== "success") {
+          throw new Error(`Zulip refused ${operation}: HTTP ${response.status}`);
+        }
+        if (result.ignored_parameters_unsupported?.length) {
+          throw new Error(`Zulip refused ${operation}: ignored_parameters_unsupported: ${JSON.stringify(result.ignored_parameters_unsupported)}`);
+        }
+        if (moving) {
+          // Never report a failed follow-up read as a failed move: retrying
+          // would repeat an already successful write. Only stored subjects
+          // confirm a requested (possibly normalized/truncated) topic.
+          let destinationChannelId = newStreamId === null ? source?.channelId ?? null : null;
+          let storedTopic = args.topic === undefined ? source?.topic ?? null : null;
+          try {
+            const placed = await withTimeout<any>(zulipClient.messages.getById({ message_id: args.message_id, apply_markdown: false }), this.moveReadTimeoutMs, "placed move placement");
+            this.onMessageObserved?.(placed.message?.id);
+            if (placed?.result === "success" &&
+                (args.stream_id === undefined || placed.message?.stream_id === args.stream_id)) {
+              if (typeof placed.message?.display_recipient === "string") destinationChannelId = `zulip:${placed.message.display_recipient}`;
+              if (typeof placed.message?.subject === "string") storedTopic = placed.message.subject;
+            }
+          } catch { /* The bot may have lost visibility after moving. */ }
+          if (movedTo && destinationChannelId === null && args.stream_id !== undefined) {
+            try {
+              const streams = await withTimeout<any>(zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }), this.moveReadTimeoutMs, "streams move placement");
+              const destination = streams?.streams?.find((stream: any) => stream.stream_id === args.stream_id);
+              if (typeof destination?.name === "string") destinationChannelId = `zulip:${destination.name}`;
+            } catch { /* Preserve the successful move even if lookup fails. */ }
+          }
+          const confirmedMove: SelfMove = {
+            moveEpochs, messageId: args.message_id, source, propagateMode: args.propagate_mode ?? "change_one",
+            newStreamId, destinationChannelId, topic: storedTopic, likelyTopic: args.topic,
+          };
+          this.onMoved?.(confirmedMove);
+          if (movedTo) {
+            movedTo = { channelId: destinationChannelId, stream: destinationChannelId?.replace(/^zulip:/, "") ?? null, topic: storedTopic };
+            return {
+              ...result,
+              moved_to: movedTo,
+              ...(movedTo.channelId === null || movedTo.topic === null
+                ? { routing_note: "Move succeeded, but destination routing could not be fully resolved; inspect list_streams/get_stream_topics before publishing." }
+                : {}),
+            };
+          }
+        }
         return result;
       }
 
@@ -922,6 +1055,7 @@ export class ZulipToolRuntime {
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
+        for (const message of page.messages) this.onMessageObserved?.(message.id);
         return {
           channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
           channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
@@ -940,6 +1074,7 @@ export class ZulipToolRuntime {
         if (messageId === undefined) throw new Error("message_id must be a number");
         const limit = clampInt(args.limit, 50, 1, 200);
         const page = await fetchAround(zulipClient, messageId, limit);
+        for (const message of page.messages) this.onMessageObserved?.(message.id);
         const anchor = page.messages.find((m) => m.id === messageId);
         return {
           message_id: messageId,
@@ -1081,6 +1216,7 @@ export class ZulipToolRuntime {
             num_after: 0,
             narrow: [["stream", channelName]],
           });
+          for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
           const unread = result.messages.filter((msg: any) => msg.id > state.lastReadMessageId);
           totalUnread += unread.length;
@@ -1131,6 +1267,7 @@ export class ZulipToolRuntime {
           num_after: 0,
           narrow: [["stream", channelName]],
         });
+        for (const message of result.messages ?? []) this.onMessageObserved?.(message.id);
 
         const unread = result.messages.filter((msg: any) => msg.id > state.lastReadMessageId);
         const count = unread.length;

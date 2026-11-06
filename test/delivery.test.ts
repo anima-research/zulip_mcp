@@ -175,7 +175,7 @@ test('viewOf reads the sweep fields off an incoming message', () => {
   assert.equal(v.text, 'hi there', 'the attachment note is not part of the text');
   assert.deepEqual(v.attachmentNames, ['shot.png']);
   // A DM is addressed even without a mention flag.
-  assert.equal(viewOf({ ...msg(5, false), metadata: { isDM: true } }).mentioned, true);
+  assert.equal(viewOf({ ...msg(5, false), metadata: { isDM: true } }).isDM, true);
 });
 
 test('selectMissed keeps every message for a channel the host had open, else mentions with vicinity', () => {
@@ -328,7 +328,7 @@ test('renderMissedBlock on a DM conversation renders [DM] lines, with no mention
     metadata: { isDM: true, mentioned: false },
   });
   const views = [viewOf(dmMsg(1, 'hey')), viewOf(dmMsg(2, 'you there?'))];
-  assert.equal(views[0].mentioned, true, 'selection still treats a DM as addressed');
+  assert.equal(views[0].isDM, true, 'selection still treats a DM as addressed');
   const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' });
   assert.deepEqual(block.split('\n').slice(1, 3), ['[T id=1] [DM] Bo: hey', '[T id=2] [DM] Bo: you there?']);
 });
