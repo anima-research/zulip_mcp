@@ -115,8 +115,19 @@ function sameConversation(message: any, destination: Record<string, any>, self?:
  * Quote/spoiler fences are rendered prose. Token scanning itself is never disabled. */
 function inCode(content: string, offset: number): boolean {
   let fence: string | undefined, inline = 0;
-  let start = 0;
-  for (const line of content.split('\n')) {
+  let start = 0, table = false;
+  const lines = content.split('\n');
+  for (const [index, line] of lines.entries()) {
+    // Only a header + separator at a block boundary establishes table cells.
+    // An ordinary pipe (notably inside `a|b`) must not close inline code.
+    if (!line.trim()) table = false;
+    if (!fence && (index === 0 || !lines[index - 1].trim()) && line.includes('|')) {
+      const cells = (row: string) => row.trim().replace(/^\||\|$/g, '').split('|');
+      const separator = cells(lines[index + 1] ?? '');
+      table = separator.length === cells(line).length &&
+        separator.every(cell => /^ *:?-+:? *$/.test(cell));
+    }
+    if (table) inline = 0; // Table rows render independently.
     const end = start + line.length;
     const marker = /^[ >\t-]*(`{3,}|~{3,})(.*)$/.exec(line);
     if (marker) {
@@ -131,16 +142,20 @@ function inCode(content: string, offset: number): boolean {
       if (fence) return true;
       if (marker && /^(quote|spoiler)(?:\s|$)/.test(marker[2].trim())) return false;
       for (const match of line.slice(0, offset-start).matchAll(/`+|\|/g)) {
-        if (match[0] === '|') inline = 0;
-        else if (!inline) inline = match[0].length;
+        if (match[0] === '|') {
+          // A paired code span owns its internal pipes, even in a table.
+          if (table && ![...line.slice(match.index! + 1).matchAll(/`+/g)].some(ticks => ticks[0].length === inline)) inline = 0;
+        } else if (!inline) inline = match[0].length;
         else if (inline === match[0].length) inline = 0;
       }
       return inline > 0;
     }
     // Inline code may span lines.
     if (!marker && !fence) for (const match of line.matchAll(/`+|\|/g)) {
-      if (match[0] === '|') inline = 0;
-      else if (!inline) inline = match[0].length;
+      if (match[0] === '|') {
+        // A paired code span owns its internal pipes, even in a table.
+        if (table && ![...line.slice(match.index! + 1).matchAll(/`+/g)].some(ticks => ticks[0].length === inline)) inline = 0;
+      } else if (!inline) inline = match[0].length;
       else if (inline === match[0].length) inline = 0;
     }
     start = end + 1;
@@ -149,11 +164,19 @@ function inCode(content: string, offset: number): boolean {
 }
 
 function labelled(message: any, url: string): string {
-  // No retained feature level: Zulip's labelled fallback works on all versions,
-  // including names matching topic_link_util.py's special-character pattern.
-  const escape = (s: string) => s.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
+  // Port of Zulip 12.3 topic_link_util.py's get_fallback_markdown_link and
+  // escape_invalid_stream_topic_characters. Zulip disables Markdown escapes;
+  // replace each match once so generated entities are not escaped again.
+  const mapping: Record<string, string> = {
+    '`': '&#96;', '>': '&gt;', '*': '&#42;', '&': '&amp;',
+    '$$': '&#36;&#36;', '[': '&#91;', ']': '&#93;',
+  };
+  // Legacy metadata may contain line breaks, even though current Zulip rejects
+  // them. Keep generated labels on one line (the URL still encodes the name).
+  const escape = (s: string) => s.replace(/[\r\n]+/g, ' ')
+    .replace(/[`>*&[\]]|(\$\$)/g, match => mapping[match]);
   const label = message.type === 'stream'
-    ? `#${escape(message.display_recipient)} > ${escape(message.subject)} @ 💬` : 'DM @ 💬';
+    ? `#${escape(message.display_recipient)} > ${escape(message.subject || 'general chat')} @ 💬` : 'DM @ 💬';
   return `[${label}](${url})`;
 }
 

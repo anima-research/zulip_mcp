@@ -70,8 +70,7 @@ async function fixture(t: TestContext) {
     link: (path: string, code = false) => {
       const url = `${realm}/#narrow/${path}`;
       if (code) return url;
-      const escape = (value: string) => value.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
-      const label = path.includes('/near/105') ? '#general >  @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : `#${escape(stream.display_recipient)} > ${escape(stream.subject)} @ 💬`;
+      const label = path.includes('/near/105') ? '#general > general chat @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : "#R&amp;D / café. (test)!&#42;' > a/b .% #? &#91;&#93; (x)!&#42;'💬 @ 💬";
       return `[${label}](${url})`;
     } };
 }

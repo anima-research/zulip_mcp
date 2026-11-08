@@ -493,7 +493,11 @@ Outside code, streams use Zulip's labelled Markdown fallback
 `[DM @ 💬](url)`. The fallback is unconditional because this server does not
 retain a feature level; native `#**channel>topic@id**` chips require feature
 level 319. Inline code and ordinary code fences use bare absolute URLs so no
-literal Markdown label appears in code. Quote/spoiler fences are prose.
+literal Markdown label appears in code. Pipes inside inline code are literal;
+only established table cells can end an unmatched code run. Quote/spoiler
+fences are prose. Channel/topic labels use Zulip's entity-based escaping (not
+backslashes); legacy CR/LF in names is folded to spaces in display labels only.
+Empty topics display as “general chat”; their URL topic operand stays empty.
 URLs use the **Copy link to message** operators:
 `<realm>/#narrow/channel/<stream-operand>/topic/<encoded-topic>/near/<id>` and
 `#narrow/dm/<sorted-participant-ids>-dm/near/<id>` (`-group` for three or more,
@@ -502,7 +506,8 @@ including UTF-8 `.XX` escapes. Stream-name slug spaces become hyphens; the
 stream operand omits the name if encoding adds more than 10 characters or
 exceeds 1.5 times its original length. Empty topics are requested verbatim.
 
-Sends resolve before uploads and chunking, and never split a generated link.
+Sends resolve before uploads and chunking, and never split a generated link. Protected-span chunk cuts always advance;
+a preferred newline inside a link at the start uses the end of that link.
 A single expansion larger than the realm limit fails before uploads/sends.
 Edits that exceed the realm message limit after expansion fail before PATCH
 rather than relying on Zulip's silent truncation. The realm's advertised
