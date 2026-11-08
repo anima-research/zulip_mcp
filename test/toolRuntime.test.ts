@@ -367,7 +367,7 @@ for (const [label, message, destination] of [
     try {
       await assert.rejects(tools.handleToolCall('send_message', {
         ...destination, reply_to: 123, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
-      }), { message: 'reply_to sets the destination; omit to/topic' });
+      }), { message: 'reply_to sets the destination; omit to' });
       assert.deepEqual(gets, []);
       assert.deepEqual(userLookups, []);
       assert.deepEqual(sends, []);
@@ -445,7 +445,7 @@ test('send_message reply_to requires an integer id and a readable message destin
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message without reply_to keeps the exact payload and callbacks without fetching, enriching the response', async () => {
+test('send_message without reply_to trims the topic, preserves callbacks and does not fetch', async () => {
   const { tools, dir, gets, sends, result } = replyRuntime(replyStream);
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
@@ -453,13 +453,14 @@ test('send_message without reply_to keeps the exact payload and callbacks withou
     const stream = { type: 'stream', to: ' general ', topic: ' topic ', content: ' original\n' };
     const dm = { type: 'private', to: 'bo@example.com,ann@example.com', topic: undefined, content: 'DM' };
     assert.deepEqual(await tools.handleToolCall('send_message', stream), {
-      ...result, type: 'stream', stream: stream.to, topic: stream.topic, channelId: 'zulip: general ',
+      ...result, type: 'stream', stream: stream.to, topic: stream.topic.trim(), channelId: 'zulip: general ',
     });
     assert.deepEqual(await tools.handleToolCall('send_message', dm), {
       ...result, type: 'private', recipients: ['bo@example.com', 'ann@example.com'], channelId: 'zulip:bo@example.com,ann@example.com',
     });
     assert.deepEqual(gets, []);
-    assert.deepEqual(sends, [stream, dm]);
+    assert.deepEqual(sends, [{ ...stream, topic: stream.topic.trim() }, dm]);
+    assert.equal(stream.topic, ' topic ', 'caller input is not mutated');
     assert.deepEqual(sent, [
       { messageId: '501', channelId: 'zulip: general ', content: stream.content },
       { messageId: '501', channelId: 'zulip:bo@example.com,ann@example.com', content: dm.content },
@@ -481,7 +482,7 @@ test('send_message schema leaves destination requirements to the runtime', () =>
   assert.equal(schema.required, undefined);
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
-  assert.deepEqual(properties.reply_to.type, ['integer', 'null']);
+  assert.deepEqual(properties.reply_to.type, ['integer', 'string', 'null']);
   assert.match(properties.reply_to.description, /Omit to;/);
 });
 
