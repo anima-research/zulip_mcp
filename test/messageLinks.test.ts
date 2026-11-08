@@ -69,8 +69,7 @@ async function fixture(t: TestContext) {
     link: (path: string, code = false) => {
       const url = `${realm}/#narrow/${path}`;
       if (code) return url;
-      const escape = (value: string) => value.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
-      const label = path.includes('/near/105') ? '#general >  @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : `#${escape(stream.display_recipient)} > ${escape(stream.subject)} @ 💬`;
+      const label = path.includes('/near/105') ? '#general > general chat @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : "#R&amp;D / café. (test)!&#42;' > a/b .% #? &#91;&#93; (x)!&#42;'💬 @ 💬";
       return `[${label}](${url})`;
     } };
 }
@@ -101,11 +100,11 @@ for (const tool of ['send_message', 'edit_message']) {
     assert.equal(argsWithContent.content, content, 'caller input is unchanged');
   });
 
-  test(`${tool}: pipes in resolved stream/topic do not change table column counts`, async (t) => {
+  test(`${tool}: pipes in resolved stream/topic use Zulip's exact fallback label`, async (t) => {
     const f = await fixture(t);
     await f.tools.handleToolCall(tool, { ...args, content: 'Intro\na|[[msg:106]]\n-|-\nAfter' });
     assert.equal(f.requests.at(-1)!.content,
-      'Intro\na|[#a\\|b > x\\|y @ 💬](' + f.realm + '/#narrow/channel/1-a.7Cb/topic/x.7Cy/near/106)\n-|-\nAfter');
+      'Intro\na|[#a|b > x|y @ 💬](' + f.realm + '/#narrow/channel/1-a.7Cb/topic/x.7Cy/near/106)\n-|-\nAfter');
   });
 
   for (const ending of ['\n', '\r\n']) {
@@ -164,7 +163,7 @@ for (const tool of ['send_message', 'edit_message']) {
     test(`${tool}: tokens in ${label} resolve`, async (t) => {
       const f = await fixture(t);
       await f.tools.handleToolCall(tool, { ...args, content });
-      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, ['inline code','multiline inline code','code fence','unclosed tilde fence','blockquote fence','nested list fence'].includes(label))));
+      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, ['inline code','multiline inline code','code fence','unclosed tilde fence','blockquote fence','nested list fence','table cells'].includes(label))));
       assert.equal(f.requests.filter((r) => r.method === 'GET').length, 1);
     });
     test(`${tool}: unreadable tokens in ${label} fail before mutations`, async (t) => {
