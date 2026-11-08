@@ -32,3 +32,9 @@
   reactions, edit markers and this bot's own messages cannot clear it. Explicit
   sends bypass refusal one reply at a time, not clear it. The bot's own moves emit no change marker;
   typing stops where its run began.
+- Departed-topic bot notices remain blocked after a stream-only second move
+  or a later move that cannot place the reference. A requested move id does not
+  raise the refusal floor until it is actually observed from Zulip.
+- Event polling keeps the post-registration stop check: stopping while queue
+  registration is pending prevents polling that queue. Removed the unused
+  queue-registration callback left over from earlier move reconciliation.

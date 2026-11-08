@@ -245,7 +245,7 @@ export class ZulipMcplServer {
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
     this.tools.onMessageObserved = (id) => this.channelManager.observeMessageId(id);
-    this.tools.onMoveStarted = (id) => this.channelManager.captureMoveEpochs(id);
+    this.tools.onMoveStarted = () => this.channelManager.captureMoveEpochs();
     this.tools.onMoved = (move) => this.adapter.noteSelfMoved?.(move);
     this.adapter.onSelfChanged = (change) => this.channelManager.reconcileSelfChange(change);
   }

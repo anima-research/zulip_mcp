@@ -2284,7 +2284,8 @@ test('R6-2 uncertain move back A to B to A replaces the older departed topic', a
   assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
   await assert.rejects(f.publish(), /unconfirmed topic/);
   await f.callMove({ message_id: 21, topic: 'A', propagate_mode: 'change_all' });
-  assert.equal(f.routingReference().leftTopic, undefined, 'unknown placement cannot carry an older departure forward');
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' },
+    'unknown placement preserves the older barrier; a person can still clear refusal');
   f.feed({ type: 'message', flags: ['mentioned'], message: raw(31, 'A') });
   await until(() => f.server.delivery.watermark(GENERAL) === 31, 'back in A');
   await f.publish();
@@ -2392,4 +2393,90 @@ test('N1 unknown channel cannot use the original channel as source proof', async
     assert.deepEqual(e.data.movedTo, { channelId: null, topic: null });
     return true;
   });
+});
+
+// R7-1a: a stream-only second move leaves the event's current topic, not
+// the original hints (which have deliberately remained refused since A).
+test('R7-1a stream-only second move keeps the current departed-topic barrier', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'A') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
+  f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'A', subject: 'B', propagate_mode: 'change_all' }));
+  await until(() => f.incoming.filter(m => m.metadata?.change === 'move').length === 1, 'A to B');
+  f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'B', subject: undefined,
+    new_stream_id: 8, propagate_mode: 'change_all' }));
+  await until(() => f.incoming.filter(m => m.metadata?.change === 'move').length === 2, 'B to archive');
+  await assert.rejects(f.publish(), /Conversation moved to zulip:archive > B/);
+  f.feed({ type: 'message', flags: [], message: { ...raw(31, 'B'), flags: [],
+    sender_id: 100, sender_email: 'notification-bot@example.com', content: 'This topic was moved to #archive>B' } });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'old-topic notice');
+  await assert.rejects(f.publish(), /Conversation moved to zulip:archive > B/);
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'B' });
+  assert.equal(f.sent.length, 0);
+});
+
+test('R7-1b unknown-source move preserves an earlier departed-topic barrier', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'A') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
+  f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'A', subject: 'B', propagate_mode: 'change_all' }));
+  await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'A to B');
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
+  assert.equal(f.cachedPlacement(21), undefined, 'the later anchor is uncached');
+  f.failReads(true);
+  await f.callMove({ message_id: 21, topic: 'elsewhere', propagate_mode: 'change_all' });
+  f.failReads(false);
+  assert.deepEqual(f.routingReference().movedTo, { channelId: null, topic: null });
+  f.feed({ type: 'message', flags: [], message: { ...raw(31, 'A'), flags: [],
+    sender_id: 100, sender_email: 'notification-bot@example.com', content: 'This topic was moved to B' } });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'late old-topic notice');
+  await assert.rejects(f.publish(), /this conversation may have moved/);
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
+  assert.equal(f.sent.length, 0);
+});
+
+test('R7-1b a likely co-moved reference keeps its barrier after an unrelated range move', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.placements.set(21, raw(21, 'A'));
+  f.placements.set(30, raw(30, 'A'));
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'A') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
+  await f.callMove({ message_id: 21, topic: 'B', propagate_mode: 'change_all' });
+  assert.deepEqual(f.routingReference().movedTo, { channelId: GENERAL, topic: null, likelyTopic: 'B' });
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
+  f.placements.set(20, raw(20, 'unrelated'));
+  await f.callMove({ message_id: 20, topic: 'elsewhere', propagate_mode: 'change_all' });
+  assert.deepEqual(f.routingReference().movedTo, { channelId: null, topic: null });
+  f.feed({ type: 'message', flags: [], message: { ...raw(31, 'A'), flags: [],
+    sender_id: 100, sender_email: 'notification-bot@example.com', content: 'This topic was moved to B' } });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'late old-topic notice');
+  await assert.rejects(f.publish(), /this conversation may have moved/);
+  assert.deepEqual(f.routingReference().leftTopic, { channelId: GENERAL, topic: 'A' });
+  assert.equal(f.sent.length, 0);
+});
+
+test('R7-2 an unverified requested id cannot raise the refusal floor', async t => {
+  const f = await fixture();
+  t.after(() => f.close());
+  await f.open();
+  f.feed({ type: 'message', flags: ['mentioned'], message: raw(30, 'A') });
+  await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
+  // This callback runs before the pre-move GET/PATCH can reject an invalid id.
+  // No successful Zulip read or event has observed this caller-supplied id.
+  f.tools.onMoveStarted!(1_000_000_000);
+  f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'A', subject: 'B', propagate_mode: 'change_all' }));
+  await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'rename refusal');
+  await assert.rejects(f.publish(), /Conversation moved to zulip:general > B/);
+  f.feed({ type: 'message', flags: [], message: { ...raw(31, 'support'), flags: [],
+    sender_id: 8, sender_full_name: 'Bob', sender_email: 'bob@example.com' } });
+  await until(() => f.server.delivery.watermark(GENERAL) === 31, 'new message');
+  await f.publish();
+  assert.deepEqual([f.sent.at(-1).to, f.sent.at(-1).topic], ['general', 'support']);
+  assert.equal(f.routingReference().from, 31);
 });
