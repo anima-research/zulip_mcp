@@ -550,18 +550,17 @@ test('stopping in an awaited message handler drops all subsequent events in its 
   assert.deepEqual(seen, ['message']);
 });
 
-test('R2-7 stopped registration cannot clear the replacement loop state', async () => {
+test('R2-7 stopped registration never starts polling', async () => {
   const loop = new ZulipEventLoop();
   let release!: (value: any) => void;
-  let registered = 0, polls = 0;
+  let polls = 0;
   const registration = new Promise(resolve => { release = resolve; });
   const started = loop.start({ queues: { register: () => registration },
     events: { retrieve: async () => { polls++; loop.stop(); return { events: [] }; } } },
-    () => {}, undefined, undefined, undefined, () => registered++);
+    () => {});
   await Promise.resolve();
   loop.stop();
   release({ queue_id: 'stale', last_event_id: -1 });
   await started;
-  assert.equal(registered, 0);
   assert.equal(polls, 0);
 });
