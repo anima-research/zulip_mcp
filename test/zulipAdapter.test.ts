@@ -130,7 +130,7 @@ test('publish uploads image blocks and links them after the text; without an upl
   const uploadPolicy = { roots: new Map<string, string>(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
   const withUploads = new ZulipAdapter(client, SELF, 's', { uploader, uploadPolicy });
   const res = await withUploads.publish('zulip:general', undefined, blocks, { threadId: 'deploys' });
-  assert.deepEqual(res, { delivered: true, messageId: '77', messageIds: ['77'] });
+  assert.deepEqual(res, { delivered: true, links: [], messageId: '77', messageIds: ['77'] });
   assert.deepEqual(uploaded, ['image-2.png']);
   assert.deepEqual(sends[0], { type: 'stream', to: 'general', topic: 'deploys', content: 'chart attached\n\n[image-2.png](/user_uploads/1/image-2.png)' });
 

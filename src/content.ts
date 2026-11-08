@@ -295,7 +295,8 @@ export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
  * paragraph boundaries, then line boundaries, then a hard cut. Boundary
  * whitespace at the split is dropped; nothing else is.
  */
-export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
+export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH, protectedText: readonly string[] = []): string[] {
+  if (protectedText.some(value => value.length > limit)) throw new Error("Message-link expansion exceeds the realm message length limit");
   const out: string[] = [];
   let rest = text;
   while (rest.length > 0) {
@@ -307,6 +308,11 @@ export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LEN
     let cut = window.lastIndexOf('\n\n');
     if (cut <= 0) cut = window.lastIndexOf('\n');
     if (cut <= 0) cut = limit;
+    for (const value of protectedText) {
+      for (let at = rest.indexOf(value); at !== -1 && at < cut; at = rest.indexOf(value, at + 1)) {
+        if (cut < at + value.length) cut = at;
+      }
+    }
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n+/, '');
   }
