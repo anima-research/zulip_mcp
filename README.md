@@ -302,7 +302,7 @@ marker. For host integrations:
 3. On an open channel, a new message (but not this bot's own messages)
    **above the refusal's message-id floor** clears refusal and routes replies
    to that message's topic. In the stream/topic the conversation left, only
-   bot senders (identified by `looksLikeBotEmail`) are ignored: a person's new
+   senders whose email has a `-bot@` local part are ignored: a person's new
    message there, including a delete-and-repost, clears refusal.
    A Notification Bot notice in the old topic does not clear refusal; a new
    destination breadcrumb can. On a closed channel, only such a message accepted
