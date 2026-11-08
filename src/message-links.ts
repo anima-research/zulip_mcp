@@ -47,7 +47,7 @@ function messageUrl(realm: string, id: number, message: any): string {
     // Zulip internal_url.ts encode_slug measures the entire id-name operand.
     const operand = encoded.length - slug.length > 10 || encoded.length > slug.length * 1.5
       ? String(message.stream_id) : encoded;
-    narrow = `stream/${operand}/topic/${hashEncode(message.subject)}`;
+    narrow = `channel/${operand}/topic/${hashEncode(message.subject)}`;
   } else if (message.type === 'private') {
     const recipients = message.display_recipient;
     if (!Array.isArray(recipients) || !recipients.length || recipients.some((r) => !positiveId(r?.id))) {
@@ -56,41 +56,157 @@ function messageUrl(realm: string, id: number, message: any): string {
     // Copy-message permalinks include everyone, including the bot, so the
     // link addresses the same conversation for other readers too.
     const ids = [...new Set<number>(recipients.map((r) => r.id))].sort((a, b) => a - b);
-    narrow = `pm-with/${ids.join(',')}-${ids.length >= 3 ? 'group' : 'dm'}`;
+    narrow = `dm/${ids.join(',')}-${ids.length >= 3 ? 'group' : 'dm'}`;
   } else throw new Error('Zulip returned an unknown message type');
-  // Legacy operators are accepted by both old and new Zulip web clients.
   return `${realm.replace(/\/+$/, '')}/#narrow/${narrow}/near/${id}`;
 }
 
-/** Resolve everything before the caller uploads, chunks, sends or edits anything. */
-export async function resolveMessageLinks(content: string, session: Pick<ZulipSession, 'client' | 'realm'>): Promise<string> {
-  const tokens = tokensIn(content);
-  if (!tokens.length) return content;
-  const links = new Map<number, string>();
-  for (const token of tokens) {
-    if (token.id === undefined || links.has(token.id)) continue;
-    const fail = (description: string) => new Error(`Cannot resolve ${token.text}: ${description}`);
+export interface MessageLink { token: string; url: string }
+export type MessageMemo = Map<number, Promise<any>>;
+export interface LinkOptions {
+  destination?: Record<string, any> | (() => Promise<Record<string, any>>);
+  allowPrivateReferences?: boolean;
+  memo?: MessageMemo;
+  links?: MessageLink[];
+  /** Exact rendered replacements, protected from send chunk boundaries. */
+  replacements?: string[];
+  selfUserId?: number | null;
+}
+
+/** Lookup diagnostics never include API bodies, request URLs or client exception text. */
+export function lookupError(code?: unknown): string {
+  if (code === 'RATE_LIMIT_HIT' || code === 'INTERNAL_SERVER_ERROR' || code === 'TRANSPORT_ERROR') {
+    return `temporarily unavailable (${code}); retry`;
+  }
+  return 'message not found or not accessible';
+}
+
+export function readMessage(client: any, id: number, memo: MessageMemo): Promise<any> {
+  if (!memo.has(id)) memo.set(id, (async () => {
     let result;
     try {
-      result = await session.client.messages.getById({ message_id: token.id });
+      result = await client.messages.getById({ message_id: id, allow_empty_topic_name: true });
     } catch {
-      // Client errors can contain response-body bytes, URLs and credentials.
-      // Never forward exception text (or attach the original as a cause).
-      throw fail('transport or parse error');
+      // Client exceptions can include response-body bytes and request URLs.
+      throw new Error(lookupError('TRANSPORT_ERROR'));
     }
-    if (result?.result !== 'success') {
-      const safeCodes = new Set(['BAD_REQUEST', 'ACCESS_DENIED', 'UNAUTHORIZED', 'RATE_LIMIT_HIT', 'INTERNAL_SERVER_ERROR']);
-      throw fail(safeCodes.has(result?.code) ? `Zulip API error ${result.code}` : 'message not found or not accessible');
+    if (result?.result !== 'success') throw new Error(lookupError(result?.code));
+    if (!result.message) throw new Error(lookupError());
+    return result.message;
+  })());
+  return memo.get(id)!;
+}
+
+function sameConversation(message: any, destination: Record<string, any>, self?: number | null): boolean {
+  if (message.type === 'stream') {
+    return ['stream', 'channel'].includes(destination.type) &&
+      (destination.to === message.stream_id || destination.to === message.display_recipient) &&
+      destination.topic === message.subject;
+  }
+  if (message.type !== 'private' || !['private', 'direct'].includes(destination.type) || !positiveId(self)) return false;
+  const to = Array.isArray(destination.to) ? destination.to : [destination.to];
+  const ids = to.map((id: unknown) => typeof id === 'string' && /^\d+$/.test(id) ? Number(id) : id);
+  if (ids.some((id: unknown) => !positiveId(id)) || !Array.isArray(message.display_recipient)) return false;
+  const canonical = (values: number[]) => [...new Set(values)].sort((a,b) => a-b).join(',');
+  return canonical([...(ids as number[]), self]) === canonical(message.display_recipient.map((r: any) => r.id));
+}
+
+/** Inline backticks and ordinary code fences use bare URLs, not literal Markdown labels.
+ * Quote/spoiler fences are rendered prose. Token scanning itself is never disabled. */
+function inCode(content: string, offset: number): boolean {
+  let fence: string | undefined, inline = 0;
+  let start = 0;
+  for (const line of content.split('\n')) {
+    const end = start + line.length;
+    const marker = /^[ >\t-]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (fence && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
+        if (offset <= end) return true;
+        fence = undefined;
+      } else if (!fence && !/^(quote|spoiler)(?:\s|$)/.test(marker[2].trim())) {
+        fence = marker[1];
+      }
     }
-    try {
-      links.set(token.id, messageUrl(session.realm, token.id, result.message));
-    } catch {
-      throw fail('message not found or not accessible');
+    if (offset <= end) {
+      if (fence) return true;
+      if (marker && /^(quote|spoiler)(?:\s|$)/.test(marker[2].trim())) return false;
+      for (const match of line.slice(0, offset-start).matchAll(/`+|\|/g)) {
+        if (match[0] === '|') inline = 0;
+        else if (!inline) inline = match[0].length;
+        else if (inline === match[0].length) inline = 0;
+      }
+      return inline > 0;
     }
+    // Inline code may span lines.
+    if (!marker && !fence) for (const match of line.matchAll(/`+|\|/g)) {
+      if (match[0] === '|') inline = 0;
+      else if (!inline) inline = match[0].length;
+      else if (inline === match[0].length) inline = 0;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+function labelled(message: any, url: string): string {
+  // No retained feature level: Zulip's labelled fallback works on all versions,
+  // including names matching topic_link_util.py's special-character pattern.
+  const escape = (s: string) => s.replace(/[\\`*[\]<>]/g, '\\$&');
+  const label = message.type === 'stream'
+    ? `#${escape(message.display_recipient)} > ${escape(message.subject)} @ 💬` : 'DM @ 💬';
+  return `[${label}](${url})`;
+}
+
+/** Resolve and authorize every reference before uploads, chunks, sends or edits. */
+export async function resolveMessageLinks(content: string, session: Pick<ZulipSession, 'client' | 'realm'>, options: LinkOptions = {}): Promise<string> {
+  const tokens = tokensIn(content); // All synchronous checks precede all reads.
+  if (!tokens.some(t => t.id !== undefined)) {
+    return content.replace(/\\(\[\[msg:[0-9]+\]\])/g, '$1');
+  }
+  const memo = options.memo ?? new Map();
+  const messages = new Map<number, any>();
+  for (const token of tokens) {
+    if (token.id === undefined || messages.has(token.id)) continue;
+    try { messages.set(token.id, await readMessage(session.client, token.id, memo)); }
+    catch (error) { throw new Error(`Cannot resolve ${token.text}: ${(error as Error).message}`); }
+  }
+  const destination = options.allowPrivateReferences === true ? undefined : typeof options.destination === 'function' ? await options.destination() : options.destination;
+  const publicStreams = new Map<number, boolean>();
+  const urls = new Map<number, string>();
+  for (const token of tokens) {
+    if (token.id === undefined || urls.has(token.id)) continue;
+    const message = messages.get(token.id);
+    const fail = (detail: string) => new Error(`Cannot resolve ${token.text}: ${detail}`);
+    let url: string;
+    try { url = messageUrl(session.realm, token.id, message); }
+    catch { throw fail(lookupError()); }
+    let allowed = options.allowPrivateReferences === true || !!destination && sameConversation(message, destination, options.selfUserId);
+    if (!allowed && message.type === 'stream' && destination && ['stream', 'channel'].includes(destination.type)) {
+      if (!publicStreams.has(message.stream_id)) {
+        let result;
+        try { result = await session.client.callEndpoint(`streams/${message.stream_id}`, 'GET', {}); }
+        catch { throw fail(lookupError('TRANSPORT_ERROR')); }
+        if (result?.result !== 'success') throw fail(lookupError(result?.code));
+        // invite_only is the audience boundary. Web-public/history flags do not
+        // widen or narrow this owner-approved rule; unknown metadata fails closed.
+        publicStreams.set(message.stream_id, result.stream?.invite_only === false);
+      }
+      allowed = publicStreams.get(message.stream_id) === true;
+    }
+    if (!allowed) throw fail(`reference is outside the allowed destination audience; escape it as \\${token.text} or explicitly set allow_private_references: true`);
+    urls.set(token.id, url);
   }
   let resolved = '', start = 0;
   for (const token of tokens) {
-    resolved += content.slice(start, token.start) + (token.id === undefined ? token.text : links.get(token.id)!);
+    resolved += content.slice(start, token.start);
+    if (token.id === undefined) resolved += token.text;
+    else {
+      const url = urls.get(token.id)!;
+      const replacement = inCode(content, token.start) ? url : labelled(messages.get(token.id), url);
+      resolved += replacement;
+      options.links?.push({token: token.text, url});
+      options.replacements?.push(replacement);
+    }
     start = token.end;
   }
   return resolved + content.slice(start);

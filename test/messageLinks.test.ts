@@ -11,7 +11,7 @@ import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 
 const stream = { id: 101, type: 'stream', stream_id: 12,
   display_recipient: "R&D / café. (test)!*'", subject: "a/b .% #? [] (x)!*'💬" };
-const streamPath = 'stream/12/topic/a.2Fb.20.2E.25.20.23.3F.20.5B.5D.20.28x.29.21.2A.27.F0.9F.92.AC/near/101';
+const streamPath = 'channel/12/topic/a.2Fb.20.2E.25.20.23.3F.20.5B.5D.20.28x.29.21.2A.27.F0.9F.92.AC/near/101';
 const messages: Record<number, unknown> = {
   101: stream,
   102: { id: 102, type: 'private', display_recipient: [{ id: 790 }, { id: 42 }] },
@@ -58,15 +58,21 @@ async function fixture(t: TestContext) {
     uploader: { async upload({ name }) { uploads++; return { name, path: '/user_uploads/1/a/file', url: `${realm}/user_uploads/1/a/file` }; } },
   });
   return { tools, requests, realm, uploads: () => uploads,
-    link: (path: string) => `${realm}/#narrow/${path}` };
+    link: (path: string, code = false) => {
+      const url = `${realm}/#narrow/${path}`;
+      if (code) return url;
+      const escape = (value: string) => value.replace(/[\\`*[\]<>]/g, '\\$&');
+      const label = path.includes('/near/105') ? '#general >  @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : `#${escape(stream.display_recipient)} > ${escape(stream.subject)} @ 💬`;
+      return `[${label}](${url})`;
+    } };
 }
 
 for (const tool of ['send_message', 'edit_message']) {
-  const args = tool === 'send_message' ? { type: 'stream', to: 'general', topic: 'links' } : { message_id: 500 };
+  const args = tool === 'send_message' ? { type: 'stream', to: 'general', topic: 'links', allow_private_references: true } : { message_id: 500, allow_private_references: true };
   for (const [id, path] of [
-    [101, streamPath], [102, 'pm-with/42,790-dm/near/102'],
-    [103, 'pm-with/7,42,790-group/near/103'], [104, 'pm-with/790-dm/near/104'],
-    [105, 'stream/12-general/topic//near/105'],
+    [101, streamPath], [102, 'dm/42,790-dm/near/102'],
+    [103, 'dm/7,42,790-group/near/103'], [104, 'dm/790-dm/near/104'],
+    [105, 'channel/12-general/topic//near/105'],
   ] as const) {
     test(`${tool}: builds the Zulip narrow for message ${id}`, async (t) => {
       const f = await fixture(t);
@@ -81,7 +87,7 @@ for (const tool of ['send_message', 'edit_message']) {
     const input = { ...args, content: '[[msg:101]] + [[msg:102]] + [[msg:101]] + [[msg:00102]]' };
     await f.tools.handleToolCall(tool, input);
     assert.deepEqual(f.requests.filter((r) => r.method === 'GET').map((r) => r.url.pathname), ['/api/v1/messages/101', '/api/v1/messages/102']);
-    const a = f.link(streamPath), b = f.link('pm-with/42,790-dm/near/102');
+    const a = f.link(streamPath), b = f.link('dm/42,790-dm/near/102');
     assert.equal(f.requests.at(-1)!.content, `${a} + ${b} + ${a} + ${b}`);
     assert.equal(input.content, '[[msg:101]] + [[msg:102]] + [[msg:101]] + [[msg:00102]]', 'caller input is not mutated');
     await f.tools.handleToolCall(tool, { ...args, content: '[[msg:101]]' });
@@ -103,7 +109,7 @@ for (const tool of ['send_message', 'edit_message']) {
     test(`${tool}: tokens in ${label} resolve`, async (t) => {
       const f = await fixture(t);
       await f.tools.handleToolCall(tool, { ...args, content });
-      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath)));
+      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, ['inline code','multiline inline code','code fence','unclosed tilde fence','blockquote fence','nested list fence'].includes(label))));
       assert.equal(f.requests.filter((r) => r.method === 'GET').length, 1);
     });
     test(`${tool}: unreadable tokens in ${label} fail before mutations`, async (t) => {
@@ -130,7 +136,7 @@ for (const tool of ['send_message', 'edit_message']) {
     const content = String.raw`\[[msg:101]] [[msg:101]] \\[[msg:999]] [[msg:102]]`;
     await f.tools.handleToolCall(tool, { ...args, content });
     assert.equal(f.requests.at(-1)!.content,
-      '[[msg:101]] ' + f.link(streamPath) + String.raw` \[[msg:999]] ` + f.link('pm-with/42,790-dm/near/102'));
+      '[[msg:101]] ' + f.link(streamPath) + String.raw` \[[msg:999]] ` + f.link('dm/42,790-dm/near/102'));
     assert.equal(f.requests.filter((r) => r.method === 'GET').length, 2);
   });
 
@@ -171,11 +177,11 @@ for (const tool of ['send_message', 'edit_message']) {
 
 test('send_message: tokens compose with reply_to and attachments before content is processed', async (t) => {
   const f = await fixture(t);
-  await f.tools.handleToolCall('send_message', { reply_to: 101, content: '[[msg:102]]', attachments: [{ data: 'aGk=', name: 'hi.txt' }] });
+  await f.tools.handleToolCall('send_message', { allow_private_references: true, reply_to: 101, content: '[[msg:102]]', attachments: [{ data: 'aGk=', name: 'hi.txt' }] });
   assert.deepEqual(f.requests.map((r) => r.method), ['GET', 'GET', 'POST']);
   assert.equal(f.requests[0].url.pathname, '/api/v1/messages/102');
   assert.equal(f.requests[1].url.pathname, '/api/v1/messages/101');
-  assert.ok(f.requests[2].content!.startsWith(f.link('pm-with/42,790-dm/near/102')));
+  assert.ok(f.requests[2].content!.startsWith(f.link('dm/42,790-dm/near/102')));
   assert.match(f.requests[2].content!, /user_uploads/);
   assert.equal(f.uploads(), 1);
 });

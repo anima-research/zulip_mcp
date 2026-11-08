@@ -620,7 +620,7 @@ export class ZulipMcplServer {
               this.stateTracker.recordSent(id, publish.channelId, text);
             }
           }
-          conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) });
+          conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}), ...(result.links ? { links: result.links } : {}) });
           break;
         }
 

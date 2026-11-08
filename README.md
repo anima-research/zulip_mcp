@@ -453,7 +453,7 @@ Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`cha
 Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends.
 Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
 
-`send_message` and `edit_message` resolve exact `[[msg:ID]]` tokens in
+`send_message`, `send_dm`, `edit_message` and MCPL `channels/publish` resolve exact `[[msg:ID]]` tokens in
 `content`, for example `{"reply_to":12345,"content":"See [[msg:67890]]"}`.
 Each decimal ID is read through the bot's Zulip API access before any uploads,
 content chunking, sends or edits. If any lookup fails (missing message, no
@@ -462,38 +462,53 @@ is sent or edited. There are at most **20 unescaped token occurrences** per call
 including duplicates; duplicate IDs are fetched once per call, never cached
 across calls. IDs must be positive safe integers (leading zeroes are accepted).
 Every `[[msg:ID]]` is resolved wherever it appears: prose, inline code, fences,
-spoiler/quote blocks, blockquotes and tables. There is no Markdown parsing.
+spoiler/quote blocks, blockquotes and tables. Scanning is independent of Markdown; code context only chooses the rendering.
 To send a literal token, write `\[[msg:ID]]`: the immediately preceding
 backslash is removed, `[[msg:ID]]` is sent unchanged, and no lookup occurs.
 Escaped tokens do not count toward the cap or undergo ID validation. If more
 backslashes precede a token, only the one immediately before it is removed.
 In JSON tool arguments, encode that backslash as `\\`, for example
 `{"content":"\\[[msg:123]]"}` sends the literal `[[msg:123]]`.
-Token lookup errors use fixed descriptions and allowlisted API codes, never
-response bodies or raw client exceptions. Any `reply_to` lookup failure also
-uses a fixed sanitized error, without API body text or client exception details.
+By default a reference is allowed only in the **same conversation** (same
+stream and topic, or same full DM participant set), or from a **non-invite-only
+stream into a stream**. The stream's `invite_only` flag is authoritative:
+web-public and private-history settings do not change this audience rule.
+Missing stream metadata fails closed. Cross-DM, private-stream-to-other-topic,
+and stream-to-DM references are otherwise refused, naming the token and
+suggesting the backslash escape. The three tools accept an explicit per-call
+`allow_private_references: true` to allow any readable source, knowingly
+revealing its location. MCPL publishes use the default policy; use a send tool
+for the explicit opt-in. Successful results include `links: [{token, url}]`
+(one entry per expanded occurrence) so the transcript records every link.
+
+Token and `reply_to` lookup errors share sanitized diagnostics: `BAD_REQUEST`
+means not found/not accessible; rate limits, server errors and transport failures
+say temporarily unavailable with an allowlisted code and advise retrying.
+API bodies, arbitrary codes and client exception text are never forwarded.
 Bare numbers and all other text are untouched: this is opt-in, not a number
 detector.
 
-The replacement is a plain absolute URL, the form Zulip's **Copy link to
-message** produces, so Zulip can render its native message-link chip rather
-than a server-invented markdown label. Stream links have the form
-`<realm>/#narrow/stream/<stream-operand>/topic/<encoded-topic>/near/<message-id>`;
-DM links use `#narrow/pm-with/<sorted-participant-ids>-dm/near/<message-id>`
-(or `-group` for three or more participants, including the bot). Names/topics
-use [Zulip's hash encoding](https://zulip.com/api/zulip-urls), including UTF-8
-`.XX` escapes and spaces replaced by hyphens in the stream-name slug only.
-The stream operand is normally `<id>-<slug>`, but Zulip omits the name when
-encoding the full operand adds more than 10 characters or exceeds 1.5 times
-its original length. For example, stream 12 named `general` uses
-`stream/12-general/topic/links/near/101`; named `R&D / café. (test)!*'`
-it uses `stream/12/topic/links/near/101`.
-The legacy `stream` and `pm-with` operators work on older servers and remain
-accepted by newer clients as aliases for `channel` and `dm`; this server does
-not retain a server feature level, so it does not guess a version threshold.
-On edits, only tokens in the supplied replacement content are resolved;
-existing links are left as supplied (the old message body is not fetched or
-merged). `send_dm` and MCPL publishes do not expand this syntax.
+Outside code, streams use Zulip's labelled Markdown fallback
+`[#channel > topic @ 💬](url)` (with Markdown-special names escaped); DMs use
+`[DM @ 💬](url)`. The fallback is unconditional because this server does not
+retain a feature level; native `#**channel>topic@id**` chips require feature
+level 319. Inline code and ordinary code fences use bare absolute URLs so no
+literal Markdown label appears in code. Quote/spoiler fences are prose.
+URLs use the **Copy link to message** operators:
+`<realm>/#narrow/channel/<stream-operand>/topic/<encoded-topic>/near/<id>` and
+`#narrow/dm/<sorted-participant-ids>-dm/near/<id>` (`-group` for three or more,
+including the bot). Names/topics use [Zulip's hash encoding](https://zulip.com/api/zulip-urls),
+including UTF-8 `.XX` escapes. Stream-name slug spaces become hyphens; the
+stream operand omits the name if encoding adds more than 10 characters or
+exceeds 1.5 times its original length. Empty topics are requested verbatim.
+
+Sends resolve before uploads and chunking, and never split a generated link.
+A single expansion larger than the realm limit fails before uploads/sends.
+Edits that exceed the realm message limit after expansion fail before PATCH
+rather than relying on Zulip's silent truncation. The realm's advertised
+`max_message_length` is used (10000 when unknown), with the existing
+`ZULIP_MAX_MESSAGE_LENGTH` override. On edits only tokens in replacement
+content change; existing links are not rewritten, and the old body is not merged.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes
