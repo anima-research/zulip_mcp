@@ -321,6 +321,8 @@ test('move_messages describes visible breadcrumbs and resolving a whole topic', 
   const tool = toolDefinitions.find(tool => tool.name === 'move_messages')!;
   assert.match(tool.description, /Notification Bot breadcrumb in the destination topic by default/);
   assert.match(tool.description, /resolve a topic.*✔ <topic> with change_all/);
+  assert.match(tool.description, /For a move refusal, reply with send_message\(\{reply_to: <messageId>, content\}\)/);
+  assert.match(tool.description, /deletion\/hidden-move refusal needs a newer readable message id with reply_to, or an explicit destination/);
   const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
   assert.match(String(properties.propagate_mode.description), /Zulip defaults to change_one/);
   assert.match(String(properties.propagate_mode.description), /change_later moves this and later messages/);
