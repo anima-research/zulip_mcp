@@ -559,8 +559,7 @@ export class ChannelManager {
     if (Number.isFinite(id)) this.highestKnownMessageId = Math.max(this.highestKnownMessageId, id);
   }
 
-  captureMoveEpochs(messageId: number): ReadonlyMap<string, number> {
-    this.observeMessageId(messageId);
+  captureMoveEpochs(): ReadonlyMap<string, number> {
     return new Map([...this.lastIncoming].map(([channelId, reference]) => [channelId, reference.epoch]));
   }
 
@@ -618,7 +617,7 @@ export class ChannelManager {
         }
         this.lastIncoming.set(channelId, { ...reference, epoch: ++this.routingEpoch,
           expectedEcho: undefined,
-          leftTopic: departure(change.previousTopic ?? reference.hints.threadId,
+          leftTopic: departure(change.previousTopic ?? change.topic,
             change.selfEcho?.destinationChannelId ?? destination, change.selfEcho?.topic ?? change.topic),
           lastEcho: change.selfEcho ? { beforeEpoch: reference.epoch, shape: change.selfEcho } : undefined,
           refusalAfter: this.refusalFloor(channelId, ...change.messageIds.map(Number)),
@@ -659,7 +658,7 @@ export class ChannelManager {
       const hasDestinationHint = exact || knownSource;
       if (uncertain || destination !== channelId) {
         this.lastIncoming.set(channelId, { ...source,
-          leftTopic: hasDestinationHint ? departure(scope.topic, destination, change.topic) : undefined,
+          leftTopic: hasDestinationHint ? departure(scope.topic, destination, change.topic) : reference.leftTopic,
           movedTo: {
             channelId: hasDestinationHint ? destination : null,
             topic: hasDestinationHint && !uncertain ? change.topic : null,
