@@ -159,6 +159,10 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
+        allow_private_references: {
+          type: "boolean", default: false,
+          description: "Explicit per-call opt-in to link any message readable by the bot across audiences, including private stream names/topics and DM participant IDs. Default false.",
+        },
         type: {
           type: ["string", "null"],
           enum: ["stream", "private", "channel", "direct", "", null],
@@ -178,7 +182,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The message content (supports Markdown). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
+          description: "The message content (supports Markdown). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
         },
         attachments: {
           type: "array",
@@ -210,12 +214,16 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
+        allow_private_references: {
+          type: "boolean", default: false,
+          description: "Explicit per-call opt-in to link any message readable by the bot across audiences, including private stream names/topics and DM participant IDs. Default false.",
+        },
         to: {
           type: "array",
           items: { type: "string" },
           description: "One or more recipients: full name, email, or user id each",
         },
-        content: { type: "string", description: "The message content (supports Markdown). May be empty when attachments are given." },
+        content: { type: "string", description: "The message content (supports Markdown). Resolves [[msg:ID]] before uploads/sends, including code; backslash escapes a token (max 20). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. May be empty when attachments are given." },
         attachments: {
           type: "array",
           description:
@@ -257,13 +265,17 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
+        allow_private_references: {
+          type: "boolean", default: false,
+          description: "Explicit per-call opt-in to link any message readable by the bot across audiences, including private stream names/topics and DM participant IDs. Default false.",
+        },
         message_id: {
           type: "number",
           description: "ID of the message to edit",
         },
         content: {
           type: "string",
-          description: "The new message content (supports Markdown, replaces the old content entirely). Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
+          description: "The new message content (supports Markdown, replaces the old content entirely). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
         },
       },
       required: ["message_id", "content"],

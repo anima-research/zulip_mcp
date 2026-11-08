@@ -24,7 +24,7 @@ import type {
 
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
-export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
+export type PublishResult = ChannelsPublishResult & { messageIds?: string[]; links?: { token: string; url: string }[] };
 
 /**
  * Routing hints for outgoing messages, derived by the MCPL layer from the

@@ -15,7 +15,7 @@ import type { PlatformAdapter } from '../src/platforms/adapter.ts';
 
 const stream = { id: 101, type: 'stream', stream_id: 12,
   display_recipient: "R&D / café. (test)!*'", subject: "a/b .% #? [] (x)!*'💬" };
-const streamPath = 'stream/12/topic/a.2Fb.20.2E.25.20.23.3F.20.5B.5D.20.28x.29.21.2A.27.F0.9F.92.AC/near/101';
+const streamPath = 'channel/12/topic/a.2Fb.20.2E.25.20.23.3F.20.5B.5D.20.28x.29.21.2A.27.F0.9F.92.AC/near/101';
 const messages: Record<number, unknown> = {
   101: stream,
   102: { id: 102, type: 'private', display_recipient: [{ id: 790 }, { id: 42 }] },
@@ -67,18 +67,24 @@ async function fixture(t: TestContext) {
     uploader: { async upload({ name }) { uploads++; return { name, path: '/user_uploads/1/a/file', url: `${realm}/user_uploads/1/a/file` }; } },
   });
   return { tools, requests, realm, uploads: () => uploads,
-    link: (path: string) => `${realm}/#narrow/${path}` };
+    link: (path: string, code = false) => {
+      const url = `${realm}/#narrow/${path}`;
+      if (code) return url;
+      const escape = (value: string) => value.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
+      const label = path.includes('/near/105') ? '#general >  @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : `#${escape(stream.display_recipient)} > ${escape(stream.subject)} @ 💬`;
+      return `[${label}](${url})`;
+    } };
 }
 
 
 test('send: large content with final bad reference cannot upload or partially chunk', async t => {
  const f=await fixture(t);
- await assert.rejects(f.tools.handleToolCall('send_message',{type:'stream',to:'general',topic:'links',content:'a'.repeat(50000)+' [[msg:101]] [[msg:999]]', attachments:[{data:'aGk=',name:'hi.txt'}]}));
+ await assert.rejects(f.tools.handleToolCall('send_message',{allow_private_references:true,type:'stream',to:'general',topic:'links',content:'a'.repeat(50000)+' [[msg:101]] [[msg:999]]', attachments:[{data:'aGk=',name:'hi.txt'}]}));
  assert.equal(f.uploads(),0); assert.ok(f.requests.every(r=>r.method==='GET'));
 });
 test('saved upstream URL example: shortened stream slug and encoded topic', async t => {
  const f=await fixture(t);
- await f.tools.handleToolCall('edit_message',{message_id:500,content:'[[msg:101]]'});
+ await f.tools.handleToolCall('edit_message',{message_id:500,allow_private_references:true,content:'[[msg:101]]'});
  const expected=f.link(streamPath);
  assert.equal(f.requests.at(-1).content,expected);
 });
@@ -86,20 +92,20 @@ test('saved upstream URL example: shortened stream slug and encoded topic', asyn
 test('malformed response must not leak raw body in error', async t => {
  const f=await fixture(t);
  let error;
- try { await f.tools.handleToolCall('edit_message',{message_id:500,content:'[[msg:995]]'}); } catch(e) {error=e;}
+ try { await f.tools.handleToolCall('edit_message',{message_id:500,allow_private_references:true,content:'[[msg:995]]'}); } catch(e) {error=e;}
  assert.ok(error); assert.ok(f.requests.every(r=>r.method==='GET'));
  assert.doesNotMatch(String(error),/PRIVATE_BO/);
 });
 for (const id of [994,993]) test(`network/access failure ${id} is atomic`, async t => {
  const f=await fixture(t);
- await assert.rejects(f.tools.handleToolCall('send_message',{type:'stream',to:'general',topic:'links',content:'[[msg:101]] [[msg:'+id+']]',attachments:[{data:'aGk=',name:'hi.txt'}]}));
+ await assert.rejects(f.tools.handleToolCall('send_message',{allow_private_references:true,type:'stream',to:'general',topic:'links',content:'[[msg:101]] [[msg:'+id+']]',attachments:[{data:'aGk=',name:'hi.txt'}]}));
  assert.equal(f.uploads(),0); assert.ok(f.requests.every(r=>r.method==='GET'));
 });
 
 test('lookup errors allowlist API codes, never body text, arbitrary codes or exception text', async () => {
   const { resolveMessageLinks } = await import('../src/message-links.ts');
   for (const [result, description] of [
-    [{result:'error',code:'ACCESS_DENIED',msg:'PRIVATE_BODY_MARKER'}, 'Zulip API error ACCESS_DENIED'],
+    [{result:'error',code:'ACCESS_DENIED',msg:'PRIVATE_BODY_MARKER'}, 'message not found or not accessible'],
     [{result:'error',code:'PRIVATE_BODY_MARKER',msg:'PRIVATE_BODY_MARKER'}, 'message not found or not accessible'],
   ] as const) {
     await assert.rejects(resolveMessageLinks('[[msg:999]]', {
@@ -108,7 +114,7 @@ test('lookup errors allowlist API codes, never body text, arbitrary codes or exc
   }
   await assert.rejects(resolveMessageLinks('[[msg:999]]', {
     realm:'https://example.invalid',client:{messages:{async getById(){throw new Error('PRIVATE_BODY_MARKER');}}} as any,
-  }), {message:'Cannot resolve [[msg:999]]: transport or parse error'});
+  }), {message:'Cannot resolve [[msg:999]]: temporarily unavailable (TRANSPORT_ERROR); retry'});
 });
 
 test('stream slug shortening includes the id prefix and uses strict upstream thresholds', async () => {
@@ -122,10 +128,10 @@ test('stream slug shortening includes the id prefix and uses strict upstream thr
     ['team space', '12-team-space'],
     ['a'.repeat(27), '12-'+ 'a'.repeat(27)],
   ]) {
-    const actual = await resolveMessageLinks('[[msg:101]]', {
+    const actual = await resolveMessageLinks('`[[msg:101]]`', {
       realm:'https://example.invalid',client:{messages:{async getById(){return {result:'success',message:{...stream,display_recipient:name}};}}} as any,
-    });
-    assert.equal(actual,`https://example.invalid/#narrow/stream/${operand}/topic/${streamPath.split('/topic/')[1]}`);
+    }, {allowPrivateReferences:true});
+    assert.equal(actual,'`'+`https://example.invalid/#narrow/channel/${operand}/topic/${streamPath.split('/topic/')[1]}`+'`');
   }
 });
 
@@ -135,7 +141,7 @@ for (const id of [995, 994, 993, 997, 999, 996, 992, 991]) {
     await assert.rejects(f.tools.handleToolCall('send_message', {
       reply_to: id, content: '[[msg:102]]', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
     }), (error: Error) => {
-      assert.equal(error.message, `Cannot resolve reply_to ${id}: message not found or not accessible`);
+      assert.equal(error.message, `Cannot resolve reply_to ${id}: ${[995,994,997].includes(id) ? 'temporarily unavailable (TRANSPORT_ERROR); retry' : 'message not found or not accessible'}`);
       assert.equal(error.cause, undefined);
       assert.doesNotMatch(String(error), /PRIVATE_BO|FetchError|No access|not JSON/);
       return true;
@@ -170,7 +176,7 @@ test('tools/call returns only the sanitized reply_to error for malformed client 
     name: 'send_message', arguments: { reply_to: 995, content: '[[msg:102]]' },
   });
   assert.deepEqual(result, {
-    content: [{ type: 'text', text: 'Error: Cannot resolve reply_to 995: message not found or not accessible' }],
+    content: [{ type: 'text', text: 'Error: Cannot resolve reply_to 995: temporarily unavailable (TRANSPORT_ERROR); retry' }],
     isError: true,
   });
   assert.deepEqual(f.requests.map((r) => r.method), ['GET', 'GET']);

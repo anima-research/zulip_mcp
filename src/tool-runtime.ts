@@ -20,8 +20,8 @@ import {
 } from "./content.js";
 import type { SelfMove } from "./platforms/adapter.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { resolveMessageLinks } from "./message-links.js";
 import { normalizeMarkdownTables } from "./markdown-tables.js";
+import { resolveMessageLinks, readMessage, type MessageMemo, type MessageLink } from "./message-links.js";
 import { assertApiSuccess, dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
@@ -291,22 +291,15 @@ export class ZulipToolRuntime {
   }
 
   /** Resolve and check a reply before uploading files or sending any chunks. */
-  private async replyDestination(args: Record<string, any>) {
+  private async replyDestination(args: Record<string, any>, memo: MessageMemo) {
     const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
     if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to");
     const unreadable = () => new Error(`Cannot resolve reply_to ${id}: message not found or not accessible`);
-    let result;
-    try {
-      result = await this.zulipClient.messages.getById({ message_id: id });
-    } catch {
-      // Client exceptions may include response bytes, URLs or credentials.
-      // Use the same fixed error for every lookup failure, without a cause.
-      throw unreadable();
-    }
-    if (result?.result !== "success") throw unreadable();
-    const message = result.message;
-    if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
+    let message;
+    try { message = await readMessage(this.zulipClient, id!, memo); }
+    catch (error) { throw new Error(`Cannot resolve reply_to ${id}: ${(error as Error).message}`); }
+    if (!["stream", "private"].includes(message.type)) throw unreadable();
     if (args.type !== undefined && args.type !== message.type) {
       throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
     }
@@ -708,8 +701,23 @@ export class ZulipToolRuntime {
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
-        const resolvedContent = hasText ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session)) : "";
-        const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
+        if (args.reply_to !== undefined) {
+          if (!Number.isSafeInteger(numberOrUndefined(args.reply_to))) throw new Error("reply_to must be an integer message id");
+          if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to");
+        }
+        const memo: MessageMemo = new Map();
+        let reply: Awaited<ReturnType<ZulipToolRuntime['replyDestination']>> | undefined;
+        const links: MessageLink[] = [], replacements: string[] = [];
+        const resolvedContent = hasText ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session, {
+          destination: async () => {
+            reply = args.reply_to !== undefined ? await this.replyDestination(args, memo) : undefined;
+            return reply ?? args;
+          }, memo, links, replacements, selfUserId: this.session.selfUserId,
+          allowPrivateReferences: args.allow_private_references === true,
+        })) : "";
+        if (!reply && args.reply_to !== undefined) reply = await this.replyDestination(args, memo);
+        const limit = this.session.maxMessageLength;
+        chunkMessage(resolvedContent, limit, replacements); // Preflight before uploads.
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
         const uploaded = await this.uploadFor(args);
         const content = withAttachmentLinks(resolvedContent, uploaded);
@@ -718,7 +726,7 @@ export class ZulipToolRuntime {
         const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
-        for (const chunk of chunkMessage(content)) {
+        for (const chunk of chunkMessage(content, this.session.maxMessageLength, replacements)) {
           last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
           ids.push(last.id);
@@ -731,6 +739,7 @@ export class ZulipToolRuntime {
           ...(args.type === "stream"
             ? { stream: reply ? channelId.slice("zulip:".length) : args.to, topic: args.topic }
             : { recipients: Array.isArray(args.to) ? args.to : String(args.to).split(",").map((to) => to.trim()) }),
+          links,
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(ids.length > 1 ? { ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : {}),
         };
@@ -742,13 +751,21 @@ export class ZulipToolRuntime {
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
-        const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
+        let ids: number[] | undefined;
+        const links: MessageLink[] = [], replacements: string[] = [];
+        const resolvedContent = hasText ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session, {
+          destination: async () => ({ type: 'private', to: ids ??= await Promise.all(wanted.map(w => this.resolveUserId(w))) }),
+          links, replacements, selfUserId: this.session.selfUserId,
+          allowPrivateReferences: args.allow_private_references === true,
+        })) : "";
+        ids ??= await Promise.all(wanted.map(w => this.resolveUserId(w)));
+        chunkMessage(resolvedContent, this.session.maxMessageLength, replacements);
         const uploaded = await this.uploadFor(args);
-        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
+        const content = withAttachmentLinks(resolvedContent, uploaded);
         const channelId = dmChannelIdFor(ids);
         const sent: number[] = [];
         let result: any = null;
-        for (const chunk of chunkMessage(content)) {
+        for (const chunk of chunkMessage(content, this.session.maxMessageLength, replacements)) {
           result = await zulipClient.messages.send({ type: "private", to: ids, content: chunk });
           if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
           sent.push(result.id);
@@ -760,6 +777,7 @@ export class ZulipToolRuntime {
           type: "private",
           recipients: ids,
           channelId,
+          links,
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}),
         };
@@ -827,9 +845,22 @@ export class ZulipToolRuntime {
         }
         const apiUrl = zulipClient.config?.apiURL ?? `${this.session.realm}/api/v1`;
         const editFields = new URLSearchParams();
+        const links: MessageLink[] = [];
+        const memo: MessageMemo = new Map();
         for (const field of moving ? ["topic", "propagate_mode", "stream_id"] : ["content"]) {
           if (args[field] !== undefined) editFields.set(field, field === "content"
-            ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session)) : String(args[field]));
+            ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session, {
+              destination: async () => {
+                let message;
+                try { message = await readMessage(zulipClient, args.message_id, memo); }
+                catch (error) { throw new Error(`Cannot resolve edit destination: ${(error as Error).message}`); }
+                return { type: message.type, to: message.type === 'stream' ? message.stream_id : message.display_recipient?.map((r: any) => r.id), topic: message.subject };
+              }, memo, links, selfUserId: this.session.selfUserId,
+              allowPrivateReferences: args.allow_private_references === true,
+            })) : String(args[field]));
+        }
+        if (!moving && (editFields.get('content')?.length ?? 0) > (this.session.maxMessageLength ?? 10000)) {
+          throw new Error("Cannot edit: message-link expansion caused content to exceed the realm message length limit");
         }
         const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
           method: "PATCH",
@@ -907,7 +938,7 @@ export class ZulipToolRuntime {
             };
           }
         }
-        return result;
+        return moving ? result : { ...result, links };
       }
 
       case "delete_message": {

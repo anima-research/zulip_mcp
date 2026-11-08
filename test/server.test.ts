@@ -3600,3 +3600,24 @@ for (const kind of ['edit', 'move', 'delete'] as const) {
   });
 }
 
+
+test('R1-3 channels/publish expands through the real adapter and returns its audit links on the wire', async () => {
+  const h = harness();
+  const sent: any[] = [];
+  const adapter = new ZulipAdapter({
+    config: {realm:'https://example.invalid'},
+    messages: {
+      async getById({message_id}: any) {return {result:'success',message:{id:message_id,type:'stream',stream_id:7,display_recipient:'general',subject:'mcpl'}};},
+      async send(args: any) {sent.push(args); return {result:'success',id:41};},
+    },
+  },790,'test');
+  h.adapter.publish = adapter.publish.bind(adapter);
+  try {
+    await initialize(h,true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE,{effectiveCapabilities:FULL_GRANT});
+    await awaitRegistered(h);
+    const result=await h.host.sendRequest(method.CHANNELS_PUBLISH,{conversationId:'c1',channelId:'zulip:general',content:[{type:'text',text:'[[msg:101]]'}]});
+    assert.deepEqual(result,{delivered:true,messageId:'41',links:[{token:'[[msg:101]]',url:'https://example.invalid/#narrow/channel/7-general/topic/mcpl/near/101'}]});
+    assert.equal(sent[0].content,'[#general > mcpl @ 💬](https://example.invalid/#narrow/channel/7-general/topic/mcpl/near/101)');
+  } finally {await h.close();}
+});

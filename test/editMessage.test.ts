@@ -72,7 +72,7 @@ test('edit_message PATCHes the id in the path and only content in the form body'
   const f = await fixture(response);
   try {
     const content = 'Updated **text** & + = \n✓';
-    assert.deepEqual(await f.tools.handleToolCall('edit_message', { message_id: 42, content, extra: 'not sent' }), response);
+    assert.deepEqual(await f.tools.handleToolCall('edit_message', { message_id: 42, content, extra: 'not sent' }), { ...response, links: [] });
     assert.deepEqual(f.calls, [{
       method: 'PATCH', path: '/api/v1/messages/42',
       body: new URLSearchParams({ content }).toString(), auth: f.authHeader,
@@ -287,7 +287,7 @@ test('move_messages validates message_id before edit fields', async () => {
 test('edit_message stays content-only and rejects moves without a request', async () => {
   const tool = toolDefinitions.find(tool => tool.name === 'edit_message')!;
   assert.deepEqual(tool.inputSchema.required, ['message_id', 'content']);
-  assert.deepEqual(Object.keys(tool.inputSchema.properties), ['message_id', 'content']);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties), ['allow_private_references', 'message_id', 'content']);
   assert.match(tool.description, /your own/);
   const f = await fixture({ result: 'success', msg: '' });
   try {

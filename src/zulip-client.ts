@@ -19,6 +19,8 @@ export interface ZulipSession {
   sessionId: string;
   /** The realm's advertised per-file upload cap (`max_file_upload_size_mib`), bytes; null when unknown. */
   maxUploadBytes?: number | null;
+  /** Realm message limit, default 10000 when unknown. */
+  maxMessageLength?: number;
 }
 
 export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env): Promise<ZulipSession> {
@@ -103,13 +105,18 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   // The realm's upload cap, so the outbound ceiling is what the server will
   // actually accept rather than a guess. Fail-open: unknown → null.
   let maxUploadBytes: number | null = null;
+  let maxMessageLength = 10000;
   try {
     const settings = await client.callEndpoint("server_settings", "GET", {});
+    if (Number.isSafeInteger(settings?.max_message_length) && settings.max_message_length > 0) maxMessageLength = settings.max_message_length;
     const mib = settings?.max_file_upload_size_mib;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
   } catch (err) {
     console.error("Failed to read realm server settings (upload cap):", err);
   }
+
+  const configuredLimit = Number(env.ZULIP_MAX_MESSAGE_LENGTH);
+  if (Number.isSafeInteger(configuredLimit) && configuredLimit > 0) maxMessageLength = configuredLimit;
 
   // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
   // Needed because Zulip's event queue only delivers message events for streams
@@ -131,5 +138,5 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   }
 
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
-  return { client, selfUserId, realm, authHeader, sessionId, maxUploadBytes };
+  return { client, selfUserId, realm, authHeader, sessionId, maxUploadBytes, maxMessageLength };
 }
