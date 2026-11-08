@@ -35,6 +35,8 @@ import type {
   SelfMove,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
+import { normalizeMarkdownTables } from '../markdown-tables.js';
+import { resolveMessageLinks, type MessageLink } from '../message-links.js';
 import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { ActiveTopicsCache } from '../active-topics.js';
@@ -811,16 +813,6 @@ export class ZulipAdapter implements PlatformAdapter {
       .filter((c): c is TextContent => c.type === 'text')
       .map(c => c.text)
       .join('\n');
-    // Image and audio blocks ride along as uploads, linked after the text
-    // (Zulip's own attachment form). Uploads happen before the send, so a
-    // failed upload fails the publish whole; a send that fails after them
-    // leaves unreferenced uploads, which Zulip garbage-collects.
-    if (this.uploader && this.uploadPolicy) {
-      const uploaded = await uploadBlocks(this.uploader, content, this.uploadPolicy);
-      textContent = withAttachmentLinks(textContent, uploaded);
-    }
-    if (!textContent) return { delivered: false };
-
     const dmIds = parseDmChannelId(channelId);
     let target: Record<string, unknown>;
     let what: string;
@@ -840,16 +832,31 @@ export class ZulipAdapter implements PlatformAdapter {
       what = `message to #${streamName}`;
     }
 
+    const links: MessageLink[] = [], replacements: string[] = [];
+    textContent = normalizeMarkdownTables(await resolveMessageLinks(textContent, {
+      client: this.zulipClient, realm: this.zulipClient.config?.realm ?? '',
+    }, { destination: target, links, replacements, selfUserId: this.identity.selfUserId }));
+    chunkMessage(textContent, this.maxMessageLength, replacements); // Preflight before uploads.
+    // Image and audio blocks ride along as uploads, linked after the text
+    // (Zulip's own attachment form). Uploads happen before the send, so a
+    // failed upload fails the publish whole; a send that fails after them
+    // leaves unreferenced uploads, which Zulip garbage-collects.
+    if (this.uploader && this.uploadPolicy) {
+      const uploaded = await uploadBlocks(this.uploader, content, this.uploadPolicy);
+      textContent = withAttachmentLinks(textContent, uploaded);
+    }
+    if (!textContent) return { delivered: false };
+
     // Zulip rejects anything over the realm's max_message_length; a long
     // reply goes out as several messages rather than failing whole.
     const messageIds: string[] = [];
-    for (const chunk of chunkMessage(textContent, this.maxMessageLength)) {
+    for (const chunk of chunkMessage(textContent, this.maxMessageLength, replacements)) {
       const result = await this.zulipClient.messages.send({ ...target, content: chunk });
       assertApiSuccess(result, what);
       this.highestMessageId = Math.max(this.highestMessageId, Number(result.id));
       messageIds.push(String(result.id));
     }
-    return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
+    return { delivered: true, links, messageId: messageIds[messageIds.length - 1], messageIds };
   }
 
   /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */

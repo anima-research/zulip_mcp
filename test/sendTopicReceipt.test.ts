@@ -16,7 +16,7 @@ const privateMessage = { type: 'private', display_recipient: [{ id: 790 }, { id:
 const properties = toolDefinitions.find(t => t.name === 'send_message')!.inputSchema.properties!;
 function strictCall(fields: Record<string, unknown>, unused: null | '') {
   // Every advertised property is present, as in a Codex strict-schema call.
-  return { ...Object.fromEntries(Object.keys(properties).map(k => [k, k === 'attachments' ? [] : unused])), ...fields };
+  return { ...Object.fromEntries(Object.keys(properties).map(k => [k, k === 'allow_private_references' ? false : k === 'attachments' ? [] : unused])), ...fields };
 }
 function fixture(message: unknown = stream) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-receipt-'));
@@ -52,7 +52,7 @@ for (const unused of [null, ''] as const) {
       assert.deepEqual(Object.keys(args).sort(), Object.keys(properties).sort());
       const result = await f.tools.handleToolCall('send_message', args);
       assert.deepEqual(f.sends, [{ ...payload, content: 'hello' }]);
-      assert.deepEqual(result, { result: 'success', id: 501, msg: '', ...destination });
+      assert.deepEqual(result, { result: 'success', id: 501, msg: '', links: [], ...destination });
       assert.equal(f.gets(), 'reply_to' in fields ? 1 : 0);
       assert.deepEqual(args, before, 'normalization does not mutate caller arguments');
     });
@@ -63,7 +63,7 @@ for (const unused of [null, ''] as const) {
     assertStrictArguments('send_message', args);
     const result = await f.tools.handleToolCall('send_message', args);
     assert.deepEqual(f.sends, [{ type: 'private', to: [790, 42, 7], topic: undefined, content: 'hello' }]);
-    assert.deepEqual(result, { result: 'success', id: 501, msg: '', type: 'private', recipients: [790, 42, 7], channelId: 'zulip:dm:7+42' });
+    assert.deepEqual(result, { result: 'success', id: 501, msg: '', links: [], type: 'private', recipients: [790, 42, 7], channelId: 'zulip:dm:7+42' });
   });
 }
 
@@ -86,7 +86,7 @@ test('explicitly empty stream topic without reply_to is refused before upload/se
 test('send_dm includes its destination alongside existing receipt fields', async t => {
   const f = fixture(); t.after(f.close);
   const result = await f.tools.handleToolCall('send_dm', { to: ['42', '7'], content: 'hello' });
-  assert.deepEqual(result, { result: 'success', id: 501, msg: '', to_user_ids: [42, 7], type: 'private', recipients: [42, 7], channelId: 'zulip:dm:7+42' });
+  assert.deepEqual(result, { result: 'success', id: 501, msg: '', links: [], to_user_ids: [42, 7], type: 'private', recipients: [42, 7], channelId: 'zulip:dm:7+42' });
 });
 
 test('reply topic and receipt follow the real zulip-js HTTP send, including chunking', async t => {

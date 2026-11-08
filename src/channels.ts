@@ -25,7 +25,7 @@ import type {
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { looksLikeBotEmail } from './history.js';
-import type { MessageChangeEvent, MoveEcho, PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
+import type { MessageChangeEvent, MoveEcho, PlatformAdapter, PlatformSystemEvent, PublishResult, RoutingHints } from './platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
@@ -720,7 +720,7 @@ export class ChannelManager {
   /**
    * Handle channels/publish from the host — route to the owning adapter.
    */
-  async publish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
+  async publish(params: ChannelsPublishParams): Promise<PublishResult> {
     if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
 
     const channelId = params.channelId;

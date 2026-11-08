@@ -330,8 +330,8 @@ test('send_message reply_to derives the current stream and topic', async () => {
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
   try {
-    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), { ...result, type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
-    assert.deepEqual(gets, [{ message_id: 123 }]);
+    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), { ...result, links: [], type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
+    assert.deepEqual(gets, [{ message_id: 123, allow_empty_topic_name: true }]);
     assert.deepEqual(sends, [{ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }]);
     assert.deepEqual(sent[0], { messageId: '501', channelId: 'zulip:General', content: 'reply' });
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -384,7 +384,7 @@ for (const code of ['BAD_REQUEST', 'UNAUTHORIZED', 'PRIVATE_BODY_MARKER']) {
         type: 'stream', reply_to: 999, content: 'reply',
         attachments: [{ data: 'aGk=', name: 'hi.txt' }],
       }), { message: 'Cannot resolve reply_to 999: message not found or not accessible' });
-      assert.deepEqual(gets, [{ message_id: 999 }]);
+      assert.deepEqual(gets, [{ message_id: 999, allow_empty_topic_name: true }]);
       assert.deepEqual(sends, []);
       assert.deepEqual(uploaded, []);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -399,7 +399,7 @@ test('send_message reply_to accepts integer-valued strings without mutating argu
       await tools.handleToolCall('send_message', args);
       assert.deepEqual(args, { reply_to, content: 'reply' });
     }
-    assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+    assert.deepEqual(gets, Array(4).fill({ message_id: 123, allow_empty_topic_name: true }));
     assert.deepEqual(sends, Array(4).fill({ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }));
     assert.deepEqual(userLookups, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -423,7 +423,7 @@ for (const [alias, message] of [
         type: alias === 'channel' ? 'direct' : 'channel', reply_to: 123, content: 'reply',
         attachments: [{ data: 'aGk=', name: 'hi.txt' }],
       }), /type disagrees/);
-      assert.deepEqual(gets, [{ message_id: 123 }, { message_id: 123 }]);
+      assert.deepEqual(gets, [{ message_id: 123, allow_empty_topic_name: true }, { message_id: 123, allow_empty_topic_name: true }]);
       assert.equal(sends.length, 1, 'a conflicting alias sends nothing');
       assert.deepEqual(uploaded, [], 'a conflicting alias uploads nothing');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -453,10 +453,10 @@ test('send_message without reply_to trims the topic, preserves callbacks and doe
     const stream = { type: 'stream', to: ' general ', topic: ' topic ', content: ' original\n' };
     const dm = { type: 'private', to: 'bo@example.com,ann@example.com', topic: undefined, content: 'DM' };
     assert.deepEqual(await tools.handleToolCall('send_message', stream), {
-      ...result, type: 'stream', stream: stream.to, topic: stream.topic.trim(), channelId: 'zulip: general ',
+      ...result, links: [], type: 'stream', stream: stream.to, topic: stream.topic.trim(), channelId: 'zulip: general ',
     });
     assert.deepEqual(await tools.handleToolCall('send_message', dm), {
-      ...result, type: 'private', recipients: ['bo@example.com', 'ann@example.com'], channelId: 'zulip:bo@example.com,ann@example.com',
+      ...result, links: [], type: 'private', recipients: ['bo@example.com', 'ann@example.com'], channelId: 'zulip:bo@example.com,ann@example.com',
     });
     assert.deepEqual(gets, []);
     assert.deepEqual(sends, [{ ...stream, topic: stream.topic.trim() }, dm]);
@@ -522,7 +522,7 @@ test('send_message reply_to uses the real client with numeric strings and aliase
     dir = state.dir;
     await state.tools.handleToolCall('send_message', { type: 'channel', reply_to: '123', content: 'reply' });
     assert.deepEqual(requests.map(({ method, url }) => ({ method, url })), [
-      { method: 'GET', url: '/api/v1/messages/123?message_id=123' },
+      { method: 'GET', url: '/api/v1/messages/123?message_id=123&allow_empty_topic_name=true' },
       { method: 'POST', url: '/api/v1/messages' },
     ]);
     assert.match(requests[1].body, /name="to"\r\n\r\n12\r\n/);
@@ -625,7 +625,7 @@ for (const message of [replyStream, { type: 'private', display_recipient: replyP
         await tools.handleToolCall('send_message', args);
         assert.deepEqual(args, original, 'normalization does not mutate the caller');
       }
-      assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+      assert.deepEqual(gets, Array(4).fill({ message_id: 123, allow_empty_topic_name: true }));
       assert.deepEqual(sends, Array(4).fill({
         type: message.type, to: message.type === 'stream' ? 12 : [790, 42, 7],
         topic: message.type === 'stream' ? replyStream.subject : undefined, content: 'reply',
@@ -640,10 +640,10 @@ test('send_message treats a null reply_to and topic as absent on a plain send', 
   try {
     assert.deepEqual(await tools.handleToolCall('send_message', {
       type: 'stream', to: 'General', topic: 'Deploy status', reply_to: null, content: 'stream',
-    }), { ...result, type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
+    }), { ...result, links: [], type: 'stream', stream: 'General', topic: 'Deploy status', channelId: 'zulip:General' });
     assert.deepEqual(await tools.handleToolCall('send_message', {
       type: 'private', to: [42], topic: null, reply_to: null, content: 'DM',
-    }), { ...result, type: 'private', recipients: [42], channelId: 'zulip:dm:42' });
+    }), { ...result, links: [], type: 'private', recipients: [42], channelId: 'zulip:dm:42' });
     assert.deepEqual(gets, []);
     assert.deepEqual(sends, [
       { type: 'stream', to: 'General', topic: 'Deploy status', content: 'stream' },

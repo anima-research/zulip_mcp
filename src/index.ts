@@ -123,7 +123,7 @@ async function main(): Promise<void> {
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
-    maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
+    maxMessageLength: session.maxMessageLength,
   });
   const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
   tools.setReactionPolicy({
