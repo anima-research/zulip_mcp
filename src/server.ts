@@ -1637,6 +1637,8 @@ export class ZulipMcplServer {
         };
       }
       case 'filters_update': {
+        // Null is a strict-schema placeholder; [] remains an explicit DM reset.
+        args = { ...args, addStreams: args.addStreams ?? undefined, removeStreams: args.removeStreams ?? undefined, setDmUsers: args.setDmUsers ?? undefined };
         const plane = this.requireFilters();
         const addStreams = Array.isArray(args.addStreams) ? args.addStreams.map((s) => this.streamArg(s)) : [];
         const removeStreams = Array.isArray(args.removeStreams) ? args.removeStreams.map((s) => this.streamArg(s)) : [];

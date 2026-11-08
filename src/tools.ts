@@ -134,19 +134,19 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         channels: {
-          type: "array",
+          type: ["array", "null"],
           items: { type: "string" },
-          description: "Optional: specific channels to check. If not provided, checks all monitored channels.",
+          description: "Optional: specific channels to check. Null, [] or omission checks all monitored channels.",
         },
         format: {
-          type: "string",
-          enum: ["detailed", "summary", "raw"],
-          description: "Output format: 'detailed', 'summary', or 'raw'",
+          type: ["string", "null"],
+          enum: ["detailed", "summary", "raw", null],
+          description: "Output format: 'detailed', 'summary', or 'raw'; null uses detailed",
           default: "detailed",
         },
         mark_as_read: {
-          type: "boolean",
-          description: "Mark messages as read after retrieving (default: true)",
+          type: ["boolean", "null"],
+          description: "Mark messages as read after retrieving (default: true; null uses default)",
           default: true,
         },
       },
@@ -161,8 +161,8 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         type: {
           type: ["string", "null"],
-          enum: ["stream", "private", "", null],
-          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied. Null or empty string means absent.",
+          enum: ["stream", "private", "channel", "direct", "", null],
+          description: "'stream' or 'private' (DM); aliases 'channel' and 'direct' normalize to those values. Required without reply_to; otherwise inferred, and must match if supplied. Null or empty string means absent.",
         },
         to: {
           type: ["string", "null"],
@@ -170,11 +170,11 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         topic: {
           type: ["string", "null"],
-          description: "Required for streams without reply_to. With a stream reply_to, overrides only the topic; refused for a private reply_to. Null or empty string means absent, except an explicitly empty topic on a stream send without reply_to is an error.",
+          description: "Required as a non-empty trimmed string for streams without reply_to; all missing/empty forms are refused. With a stream reply_to, overrides only the topic; refused for a private reply_to. Null or empty string means absent; whitespace-only strings also mean absent. Strings are trimmed before sending.",
         },
         reply_to: {
-          type: ["integer", "null"],
-          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; topic may override a stream reply's topic only. Conflicting types, supplied to, private-reply topics or unreadable IDs fail before uploads or sends. Null or empty string means absent; 0 also means absent. Does not quote the message.",
+          type: ["integer", "string", "null"],
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; topic may override a stream reply's topic only. Conflicting types, supplied to, private-reply topics or unreadable IDs fail before uploads or sends. Null or empty string means absent; 0 and integer-valued strings equal to zero (including \"0\") also mean absent. Integer-valued strings are accepted for IDs. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -276,12 +276,12 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         message_id: { type: "number", description: "ID of the message to move" },
-        topic: { type: ["string", "null"], description: "New topic name" },
-        stream_id: { type: ["integer", "null"], minimum: 1, description: "Destination stream ID" },
+        topic: { type: ["string", "null"], description: "New topic name. Null leaves the topic unchanged; an empty string moves to the unnamed topic (general chat)." },
+        stream_id: { type: ["integer", "null"], minimum: 1, description: "Destination stream ID. Null leaves the stream unchanged." },
         propagate_mode: {
-          type: "string",
-          enum: ["change_one", "change_later", "change_all"],
-          description: "Requires topic or stream_id. Zulip defaults to change_one (this message only); change_later moves this and later messages in the same topic; change_all renames/moves the whole topic. Omit to use the server default.",
+          type: ["string", "null"],
+          enum: ["change_one", "change_later", "change_all", null],
+          description: "Requires topic or stream_id. Zulip defaults to change_one (this message only); change_later moves this and later messages in the same topic; change_all renames/moves the whole topic. Null or omission uses the server default.",
         },
       },
       required: ["message_id"],
@@ -452,10 +452,10 @@ export const toolDefinitions: ToolDefinition[] = [
       type: "object",
       properties: {
         channel: { type: "string", description: "Stream name (e.g. 'general'), stream channel id ('zulip:general'), or DM conversation id ('zulip:dm:42')" },
-        topic: { type: "string", description: "Optional: limit to one topic (streams only)" },
-        limit: { type: "number", description: "Max messages to fetch (default 50, max 1000)" },
-        before: { type: "number", description: "Only messages older than this message id (exclusive)" },
-        after: { type: "number", description: "Only messages newer than this message id (exclusive)" },
+        topic: { type: ["string", "null"], description: "Optional: limit to one topic (streams only). Null or empty string means absent." },
+        limit: { type: ["number", "null"], description: "Max messages to fetch (default 50, max 1000). Null uses the default." },
+        before: { type: ["number", "null"], description: "Only messages older than this message id (exclusive). Null or 0 means absent (default newest page)." },
+        after: { type: ["number", "null"], description: "Only messages newer than this message id (exclusive). Null or 0 means absent (default newest page)." },
       },
       required: ["channel"],
     },
@@ -509,12 +509,12 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        addStreams: { type: "array", items: { type: "string" }, description: "Stream names to allow" },
-        removeStreams: { type: "array", items: { type: "string" }, description: "Stream names to stop delivering" },
+        addStreams: { type: ["array", "null"], items: { type: "string" }, description: "Stream names to allow. Null or [] means no additions." },
+        removeStreams: { type: ["array", "null"], items: { type: "string" }, description: "Stream names to stop delivering. Null or [] means no removals." },
         setDmUsers: {
-          type: "array",
+          type: ["array", "null"],
           items: { type: "string" },
-          description: "Replace the DM allowlist with these user ids/emails. CAREFUL: an empty array means UNRESTRICTED (anyone may DM). Omit to leave DMs unchanged.",
+          description: "Replace the DM allowlist with these user ids/emails. CAREFUL: an empty array means UNRESTRICTED (anyone may DM). Null or omission leaves DMs unchanged; do NOT use [] as an unused placeholder.",
         },
       },
     },

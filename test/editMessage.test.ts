@@ -225,7 +225,7 @@ test('move_messages requires a topic or stream_id without making a request', asy
 });
 
 for (const { field, invalid, error } of [
-  { field: 'propagate_mode', invalid: ['all', 'CHANGE_ALL', '', null, 1, false, {}],
+  { field: 'propagate_mode', invalid: ['all', 'CHANGE_ALL', '', 1, false, {}],
     error: /^Error: propagate_mode must be change_one, change_later, or change_all$/ },
   { field: 'stream_id', invalid: [0, -1, 1.5, '17', false, NaN, Infinity, {}],
     error: /^Error: stream_id must be a positive integer$/ },
@@ -266,7 +266,7 @@ test('move_messages schema exposes optional topic, propagation, and stream field
   assert.deepEqual(properties.topic.type, ['string', 'null']);
   assert.deepEqual(properties.stream_id.type, ['integer', 'null']);
   assert.equal(properties.stream_id.minimum, 1);
-  assert.deepEqual(properties.propagate_mode.enum, ['change_one', 'change_later', 'change_all']);
+  assert.deepEqual(properties.propagate_mode.enum, ['change_one', 'change_later', 'change_all', null]);
   assert.equal(properties.propagate_mode.default, undefined, 'Zulip chooses the default');
 });
 
@@ -470,5 +470,15 @@ test('move_messages treats null destinations as absent before requests', async (
       message_id: 42, topic: null, stream_id: null, propagate_mode: 'change_one',
     }), /^Error: topic or stream_id is required$/);
     assert.deepEqual(f.calls, []); assert.deepEqual(f.lookups, []);
+  } finally { await f.close(); }
+});
+
+test('move_messages null propagation leaves the server default out of the PATCH', async () => {
+  const f = await fixture({ result: 'success' });
+  try {
+    const args = { message_id: 42, topic: null, stream_id: 17, propagate_mode: null };
+    assertStrictArguments('move_messages', args);
+    await f.tools.handleToolCall('move_messages', args);
+    assert.deepEqual(Object.fromEntries(new URLSearchParams(f.calls[0].body)), { stream_id: '17' });
   } finally { await f.close(); }
 });

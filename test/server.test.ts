@@ -34,6 +34,7 @@ import type { ZulipRawMessage } from '../src/history.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
+import { assertStrictArguments } from './strictArguments.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
@@ -430,9 +431,9 @@ test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing 
     for (const [name, fields] of [['send_message', ['type', 'to', 'topic', 'reply_to']], ['move_messages', ['topic', 'stream_id']]] as const) {
       const definition = tools.find(t => t.name === name) as unknown as { inputSchema: { properties: Record<string, { type: string[]; enum?: unknown[] }> } };
       for (const field of fields) {
-        assert.deepEqual(definition.inputSchema.properties[field].type, [field === 'reply_to' || field === 'stream_id' ? 'integer' : 'string', 'null']);
+        assert.deepEqual(definition.inputSchema.properties[field].type, field === 'reply_to' ? ['integer', 'string', 'null'] : [field === 'stream_id' ? 'integer' : 'string', 'null']);
       }
-      if (name === 'send_message') assert.deepEqual(definition.inputSchema.properties.type.enum, ['stream', 'private', '', null]);
+      if (name === 'send_message') assert.deepEqual(definition.inputSchema.properties.type.enum, ['stream', 'private', 'channel', 'direct', '', null]);
     }
     await h.close();
   }
@@ -1124,6 +1125,17 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
     assert.equal(plane.streamAllowed('dev'), true);
     assert.equal(plane.dmAllowed({ id: 42, email: 'x' }), true);
     assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), false);
+
+    // A strict-shaped stream-only update must not replace the DM allowlist.
+    const strictUpdate = { addStreams: ['general'], removeStreams: null, setDmUsers: null };
+    assertStrictArguments('filters_update', strictUpdate);
+    const kept = json(await call('filters_update', strictUpdate));
+    assert.deepEqual(kept.dmUsers, ['42']);
+    assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), false);
+    const noChange = await call('filters_update', { addStreams: null, removeStreams: [], setDmUsers: null });
+    assert.equal(noChange.isError, true);
+    assert.match(noChange.content[0].text, /Nothing to change/);
+    assert.deepEqual(plane.current().dmUsers, ['42']);
 
     // Clearing the DM allowlist is allowed, and says what it means.
     const anyone = json(await call('filters_update', { setDmUsers: [] }));

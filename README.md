@@ -455,24 +455,50 @@ For stream replies, optionally provide `topic` to send in a different topic **in
 A topic on a private reply, supplied `to`, conflicting types, or unreadable IDs fail before uploads or sends.
 Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
 Strict-schema callers may include every property: unused `type`, `to`, `topic`, and `reply_to`
-can be `null` or `""` (both mean absent); `reply_to: 0` also means absent. The published
-destination schemas allow `null`. An explicitly empty topic on a stream send **without**
-`reply_to` remains an error; use `[]` for unused attachments.
-For `move_messages`, unused `topic` or `stream_id` may be `null`; an empty topic still
-means move to the unnamed topic. Strict clients can use `propagate_mode: "change_one"`
-for the default single-message move. `send_dm` requires recipients, and `edit_message`
-has no optional destination fields.
+can be `null` or `""` (both mean absent); `reply_to: 0` and `reply_to: "0"` also mean absent.
+The published schemas allow these forms, including integer-valued strings for `reply_to`.
+Send topics are trimmed; a whitespace-only topic is absent. A standalone stream send
+**requires a non-empty topic**, whether the absent spelling is omitted, `null`, `""`, or whitespace.
+This deliberately refuses general-chat sends: Zulip 10+ (feature level 334) can accept
+empty topics as *general chat*, subject to realm/channel topic requirements. This is
+not unchanged server behavior or an error on every Zulip realm. Use `[]` for unused attachments.
+For replies, an absent topic retains the parent's topic (including an existing unnamed topic).
+For `move_messages`, unused `topic` or `stream_id` may be `null`; `topic: ""` is **not**
+a placeholder: it moves to the unnamed topic. `propagate_mode: null` uses the server
+default (`change_one`); an explicit `"change_one"` also works.
+
+Other strict-shaped calls with safe absent forms:
+- `filters_update`: `addStreams`/`removeStreams` accept `null` or `[]` for no change.
+  **Use `setDmUsers: null` to leave the DM allowlist unchanged. `setDmUsers: []` retains
+  its existing meaning: UNRESTRICTED (anyone may DM), not an unused placeholder.**
+- `fetch_history`: `before`/`after` accept `null` or `0` for no cursor (newest page by default);
+  `topic: null`/`""` means no topic filter; `limit: null` uses 50.
+- `get_unread_messages`: `channels: null`/`[]` checks all monitored channels;
+  `format: null` and `mark_as_read: null` use their defaults.
+- `send_dm` requires recipients; `edit_message` has no optional destination fields.
+  Upload fields (also in attachments) accept `""` for unused `file`/`data`/`name`/`mime_type`.
+
+The remaining optional-field tools have been surveyed, but are **not covered by this
+strict-placeholder contract**: `stop_monitoring` (`[]` does not mean stop all),
+`get_channel_history` (date/format/boolean defaults), `list_streams`, `get_stream_topics`,
+`list_users` (boolean options), and `fetch_around` (limit). Do not mechanically fill their
+optional fields with placeholders: omit them, or choose explicit option/default values.
+Tools with only required fields or no properties have no optional-placeholder ambiguity.
 
 | Send tool | Destination fields in every successful receipt (in addition to existing fields) |
 | --- | --- |
-| `send_message` (stream, including replies) | `type: "stream"`, `stream` (name, not numeric ID), `topic`, `channelId` |
-| `send_message` (DM, including replies) | `type: "private"`, `recipients` (email addresses for email sends; user IDs for ID sends/replies), `channelId` |
+| `send_message` (stream, including replies) | `type: "stream"`, `stream` (input name for standalone sends; referenced stream name for replies), `topic`, `channelId` |
+| `send_message` (DM, including replies) | `type: "private"`, `recipients` (email addresses for schema-based standalone sends; user IDs for replies), `channelId` |
 | `send_dm` | `type: "private"`, `recipients` (resolved user IDs), `channelId`; existing `to_user_ids` is retained |
 
 Receipts describe the selected send destination, including any reply topic override, also for
-attachments or chunked messages. `channelId` matches the existing send callback: `zulip:<stream>`
-for streams, `zulip:dm:<sorted IDs>` for ID-based DMs (reply IDs exclude the bot except self-DMs),
-and `zulip:<email destination>` for raw email sends. No extra directory/placement lookup is made.
+attachments or chunked messages. For non-reply sends they echo the normalized input, not a
+destination confirmed by Zulip; no extra directory/placement lookup is made. `type` is always
+canonical (`stream`/`private`), including `channel`/`direct` aliases. The runtime also accepts
+numeric ID-array `to` values outside the published `send_message` schema; those receipts contain
+user IDs. `channelId` matches the existing send callback: `zulip:<stream>` for streams,
+`zulip:dm:<sorted IDs>` for ID-based DMs (reply channel IDs exclude the bot except self-DMs;
+`recipients` includes every sent participant), and `zulip:<email destination>` for raw email sends.
 MCPL `channels/publish` retains its existing protocol receipt.
 
 `send_message` and `edit_message` resolve exact `[[msg:ID]]` tokens in
