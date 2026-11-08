@@ -70,7 +70,7 @@ async function fixture(t: TestContext) {
     link: (path: string, code = false) => {
       const url = `${realm}/#narrow/${path}`;
       if (code) return url;
-      const escape = (value: string) => value.replace(/[\\`*[\]<>]/g, '\\$&');
+      const escape = (value: string) => value.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
       const label = path.includes('/near/105') ? '#general >  @ 💬' : path.startsWith('dm/') ? 'DM @ 💬' : `#${escape(stream.display_recipient)} > ${escape(stream.subject)} @ 💬`;
       return `[${label}](${url})`;
     } };

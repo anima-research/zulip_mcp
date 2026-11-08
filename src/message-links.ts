@@ -151,7 +151,7 @@ function inCode(content: string, offset: number): boolean {
 function labelled(message: any, url: string): string {
   // No retained feature level: Zulip's labelled fallback works on all versions,
   // including names matching topic_link_util.py's special-character pattern.
-  const escape = (s: string) => s.replace(/[\\`*[\]<>]/g, '\\$&');
+  const escape = (s: string) => s.replace(/[\\`*_$~|[\]<>]/g, '\\$&');
   const label = message.type === 'stream'
     ? `#${escape(message.display_recipient)} > ${escape(message.subject)} @ 💬` : 'DM @ 💬';
   return `[${label}](${url})`;
