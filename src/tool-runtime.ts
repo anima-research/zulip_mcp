@@ -719,7 +719,9 @@ export class ZulipToolRuntime {
         if (!reply && args.reply_to !== undefined) reply = await this.replyDestination(args, memo);
         const limit = this.session.maxMessageLength;
         chunkMessage(resolvedContent, limit, replacements); // Preflight before uploads.
-        if (destination ?? reply) args = { ...args, ...(destination ?? reply) };
+        if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
+        // Send to the authorized canonical destination without changing receipt/callback metadata.
+        const sendDestination = destination ?? args;
         const uploaded = await this.uploadFor(args);
         const content = withAttachmentLinks(resolvedContent, uploaded);
         const ids: number[] = [];
@@ -728,7 +730,7 @@ export class ZulipToolRuntime {
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
         for (const chunk of chunkMessage(content, this.session.maxMessageLength, replacements)) {
-          last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
+          last = await zulipClient.messages.send({ type: sendDestination.type, to: sendDestination.to, topic: sendDestination.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
           ids.push(last.id);
           this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
