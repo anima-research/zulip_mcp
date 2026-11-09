@@ -65,3 +65,19 @@ test('nullable history and unread defaults work with every property present', as
   const result = await f.tools.handleToolCall('get_unread_messages', unread);
   assert.equal(result.channels_checked[0].channel, 'General');
 });
+
+test('fetch_history after: 1 reads forward from the oldest', async t => {
+  const f = fixture(); t.after(f.close);
+  await f.tools.handleToolCall('fetch_history', { channel: 'General', after: 1 });
+  assert.equal(f.calls[0].anchor, 1);
+  assert.equal(f.calls[0].num_before, 0);
+  assert.equal(f.calls[0].num_after, 50);
+});
+
+test('fetch_history limit: 0 clamps the requested page to one message', async t => {
+  const f = fixture(); t.after(f.close);
+  await f.tools.handleToolCall('fetch_history', { channel: 'General', limit: 0 });
+  assert.equal(f.calls[0].anchor, 'newest');
+  assert.equal(f.calls[0].num_before, 1);
+  assert.equal(f.calls[0].num_after, 0);
+});

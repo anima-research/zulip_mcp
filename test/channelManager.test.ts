@@ -715,3 +715,43 @@ test('a host that acts on a pending channel has confirmed it (#20)', async () =>
   await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(sent.length, 1, 'nothing left to re-announce');
 });
+
+// R2-4: explicit recovery is useful only when the standalone send is valid.
+for (const destination of [
+  { channelId: 'zulip:archive', topic: '', uncertain: false, alternative: false },
+  { channelId: 'zulip:archive', topic: '', uncertain: true, alternative: false },
+  { channelId: 'zulip:archive', topic: '   ', uncertain: false, alternative: false },
+  { channelId: null, topic: 'deploys', uncertain: false, alternative: false },
+  { channelId: 'zulip:', topic: 'deploys', uncertain: false, alternative: false },
+  { channelId: 'zulip:archive', topic: 'deploys', uncertain: false, alternative: true },
+  { channelId: 'zulip:archive', topic: 'deploys', uncertain: true, alternative: true },
+]) {
+  test(`R2-4 move recovery hint ${JSON.stringify(destination)}`, async t => {
+    const { manager, calls } = makeManager();
+    t.after(() => manager.destroy());
+    manager.noteConversation('zulip:C1', zulipMessage('zulip:C1'));
+    manager.reconcileSelfChange({
+      kind: 'move', channelId: 'zulip:C1', messageId: '42', messageIds: ['42'],
+      authorId: '1', authorName: 'alice', authorEmail: null, actorId: null,
+      topic: destination.topic, previousTopic: 'router A', movedToChannelId: destination.channelId,
+      newStreamId: 8, routingUncertain: destination.uncertain,
+      moveScope: { topic: 'router A', propagateMode: 'change_one' },
+      content: null, previousContent: null, mentioned: false, previouslyMentioned: false,
+      vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(0),
+    });
+    await assert.rejects(
+      () => manager.publish({ conversationId: '', channelId: 'zulip:C1', content: [] }),
+      (error: any) => {
+        assert.match(error.message, /send_message\(\{reply_to: 42, content\}\)/);
+        assert.equal(error.data.movedTo.topic, destination.uncertain || destination.channelId === null ? null : destination.topic);
+        if (destination.alternative) {
+          assert.match(error.message, /alternatively .*send_message\(\{type: "stream", to: "archive", topic: "deploys"/);
+        } else {
+          assert.doesNotMatch(error.message, /alternatively|send_message\(\{type:/);
+        }
+        return true;
+      },
+    );
+    assert.equal(calls.length, 0, 'refused publishes never reach the adapter');
+  });
+}

@@ -748,10 +748,12 @@ export class ChannelManager {
       }
       const hint = isDM ? 'private conversation' :
         `${movedTo.channelId ?? `stream unknown${movedTo.streamId !== undefined ? ` (stream ${movedTo.streamId})` : ''}`} > ${movedTo.topic ?? `(unconfirmed topic)${topic ? `; likely ${topic}` : ''}`}`;
-      const fallback = isDM ? 'use an explicit private recipient' :
-        `use send_message({type: "stream", to: ${JSON.stringify(stream)}, topic: ${JSON.stringify(topic ?? null)}, content: ...}) after checking list_streams/get_stream_topics if unknown`;
+      const fallback = typeof stream === 'string' && stream.trim().length > 0 &&
+        typeof topic === 'string' && topic.trim().length > 0
+        ? `; alternatively use send_message({type: "stream", to: ${JSON.stringify(stream)}, topic: ${JSON.stringify(topic)}, content: ...}) after checking list_streams/get_stream_topics if unknown`
+        : '';
       throw new McplRpcError(-32602,
-        `Nothing was posted. ${movedTo.topic !== null ? `Conversation moved to ${hint}` : `Conversation placement unconfirmed; destination hint: ${hint}`}. Reply with ${recovery}; alternatively ${fallback}.`,
+        `Nothing was posted. ${movedTo.topic !== null ? `Conversation moved to ${hint}` : `Conversation placement unconfirmed; destination hint: ${hint}`}. Reply with ${recovery}${fallback}.`,
         data);
     }
     return adapter.publish(
