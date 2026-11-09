@@ -37,7 +37,7 @@ export const toolDefinitions: ToolDefinition[] = [
         channels: {
           type: "array",
           items: { type: "string" },
-          description: "Channel names to stop monitoring. If not provided, stops all.",
+          description: "Channel names to stop monitoring. Omission or [] stops all monitoring; there is no no-op form.",
         },
       },
     },
@@ -457,7 +457,7 @@ export const toolDefinitions: ToolDefinition[] = [
       "Fetch message history from a stream (optionally one topic) or a DM conversation, oldest first. By default returns " +
       "the most recent messages. Use `before` (a message id) to scroll further back — pass the id of " +
       "the oldest message you have seen to page backwards. Use `after` (a message id) to fetch only " +
-      "messages newer than a given point. Message ids are realm-global and increase over time, so " +
+      "messages newer than a given point; after: 1 reads from the oldest. Message ids are realm-global and increase over time, so " +
       "they work as cursors across streams and topics. Each line leads with the id so you can " +
       "fetch_around(id) for more context.",
     inputSchema: {
@@ -465,9 +465,9 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         channel: { type: "string", description: "Stream name (e.g. 'general'), stream channel id ('zulip:general'), or DM conversation id ('zulip:dm:42')" },
         topic: { type: ["string", "null"], description: "Optional: limit to one topic (streams only). Null or empty string means absent." },
-        limit: { type: ["number", "null"], description: "Max messages to fetch (default 50, max 1000). Null uses the default." },
+        limit: { type: ["number", "null"], description: "Max messages to fetch (default 50, max 1000). Null uses the default; 0 is clamped to 1 message." },
         before: { type: ["number", "null"], description: "Only messages older than this message id (exclusive). Null or 0 means absent (default newest page)." },
-        after: { type: ["number", "null"], description: "Only messages newer than this message id (exclusive). Null or 0 means absent (default newest page)." },
+        after: { type: ["number", "null"], description: "Only messages newer than this message id (exclusive). Null or 0 means absent (default newest page); after: 1 reads from the oldest." },
       },
       required: ["channel"],
     },
@@ -526,7 +526,7 @@ export const toolDefinitions: ToolDefinition[] = [
         setDmUsers: {
           type: ["array", "null"],
           items: { type: "string" },
-          description: "Replace the DM allowlist with these user ids/emails. CAREFUL: an empty array means UNRESTRICTED (anyone may DM). Null or omission leaves DMs unchanged; do NOT use [] as an unused placeholder.",
+          description: "Replace the DM allowlist with these user ids/emails. CAREFUL: an empty array means UNRESTRICTED (anyone may DM). Send [] alone: combining it with non-empty addStreams or removeStreams is refused. Null or omission leaves DMs unchanged; do NOT use [] as an unused placeholder.",
         },
       },
     },

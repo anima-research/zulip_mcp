@@ -1637,12 +1637,14 @@ export class ZulipMcplServer {
         };
       }
       case 'filters_update': {
-        // Null is a strict-schema placeholder; [] remains an explicit DM reset.
-        args = { ...args, addStreams: args.addStreams ?? undefined, removeStreams: args.removeStreams ?? undefined, setDmUsers: args.setDmUsers ?? undefined };
         const plane = this.requireFilters();
         const addStreams = Array.isArray(args.addStreams) ? args.addStreams.map((s) => this.streamArg(s)) : [];
         const removeStreams = Array.isArray(args.removeStreams) ? args.removeStreams.map((s) => this.streamArg(s)) : [];
         const setDmUsers = Array.isArray(args.setDmUsers) ? args.setDmUsers.map(String) : undefined;
+        // [] is an explicit DM reset, not a placeholder for a stream-only edit.
+        if (setDmUsers?.length === 0 && (addStreams.length > 0 || removeStreams.length > 0)) {
+          throw new Error('Send setDmUsers: [] alone, without non-empty addStreams or removeStreams; it makes DMs UNRESTRICTED. Use setDmUsers: null to leave DMs unchanged.');
+        }
         if (addStreams.length === 0 && removeStreams.length === 0 && setDmUsers === undefined) {
           throw new Error('Nothing to change: pass addStreams, removeStreams, and/or setDmUsers.');
         }

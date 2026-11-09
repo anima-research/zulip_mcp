@@ -471,15 +471,17 @@ Other strict-shaped calls with safe absent forms:
 - `filters_update`: `addStreams`/`removeStreams` accept `null` or `[]` for no change.
   **Use `setDmUsers: null` to leave the DM allowlist unchanged. `setDmUsers: []` retains
   its existing meaning: UNRESTRICTED (anyone may DM), not an unused placeholder.**
+  Send `setDmUsers: []` alone; combining it with non-empty `addStreams` or `removeStreams` is refused.
 - `fetch_history`: `before`/`after` accept `null` or `0` for no cursor (newest page by default);
-  `topic: null`/`""` means no topic filter; `limit: null` uses 50.
+  `after: 1` reads from the oldest; `topic: null`/`""` means no topic filter;
+  `limit: null` uses 50, while `limit: 0` is clamped to 1 message.
 - `get_unread_messages`: `channels: null`/`[]` checks all monitored channels;
   `format: null` and `mark_as_read: null` use their defaults.
 - `send_dm` requires recipients; `edit_message` has no optional destination fields.
   Upload fields (also in attachments) accept `""` for unused `file`/`data`/`name`/`mime_type`.
 
 The remaining optional-field tools have been surveyed, but are **not covered by this
-strict-placeholder contract**: `stop_monitoring` (`[]` does not mean stop all),
+strict-placeholder contract**: `stop_monitoring` (`[]` stops all monitoring; there is no no-op form),
 `get_channel_history` (date/format/boolean defaults), `list_streams`, `get_stream_topics`,
 `list_users` (boolean options), and `fetch_around` (limit). Do not mechanically fill their
 optional fields with placeholders: omit them, or choose explicit option/default values.
@@ -492,8 +494,9 @@ Tools with only required fields or no properties have no optional-placeholder am
 | `send_dm` | `type: "private"`, `recipients` (resolved user IDs), `channelId`; existing `to_user_ids` is retained |
 
 Receipts describe the selected send destination, including any reply topic override, also for
-attachments or chunked messages. For non-reply sends they echo the normalized input, not a
-destination confirmed by Zulip; no extra directory/placement lookup is made. `type` is always
+attachments or chunked messages. Non-reply destinations and reply topic overrides echo the
+normalized input, not a destination confirmed by Zulip (which may truncate topics); no extra
+directory/placement lookup is made. `type` is always
 canonical (`stream`/`private`), including `channel`/`direct` aliases. The runtime also accepts
 numeric ID-array `to` values outside the published `send_message` schema; those receipts contain
 user IDs. `channelId` matches the existing send callback: `zulip:<stream>` for streams,

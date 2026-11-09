@@ -24,7 +24,7 @@ import {
   type JsonRpcRequest,
   type PushEventParams,
 } from '@animalabs/mcpl-core';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
@@ -1153,6 +1153,62 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// R2-3: an ambiguous placeholder must not open DMs or partially edit streams.
+for (const streams of [
+  { addStreams: ['dev'], removeStreams: [] },
+  { addStreams: [], removeStreams: ['general'] },
+  { addStreams: ['ops'], removeStreams: ['general'] },
+]) {
+  test(`R2-3 filters_update refuses a mixed DM reset ${JSON.stringify(streams)}`, async t => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-mixed-dm-reset-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, 'filters.json');
+    writeFileSync(path, JSON.stringify({ streams: ['general', 'dev'], dmUsers: ['42'] }));
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    plane.start();
+    t.after(() => plane.stop());
+    const h = harness({ filters: plane });
+    t.after(() => h.close());
+    await initialize(h, true);
+    await settled(h);
+    const before = readFileSync(path, 'utf8');
+    const result = await h.host.sendRequest('tools/call', {
+      name: 'filters_update', arguments: { ...streams, setDmUsers: [] },
+    }) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /setDmUsers.*\[\].*(alone|own)/);
+    assert.deepEqual(plane.current().streams, ['general', 'dev']);
+    assert.deepEqual(plane.current().dmUsers, ['42']);
+    assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), false);
+    assert.equal(readFileSync(path, 'utf8'), before, 'no partial update persisted');
+  });
+}
+
+for (const streams of [{}, { addStreams: [], removeStreams: [] }, { addStreams: null, removeStreams: null }]) {
+  test(`R2-3 filters_update permits an isolated DM reset ${JSON.stringify(streams)}`, async t => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-alone-dm-reset-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, 'filters.json');
+    writeFileSync(path, JSON.stringify({ streams: ['general'], dmUsers: ['42'] }));
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    plane.start();
+    t.after(() => plane.stop());
+    const h = harness({ filters: plane });
+    t.after(() => h.close());
+    await initialize(h, true);
+    await settled(h);
+    const result = await h.host.sendRequest('tools/call', {
+      name: 'filters_update', arguments: { ...streams, setDmUsers: [] },
+    }) as { isError?: boolean; content: { text: string }[] };
+    assert.notEqual(result.isError, true);
+    const value = JSON.parse(result.content[0].text);
+    assert.equal(value.dmUsers, null);
+    assert.match(value.note, /UNRESTRICTED/);
+    assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), true);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { streams: ['general'] });
+  });
+}
 
 test('attachments on live delivery are inlined from the configured source', async () => {
   const fetched: string[] = [];
