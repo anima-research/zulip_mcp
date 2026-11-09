@@ -97,70 +97,67 @@ export function readMessage(client: any, id: number, memo: MessageMemo): Promise
   return memo.get(id)!;
 }
 
-function sameConversation(message: any, destination: Record<string, any>, self?: number | null): boolean {
-  if (message.type === 'stream') {
-    return ['stream', 'channel'].includes(destination.type) &&
-      (destination.to === message.stream_id || destination.to === message.display_recipient) &&
-      destination.topic === message.subject;
-  }
-  if (message.type !== 'private' || !['private', 'direct'].includes(destination.type) || !positiveId(self)) return false;
-  const to = Array.isArray(destination.to) ? destination.to : [destination.to];
-  const ids = to.map((id: unknown) => typeof id === 'string' && /^\d+$/.test(id) ? Number(id) : id);
-  if (ids.some((id: unknown) => !positiveId(id)) || !Array.isArray(message.display_recipient)) return false;
-  const canonical = (values: number[]) => [...new Set(values)].sort((a,b) => a-b).join(',');
-  return canonical([...(ids as number[]), self]) === canonical(message.display_recipient.map((r: any) => r.id));
+/** Only send_message's scalar private `to` is a documented comma list.
+ * Array entries are atomic full-name/email/id queries (names can contain commas). */
+export function recipientQueries(to: unknown): string[] {
+  return (Array.isArray(to) ? to.map(String) : String(to ?? '').split(','))
+    .map(value => value.trim());
 }
 
-/** Inline backticks and ordinary code fences use bare URLs, not literal Markdown labels.
- * Quote/spoiler fences are rendered prose. Token scanning itself is never disabled. */
-function inCode(content: string, offset: number): boolean {
-  let fence: string | undefined, inline = 0;
-  let start = 0, table = false;
-  const lines = content.split('\n');
-  for (const [index, line] of lines.entries()) {
-    // Only a header + separator at a block boundary establishes table cells.
-    // An ordinary pipe (notably inside `a|b`) must not close inline code.
-    if (!line.trim()) table = false;
-    if (!fence && (index === 0 || !lines[index - 1].trim()) && line.includes('|')) {
-      const cells = (row: string) => row.trim().replace(/^\||\|$/g, '').split('|');
-      const separator = cells(lines[index + 1] ?? '');
-      table = separator.length === cells(line).length &&
-        separator.every(cell => /^ *:?-+:? *$/.test(cell));
-    }
-    if (table) inline = 0; // Table rows render independently.
-    const end = start + line.length;
-    const marker = /^[ >\t-]*(`{3,}|~{3,})(.*)$/.exec(line);
-    if (marker) {
-      if (fence && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
-        if (offset <= end) return true;
-        fence = undefined;
-      } else if (!fence && !/^(quote|spoiler)(?:\s|$)/.test(marker[2].trim())) {
-        fence = marker[1];
-      }
-    }
-    if (offset <= end) {
-      if (fence) return true;
-      if (marker && /^(quote|spoiler)(?:\s|$)/.test(marker[2].trim())) return false;
-      for (const match of line.slice(0, offset-start).matchAll(/`+|\|/g)) {
-        if (match[0] === '|') {
-          // A paired code span owns its internal pipes, even in a table.
-          if (table && ![...line.slice(match.index! + 1).matchAll(/`+/g)].some(ticks => ticks[0].length === inline)) inline = 0;
-        } else if (!inline) inline = match[0].length;
-        else if (inline === match[0].length) inline = 0;
-      }
-      return inline > 0;
-    }
-    // Inline code may span lines.
-    if (!marker && !fence) for (const match of line.matchAll(/`+|\|/g)) {
-      if (match[0] === '|') {
-        // A paired code span owns its internal pipes, even in a table.
-        if (table && ![...line.slice(match.index! + 1).matchAll(/`+/g)].some(ticks => ticks[0].length === inline)) inline = 0;
-      } else if (!inline) inline = match[0].length;
-      else if (inline === match[0].length) inline = 0;
-    }
-    start = end + 1;
+/** Resolve once; the caller must send this exact destination after authorization.
+ * Zulip JSON-decodes stream `to` before interpreting integers as ids and strings
+ * as names. In particular, bare "12" is NOT the stream named "12". */
+export async function canonicalDestination(client: any, destination: Record<string, any>,
+  resolveUserId?: (query: string) => Promise<number>): Promise<Record<string, any>> {
+  if (['private', 'direct'].includes(destination.type)) {
+    const queries = recipientQueries(destination.to);
+    if (!queries.length || queries.some(q => !q)) throw new Error('to must name at least one recipient');
+    const ids = await Promise.all(queries.map(async q => resolveUserId ? resolveUserId(q) : /^\d+$/.test(q) ? Number(q) : NaN));
+    if (ids.some(id => !positiveId(id))) throw new Error('Cannot resolve DM destination');
+    return { ...destination, type: 'private', to: [...new Set(ids)] };
   }
-  return false;
+  if (!['stream', 'channel'].includes(destination.type)) throw new Error('Unknown destination type');
+  let to = destination.to;
+  if (typeof to === 'string') {
+    try { to = JSON.parse(to); } catch { /* An unquoted name is also accepted. */ }
+  }
+  if (Array.isArray(to) && to.length === 1) to = to[0];
+  if (typeof to === 'string' && to) {
+    let result;
+    try { result = await client.callEndpoint('get_stream_id', 'GET', { stream: to }); }
+    catch { throw new Error('Cannot resolve stream destination: temporarily unavailable; retry'); }
+    if (result?.result !== 'success' || !positiveId(result.stream_id)) throw new Error('Cannot resolve stream destination');
+    to = result.stream_id;
+  }
+  if (!positiveId(to)) throw new Error('Cannot resolve stream destination');
+  return { ...destination, type: 'stream', to };
+}
+
+function sameConversation(message: any, destination: Record<string, any>, self?: number | null): boolean {
+  if (message.type === 'stream') {
+    return destination.type === 'stream' && destination.to === message.stream_id &&
+      typeof destination.topic === 'string' && destination.topic.toLowerCase() === message.subject.toLowerCase();
+  }
+  if (message.type !== 'private' || destination.type !== 'private' || !positiveId(self)) return false;
+  const ids = destination.to;
+  if (!Array.isArray(ids) || ids.some(id => !positiveId(id)) || !Array.isArray(message.display_recipient)) return false;
+  const canonical = (values: number[]) => [...new Set(values)].sort((a,b) => a-b).join(',');
+  return canonical([...ids, self]) === canonical(message.display_recipient.map((r: any) => r.id));
+}
+
+/** Message-wide opt-in to labels, not a Zulip Markdown parser. Reject even
+ * escaped/unmatched delimiters and closed fences; their state is irrelevant. */
+function canLabelMessage(content: string): boolean {
+  return !content.includes('`') && !content.includes('~~~') &&
+    // Over-refuse any dollar (including unmatched/escaped math delimiters).
+    !content.includes('$') &&
+    // Outside exact tokens (including escaped ones), reject brackets and <
+    // (time syntax, HTML and autolinks), even when escaped or unmatched.
+    !/[\[\]<]/.test(content.replace(/\[\[msg:[0-9]+\]\]/g, '')) &&
+    // Over-refuse tabs anywhere and four spaces at any list/quote nesting step.
+    // Marker runs need not be valid Markdown; stop only at non-marker text.
+    !/\t|^(?:[^\S\r\n]|[-*+>]|\d+[.)])* {4}/m.test(content) &&
+    !/^ {0,3}(?:> *)*([*_-])(?:[ \t]*\1){2,}[ \t]*\r?$/m.test(content);
 }
 
 function labelled(message: any, url: string): string {
@@ -169,12 +166,12 @@ function labelled(message: any, url: string): string {
   // replace each match once so generated entities are not escaped again.
   const mapping: Record<string, string> = {
     '`': '&#96;', '>': '&gt;', '*': '&#42;', '&': '&amp;',
-    '$$': '&#36;&#36;', '[': '&#91;', ']': '&#93;',
+    '$$': '&#36;&#36;', '[': '&#91;', ']': '&#93;', '|': '&#124;',
   };
   // Legacy metadata may contain line breaks, even though current Zulip rejects
   // them. Keep generated labels on one line (the URL still encodes the name).
   const escape = (s: string) => s.replace(/[\r\n]+/g, ' ')
-    .replace(/[`>*&[\]]|(\$\$)/g, match => mapping[match]);
+    .replace(/[`>*&|[\]]|(\$\$)/g, match => mapping[match]);
   const label = message.type === 'stream'
     ? `#${escape(message.display_recipient)} > ${escape(message.subject || 'general chat')} @ 💬` : 'DM @ 💬';
   return `[${label}](${url})`;
@@ -216,16 +213,17 @@ export async function resolveMessageLinks(content: string, session: Pick<ZulipSe
       }
       allowed = publicStreams.get(message.stream_id) === true;
     }
-    if (!allowed) throw fail(`reference is outside the allowed destination audience; escape it as \\${token.text} or explicitly set allow_private_references: true`);
+    if (!allowed) throw fail(`reference is outside the allowed destination audience; escape it as \\${token.text} or use send_message with allow_private_references: true`);
     urls.set(token.id, url);
   }
+  const useLabels = canLabelMessage(content);
   let resolved = '', start = 0;
   for (const token of tokens) {
     resolved += content.slice(start, token.start);
     if (token.id === undefined) resolved += token.text;
     else {
       const url = urls.get(token.id)!;
-      const replacement = inCode(content, token.start) ? url : labelled(messages.get(token.id), url);
+      const replacement = useLabels ? labelled(messages.get(token.id), url) : url;
       resolved += replacement;
       options.links?.push({token: token.text, url});
       options.replacements?.push(replacement);

@@ -104,7 +104,7 @@ for (const tool of ['send_message', 'edit_message']) {
     const f = await fixture(t);
     await f.tools.handleToolCall(tool, { ...args, content: 'Intro\na|[[msg:106]]\n-|-\nAfter' });
     assert.equal(f.requests.at(-1)!.content,
-      'Intro\na|[#a|b > x|y @ 💬](' + f.realm + '/#narrow/channel/1-a.7Cb/topic/x.7Cy/near/106)\n-|-\nAfter');
+      'Intro\na|[#a&#124;b > x&#124;y @ 💬](' + f.realm + '/#narrow/channel/1-a.7Cb/topic/x.7Cy/near/106)\n-|-\nAfter');
   });
 
   for (const ending of ['\n', '\r\n']) {
@@ -112,7 +112,8 @@ for (const tool of ['send_message', 'edit_message']) {
       const f = await fixture(t);
       const content = 'See [[msg:101]] and `npm test`\n\nResults:\na|b\n-|-\nc|d\nDone.\n\n[docs](https://example.invalid)';
       await f.tools.handleToolCall(tool, { ...args, content: content.replaceAll('\n', ending) });
-      const expected = content.replace('[[msg:101]]', f.link(streamPath))
+      // R2 refuses labels message-wide beside code or existing Markdown links.
+      const expected = content.replace('[[msg:101]]', f.link(streamPath, true))
         .replace('Results:\n', 'Results:\n\n').replace('\nDone.', '\n\nDone.');
       assert.deepEqual(f.requests.map(r => r.method), ['GET', tool === 'send_message' ? 'POST' : 'PATCH']);
       assert.equal(f.requests.at(-1)!.content, expected.replaceAll('\n', ending));
@@ -163,7 +164,7 @@ for (const tool of ['send_message', 'edit_message']) {
     test(`${tool}: tokens in ${label} resolve`, async (t) => {
       const f = await fixture(t);
       await f.tools.handleToolCall(tool, { ...args, content });
-      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, ['inline code','multiline inline code','code fence','unclosed tilde fence','blockquote fence','nested list fence','table cells'].includes(label))));
+      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, true)));
       assert.equal(f.requests.filter((r) => r.method === 'GET').length, 1);
     });
     test(`${tool}: unreadable tokens in ${label} fail before mutations`, async (t) => {

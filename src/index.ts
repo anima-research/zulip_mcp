@@ -53,7 +53,7 @@ import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
 import { agentLineTimeFormatter } from './timezone.js';
-import { initializeZulipClient } from './zulip-client.js';
+import { initializeZulipClient, updateRealmMessageLength } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
@@ -120,6 +120,7 @@ async function main(): Promise<void> {
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
     maxMessageLength: session.maxMessageLength,
+    onRealmMessageLength: limit => updateRealmMessageLength(session, limit),
   });
   const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
   tools.setReactionPolicy({
