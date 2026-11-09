@@ -182,7 +182,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The message content (supports Markdown). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
+          description: "The message content (supports Markdown). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Stream and DM labels follow the same message-wide rule: no backtick, triple tilde, tab or dollar sign anywhere (including $$ math), no square brackets or < outside exact [[msg:ID]] tokens (including escaped tokens; < covers time syntax, HTML and autolinks), no four consecutive spaces before any line's first non-marker character (including nested list/quote markers), and no horizontal rule; otherwise every token becomes a bare message URL. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail before uploads/sends). May be empty when attachments are given.",
         },
         attachments: {
           type: "array",
@@ -223,7 +223,7 @@ export const toolDefinitions: ToolDefinition[] = [
           items: { type: "string" },
           description: "One or more recipients: full name, email, or user id each",
         },
-        content: { type: "string", description: "The message content (supports Markdown). Resolves [[msg:ID]] before uploads/sends, including code; backslash escapes a token (max 20). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. May be empty when attachments are given." },
+        content: { type: "string", description: "The message content (supports Markdown). Resolves [[msg:ID]] before uploads/sends, including code; backslash escapes a token (max 20). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Stream and DM labels follow the same message-wide rule: no backtick, triple tilde, tab or dollar sign anywhere (including $$ math), no square brackets or < outside exact [[msg:ID]] tokens (including escaped tokens; < covers time syntax, HTML and autolinks), no four consecutive spaces before any line's first non-marker character (including nested list/quote markers), and no horizontal rule; otherwise every token becomes a bare message URL. Returns links: [{token, url}]. May be empty when attachments are given." },
         attachments: {
           type: "array",
           description:
@@ -275,7 +275,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         content: {
           type: "string",
-          description: "The new message content (supports Markdown, replaces the old content entirely). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
+          description: "The new message content (supports Markdown, replaces the old content entirely). Default references must be in the destination conversation, or in a non-invite-only stream with a stream destination. Refused references can be backslash-escaped. Stream and DM labels follow the same message-wide rule: no backtick, triple tilde, tab or dollar sign anywhere (including $$ math), no square brackets or < outside exact [[msg:ID]] tokens (including escaped tokens; < covers time syntax, HTML and autolinks), no four consecutive spaces before any line's first non-marker character (including nested list/quote markers), and no horizontal rule; otherwise every token becomes a bare message URL. Returns links: [{token, url}]. Exact [[msg:ID]] tokens anywhere (including code) become Zulip message links; \\[[msg:ID]] sends the literal token with the backslash removed and no lookup (max 20 unescaped occurrences; unreadable IDs fail without editing).",
         },
       },
       required: ["message_id", "content"],

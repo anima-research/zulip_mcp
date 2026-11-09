@@ -1,4 +1,4 @@
-/** R1 regressions: real handlers, isolated clients, no external services. */
+/** Audience and atomic-delivery regressions: real handlers, isolated clients, no external services. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -13,7 +13,7 @@ function fixture(t: any, options: {public?: boolean; limit?: number; error?: str
   const client = {config:{realm:'https://example.invalid'}, messages:{
     async getById(args: any) { reads.push(args); return options.error ? {result:'error',code:options.error,msg:'PRIVATE_BODY'} : {result:'success',message:args.message_id===102 ? {id:102,type:'private',display_recipient:[{id:1},{id:2}]} : stream(args.message_id)}; },
     async send(args: any) { sent.push(args); return {result:'success',id:501}; },
-  }, async callEndpoint() {return {result:'success',stream:{invite_only:!options.public,history_public_to_subscribers:false,is_web_public:false}};} };
+  }, async callEndpoint(path: string, _method?: string, args?: any) {if(path==='get_stream_id')return {result:'success',stream_id:args.stream==='private'?12:20} as any; return {result:'success',stream:{invite_only:!options.public,history_public_to_subscribers:false,is_web_public:false}};} };
   const dir=mkdtempSync(join(tmpdir(),'links-r1-')); t.after(()=>rmSync(dir,{recursive:true,force:true}));
   const tools=new ZulipToolRuntime({client,realm:'https://example.invalid',authHeader:'test',selfUserId:1,sessionId:'r1',maxMessageLength:options.limit} as any,dir,{uploader:{async upload(){uploads++;return {name:'x',path:'/x',url:'https://example.invalid/x'};}}});
   return {tools,client,reads,sent,uploads:()=>uploads};
@@ -37,9 +37,10 @@ test('R1-1 DM outside same DM refused; same DM allowed including self',async t=>
  const f=fixture(t); await assert.rejects(f.tools.handleToolCall('send_message',{...send,content:'[[msg:102]]'}));
  await f.tools.handleToolCall('send_message',{type:'private',to:[2],content:'[[msg:102]]'}); assert.match(f.sent[0].content,/\[DM @ 💬\]\(.*#narrow\/dm\/1,2-dm\/near\/102\)/);
 });
-test('R1-2 inside inline code bare URL; outside labelled markdown',async t=>{
+test('R1-2 one inline-code token forces bare URLs throughout the message',async t=>{
  const f=fixture(t); await f.tools.handleToolCall('send_message',{...send,allow_private_references:true,content:'`[[msg:101]]` [[msg:101]]'});
- assert.match(f.sent[0].content,/^`https:.*101` \[#private/);
+ const url = 'https://example.invalid/#narrow/channel/12-private/topic/secret/near/101';
+ assert.equal(f.sent[0].content, `\`${url}\` ${url}`);
 });
 test('R1-3 send_dm resolves before uploads and fails closed',async t=>{
  const f=fixture(t); await assert.rejects(f.tools.handleToolCall('send_dm',{to:['2'],content:'[[msg:101]]',attachments:[{data:'eA==',name:'x'}]})); assert.equal(f.uploads(),0); assert.equal(f.sent.length,0);
@@ -72,7 +73,7 @@ test('R1-7 request literal empty topic names',async t=>{
 });
 
 test('R1-1 unknown metadata and stream-to-DM fail closed even for public streams',async t=>{
- const f=fixture(t,{public:true}); f.client.callEndpoint=async()=>({result:'success',stream:{}} as any);
+ const f=fixture(t,{public:true}); f.client.callEndpoint=async(path)=>path==='get_stream_id'?{result:'success',stream_id:20} as any:({result:'success',stream:{}} as any);
  await assert.rejects(f.tools.handleToolCall('send_message',send),/outside the allowed/);
  await assert.rejects(f.tools.handleToolCall('send_message',{type:'private',to:[2],content:'[[msg:101]]'}),/outside the allowed/);
  assert.equal(f.sent.length,0);
@@ -103,4 +104,20 @@ test('R1-5 transport failure advises retry without raw body or URL',async t=>{
  for(const args of [send,{reply_to:101,content:'hi'}]) await assert.rejects(f.tools.handleToolCall('send_message',args),error=>{
   assert.match(String(error),/temporarily unavailable \(TRANSPORT_ERROR\); retry/); assert.doesNotMatch(String(error),/PRIVATE_BODY|secret.invalid/); return true;
  });
+});
+
+test('edit length counts Unicode code points, not UTF-16 units',async t=>{
+ const f=fixture(t,{limit:4});let patches=0;
+ t.mock.method(globalThis,'fetch',async(_url:any,options:any)=>{patches++;assert.equal(options.body.get('content'),'😀'.repeat(4));return new Response(JSON.stringify({result:'success'}));});
+ await f.tools.handleToolCall('edit_message',{message_id:101,content:'😀'.repeat(4)});
+ assert.equal(patches,1);assert.equal(f.reads.length,0);
+ await assert.rejects(f.tools.handleToolCall('edit_message',{message_id:101,content:'😀'.repeat(5)}),error=>{
+  assert.match(String(error),/content exceeds.*limit/);assert.doesNotMatch(String(error),/expansion/);return true;
+ });assert.equal(patches,1);
+});
+test('escaped tokens do not blame expansion for an over-limit edit',async t=>{
+ const f=fixture(t,{limit:4});
+ await assert.rejects(f.tools.handleToolCall('edit_message',{message_id:101,content:'\\[[msg:101]]'}),error=>{
+  assert.doesNotMatch(String(error),/expansion/);return true;
+ });assert.equal(f.reads.length,0);
 });

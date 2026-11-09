@@ -19,8 +19,16 @@ export interface ZulipSession {
   sessionId: string;
   /** The realm's advertised per-file upload cap (`max_file_upload_size_mib`), bytes; null when unknown. */
   maxUploadBytes?: number | null;
-  /** Realm message limit, default 10000 when unknown. */
+  /** Realm message limit (learned at event registration), default 10000. */
   maxMessageLength?: number;
+}
+
+/** Share the /register realm limit while preserving the explicit env override. */
+export function updateRealmMessageLength(session: Pick<ZulipSession, 'maxMessageLength'>,
+  limit: number, env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number(env.ZULIP_MAX_MESSAGE_LENGTH);
+  session.maxMessageLength = Number.isSafeInteger(configured) && configured > 0 ? configured : limit;
+  return session.maxMessageLength;
 }
 
 export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env): Promise<ZulipSession> {
@@ -108,7 +116,6 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   let maxMessageLength = 10000;
   try {
     const settings = await client.callEndpoint("server_settings", "GET", {});
-    if (Number.isSafeInteger(settings?.max_message_length) && settings.max_message_length > 0) maxMessageLength = settings.max_message_length;
     const mib = settings?.max_file_upload_size_mib;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
   } catch (err) {

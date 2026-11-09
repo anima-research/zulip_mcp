@@ -35,7 +35,7 @@ import type {
   SelfMove,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
-import { resolveMessageLinks, type MessageLink } from '../message-links.js';
+import { resolveMessageLinks, canonicalDestination, type MessageLink } from '../message-links.js';
 import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
@@ -192,6 +192,8 @@ export interface ZulipAdapterOptions {
   dmDiscoveryLimit?: number;
   /** The realm's max message length; longer publishes are split. */
   maxMessageLength?: number;
+  /** Share a newly registered realm limit with tool sends/edits; return the effective override. */
+  onRealmMessageLength?: (limit: number) => number;
   /** Uploads for the media blocks of a publish (image/audio with inline data). Unset: such blocks are dropped. */
   uploader?: Uploader;
   /** Size and count limits for those uploads. Required with `uploader`. */
@@ -214,7 +216,9 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly backscrollLimits: ReadonlyMap<string, number>;
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
-  private readonly maxMessageLength: number | undefined;
+  private maxMessageLength: number | undefined;
+  private readonly onRealmMessageLength?: (limit: number) => number;
+  private readonly configuredMaxMessageLength: number | undefined;
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
   private readonly formatTime: (d: Date) => string;
@@ -266,6 +270,8 @@ export class ZulipAdapter implements PlatformAdapter {
     this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
     this.maxMessageLength = options.maxMessageLength;
+    this.configuredMaxMessageLength = options.maxMessageLength;
+    this.onRealmMessageLength = options.onRealmMessageLength;
     this.uploader = options.uploader ?? null;
     this.uploadPolicy = options.uploadPolicy ?? null;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
@@ -827,7 +833,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const links: MessageLink[] = [], replacements: string[] = [];
     textContent = await resolveMessageLinks(textContent, {
       client: this.zulipClient, realm: this.zulipClient.config?.realm ?? '',
-    }, { destination: target, links, replacements, selfUserId: this.identity.selfUserId });
+    }, { destination: async () => target = await canonicalDestination(this.zulipClient, target), links, replacements, selfUserId: this.identity.selfUserId });
     chunkMessage(textContent, this.maxMessageLength, replacements); // Preflight before uploads.
     // Image and audio blocks ride along as uploads, linked after the text
     // (Zulip's own attachment form). Uploads happen before the send, so a
@@ -1115,7 +1121,11 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
-    const loop = this.eventLoop = new ZulipEventLoop();
+    const loop = this.eventLoop = new ZulipEventLoop({
+      onRealmMessageLength: limit => {
+        this.maxMessageLength = this.onRealmMessageLength?.(limit) ?? this.configuredMaxMessageLength ?? limit;
+      },
+    });
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
     // same message reads backwards otherwise. Reactions await the earlier

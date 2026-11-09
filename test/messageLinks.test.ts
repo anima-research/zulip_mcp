@@ -108,7 +108,7 @@ for (const tool of ['send_message', 'edit_message']) {
     test(`${tool}: tokens in ${label} resolve`, async (t) => {
       const f = await fixture(t);
       await f.tools.handleToolCall(tool, { ...args, content });
-      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, ['inline code','multiline inline code','code fence','unclosed tilde fence','blockquote fence','nested list fence','table cells'].includes(label))));
+      assert.equal(f.requests.at(-1)!.content, content.replace('[[msg:101]]', f.link(streamPath, true)));
       assert.equal(f.requests.filter((r) => r.method === 'GET').length, 1);
     });
     test(`${tool}: unreadable tokens in ${label} fail before mutations`, async (t) => {
