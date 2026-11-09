@@ -54,7 +54,7 @@ export interface ZulipEventMessage {
 /** `flags` are the receiving user's message flags from the event envelope
  * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
  * `streamName` is null for direct messages. */
-export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
+export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void | Promise<void>;
 
 /** A `reaction` event as the queue delivers it. */
 export interface ZulipReactionEvent {
@@ -378,6 +378,7 @@ export class ZulipEventLoop {
         this.consecutiveFailures = 0;
 
         for (const event of response.events) {
+          if (this.stopped) return;
           lastEventId = event.id;
 
           if (event.type === 'reaction' && onReaction && typeof event.message_id === 'number') {
@@ -472,7 +473,7 @@ export class ZulipEventLoop {
               // The event is already acked (lastEventId advanced); Zulip won't
               // redeliver it, so we log and move on (at-most-once).
               try {
-                onMessage(isStream ? streamName : null, msg, event.flags ?? []);
+                await onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {
                 console.error('Zulip event loop: onMessage handler threw:', handlerError);
               }

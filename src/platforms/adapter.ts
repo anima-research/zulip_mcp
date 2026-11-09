@@ -127,6 +127,11 @@ export interface MessageChangeEvent {
   previousContent: string | null;
   /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
   mentioned: boolean;
+  /** Verified quote-reply addressing, independent of Zulip's mention flag. */
+  replyToSelf?: boolean;
+  /** True only for a resolved verdict (including content with no quote targets). */
+  replyToSelfVerified?: boolean;
+  previouslyReplyToSelf?: boolean | null;
   /** The bot was mentioned in the message as it read before the change, as
    *  far as the adapter knows (a deleted message keeps its last verdict);
    *  null when the message was not in the adapter's cache and only its
@@ -146,6 +151,9 @@ export type OnMessageChange = (event: MessageChangeEvent) => void;
 /** History request against one channel, in the platform's own id space. */
 export interface ChannelHistoryQuery {
   limit: number;
+  /** Mutable allowance shared across a catch-up walk. Adapters subtract only
+   *  milliseconds awaiting quote GETs, not history HTTP or host acceptance. */
+  quoteLookupBudget?: { remainingMs: number };
   /** Exclusive: only messages older than this id. */
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
@@ -166,6 +174,8 @@ export interface ChannelHistoryPage {
   scannedThrough: number | null;
   /** The platform reports nothing newer than this page. */
   reachedNewest: boolean;
+  /** Quote verdicts skipped for this page's GET/wait budget, not verified ambient. */
+  unverifiedMessageIds?: string[];
 }
 
 export interface PlatformAdapter {

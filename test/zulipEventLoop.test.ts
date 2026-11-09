@@ -511,3 +511,41 @@ test('a refused queue registration is surfaced and retried, never polled as queu
   assert.ok(!logged.some((l) => /no events array/.test(l)), 'not misreported as a malformed poll');
   assert.deepEqual(pauses, [5000], 'the outer loop pauses before retrying');
 });
+
+test('a long poll completed after stop delivers none of its events', async () => {
+  const loop = new ZulipEventLoop();
+  let release!: (response: unknown) => void;
+  let polling!: () => void;
+  const polled = new Promise<void>((resolve) => { polling = resolve; });
+  const seen: string[] = [];
+  const running = loop.start({
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: () => new Promise((resolve) => { release = resolve; polling(); }) },
+  }, () => { seen.push('message'); }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
+  await polled;
+  loop.stop();
+  release({ events: [
+    { id: 1, type: 'reaction', message_id: 1, user_id: 101 },
+    { id: 2, type: 'delete_message', message_ids: [1], message_type: 'stream', stream_id: 7 },
+  ] });
+  await running;
+  assert.deepEqual(seen, []);
+});
+
+test('stopping in an awaited message handler drops all subsequent events in its batch', async () => {
+  const loop = new ZulipEventLoop();
+  const seen: string[] = [];
+  await loop.start({
+    queues: { register: async () => ({ queue_id: 'q', last_event_id: -1 }) },
+    events: { retrieve: async () => ({ events: [
+      { id: 1, type: 'message', message: { id: 1, type: 'stream', display_recipient: 'general', timestamp: 1 } },
+      { id: 2, type: 'reaction', message_id: 1, user_id: 101 },
+      { id: 3, type: 'delete_message', message_ids: [1], message_type: 'stream', stream_id: 7 },
+    ] }) },
+  }, async () => {
+    seen.push('message');
+    await Promise.resolve();
+    loop.stop();
+  }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
+  assert.deepEqual(seen, ['message']);
+});
