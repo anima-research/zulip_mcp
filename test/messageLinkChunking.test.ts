@@ -1,4 +1,4 @@
-/** Reviewer regressions; child timeout can interrupt a synchronous chunk-loop hang. */
+/** Inline pipes and protected-span chunking; child timeout can interrupt a synchronous chunk-loop hang. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -13,9 +13,9 @@ for (const content of ['`a|[[msg:101]]`', '`a|\n[[msg:101]]`', '``a|[[msg:101]]`
     assert.equal(await resolveMessageLinks(content,session,{allowPrivateReferences:true}),content.replace('[[msg:101]]',url));
   });
 }
-test('R1-2 only established table cells reset unmatched inline code', async () => {
+test('R1-2 table backticks force bare URLs, matched or unmatched', async () => {
   const content='| a | b |\n| --- | --- |\n| `unclosed | [[msg:101]] |';
-  assert.equal(await resolveMessageLinks(content,session,{allowPrivateReferences:true}),content.replace('[[msg:101]]',`[#general > secret @ 💬](${url})`));
+  assert.equal(await resolveMessageLinks(content,session,{allowPrivateReferences:true}),content.replace('[[msg:101]]',url));
   const paired='| a | b |\n| --- | --- |\n| `a|[[msg:101]]` | x |';
   assert.equal(await resolveMessageLinks(paired,session,{allowPrivateReferences:true}),paired.replace('[[msg:101]]',url));
 });

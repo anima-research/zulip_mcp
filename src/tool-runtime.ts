@@ -21,7 +21,7 @@ import {
 import type { SelfMove } from "./platforms/adapter.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { normalizeMarkdownTables } from "./markdown-tables.js";
-import { resolveMessageLinks, readMessage, type MessageMemo, type MessageLink } from "./message-links.js";
+import { resolveMessageLinks, canonicalDestination, readMessage, type MessageMemo, type MessageLink } from "./message-links.js";
 import { assertApiSuccess, dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage } from "./content.js";
 import { messageLineHead } from "./message-line.js";
@@ -707,11 +707,12 @@ export class ZulipToolRuntime {
         }
         const memo: MessageMemo = new Map();
         let reply: Awaited<ReturnType<ZulipToolRuntime['replyDestination']>> | undefined;
+        let destination: Record<string, any> | undefined;
         const links: MessageLink[] = [], replacements: string[] = [];
         const resolvedContent = hasText ? normalizeMarkdownTables(await resolveMessageLinks(args.content, this.session, {
           destination: async () => {
             reply = args.reply_to !== undefined ? await this.replyDestination(args, memo) : undefined;
-            return reply ?? args;
+            return destination ??= await canonicalDestination(zulipClient, reply ?? args, q => this.resolveUserId(q));
           }, memo, links, replacements, selfUserId: this.session.selfUserId,
           allowPrivateReferences: args.allow_private_references === true,
         })) : "";
@@ -719,6 +720,8 @@ export class ZulipToolRuntime {
         const limit = this.session.maxMessageLength;
         chunkMessage(resolvedContent, limit, replacements); // Preflight before uploads.
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
+        // Send to the authorized canonical destination without changing receipt/callback metadata.
+        const sendDestination = destination ?? args;
         const uploaded = await this.uploadFor(args);
         const content = withAttachmentLinks(resolvedContent, uploaded);
         const ids: number[] = [];
@@ -727,7 +730,7 @@ export class ZulipToolRuntime {
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
         for (const chunk of chunkMessage(content, this.session.maxMessageLength, replacements)) {
-          last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
+          last = await zulipClient.messages.send({ type: sendDestination.type, to: sendDestination.to, topic: sendDestination.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
           ids.push(last.id);
           this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
@@ -859,8 +862,10 @@ export class ZulipToolRuntime {
               allowPrivateReferences: args.allow_private_references === true,
             })) : String(args[field]));
         }
-        if (!moving && (editFields.get('content')?.length ?? 0) > (this.session.maxMessageLength ?? 10000)) {
-          throw new Error("Cannot edit: message-link expansion caused content to exceed the realm message length limit");
+        if (!moving && [...(editFields.get('content') ?? '')].length > (this.session.maxMessageLength ?? 10000)) {
+          throw new Error(links.length > 0
+            ? "Cannot edit: message-link expansion caused content to exceed the configured message length limit"
+            : "Cannot edit: content exceeds the configured message length limit");
         }
         const response = await fetch(`${apiUrl}/messages/${encodeURIComponent(args.message_id)}`, {
           method: "PATCH",

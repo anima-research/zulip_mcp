@@ -514,7 +514,7 @@ is sent or edited. There are at most **20 unescaped token occurrences** per call
 including duplicates; duplicate IDs are fetched once per call, never cached
 across calls. IDs must be positive safe integers (leading zeroes are accepted).
 Every `[[msg:ID]]` is resolved wherever it appears: prose, inline code, fences,
-spoiler/quote blocks, blockquotes and tables. Scanning is independent of Markdown; code context only chooses the rendering.
+spoiler/quote blocks, blockquotes and tables. Scanning is independent of Markdown; a conservative message-wide rule chooses the rendering.
 To send a literal token, write `\[[msg:ID]]`: the immediately preceding
 backslash is removed, `[[msg:ID]]` is sent unchanged, and no lookup occurs.
 Escaped tokens do not count toward the cap or undergo ID validation. If more
@@ -530,8 +530,10 @@ and stream-to-DM references are otherwise refused, naming the token and
 suggesting the backslash escape. The three tools accept an explicit per-call
 `allow_private_references: true` to allow any readable source, knowingly
 revealing its location. MCPL publishes use the default policy; use a send tool
-for the explicit opt-in. Successful results include `links: [{token, url}]`
-(one entry per expanded occurrence) so the transcript records every link.
+for the explicit opt-in. Successful results from `send_message`, `send_dm`,
+and `edit_message` include
+`links: [{token, url}]` (one entry per expanded occurrence), so their tool
+transcripts record every link. The host does not record publish link metadata.
 
 Token and `reply_to` lookup errors share sanitized diagnostics: `BAD_REQUEST`
 means not found/not accessible; rate limits, server errors and transport failures
@@ -540,14 +542,17 @@ API bodies, arbitrary codes and client exception text are never forwarded.
 Bare numbers and all other text are untouched: this is opt-in, not a number
 detector.
 
-Outside code, streams use Zulip's labelled Markdown fallback
-`[#channel > topic @ 💬](url)` (with Markdown-special names escaped); DMs use
-`[DM @ 💬](url)`. The fallback is unconditional because this server does not
-retain a feature level; native `#**channel>topic@id**` chips require feature
-level 319. Inline code and ordinary code fences use bare absolute URLs so no
-literal Markdown label appears in code. Pipes inside inline code are literal;
-only established table cells can end an unmatched code run. Quote/spoiler
-fences are prose. Channel/topic labels use Zulip's entity-based escaping (not
+Streams use Zulip's labelled Markdown fallback `[#channel > topic @ 💬](url)`
+and DMs use `[DM @ 💬](url)` only when the whole message has no backtick of any
+count (even escaped/unmatched), `~~~`, tab or `$` anywhere (including `$$` math),
+no `[`, `]` or `<` outside exact `[[msg:ID]]` tokens (including escaped tokens;
+`<` covers `<time:...>`, HTML and autolinks), no four consecutive spaces
+before a line's first non-marker character (including at any list/quote nesting step),
+and no horizontal rule; otherwise **every token becomes its bare message URL**, still a working link.
+This rejects all fences and intentionally avoids Markdown-parser parity: even a
+closed “quote then comment” message (including Anarchid's case) gets bare URLs, not labels.
+The fallback does not require a feature level; native `#**channel>topic@id**`
+chips require feature level 319. Channel/topic labels use Zulip's entity-based escaping (not
 backslashes); legacy CR/LF in names is folded to spaces in display labels only.
 Empty topics display as “general chat”; their URL topic operand stays empty.
 URLs use the **Copy link to message** operators:
@@ -561,10 +566,12 @@ exceeds 1.5 times its original length. Empty topics are requested verbatim.
 Sends resolve before uploads and chunking, and never split a generated link. Protected-span chunk cuts always advance;
 a preferred newline inside a link at the start uses the end of that link.
 A single expansion larger than the realm limit fails before uploads/sends.
-Edits that exceed the realm message limit after expansion fail before PATCH
-rather than relying on Zulip's silent truncation. The realm's advertised
-`max_message_length` is used (10000 when unknown), with the existing
-`ZULIP_MAX_MESSAGE_LENGTH` override. On edits only tokens in replacement
+All edits, including token-free edits, that exceed the configured message limit
+in Unicode code points fail before PATCH rather than relying on Zulip's silent
+truncation. The realm's `max_message_length` is read from event-queue
+`POST /register` (`realm` in `fetch_event_types`); until registration or when
+unknown, the default is 10000. `ZULIP_MAX_MESSAGE_LENGTH` overrides it.
+On edits only tokens in replacement
 content change; existing links are not rewritten, and the old body is not merged.
 
 After token resolution, `send_message`, `send_dm`, `edit_message` and MCPL publishes insert missing

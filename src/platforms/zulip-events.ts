@@ -166,6 +166,7 @@ export interface ZulipEventClient {
     register(params: Record<string, unknown>): Promise<{
       queue_id: string;
       last_event_id: number;
+      max_message_length?: number;
       /** Present on a returned (not thrown) error: zulip-js hands 4xx bodies back as values. */
       result?: string;
       msg?: string;
@@ -178,6 +179,8 @@ export interface ZulipEventClient {
 }
 
 export interface ZulipEventLoopOptions {
+  /** Realm limit from /register, not /server_settings. */
+  onRealmMessageLength?: (limit: number) => void;
   /** First retry delay after a poll failure. Default 2000ms. */
   baseBackoffMs?: number;
   /** Upper bound for the exponential backoff. Default 60000ms. */
@@ -217,12 +220,14 @@ export class ZulipEventLoop {
   /** True while a 'degraded' event is outstanding, so 'recovered' fires once. */
   private degradedActive = false;
 
+  private readonly onRealmMessageLength?: (limit: number) => void;
   private readonly baseBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly degradedThreshold: number;
   private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(options: ZulipEventLoopOptions = {}) {
+    this.onRealmMessageLength = options.onRealmMessageLength;
     this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
@@ -289,6 +294,7 @@ export class ZulipEventLoop {
     // [\"notification_settings_null\"] field is missing" when it is absent.
     const registration = await zulipClient.queues.register({
       event_types: ['message', 'reaction', 'update_message', 'delete_message'],
+      fetch_event_types: ['realm'],
       all_public_streams: 'true',
       apply_markdown: 'false',
       client_capabilities: JSON.stringify({ notification_settings_null: false, bulk_message_deletion: true }),
@@ -307,6 +313,9 @@ export class ZulipEventLoop {
       );
     }
 
+    if (Number.isSafeInteger(registration.max_message_length) && registration.max_message_length! > 0) {
+      this.onRealmMessageLength?.(registration.max_message_length!);
+    }
     this.queueId = registration.queue_id;
     let lastEventId = registration.last_event_id;
 

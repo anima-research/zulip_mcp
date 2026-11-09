@@ -26,10 +26,38 @@ function fixture(message: unknown = stream) {
     client: { messages: {
       async getById() { gets++; return { result: 'success', message }; },
       async send(p: any) { sends.push(p); return { result: 'success', id: 501, msg: '' }; },
-    }, users: { async retrieve() { throw new Error('No user-directory lookup expected'); } } },
+    }, users: { async retrieve() { throw new Error('No user-directory lookup expected'); } },
+    async callEndpoint(path: string, method: string, args: any) {
+      assert.equal(path, 'get_stream_id'); assert.equal(method, 'GET');
+      assert.deepEqual(args, { stream: 'General' });
+      return { result: 'success', stream_id: 12 };
+    } },
     realm: 'https://example.invalid', authHeader: '', selfUserId: 790, sessionId: 'receipt',
   }, dir, { uploader: { async upload() { uploads++; throw new Error('Unexpected upload'); } } });
   return { tools, sends, gets: () => gets, uploads: () => uploads, close: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+for (const content of ['hello', '[[msg:101]]']) {
+  test(`stream receipt and callback preserve the caller's name for ${content}`, async t => {
+    const f = fixture({ ...stream, id: 101 }); t.after(f.close);
+    const callbacks: any[] = [];
+    f.tools.onSent = event => callbacks.push(event);
+    const args = strictCall({ type: 'stream', to: 'General', topic: 'Parent', content }, null);
+    assertStrictArguments('send_message', args);
+    const before = structuredClone(args);
+    const url = 'https://example.invalid/#narrow/channel/12-General/topic/Parent/near/101';
+    const hasToken = content === '[[msg:101]]';
+    const rendered = hasToken ? `[#General > Parent @ 💬](${url})` : content;
+    const receipt = await f.tools.handleToolCall('send_message', args);
+    assert.deepEqual(receipt, {
+      result: 'success', id: 501, msg: '', type: 'stream',
+      channelId: 'zulip:General', stream: 'General', topic: 'Parent',
+      links: hasToken ? [{ token: content, url }] : [],
+    });
+    assert.deepEqual(f.sends, [{ type: 'stream', to: hasToken ? 12 : 'General', topic: 'Parent', content: rendered }]);
+    assert.deepEqual(callbacks, [{ messageId: '501', channelId: 'zulip:General', content: rendered }]);
+    assert.deepEqual(args, before, 'canonicalization does not mutate caller arguments');
+  });
 }
 
 for (const unused of [null, ''] as const) {
