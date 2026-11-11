@@ -27,7 +27,10 @@
   message-id floor clears refusal: in any topic of an open stream, or accepted as a push on a closed channel.
   In the stream/topic the conversation left, only bot senders are ignored
   (including old-topic Notification Bot notices); a person's new message there,
-  including a delete-and-repost, clears refusal. Destination breadcrumbs can.
+  including a delete-and-repost, clears refusal. Destination breadcrumbs outside
+  the departed topic can. After an unplaceable move back to the departed topic,
+  its breadcrumb does not clear refusal; a person's new message above the floor
+  or reply_to to a readable moved message recovers.
   Routing then follows that message's topic. Existing/moved copies, echoes, reads,
   reactions, edit markers and this bot's own messages cannot clear it. Explicit
   sends bypass refusal one reply at a time, not clear it. The bot's own moves emit no change marker;
@@ -35,6 +38,5 @@
 - Departed-topic bot notices remain blocked after a stream-only second move
   or a later move that cannot place the reference. A requested move id does not
   raise the refusal floor until it is actually observed from Zulip.
-- Event polling keeps the post-registration stop check: stopping while queue
-  registration is pending prevents polling that queue. Removed the unused
-  queue-registration callback left over from earlier move reconciliation.
+- An event loop stopped during queue registration no longer adopts the late
+  queue or reports a gap for it.

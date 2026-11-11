@@ -234,7 +234,7 @@ export class ZulipToolRuntime {
   onSent: ((sent: SentRecord) => void) | null = null;
   /** Successful moves reconcile routing/cache without waiting for an echo. */
   onMoved: ((move: SelfMove) => void) | null = null;
-  onMoveStarted: ((messageId: number) => ReadonlyMap<string, number>) | null = null;
+  onMoveStarted: (() => ReadonlyMap<string, number>) | null = null;
   onMessageObserved: ((messageId: number) => void) | null = null;
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
@@ -782,7 +782,7 @@ export class ZulipToolRuntime {
         }
         // The original placement decides the propagation range even when the
         // acted-on message is not the current conversation's source.
-        const moveEpochs = moving ? this.onMoveStarted?.(args.message_id) : undefined;
+        const moveEpochs = moving ? this.onMoveStarted?.() : undefined;
         let original: any = null;
         if (moving) {
           try {

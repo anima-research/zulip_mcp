@@ -550,17 +550,32 @@ test('stopping in an awaited message handler drops all subsequent events in its 
   assert.deepEqual(seen, ['message']);
 });
 
-test('R2-7 stopped registration never starts polling', async () => {
-  const loop = new ZulipEventLoop();
-  let release!: (value: any) => void;
-  let polls = 0;
-  const registration = new Promise(resolve => { release = resolve; });
-  const started = loop.start({ queues: { register: () => registration },
-    events: { retrieve: async () => { polls++; loop.stop(); return { events: [] }; } } },
-    () => {});
-  await Promise.resolve();
+test('R8-2 stopped replacement registration emits no stale gap or poll', async () => {
+  const loop = new ZulipEventLoop({ sleep: async () => {} });
+  let release!: (value: { queue_id: string; last_event_id: number }) => void;
+  let registering!: () => void;
+  const replacementStarted = new Promise<void>(resolve => { registering = resolve; });
+  const registration = new Promise<{ queue_id: string; last_event_id: number }>(resolve => { release = resolve; });
+  let registers = 0;
+  const polledQueues: string[] = [];
+  const systemEvents: PlatformSystemEvent[] = [];
+  const started = loop.start({
+    queues: { register: async () => {
+      if (++registers === 1) return { queue_id: 'expired', last_event_id: -1 };
+      registering();
+      return registration;
+    } },
+    events: { retrieve: async ({ queue_id }) => {
+      polledQueues.push(queue_id);
+      return { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'Queue expired' };
+    } },
+  }, () => {}, event => { systemEvents.push(event); });
+  await replacementStarted;
   loop.stop();
   release({ queue_id: 'stale', last_event_id: -1 });
   await started;
-  assert.equal(polls, 0);
+  assert.equal(registers, 2, 'the expired queue triggered replacement registration');
+  assert.deepEqual(polledQueues, ['expired'], 'the late replacement is never polled');
+  assert.deepEqual(systemEvents.filter(event => event.kind === 'gap'), [],
+    'stopping during registration must not report a stale replacement gap');
 });

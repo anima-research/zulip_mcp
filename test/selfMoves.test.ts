@@ -2272,7 +2272,7 @@ for (const path of ['tool', 'third-party']) for (const sender of ['human', 'bot'
   });
 }
 
-test('R6-2 uncertain move back A to B to A replaces the older departed topic', async t => {
+test('R6-2 uncertain move back A to B to A preserves the older departed topic', async t => {
   const f = await fixture();
   t.after(() => f.close());
   await f.open();
@@ -2469,7 +2469,7 @@ test('R7-2 an unverified requested id cannot raise the refusal floor', async t =
   await until(() => f.server.delivery.watermark(GENERAL) === 30, 'A conversation');
   // This callback runs before the pre-move GET/PATCH can reject an invalid id.
   // No successful Zulip read or event has observed this caller-supplied id.
-  f.tools.onMoveStarted!(1_000_000_000);
+  f.tools.onMoveStarted!();
   f.feed(move([30], { message_id: 30, user_id: 7, orig_subject: 'A', subject: 'B', propagate_mode: 'change_all' }));
   await until(() => f.incoming.some(m => m.metadata?.change === 'move'), 'rename refusal');
   await assert.rejects(f.publish(), /Conversation moved to zulip:general > B/);

@@ -305,7 +305,7 @@ marker. For host integrations:
    senders whose email has a `-bot@` local part are ignored: a person's new
    message there, including a delete-and-repost, clears refusal.
    A Notification Bot notice in the old topic does not clear refusal; a new
-   destination breadcrumb can. On a closed channel, only such a message accepted
+   destination breadcrumb outside the departed topic can. On a closed channel, only such a message accepted
    as a push does so. Existing/moved copies, this bot's own messages, echoes,
    reads, reactions and
    edit markers do not clear refusal. Explicit sends bypass it for one reply;
@@ -322,6 +322,9 @@ render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
 
 ### Known limitations of move reconciliation
 
+- After a move the bot cannot place takes the conversation back into the topic
+  it left, the breadcrumb there does not clear refusal. A person's new message
+  above the refusal floor or `reply_to` to a readable moved message recovers.
 - Deletions and moves out of visibility are indistinguishable. Refusal depends
   on the followed message disappearing with the last cached message in its
   topic, not proof that the whole topic was deleted. A newer human message in
