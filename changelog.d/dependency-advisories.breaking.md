@@ -1,7 +1,8 @@
-- **Hosts on Node 20.0–20.9:** the server now requires Node 20.10 or later
-  (`engines.node` is `>=20.10.0`). sharp 0.35's ESM build, which the server
-  imports, reads its own `package.json` with `import … with { type: 'json' }`,
-  which Node 20 parses from 20.10.0, though sharp itself declares `>=20.9.0`.
+- **Hosts on Node 18, 19 or 20.0–20.9:** the server now requires Node 20.10 or
+  later (`engines.node` is `>=20.10.0`; 2.2.1 allowed Node 18 and later).
+  sharp 0.35's ESM build, which the server imports, reads its own
+  `package.json` with `import … with { type: 'json' }`, which Node 20 parses
+  from 20.10.0, though sharp itself declares `>=20.9.0`.
 - **Hosts that relied on sharp's install-time source build:** sharp 0.33.5's
   install script built sharp from source when it found a globally installed
   libvips, or when `npm_config_build_from_source` was set, with
@@ -26,17 +27,16 @@
 - **Hosts installed with npm 10 where sharp's native binary can't load:**
   npm 10, which Node 22 and Node 20 from 20.10 ship, installs sharp's
   WebAssembly build alongside sharp 0.35 (observed on Linux x64), and npm
-  11, which Node 24 ships, doesn't. Where that build is installed and the
-  native binary can't load, sharp loads the WebAssembly build without saying
-  so, and the server starts and inlines images on it, more slowly and with
-  more memory.
-- **Where sharp can't load,** the server now says so at start. When images
-  may be inlined, as by default (`ZULIP_INLINE_IMAGES` isn't `false` and
-  `ZULIP_INLINE_IMAGES_MAX` is above 0), it exits, printing sharp's error,
-  that loading sharp needs Node 20.10 or later, and the two ways through:
-  set `ZULIP_INLINE_IMAGES=false`, or install sharp's WebAssembly build
-  where the server is installed, for which it prints the `npm install
-  --no-save` command and where to run it. Otherwise the server doesn't load
-  sharp. The command leaves `package.json` and `package-lock.json`
-  unchanged, and with npm 11 a later `npm install` or `npm ci` removes the
-  build again.
+  11, which Node 24, 25 and 26 ship, doesn't. Where that build is
+  installed and the native binary can't load, sharp loads the WebAssembly
+  build without saying so, and the server starts and inlines images on it,
+  more slowly and with more memory.
+- **Hosts where sharp can't load:** the server now says so at start. When
+  images may be inlined, as by default (`ZULIP_INLINE_IMAGES` isn't `false`
+  and `ZULIP_INLINE_IMAGES_MAX` is above 0), it exits, printing sharp's error,
+  that loading sharp needs Node 20.10 or later, and the two ways through: set
+  `ZULIP_INLINE_IMAGES=false`, or install sharp's WebAssembly build where the
+  server is installed, for which it prints the `npm install --no-save` command
+  and where to run it. Otherwise the server doesn't load sharp. The command
+  leaves `package.json` and `package-lock.json` unchanged, and with npm 11 a
+  later `npm install` or `npm ci` removes the build again.
