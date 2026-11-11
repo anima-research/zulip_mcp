@@ -25,7 +25,7 @@
   Windows with Node 21 or later it isn't installed. On such a host, unless
   sharp's WebAssembly build is installed, sharp fails to load.
 - **Hosts installed with npm 10 where sharp's native binary can't load:**
-  npm 10, which Node 22 and Node 20 from 20.10 ship, installs sharp's
+  npm 10, which Node 20 from 20.10, 21, 22 and 23 ship, installs sharp's
   WebAssembly build alongside sharp 0.35 (observed on Linux x64), and npm
   11, which Node 24, 25 and 26 ship, doesn't. Where that build is
   installed and the native binary can't load, sharp loads the WebAssembly
