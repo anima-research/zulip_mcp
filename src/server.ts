@@ -862,7 +862,7 @@ export class ZulipMcplServer {
     // operation as failed. A muted stream, or one outside the allowlist,
     // yields none: nothing from it reaches the agent, backscroll included.
     const requested = Math.max(0, Math.floor(params.history?.limit ?? 0));
-    let page: { messages: KeyedMessage[]; older: boolean } | null = null;
+    let page: { messages: KeyedMessage[]; older: boolean; sinceLastSeen: boolean } | null = null;
     if (requested > 0 && this.adapter.fetchHistory && (this.isMuted(key) || !this.isAllowed(key))) {
       result.history = [];
       result.historyTruncated = false;
@@ -886,13 +886,16 @@ export class ZulipMcplServer {
       // result, JSON that already shows author, threadId and metadata.
       result.history = this.projectHistoryReactions(messages).map((m) => toWire(m, descriptor.id));
       result.historyTruncated = requested > limit;
-      page = { messages, older: beforeMessageId !== undefined };
+      page = { messages, older: beforeMessageId !== undefined, sinceLastSeen: afterMessageId !== undefined };
     }
 
     this.channelManager.markOpen(descriptor.id);
     if (page) {
-      // Handed to the host in this very response: forwarded.
-      for (const m of page.messages) this.accepted(key, Number(m.messageId));
+      const newest = Math.max(...page.messages.map((m) => Number(m.messageId)).filter(Number.isFinite));
+      if (Number.isFinite(newest) && (page.sinceLastSeen || this.placeOf(key) === undefined)) this.decide(key, newest);
+      const place = this.placeOf(key);
+      // Handed to the host in this very response: forwarded, up to the lane's place.
+      for (const m of page.messages) if (place !== undefined && Number(m.messageId) <= place) this.accepted(key, Number(m.messageId));
       // This history goes to the agent, which answers it through
       // channels/publish, so its newest message gives the topic. A page
       // fetched before a given message is older history, read for context,
@@ -1113,12 +1116,25 @@ export class ZulipMcplServer {
     const lane = lanes.lane(message.key);
     if (lane.isEnded) return;
     const id = numericId(message);
+    const place = this.placeOf(message.key);
+    if (id !== null && place !== undefined && id <= place) return;
     if (id !== null) this.delivery.hold(message.key, id, 'queued');
     lane.enter(() => this.route(message, newChannel, lane), { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
   private letGo(key: ChannelKey, id: number): void {
     if (this.delivery.release(key, id)) this.delivery.save();
+  }
+
+  private placeOf(key: ChannelKey): number | undefined {
+    const own = this.lanes?.lane(key).place;
+    const watermark = this.delivery.watermark(key);
+    if (own === undefined) return watermark;
+    return watermark === undefined ? own : Math.max(own, watermark);
+  }
+
+  private decide(key: ChannelKey, id: number): void {
+    if (Number.isFinite(id)) this.lanes?.lane(key).decide(id);
   }
 
   /**
@@ -1136,12 +1152,18 @@ export class ZulipMcplServer {
     // Muted stream, or outside the allowlist: nothing reaches the agent —
     // ambient AND mentions — and nothing is tallied, before any other
     // routing. Rechecked here (not only at the event) for what was held.
-    if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
+    if (this.isMuted(key) || !this.isAllowed(key, message)) {
+      this.decide(key, id);
+      return this.letGo(key, id);
+    }
 
     // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
     // and push alike. Held, not let go: the host asked not to hear it now,
     // which is not the same as having heard it.
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return this.delivery.hold(key, id, 'failed');
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+      this.decide(key, id);
+      return this.delivery.hold(key, id, 'failed');
+    }
 
     // A channel the host has never seen — a DM from someone new, or a stream
     // the bot was added to after startup (#20): make it a registered channel
@@ -1185,6 +1207,7 @@ export class ZulipMcplServer {
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
 
+    this.decide(key, id);
     if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
 
     // The watermark moves in onDelivered, once the host has accepted it.

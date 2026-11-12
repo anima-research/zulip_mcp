@@ -34,11 +34,22 @@ export class Lane<W> {
   private holds = 0;
   private waitingForTurn = false;
   private ended = false;
+  private decidedThrough: number | undefined;
 
   constructor(
     readonly key: ChannelKey,
     private readonly lanes: Lanes<W>,
   ) {}
+
+  /** The highest message id this lane has decided on in its connection, if any. */
+  get place(): number | undefined {
+    return this.decidedThrough;
+  }
+
+  /** A message was decided on: the place moves up to it, and never down. */
+  decide(id: number): void {
+    if (this.decidedThrough === undefined || id > this.decidedThrough) this.decidedThrough = id;
+  }
 
   /** What the host sent about this channel: taken before anything in the other queue. */
   host(job: Job<W>): void {

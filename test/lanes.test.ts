@@ -197,3 +197,13 @@ test('past the cap, the lane with the most waiting messages is given up: its mes
   assert.deepEqual(log.filter((x) => x.startsWith('A') || x === 'read'), ['A running', 'read', 'A change']);
   assert.ok(log.includes('B 20'));
 });
+
+test('the place moves up to what a lane decides, and never down', () => {
+  const lane = lanes().lane(A);
+  assert.equal(lane.place, undefined);
+  lane.decide(5);
+  lane.decide(3);
+  assert.equal(lane.place, 5);
+  lane.decide(8);
+  assert.equal(lane.place, 8);
+});

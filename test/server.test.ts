@@ -1445,6 +1445,46 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
   await h.close();
 });
 
+test('a message whose event arrives after an open\'s since-last-seen page handed it is dropped, and reaches the host once', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2), streamMsg(3)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'the first message accepted');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 10, sinceLastSeen: true },
+  })) as { history?: { messageId: string }[] };
+  assert.deepEqual(opened.history?.map((m) => m.messageId), ['2', '3']);
+  h.adapter.emit!(streamMsg(3));
+  h.adapter.emit!(streamMsg(4));
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '4'], 'the page\'s 3 isn\'t delivered again');
+  assert.equal(h.delivery.watermark('zulip:general'), 4);
+  await h.close();
+});
+
+test('an open with a page on a channel with no watermark gives it one, and the next connection\'s catch-up starts above the page', async () => {
+  const first = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+  assert.equal(first.delivery.watermark('zulip:general'), 2);
+  await first.close();
+  first.adapter.history.push(streamMsg(3));
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.equal(second.pushed.length, 1, 'the catch-up block');
+  const block = (second.pushed[0].payload.content[0] as { text: string }).text;
+  assert.match(block, /id=3\]/);
+  assert.doesNotMatch(block, /id=2\]/);
+  await second.close();
+});
+
 test('a message waiting for its attachments reaches the host before a later message of its channel', async () => {
   const fetches = heldFetches();
   const h = harness({ attachments: fetches.options });
@@ -2398,12 +2438,64 @@ test('a channel_open with backscroll during the sweep window does not hide the o
       channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 },
     })) as { history?: IncomingChannelMessage[] };
     assert.deepEqual(opened.history!.map((m) => m.messageId), ['7', '8']);
-    assert.equal(second.delivery.watermark('zulip:general'), 8, 'the backscroll moved the live watermark');
+    assert.equal(second.delivery.watermark('zulip:general'), 3, 'a page of the newest rows counts nothing below it as seen');
     release();
     await until(() => second.pushed.length === 1, 'the sweep still delivers from where the connection began');
     const block = (second.pushed[0].payload.content[0] as { text: string }).text;
     for (const id of [4, 5, 6]) assert.match(block, new RegExp(`id=${id}\\]`));
+    await until(() => second.delivery.watermark('zulip:general') === 8, 'the watermark moves once the host accepts the block');
     await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a page of the newest rows, answered before the catch-up block, loses nothing below it when the connection ends before the block', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-page-before-block-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'pb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.close();
+
+    const unread = () => [streamMsg(4, { mentioned: true }), ...[5, 6, 7, 8].map((id) => streamMsg(id))];
+    const second = harness({ stateDir: dir, sessionId: 'pb', history: unread() });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let calls = 0;
+    let readEnded!: () => void;
+    const ended = new Promise<void>((r) => { readEnded = r; });
+    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+    second.adapter.fetchHistory = async (channelId, query) => {
+      if (calls++ !== 0) return realFetch(channelId, query);
+      await gate;
+      try {
+        return await realFetch(channelId, query);
+      } finally {
+        readEnded();
+      }
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => calls === 1, 'the catch-up read to start');
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+    await second.close();
+    release();
+    await ended;
+    await new Promise<void>((r) => setImmediate(r));
+
+    const third = harness({ stateDir: dir, sessionId: 'pb', history: unread() });
+    await initialize(third, true);
+    await settled(third);
+    await third.server.quiet();
+    assert.equal(third.pushed.length, 1, 'the catch-up block');
+    const block = (third.pushed[0].payload.content[0] as { text: string }).text;
+    for (const id of [4, 5, 6, 7, 8]) assert.match(block, new RegExp(`id=${id}\\]`));
+    await third.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

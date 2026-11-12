@@ -29,3 +29,14 @@
   of its closed channel waited for its attachments no longer has that
   message pushed: the mute and the allowlist are checked again when the
   attachments are in.
+- A message could reach the host twice when its event arrived after an
+  open's `sinceLastSeen` history had already returned it: once in the
+  history, and again as a message. An event for a message that its channel
+  has already dealt with is now dropped.
+- An open whose history was a channel's newest messages counted every
+  message below that history as seen, including ones the server hadn't
+  handed on yet, such as at a connection's start before the channel's
+  catch-up. If the connection ended before the catch-up, those messages were
+  never offered. Such an open now counts as seen only what its channel had
+  already dealt with, and the catch-up block moves the watermark when the
+  host accepts it.
