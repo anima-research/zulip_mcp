@@ -6,7 +6,6 @@
   earlier release reads the file as before.
 - A run without MCPL writes no delivery state file. It used to write one when
   it stopped.
-- `ZULIP_SUBSCRIBE` subscribes once a client has connected and the stream
-  list has been read: with MCPL at the event queue's registration, and
-  without MCPL at one read of the list. It used to subscribe as the process
-  started.
+- `ZULIP_SUBSCRIBE` subscribes once a client has connected and the first
+  stream list has been read, or once a client without MCPL got no answer to
+  its read of the list. It used to subscribe as the process started.

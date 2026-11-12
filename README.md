@@ -27,7 +27,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   open and close. Opening a channel subscribes the bot to the stream first
   (Zulip only delivers events to subscribers) — a stream the bot cannot
   subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically.
+  return backscroll atomically. A stream whose
+  name reads as a DM channel id, such as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
@@ -313,9 +314,12 @@ the next `channels/changed` also removes each id the unanswered one added,
 unless a stream holds that id now. The watermark, the missed tally and
 the filters entries carry to the new name. Once the host answers, a request
 for the old id is refused, and the refusal names the new id, unless another
-stream has taken the old name, as in a swap. A stream that was open
-at last sight and was renamed while the server was down gets one push from
-its new channel when a host next connects. An archived stream, or one the
+stream has taken the old name, as in a swap. With MCPL, `send_message`,
+`listen` and `unlisten` given the old name are refused the same way, and
+send nothing to Zulip. A stream that was open at last sight and was renamed
+while the server was down, or while no host was connected, gets one push
+from its new channel when a host next connects, and then its backlog, as
+any stream open at last sight does. An archived stream, or one the
 bot lost access to, is removed at the host the same way, with nothing
 added.
 
