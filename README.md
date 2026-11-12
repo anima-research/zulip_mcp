@@ -341,12 +341,10 @@ oldest stops being retried and stays usable. One consequence worth knowing:
 `channels/list` can name a channel the host never confirmed.
 
 A host that opens or closes a channel has confirmed it, whatever became of
-the announcement, and it leaves the retry set at that point. Against
-agent-framework that is the only confirmation available for an announcement
-made inside a tool call: it reconciles (a blocking `channels/open` or
-`channels/close` per descriptor) before it answers, and this server serves
-one request at a time, so the answer cannot arrive until the tool returns.
-Without that rule the backlog would be retried on every refresh forever.
+the announcement, and it leaves the retry set at that point. For a host that
+takes `channels/changed` as a notification and never answers it, that is
+the only confirmation available. Without that rule the backlog would be
+retried on every refresh forever.
 
 Silence is not refusal either. A host that itemizes only the descriptors it
 changed leaves the rest unstated, and they are treated as pending, not
@@ -355,15 +353,18 @@ unregistered and closed, it is not announced again, and `refresh_channels`
 lists it under `refused`. Asking again is an agent decision — an explicit
 `refresh_channels` retries refused channels.
 
-An announcement waits 5 seconds, not the protocol default of 30. This
-server answers one request at a time, and agent-framework's
-`channels/changed` handler reconciles (a blocking `channels/open` per
-descriptor) *before* it answers, while its `channels/register` handler
-answers first. So an announcement made inside a tool call cannot be
-answered until that call returns. Timing out quickly keeps the channel
-usable, lets the host's own `channels/open` be served, and leaves the
-re-announcement to the next refresh; descriptors are recorded before the
-announcement goes out so that open succeeds when it lands.
+An announcement waits 5 seconds, not the protocol default of 30, since the
+channel's messages wait behind it. agent-framework 0.18.0 and older
+reconciled (a blocking `channels/open` per descriptor) *before* it answered
+`channels/changed`. A host's `channels/open` or `channels/close` of a channel
+this server can already name doesn't wait for the requests ahead of it. It
+waits for what runs on that channel and for the host's earlier requests about
+it, so such a host can answer an announcement made inside a tool call or a
+delivery. A `channels/open` that has to re-discover its channel is the
+exception: the host's own open of that channel waits behind it, and the
+announcement times out. Descriptors are recorded before the announcement goes
+out, so that open succeeds when it lands, and the re-announcement is left to
+the next refresh.
 
 ## Filters plane
 

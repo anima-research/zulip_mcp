@@ -34,9 +34,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   /** `channels/changed`, Request form (§14.5) — itemized like register.
-   *  `timeoutMs` bounds the wait: a host that reconciles before answering
-   *  cannot be served while this server is inside a request of its own, so
-   *  waiting out the default 30s would stall the whole loop. */
+   *  `timeoutMs` bounds the wait. */
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }

@@ -57,7 +57,7 @@ import { ChannelIds } from './channel-ids.js';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { StreamDirectory, type DirectoryChange } from './stream-directory.js';
 import { ContextProvider } from './context.js';
-import { Lanes } from './lanes.js';
+import { Lanes, type Lane } from './lanes.js';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
@@ -79,12 +79,9 @@ import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
-/** How long an announcement waits for the host. Short on purpose: this
- *  server answers one request at a time, so a host that reconciles before it
- *  answers `channels/changed` (agent-framework does) cannot be served while
- *  this is outstanding. Timing out fast keeps the channel usable, lets the
- *  host's own `channels/open` be answered, and leaves the re-announcement to
- *  the next refresh. */
+/** How long an announcement waits for the host. A host that takes
+ *  `channels/changed` as a notification never answers it, and the channel's
+ *  messages wait this long behind it. */
 const ANNOUNCE_TIMEOUT_MS = 5_000;
 
 const REMOVED_LINE = '';
@@ -173,6 +170,7 @@ export class ZulipMcplServer {
   private lanes: Lanes<null> | null = null;
   private requestTail: Promise<void> = Promise.resolve();
   private requestsWaiting = 0;
+  private readonly lifecycleOnChain = new Map<string, number>();
   private healDone: Promise<void> = Promise.resolve();
   private healing = false;
   private readonly catchupLimit: number;
@@ -379,6 +377,9 @@ export class ZulipMcplServer {
     try {
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
+        if (msg.type === 'request' && this.enterHostQueue(conn, msg.request)) continue;
+        const lifecycleId = msg.type === 'request' ? lifecycleChannelId(msg.request) : null;
+        if (lifecycleId !== null) this.lifecycleOnChain.set(lifecycleId, (this.lifecycleOnChain.get(lifecycleId) ?? 0) + 1);
         this.requestsWaiting++;
         this.requestTail = this.requestTail.then(async () => {
           try {
@@ -388,6 +389,11 @@ export class ZulipMcplServer {
               : this.handleNotification(conn, msg.notification));
           } finally {
             this.requestsWaiting--;
+            if (lifecycleId !== null) {
+              const left = (this.lifecycleOnChain.get(lifecycleId) ?? 1) - 1;
+              if (left > 0) this.lifecycleOnChain.set(lifecycleId, left);
+              else this.lifecycleOnChain.delete(lifecycleId);
+            }
           }
         });
       }
@@ -415,6 +421,41 @@ export class ZulipMcplServer {
 
   private isQuiet(): boolean {
     return (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.channelManager.isIdle() && !this.healing;
+  }
+
+  private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {
+    const channelId = lifecycleChannelId(req);
+    if (channelId === null || !this.mcplActive || !this.lanes || this.lifecycleOnChain.has(channelId)) return false;
+    if (!this.grant.has('channels.lifecycle')) return false;
+    const answer = this.ids.resolve(channelId);
+    if (!answer || !('key' in answer)) return false;
+    const key = answer.key;
+    if (req.method === method.CHANNELS_CLOSE) {
+      const close = req.params as unknown as ChannelsCloseParams;
+      this.serveInLane(conn, req, key, () => this.handleChannelClose(close));
+      return true;
+    }
+    const open = req.params as unknown as ChannelsOpenParams;
+    let descriptor: ChannelDescriptor;
+    try {
+      descriptor = this.channelManager.findChannel(open);
+    } catch {
+      return false;
+    }
+    if (this.ids.keyOfDescriptor(descriptor) !== key) return false;
+    this.serveInLane(conn, req, key, () => this.openChannel(open, descriptor, key));
+    return true;
+  }
+
+  private serveInLane(conn: McplConnection, req: JsonRpcRequest, key: ChannelKey, serve: () => unknown): void {
+    this.lanes?.lane(key).host(async () => {
+      if (conn.isClosed) return;
+      try {
+        conn.sendResponse(req.id, await serve());
+      } catch (err) {
+        this.answerError(conn, req, err);
+      }
+    });
   }
 
   /**
@@ -658,14 +699,17 @@ export class ZulipMcplServer {
         case method.CHANNELS_OPEN: {
           this.requireMcpl();
           const open = params as unknown as ChannelsOpenParams;
-          conn.sendResponse(req.id, await this.handleChannelOpen(open));
+          const { descriptor, key } = await this.openTarget(open);
+          this.serveInLane(conn, req, key, () => this.openChannel(open, descriptor, key));
           break;
         }
 
         case method.CHANNELS_CLOSE: {
           this.requireMcpl();
           const close = params as unknown as ChannelsCloseParams;
-          conn.sendResponse(req.id, this.handleChannelClose(close));
+          const answer = typeof close.channelId === 'string' ? this.ids.resolve(close.channelId) : null;
+          if (answer && 'key' in answer) this.serveInLane(conn, req, answer.key, () => this.handleChannelClose(close));
+          else conn.sendResponse(req.id, this.handleChannelClose(close));
           break;
         }
 
@@ -717,14 +761,18 @@ export class ZulipMcplServer {
           conn.sendError(req.id, -32601, `Method not found: ${req.method}`);
       }
     } catch (err) {
-      if (err instanceof McplRpcError) {
-        conn.sendError(req.id, err.code, err.message, err.data);
-        return;
-      }
-      const e = err as Error;
-      console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, e.stack ?? e.message);
-      conn.sendError(req.id, -32603, e.message ?? String(err));
+      this.answerError(conn, req, err);
     }
+  }
+
+  private answerError(conn: McplConnection, req: JsonRpcRequest, err: unknown): void {
+    if (err instanceof McplRpcError) {
+      conn.sendError(req.id, err.code, err.message, err.data);
+      return;
+    }
+    const e = err as Error;
+    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, e.stack ?? e.message);
+    conn.sendError(req.id, -32603, e.message ?? String(err));
   }
 
   // ── Notifications ──
@@ -769,7 +817,7 @@ export class ZulipMcplServer {
 
   // ── Channel lifecycle ──
 
-  private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
+  private async openTarget(params: ChannelsOpenParams): Promise<{ descriptor: ChannelDescriptor; key: ChannelKey }> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     if (params.channelId) {
       const answer = await this.ids.keyOf(params.channelId);
@@ -778,6 +826,11 @@ export class ZulipMcplServer {
     const descriptor = await this.findChannelRediscovering(params);
     const key = this.ids.keyOfDescriptor(descriptor);
     if (key === null) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel: ${descriptor.id}`, { channelId: descriptor.id });
+    return { descriptor, key };
+  }
+
+  private async openChannel(params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey): Promise<ChannelsOpenResult> {
+    if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
     this.channelManager.confirmAnnounced(descriptor.id);
@@ -806,6 +859,7 @@ export class ZulipMcplServer {
     // operation as failed. A muted stream, or one outside the allowlist,
     // yields none: nothing from it reaches the agent, backscroll included.
     const requested = Math.max(0, Math.floor(params.history?.limit ?? 0));
+    let page: { messages: KeyedMessage[]; older: boolean } | null = null;
     if (requested > 0 && this.adapter.fetchHistory && (this.isMuted(key) || !this.isAllowed(key))) {
       result.history = [];
       result.historyTruncated = false;
@@ -818,25 +872,28 @@ export class ZulipMcplServer {
       const afterMessageId =
         params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined;
       const beforeMessageId = afterMessageId === undefined ? params.history?.beforeMessageId : undefined;
-      const page = await this.adapter.fetchHistory(key, { limit, beforeMessageId, afterMessageId });
+      const read = await this.adapter.fetchHistory(key, { limit, beforeMessageId, afterMessageId });
       // Not attributed: the host hands this back as the channel_open tool
       // result, JSON that already shows author, threadId and metadata.
-      result.history = this.projectHistoryReactions(page.messages).map((m) => toWire(m, descriptor.id));
+      result.history = this.projectHistoryReactions(read.messages).map((m) => toWire(m, descriptor.id));
       result.historyTruncated = requested > limit;
+      page = { messages: read.messages, older: beforeMessageId !== undefined };
+    }
+
+    this.channelManager.markOpen(descriptor.id);
+    if (page) {
       // Handed to the host in this very response: forwarded.
       for (const m of page.messages) this.accepted(key, Number(m.messageId));
       // This history goes to the agent, which answers it through
       // channels/publish, so its newest message gives the topic. A page
       // fetched before a given message is older history, read for context,
       // and moves nothing.
-      if (beforeMessageId === undefined) {
+      if (!page.older) {
         for (let i = page.messages.length - 1; i >= 0; i--) {
           if (this.channelManager.noteConversation(key, page.messages[i])) break;
         }
       }
     }
-
-    this.channelManager.markOpen(descriptor.id);
     this.delivery.markOpen(key);
     this.delivery.save();
     return result;
@@ -1044,7 +1101,7 @@ export class ZulipMcplServer {
     if (lane.isEnded) return;
     const id = numericId(message);
     if (id !== null) this.delivery.hold(message.key, id, 'queued');
-    lane.enter(() => this.route(message, newChannel), { kind: 'message', ...(id !== null ? { id } : {}) });
+    lane.enter(() => this.route(message, newChannel, lane), { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
   private letGo(key: ChannelKey, id: number): void {
@@ -1057,7 +1114,7 @@ export class ZulipMcplServer {
    * dropped on a closed channel does not, so the next sweep can still find
    * it if the host opens the channel meanwhile.
    */
-  private async route(message: KeyedMessage, newChannel?: ChannelDescriptor): Promise<void> {
+  private async route(message: KeyedMessage, newChannel?: ChannelDescriptor, lane?: Lane<null>): Promise<void> {
     const key = message.key;
     const id = Number(message.messageId);
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
@@ -1078,6 +1135,12 @@ export class ZulipMcplServer {
     // first, so the host can open it and route a reply back to it. The
     // message that arrived is itself the proof that the channel is reachable.
     if (newChannel && this.ids.heldIdOf(key) === undefined) {
+      if (lane) {
+        void this.channelManager.registerAdditional([newChannel]);
+        const entryId = numericId(message);
+        lane.enterFirst(() => this.route(message, undefined, lane), { kind: 'message', ...(entryId !== null ? { id: entryId } : {}) });
+        return;
+      }
       await this.channelManager.registerAdditional([newChannel]);
     }
 
@@ -1844,19 +1907,15 @@ export class ZulipMcplServer {
     return { visible: descriptors.length, added: result.announced, local: result.local, refused: result.refused, reason: result.reason };
   }
 
-  /**
-   * Make sure a channel this server is about to deliver from is registered.
-   * Runs off the request loop (the event path), so the announcement cannot
-   * deadlock against a host that reconciles before it answers.
-   */
-  private async ensureChannelKnown(key: ChannelKey): Promise<void> {
-    if (this.ids.heldIdOf(key) !== undefined) return;
-    if (!this.conn || !this.mcplActive || !this.adapter.describeChannels) return;
+  private async unheldDescriptor(key: ChannelKey): Promise<ChannelDescriptor | null> {
+    if (this.ids.heldIdOf(key) !== undefined) return null;
+    if (!this.conn || !this.mcplActive || !this.adapter.describeChannels) return null;
     try {
       const [descriptor] = await this.adapter.describeChannels([key]);
-      if (descriptor) await this.channelManager.registerAdditional([descriptor]);
+      return descriptor ?? null;
     } catch (error) {
       console.error(`[zulip-mcp] could not register ${this.label(key)} from a message change:`, (error as Error).message);
+      return null;
     }
   }
 
@@ -2088,7 +2147,10 @@ export class ZulipMcplServer {
         });
       },
       (reaction) => this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction)),
-      (change) => this.lanes?.lane(change.key).enter(() => this.onMessageChange(change)),
+      (change) => {
+        const lane = this.lanes?.lane(change.key);
+        lane?.enter(() => this.onMessageChange(change, lane));
+      },
     );
   }
 
@@ -2149,7 +2211,7 @@ export class ZulipMcplServer {
    * already changed if it arrives at all. The synthetic id never advances a
    * watermark; the line carries the message's own id for fetch_around.
    */
-  private async onMessageChange(ev: MessageChangeEvent): Promise<void> {
+  private async onMessageChange(ev: MessageChangeEvent, lane: Lane<null>, announce = true): Promise<void> {
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.forgetPendingReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
@@ -2159,7 +2221,14 @@ export class ZulipMcplServer {
     // mention, say. Register the channel from it for the same reason a
     // message registers one (#20): the agent cannot open what it was told
     // about but this server never announced.
-    await this.ensureChannelKnown(ev.key);
+    if (announce) {
+      const descriptor = await this.unheldDescriptor(ev.key);
+      if (descriptor) {
+        void this.channelManager.registerAdditional([descriptor]);
+        lane.enterFirst(() => this.onMessageChange(ev, lane, false));
+        return;
+      }
+    }
     const open = this.channelManager.isKeyOpen(ev.key);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
@@ -2275,7 +2344,13 @@ export class ZulipMcplServer {
   private async channelsChangedWithHost(params: ChannelsChangedParams, timeoutMs = this.announceTimeoutMs): Promise<ChannelsRegisterResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    return (await conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs)) as ChannelsRegisterResult | undefined;
+    const answer = conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs);
+    for (const descriptor of params.added ?? []) {
+      const key = this.ids.keyOfDescriptor(descriptor);
+      const renamed = key !== null && (params.removed ?? []).includes(this.ids.heldIdOf(key) ?? '');
+      if (key !== null && !renamed) this.lanes?.lane(key).holdOtherUntil(answer);
+    }
+    return (await answer) as ChannelsRegisterResult | undefined;
   }
 
   private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
@@ -2283,6 +2358,12 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
   }
+}
+
+function lifecycleChannelId(req: JsonRpcRequest): string | null {
+  if (req.method !== method.CHANNELS_OPEN && req.method !== method.CHANNELS_CLOSE) return null;
+  const channelId = (req.params as { channelId?: unknown } | undefined)?.channelId;
+  return typeof channelId === 'string' ? channelId : null;
 }
 
 /** A message's cursor id; null for reactions and system markers, which have none. */

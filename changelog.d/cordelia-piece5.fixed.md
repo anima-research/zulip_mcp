@@ -5,3 +5,10 @@
   the order the server received them, so a reaction or an edit follows the
   message it is about. A message waiting for its attachments holds back only
   its own channel.
+- A host's `channels/open` or `channels/close` of a channel the server
+  already knows no longer waits for the requests ahead of it, such as a tool
+  call that waits for the host. It waits for the job running on its own
+  channel, such as one message being handled. So a host that opens a channel
+  before it answers that channel's announcement, as agent-framework 0.18.0
+  and older did, no longer stalls for 5 s behind a tool call that announced
+  the channel.

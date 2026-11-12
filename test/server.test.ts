@@ -268,7 +268,7 @@ interface Harness {
   serverSide: McplConnection;
   /** How the host answers channels/incoming: per-message rejections (for
    *  good, or once), and whole batches that error out (counted down per batch). */
-  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string> };
+  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile' | 'held'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string>; heldChanged: (() => void)[] };
   close(): Promise<void>;
 }
 
@@ -322,9 +322,10 @@ function harness(opts: HarnessOptions = {}): Harness {
     rejectIds: new Set<string>(),
     rejectOnce: new Set<string>(),
     failIncomingBatches: 0,
-    changedAnswer: 'accept' as 'accept' | 'refuse' | 'error' | 'reconcile',
+    changedAnswer: 'accept' as 'accept' | 'refuse' | 'error' | 'reconcile' | 'held',
     reconcileOpens: [] as { channelId: string; ok: boolean; detail: string }[],
     rejectPushes: new Set<string>(),
+    heldChanged: [] as (() => void)[],
   };
   // The host reactor: answer every server→host Request the way conhost does.
   host.on('request', (req) => {
@@ -351,12 +352,14 @@ function harness(opts: HarnessOptions = {}): Harness {
       // 'error' stands for every host that does not answer this Request:
       // a transport drop, a timeout, or one that treats it as a Notification.
       if (policy.changedAnswer === 'error') host.sendError(req.id, -32601, 'channels/changed unsupported');
+      else if (policy.changedAnswer === 'held') policy.heldChanged.push(() => host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) }));
       else if (policy.changedAnswer === 'reconcile') {
-        // agent-framework's handleChanged: reconcile (a blocking channels/open
-        // per descriptor) BEFORE answering. This server answers one request at
-        // a time, so while it waits for this answer it cannot serve that open.
+        // agent-framework's handleChanged in 0.18.0 and older: reconcile (a
+        // blocking channels/open per descriptor) BEFORE answering.
         void (async () => {
           for (const c of p.added ?? []) {
+            // As over a real transport, the open comes in a later turn of the event loop.
+            await new Promise((resolve) => setImmediate(resolve));
             try {
               const opened = (await host.sendRequest(method.CHANNELS_OPEN, { channelId: c.id, type: c.type, address: {} })) as { channel?: ChannelDescriptor };
               policy.reconcileOpens.push({ channelId: c.id, ok: Boolean(opened?.channel), detail: 'opened' });
@@ -1346,6 +1349,31 @@ function withLog(m: IncomingChannelMessage): IncomingChannelMessage {
   return { ...m, metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.log`, name: 'run.log', mimeType: 'text/plain', isImage: false }] } };
 }
 
+test('a close waits only for the job running on its channel, and the messages behind that job are handled as on a closed channel', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3));
+  h.adapter.emit!(streamMsg(4));
+  let closed = false;
+  const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' }).then(() => { closed = true; });
+  await h.host.sendRequest('ping');
+  assert.equal(closed, false, 'the close waits for the job that is running');
+  fetches.release();
+  await close;
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => ['2', '3', '4'].includes(m.messageId)), []);
+  assert.equal(h.pushed.length, 0);
+  const missed = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'channel_missed', arguments: { channel: '#general' } })) as { content: { text: string }[] }).content[0].text);
+  assert.equal(missed.missedMessages, 3, 'the three that waited are counted, and the one whose job was running is not');
+  await h.close();
+});
+
 test('a message waiting for its attachments reaches the host before a later message of its channel', async () => {
   const fetches = heldFetches();
   const h = harness({ attachments: fetches.options });
@@ -2326,20 +2354,20 @@ test('a channel the host never answered for stays usable here and is re-announce
 });
 
 test('a host that opens or closes a pending channel has confirmed it; the backlog does not grow forever (#20)', async () => {
-  // Against agent-framework the answer to an announcement made inside a tool
-  // call can never arrive (it reconciles first, and this server serves one
-  // request at a time). The host acting on the channel is the only
-  // confirmation available, so it has to count as one.
+  // A host that takes channels/changed as a notification never answers it.
+  // The host acting on the channel is the only confirmation available, so
+  // it has to count as one.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);
-  h.policy.changedAnswer = 'reconcile';
+  h.policy.changedAnswer = 'error';
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
 
   const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { pendingAnnouncement?: string[] };
-  assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'the answer could not arrive in time');
-  await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
+  assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'no answer came');
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} });
+  h.policy.changedAnswer = 'accept';
 
   // Second call: nothing pending, no second announcement, no stall.
   const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
@@ -2383,24 +2411,17 @@ test('listen registers what it subscribed the bot to and reports how the host an
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
 
-  // A host that cannot answer in time: the tool says so rather than logging it.
-  h.policy.changedAnswer = 'reconcile';
+  // A host that does not answer: the tool says so rather than logging it.
+  h.policy.changedAnswer = 'error';
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM, { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } }];
   const stalled = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['infra'] } })) as { content: { text: string }[] }).content[0].text) as
     { registration: { announced: string[]; local: string[] } };
   assert.deepEqual(stalled.registration.local, ['zulip:infra'], 'the tool result carries the outcome; the note is the runtime\'s (see toolRuntime tests)');
-  await until(() => h.policy.reconcileOpens.some((o) => o.channelId === 'zulip:infra'), "the host's reconcile-time open is served");
   await h.close();
 });
 
-test('a host that reconciles before it answers does not cost the channel — the reported failure (#20)', async () => {
-  // agent-framework answers channels/register BEFORE reconciling and
-  // channels/changed AFTER, and this server serves one request at a time. So
-  // an announcement made inside a tool call cannot be answered until the tool
-  // returns: the host waits for a channels/open this server cannot reach, and
-  // the announcement times out. That is why restarting fixed the reported
-  // streams and refresh_channels never did.
-  const h = harness({ announceTimeoutMs: 80 });
+test('a host that opens a channel before it answers its announcement gets the open served while a tool call waits for that answer', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
   await initialize(h, true);
   await settled(h);
   h.policy.changedAnswer = 'reconcile';
@@ -2408,18 +2429,10 @@ test('a host that reconciles before it answers does not cost the channel — the
 
   const report = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; pendingAnnouncement?: string[]; note: string };
-  assert.deepEqual(report.added, [], 'the answer never arrived in time');
-  assert.deepEqual(report.pendingAnnouncement, ['zulip:ops'], 'and the agent is told exactly that');
-
-  // The channel is usable anyway: the agent can open what it was told about.
-  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
-  assert.equal(opened.channel.id, 'zulip:ops');
-
-  // And the host's own reconcile-time open is answered once the tool call
-  // returns, because the descriptor was recorded before the announcement went
-  // out rather than after the answer came back.
-  await until(() => h.policy.reconcileOpens.length > 0, "the host's own channels/open is served");
   assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
+  assert.deepEqual(report.added, ['zulip:ops'], 'the host answered the announcement');
+  assert.equal(report.pendingAnnouncement, undefined);
+  assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
   await h.close();
 });
 
@@ -2444,6 +2457,65 @@ test('channels/open re-discovery settles against a host that reconciles before i
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 1);
   assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
+  await h.close();
+});
+
+test('a new stream\'s first message arrives on its channel when the host opens it before it answers the announcement, and as on a closed channel when it answers first', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.emit!(streamMsg(20, { channelId: 'zulip:ops', text: 'first in ops' }), LATE_STREAM);
+  await until(() => h.incoming.length === 1, 'the message on the opened channel');
+  assert.deepEqual(h.incoming.map((m) => [m.channelId, m.messageId]), [['zulip:ops', '20']]);
+
+  h.policy.changedAnswer = 'accept';
+  const infra: ChannelDescriptor = { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } };
+  h.adapter.emit!(streamMsg(21, { channelId: 'zulip:infra', text: 'first in infra' }), infra);
+  await h.server.quiet();
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:infra', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:infra');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['20'], 'the infra message was handled as on a closed channel');
+  await h.close();
+});
+
+test('an edit from a new stream arrives on its channel when the host opens it before it answers the announcement', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.change!({
+    kind: 'edit', channelId: 'zulip:ops', messageId: '900', messageIds: ['900'], authorId: '9', authorName: 'Ann',
+    authorEmail: 'ann@example.com', actorId: '9', topic: 'incidents', previousTopic: null, movedToChannelId: null,
+    content: '@bot look at this', previousContent: 'look at this', mentioned: true, previouslyMentioned: false,
+    vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+  });
+  await until(() => h.incoming.length === 1, 'the edit on the opened channel');
+  assert.equal(h.incoming[0].channelId, 'zulip:ops');
+  assert.match((h.incoming[0].content[0] as TextContent).text, /^\[edited\]/);
+  assert.equal(h.pushed.length, 0);
+  await h.close();
+});
+
+test('an open and then a close for a channel id the directory does not hold yet are served in that order', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+  h.policy.changedAnswer = 'held';
+  const answered: string[] = [];
+  const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }).then(() => answered.push('open'));
+  await until(() => h.policy.heldChanged.length === 1, "the open's re-discovery to announce the stream");
+  const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' }).then(() => answered.push('close'));
+  // Time for the close to be read while the announcement is out. It changes
+  // only whether a server that served the close first could show it.
+  await new Promise((r) => setTimeout(r, 50));
+  h.policy.heldChanged.shift()!();
+  await Promise.all([open, close]);
+  assert.deepEqual(answered, ['open', 'close']);
+  assert.equal(h.server.channelManager.isOpen('zulip:ops'), false);
   await h.close();
 });
 
