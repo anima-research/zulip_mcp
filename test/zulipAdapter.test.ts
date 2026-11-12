@@ -636,3 +636,30 @@ test('a miss while a read of the stream list is in flight waits for that read', 
   assert.equal(listCalls, 1);
 });
 
+test('a miss that joined a read already in flight is read for again at its next miss, since that read may have begun before its stream existed', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }] };
+      }
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }, { name: 'south', stream_id: 12 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const first = adapter.refreshStreams('stream 11');
+  const joined = adapter.refreshStreams('stream 12');
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  release!();
+  await Promise.all([first, joined]);
+  assert.equal(directory.nameOf(12), undefined, 'the read in flight began before #south');
+  await adapter.refreshStreams('stream 12');
+  assert.equal(directory.nameOf(12), 'south');
+  assert.equal(listCalls, 2);
+});
+
