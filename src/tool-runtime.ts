@@ -797,16 +797,30 @@ export class ZulipToolRuntime {
       }
 
       case "get_stream_topics": {
-        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${args.stream_id}/topics`, `topics of stream ${args.stream_id}`);
+        const byName = args.stream !== undefined && args.stream !== null;
+        const byId = args.stream_id !== undefined && args.stream_id !== null;
+        if (byName === byId) throw new Error("Give exactly one of stream and stream_id.");
+        const limit = args.limit ?? undefined;
+        if (limit !== undefined && !(typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0)) {
+          throw new Error("limit must be a positive integer.");
+        }
+        const streamId = byName
+          ? (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id
+          : args.stream_id;
+        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];
-        const formatted = topics
+        const shown = limit === undefined ? topics : topics.slice(0, limit);
+        const formatted = shown
           .map((t: any, idx: number) => `${idx + 1}. **${t.name}** (latest msg: ${t.max_id})`)
           .join("\n");
+        const heading = shown.length < topics.length
+          ? `${topics.length} Topics, the newest ${shown.length} shown`
+          : `${topics.length} Topics`;
 
         return {
           topic_count: topics.length,
-          formatted_list: `📑 **${topics.length} Topics**\n\n${formatted}`,
+          formatted_list: `📑 **${heading}**\n\n${formatted}`,
           ...(args.verbose && { raw_data: result }),
         };
       }
