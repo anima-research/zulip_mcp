@@ -74,6 +74,8 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   published: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[];
   typing: { channelId: string; op: string; metadata?: Record<string, unknown> }[];
   emit: ((message: IncomingChannelMessage | KeyedMessage, newChannel?: ChannelDescriptor) => void) | null;
+  enter: OnIncomingMessage | null;
+  enterChange: OnMessageChange | null;
   systemEvent: OnSystemEvent | null;
   react: ((event: Omit<Parameters<OnReaction>[0], 'key'> & { channelId: string }) => void) | null;
   change: ((event: Omit<MessageChangeEvent, 'key' | 'movedToKey'> & { channelId: string; movedToChannelId: string | null }) => void) | null;
@@ -114,6 +116,8 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     published: [],
     typing: [],
     emit: null,
+    enter: null,
+    enterChange: null,
     systemEvent: null,
     react: null,
     change: null,
@@ -182,17 +186,25 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       directory().registration(streamList(adapter.visible));
       adapter.emit = (message, newChannel) => {
         if (newChannel) learn([newChannel]);
-        if ('key' in message) return onMessage(message as unknown as KeyedMessage, newChannel);
-        const { channelId, ...m } = message;
-        onMessage({ ...m, key: adapter.keyOf(channelId) } as KeyedMessage, newChannel);
+        let keyed = message as unknown as KeyedMessage;
+        if (!('key' in message)) {
+          const { channelId, ...m } = message;
+          keyed = { ...m, key: adapter.keyOf(channelId) } as KeyedMessage;
+        }
+        onMessage({ key: keyed.key, messageId: keyed.messageId, ready: async () => ({ message: keyed, ...(newChannel ? { newChannel } : {}) }) });
       };
+      adapter.enter = onMessage;
+      adapter.enterChange = onMessageChange ?? null;
       adapter.systemEvent = onSystemEvent ?? null;
       adapter.react = onReaction ? ({ channelId, ...ev }) => onReaction({ ...ev, key: adapter.keyOf(channelId) }) : null;
       adapter.change = onMessageChange
-        ? ({ channelId, movedToChannelId, ...ev }) => onMessageChange({ ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) })
+        ? ({ channelId, movedToChannelId, ...ev }) => {
+            const change = { ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) };
+            onMessageChange({ key: change.key, ready: async () => change });
+          }
         : null;
     },
-    stopEvents() { adapter.emit = null; },
+    stopEvents() { adapter.emit = null; adapter.enter = null; adapter.enterChange = null; },
   } as unknown as FakeAdapter;
   Object.defineProperty(adapter, 'discoverChannels', {
     get: () => async () => learn(await discover()),
@@ -3890,7 +3902,7 @@ for (const verified of [false, true]) {
       await settled(h);
       h.policy.rejectPushes.add('5');
       h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
-      await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply refused and held');
+      await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'reply refused and held');
       h.adapter.change!({
         kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'],
         authorId: '101', authorName: 'User', authorEmail: 'user@example.invalid', actorId: '102',
@@ -4435,6 +4447,79 @@ test("a delivery still fetching its attachments when shutdown's grace runs out s
   const offersOf2 = second.pushed.filter((p) => p.eventId === 'zulip_msg_2' || (p.tags?.includes('zulip:missed') && /id=2\]/.test((p.payload.content[0] as { text: string }).text)));
   assert.equal(offersOf2.length, 1);
   assert.equal(second.delivery.watermark('zulip:general'), 2);
+  await second.close();
+});
+
+test('a message that the adapter finds is not for the host holds nothing: the next message the host accepts moves the watermark past it', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  h.adapter.enter!({ key: h.adapter.keyOf('zulip:general'), messageId: '2', ready: async () => null });
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 3, 'the watermark past 2');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  await h.close();
+});
+
+test("a message whose quote lookup outlasts its connection's shutdown sends nothing when the lookup answers, and the next connection offers it once", async () => {
+  const first = harness({ shutdownGraceMs: 20 });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  first.adapter.history = [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })];
+  const { channelId, ...two } = streamMsg(2, { mentioned: true });
+  const key = first.adapter.keyOf(channelId);
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let looking = false;
+  first.adapter.enter!({ key, messageId: '2', ready: async () => { looking = true; await lookup; return { message: { ...two, key } as KeyedMessage }; } });
+  await until(() => looking, "2's quote lookup");
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  answer();
+  await second.host.sendRequest('ping');
+  await second.server.quiet();
+  const offersOf2 = second.pushed.filter((p) => p.eventId === 'zulip_msg_2' || (p.tags?.includes('zulip:missed') && /id=2\]/.test((p.payload.content[0] as { text: string }).text)));
+  assert.equal(offersOf2.length, 1);
+  assert.equal(second.delivery.watermark('zulip:general'), 2);
+  await second.close();
+});
+
+test("a change still being placed when its connection's shutdown grace runs out goes to no connection, as on main", async () => {
+  const first = harness({ shutdownGraceMs: 20 });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  const key = first.adapter.keyOf('zulip:general');
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let placing = false;
+  first.adapter.enterChange!({ key, ready: async () => {
+    placing = true;
+    await lookup;
+    return {
+      kind: 'edit', key, messageId: '1', messageIds: ['1'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com',
+      actorId: '9', topic: 'deploys', previousTopic: null, movedToKey: null, content: '@bot fixed', previousContent: '@bot',
+      mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    };
+  } });
+  await until(() => placing, 'the edit being placed');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  answer();
+  await second.host.sendRequest('ping');
+  await second.server.quiet();
+  assert.deepEqual([...second.pushed.map((p) => p.eventId), ...second.incoming.map((m) => m.messageId)].filter((id) => /edit|changed/.test(String(id))), []);
   await second.close();
 });
 

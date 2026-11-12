@@ -1,10 +1,10 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type { KeyedMessage } from '../src/channel-key.ts';
-import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
+import type { IncomingEntry, MessageChangeEvent } from '../src/platforms/adapter.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
-import { standInApi } from './zulip-stand-in.ts';
+import { inTurn, oneLane, standInApi } from './zulip-stand-in.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type ChannelKey } from '../src/channel-key.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
@@ -75,10 +75,10 @@ async function receive(
     },
   }).api;
   const adapter = new ZulipAdapter(client, selfUserId, 'session');
-  adapter.startEvents((message) => {
+  adapter.startEvents(inTurn(({ message }) => {
     if (message.messageId === String(sentinel)) finish();
     else received.push(message);
-  });
+  }));
   try {
     await finished;
     return received;
@@ -336,10 +336,11 @@ for (const [label, before, after, wasReply, isReply] of [
         ] };
       },
     }).api, SELF, 'session', { directory: knownStreams() });
-    adapter.startEvents((m) => incoming.push(m), undefined, undefined, (c) => {
+    const lane = oneLane();
+    adapter.startEvents(lane(({ message: m }) => { incoming.push(m); }), undefined, undefined, lane((c) => {
       changes.push(c);
       if (changes.length === 2) finish();
-    });
+    }));
     try {
       await finished;
       assert.equal(incoming[0].metadata?.mentioned, false);
@@ -418,7 +419,7 @@ test('history also withholds inferred addressing for bot-authored quotes', async
 });
 
 for (const restart of [false, true]) {
-  test(`stopping during a quote lookup drops the message and remaining batch${restart ? ' across a restart' : ''}`, { timeout: 2000 }, async () => {
+  test(`a quote lookup waits in its message's turn: the rest of the batch is handed at once, and a stop leaves the lookup to answer${restart ? ' across a restart' : ''}`, { timeout: 2000 }, async () => {
     let release!: (value: unknown) => void;
     let lookupStarted!: () => void;
     const started = new Promise<void>((resolve) => { lookupStarted = resolve; });
@@ -434,21 +435,27 @@ for (const restart of [false, true]) {
         return { events: rows.map((message, i) => ({ id: i + 1, type: 'message', message, flags: [] })) };
       },
     }).api, SELF, 'session', { directory: knownStreams() });
-    const oldMessages: string[] = [];
+    const oldEntries: IncomingEntry[] = [];
     const newMessages: string[] = [];
     try {
-      adapter.startEvents((m) => oldMessages.push(m.messageId));
+      let handed!: () => void;
+      const bothHanded = new Promise<void>((resolve) => { handed = resolve; });
+      adapter.startEvents((entry) => { if (oldEntries.push(entry) === 2) handed(); });
+      await bothHanded;
+      assert.deepEqual(oldEntries.map((entry) => entry.messageId), ['300', '301']);
+      const quoting = oldEntries[0].ready();
       await started;
       adapter.stopEvents();
       if (restart) {
         let received!: () => void;
         const done = new Promise<void>((resolve) => { received = resolve; });
-        adapter.startEvents((m) => { newMessages.push(m.messageId); received(); });
+        adapter.startEvents(inTurn(({ message: m }) => { newMessages.push(m.messageId); received(); }));
         await done;
       }
       release({ message: raw(QUOTED, 'original', { sender_id: SELF }) });
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(oldMessages, []);
+      const ready = await quoting;
+      assert.equal(ready?.message.messageId, '300');
+      assert.equal(ready?.message.metadata?.replyToSelf, true);
       assert.deepEqual(newMessages, restart ? ['400'] : []);
     } finally {
       adapter.stopEvents();
@@ -511,7 +518,9 @@ for (const kind of ['reaction', 'edit'] as const) {
     const placed: string[] = [];
     let finish!: () => void;
     const finished = new Promise<void>((resolve) => { finish = resolve; });
-    let served = false;
+    let polls = 0;
+    let quoted!: () => void;
+    const quoteAnswered = new Promise<void>((resolve) => { quoted = resolve; });
     const following = kind === 'reaction'
       ? { type: 'reaction', op: 'add', emoji_name: 'eyes', message_id: QUOTED, user_id: 101 }
       : { type: 'update_message', message_id: QUOTED, user_id: 101, orig_content: 'original', content: 'corrected original', flags: [] };
@@ -523,18 +532,22 @@ for (const kind of ['reaction', 'edit'] as const) {
       },
       'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
       'GET /events': async () => {
-        if (served) return new Promise(() => {});
-        served = true;
+        polls++;
+        if (polls === 1) return { events: [{ id: 1, type: 'message', message: raw(300, quote()), flags: [] }] };
+        if (polls > 2) return new Promise(() => {});
+        await quoteAnswered;
         return { events: [
-          { id: 1, type: 'message', message: raw(300, quote()), flags: [] },
           { id: 2, ...following },
           { id: 3, type: 'message', message: raw(999, 'done'), flags: [] },
         ] };
       },
     }).api, SELF, 'session', { directory: knownStreams() });
     adapter.startEvents(
-      (m) => { if (m.messageId === '999') finish(); }, undefined,
-      (ev) => { placed.push(ev.messageId); }, (ev) => { placed.push(ev.messageId); },
+      (entry) => {
+        if (entry.messageId === '300') void entry.ready().then(() => quoted());
+        if (entry.messageId === '999') finish();
+      }, undefined,
+      (ev) => { placed.push(ev.messageId); }, inTurn((ev) => { placed.push(ev.messageId); }),
     );
     try {
       await finished;
@@ -606,7 +619,9 @@ test('history reports a quote skipped after the page wait deadline as unverified
 for (const resolvedOther of [false, true]) {
   test(`an intact quote edit ${resolvedOther ? 'resolved to another author is a confident negative verdict' : 'with an unavailable target is not a confident negative verdict'}`, { timeout: 2000 }, async () => {
   let targetGets = 0;
-  let served = false;
+  let polls = 0;
+  let classified!: () => void;
+  const verdictIn = new Promise<void>((resolve) => { classified = resolve; });
   let finish!: (change: MessageChangeEvent) => void;
   const changed = new Promise<MessageChangeEvent>((resolve) => { finish = resolve; });
   const before = quote();
@@ -621,16 +636,19 @@ for (const resolvedOther of [false, true]) {
     },
     'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
     'GET /events': async () => {
-      if (served) return new Promise(() => {});
-      served = true;
-      const rows = [raw(300, before), ...Array.from({ length: 2001 }, (_, i) => raw(1000 + i, 'cache fill', { sender_id: SELF }))];
+      polls++;
+      if (polls === 1) return { events: [{ id: 0, type: 'message', message: raw(300, before), flags: [] }] };
+      if (polls > 2) return new Promise(() => {});
+      await verdictIn;
+      const fills = Array.from({ length: 2001 }, (_, i) => raw(1000 + i, 'cache fill', { sender_id: SELF }));
       return { events: [
-        ...rows.map((message, i) => ({ id: i, type: 'message', message, flags: [] })),
+        ...fills.map((message, i) => ({ id: i + 1, type: 'message', message, flags: [] })),
         { id: 3000, type: 'update_message', message_id: 300, user_id: 102, orig_content: before, content: before + ' corrected', flags: [] },
       ] };
     },
   }).api, SELF, 'session', { directory: knownStreams() });
-  adapter.startEvents((m) => { assert.equal(m.metadata?.replyToSelf, true); }, undefined, undefined, finish);
+  const lane = oneLane();
+  adapter.startEvents(lane(({ message: m }) => { assert.equal(m.metadata?.replyToSelf, true); classified(); }), undefined, undefined, lane(finish));
   try {
     const edit = await changed;
     assert.equal(edit.replyToSelf, false);
@@ -832,16 +850,17 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
         ] };
       },
     }).api, SELF, 'session', { directory: knownStreams() });
-    adapter.startEvents((message) => {
+    const lane = oneLane();
+    adapter.startEvents(lane(({ message }) => {
       assert.equal(message.metadata?.replyToSelf, true);
       (adapter as unknown as { seen: Map<number, unknown> }).seen.delete(QUOTED);
       if (outcome === 'budget-skipped') {
         (ZulipAdapter as unknown as { quoteBudget: { tokens: number; updatedAt: number } }).quoteBudget = { tokens: 0, updatedAt: 0 };
       }
-    }, undefined, undefined, (change) => {
+    }), undefined, undefined, lane((change) => {
       changes.push(change);
       if (changes.length === 2) finish();
-    });
+    }));
     try {
       await finished;
       assert.deepEqual(changes.map((change) => change.kind), ['edit', 'delete']);

@@ -1436,3 +1436,33 @@ scenario('57. a rename whose announcement gets no answer: the stream\'s message 
     assert.equal(arrivedOn(run, addressed), 'zulip:general');
   } finally { run.releaseChanged(); await run.close(); }
 });
+
+scenario('58. a quote lookup held on one stream: a mention on another stream reaches the host meanwhile', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const quoting = r.post(17, `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`);
+    await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), 'the quote lookup');
+    const mention = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, mention), 'the other stream\'s mention');
+    assert.equal(run.logs.some((l) => l.includes('could not resolve message 999')), false, 'the mention came while the lookup was still out');
+    assert.equal(named(run, quoting), false);
+    release();
+    await run.server.quiet();
+  } finally { release(); await run.close(); }
+});
+
+scenario('59. two messages without stream_id of a stream the directory doesn\'t hold, the second after an event taught the directory its name: the first reaches the host first, and neither is lost', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot one', { mentioned: true, noStreamId: true });
+    r.regain(30, 'north');
+    const second = r.post(30, '@bot two', { mentioned: true, noStreamId: true });
+    await until(() => named(run, first) && named(run, second), 'both messages');
+    const order = run.pushed.map((p) => origin(p).messageId).filter((id) => id === String(first) || id === String(second));
+    assert.deepEqual(order, [String(first), String(second)]);
+  } finally { await run.close(); }
+});

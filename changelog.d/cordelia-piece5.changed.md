@@ -16,6 +16,9 @@
   that the host already has: the host refused a message and reconnected, a
   `sinceLastSeen` open whose limit cut its history settled that message, and
   the connection ended before the host accepted the catch-up block.
+- A message waiting for its quote lookup, or for a read of the stream list
+  for its stream id, now holds back only its own channel. It held back every
+  later event: up to 3 s for a quote lookup, and up to 15 s for the read.
 - While the host hasn't answered a stream's rename, nothing of that stream
   goes to the host: agent-framework drops the old id as it reads the
   announcement, before it answers. A host that doesn't answer delays the

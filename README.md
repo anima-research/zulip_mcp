@@ -32,13 +32,15 @@ Discord and Slack adapters that once lived here moved to those servers.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
-  (`channel_missed`). Message events are handled in order, and a quote lookup
-  delays later events in the same batch by up to three seconds per message.
-  On live delivery, each channel's messages, reactions and changes are offered
-  to the host in the order the server received them, and a message waiting for
-  its attachments holds back only its own channel.
-  Stopping delivery mid-batch drops the rest of that batch, and the next sweep
-  recovers what it can.
+  (`channel_missed`). On live delivery, each channel's messages, reactions and
+  changes are offered to the host in the order the server received them. A
+  message waiting for its quote lookup or its attachments holds back only its
+  own channel. An event that only a lookup can place waits for it, such as a
+  reaction to a message the server hasn't seen, and the reactions, changes and
+  messages after it that carry no stream id wait behind it. When delivery
+  stops, a message the server already holds is offered at the next
+  connection; one still waiting for the lookup that places it is dropped, and
+  the next catch-up recovers what it can.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message

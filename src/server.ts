@@ -69,7 +69,7 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { IncomingEntry, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
@@ -1007,20 +1007,27 @@ export class ZulipMcplServer {
   }
 
   /** One message from the adapter: it enters its channel's lane, held until it is decided. */
-  private onIncoming(message: KeyedMessage, newChannel?: ChannelDescriptor): void {
-    if (this.lanes) this.enterMessage(this.lanes, message, newChannel);
-  }
-
-  private enterMessage(lanes: Lanes<null>, message: KeyedMessage, newChannel: ChannelDescriptor | undefined): void {
-    const lane = lanes.lane(message.key);
+  private onIncoming(entry: IncomingEntry): void {
+    if (!this.lanes) return;
+    const key = entry.key;
+    const lane = this.lanes.lane(key);
     if (lane.isEnded) return;
-    const id = numericId(message);
-    const place = this.placeOf(message.key);
+    const id = numericId(entry);
+    const place = this.placeOf(key);
     if (id !== null && place !== undefined && id <= place) return;
-    const reply = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true &&
-      !this.isMuted(message.key) && this.isAllowed(message.key, message);
-    if (id !== null) this.delivery.hold(message.key, id, 'queued', { reply });
-    lane.enter(() => this.route(message, newChannel, lane), { kind: 'message', ...(id !== null ? { id } : {}) });
+    if (id !== null) this.delivery.hold(key, id, 'queued');
+    lane.enter(async () => {
+      const ready = await entry.ready();
+      if (lane.isEnded) return;
+      if (ready === null) {
+        if (id === null) return;
+        this.decide(key, id);
+        return this.letGo(key, id);
+      }
+      const { message, newChannel } = ready;
+      if (id !== null && (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true) this.delivery.verifyReply(key, id);
+      return this.route(message, newChannel, lane);
+    }, { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
   private letGo(key: ChannelKey, id: number): void {
@@ -2182,7 +2189,7 @@ export class ZulipMcplServer {
     if (this.eventsStarted) return;
     this.eventsStarted = true;
     this.adapter.startEvents(
-      (message, newChannel) => this.onIncoming(message, newChannel),
+      (entry) => this.onIncoming(entry),
       (event) => {
         try {
           this.onSystemEvent(event);
@@ -2191,9 +2198,12 @@ export class ZulipMcplServer {
         }
       },
       (reaction) => this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction)),
-      (change) => {
-        const lane = this.lanes?.lane(change.key);
-        lane?.enter(() => this.onMessageChange(change, lane));
+      (entry) => {
+        const lane = this.lanes?.lane(entry.key);
+        lane?.enter(async () => {
+          const change = await entry.ready();
+          if (change !== null && !lane.isEnded) return this.onMessageChange(change, lane);
+        });
       },
     );
   }

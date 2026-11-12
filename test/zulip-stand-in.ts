@@ -42,3 +42,17 @@ export function standInApi(routes: Record<string, Route>): { api: ZulipApi; call
   });
   return { api, calls };
 }
+
+type InTurn = <T>(take: (ready: T) => void) => (entry: { ready(): Promise<T | null> }) => void;
+
+export function oneLane(): InTurn {
+  let turn: Promise<void> = Promise.resolve();
+  return (take) => (entry) => {
+    turn = turn.then(async () => {
+      const ready = await entry.ready();
+      if (ready !== null) take(ready);
+    });
+  };
+}
+
+export const inTurn: InTurn = (take) => oneLane()(take);

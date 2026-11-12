@@ -50,11 +50,20 @@ export interface RoutingHints {
 }
 
 /**
- * Delivery callback. `newChannel` is set when the message belongs to a
- * channel the adapter has not described before (a DM from a new
- * conversation) — the server registers it with the host before routing.
+ * A message from the event stream, placed in its channel when it arrives.
+ * The server runs `ready` in the channel's turn: it does what may wait on
+ * the platform, and answers null for a message that isn't for the host.
+ * `newChannel` is set when the message belongs to a channel the adapter has
+ * not described before (a DM from a new conversation) — the server
+ * registers it with the host before routing.
  */
-export type OnIncomingMessage = (message: KeyedMessage, newChannel?: ChannelDescriptor) => void;
+export interface IncomingEntry {
+  key: ChannelKey;
+  messageId: string;
+  ready(): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null>;
+}
+
+export type OnIncomingMessage = (entry: IncomingEntry) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -155,7 +164,17 @@ export interface MessageChangeEvent {
   timestamp: Date;
 }
 
-export type OnMessageChange = (event: MessageChangeEvent) => void;
+/**
+ * A change from the event stream, placed in its channel when it arrives.
+ * The server runs `ready` in the channel's turn; it answers null for a
+ * change that isn't for the host.
+ */
+export interface ChangeEntry {
+  key: ChannelKey;
+  ready(): Promise<MessageChangeEvent | null>;
+}
+
+export type OnMessageChange = (entry: ChangeEntry) => void;
 
 /** History request against one channel. */
 export interface ChannelHistoryQuery {

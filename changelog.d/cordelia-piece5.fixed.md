@@ -93,3 +93,11 @@
   all channels together, the channel with the most gives them up, and a read
   from history brings them in order, in passes of at most the catch-up limit,
   before the messages that arrived after them.
+- A reaction to a message the server hadn't seen could reach the host after
+  a later reaction, since it waited for its own lookup alone. Events that
+  only a lookup can place are now placed one at a time, in the order Zulip
+  sent them, and the reactions, changes and messages without a stream id
+  that arrive meanwhile wait behind them.
+- A message whose quote lookup was under way when delivery stopped was
+  dropped. The server now holds it before the lookup, so the next
+  connection offers it.

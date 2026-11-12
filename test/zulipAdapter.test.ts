@@ -4,7 +4,7 @@ import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
 import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
-import { standInApi } from './zulip-stand-in.ts';
+import { inTurn, standInApi } from './zulip-stand-in.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey } from '../src/channel-key.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
@@ -192,7 +192,7 @@ test('every stream message carries its stream descriptor, so a stream joined aft
   const client = eventingClient([], [streamEvent(900, 'ops', 12), streamEvent(901, 'ops', 12), streamEvent(902, 'general', 7)], [{ name: 'ops', stream_id: 12 }, { name: 'general', stream_id: 7 }]);
   const adapter = new ZulipAdapter(client, SELF, 's');
   const seen: { key: string; descriptor?: string }[] = [];
-  adapter.startEvents((m, descriptor) => seen.push({ key: m.key, descriptor: descriptor?.id }));
+  adapter.startEvents(inTurn(({ message: m, newChannel: descriptor }) => { seen.push({ key: m.key, descriptor: descriptor?.id }); }));
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
 
@@ -207,7 +207,7 @@ test('the descriptor a message carries matches the one discovery builds for the 
   const adapter = new ZulipAdapter(client, SELF, 's');
   const discovered = (await adapter.discoverChannels()).find((c) => c.id === 'zulip:general')!;
   let fromEvent: ChannelDescriptor | undefined;
-  adapter.startEvents((_m, descriptor) => { fromEvent = descriptor; });
+  adapter.startEvents(inTurn(({ newChannel: descriptor }) => { fromEvent = descriptor; }));
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
   assert.ok(fromEvent);
@@ -221,7 +221,7 @@ test('a message without a stream_id is placed by its exact name, and its descrip
   const client = eventingClient([], [streamEvent(900, 'ops', undefined)], [{ name: 'ops', stream_id: 12 }]);
   const adapter = new ZulipAdapter(client, SELF, 's');
   const seen: { id: string; address: unknown }[] = [];
-  adapter.startEvents((_m, descriptor) => { if (descriptor) seen.push({ id: descriptor.id, address: descriptor.address }); });
+  adapter.startEvents(inTurn(({ newChannel: descriptor }) => { if (descriptor) seen.push({ id: descriptor.id, address: descriptor.address }); }));
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
   assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: 12 } }]);
@@ -279,7 +279,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m) => { delivered.push(m.messageId); }, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents(inTurn(({ message: m }) => { delivered.push(m.messageId); }), undefined, undefined, inTurn((c) => { changes.push(c); }));
     const deadline = Date.now() + 2000;
     while (changes.length < 6 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
@@ -352,7 +352,7 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents(() => {}, undefined, undefined, inTurn((c) => { changes.push(c); }));
     const deadline = Date.now() + 2000;
     while (!released && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     await adapter.deleteMessage(GENERAL, '5');
@@ -392,7 +392,7 @@ test('a delete noted again becomes the newest mark, and noting it again removes 
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents(() => {}, undefined, undefined, inTurn((c) => { changes.push(c); }));
     const deadline = Date.now() + 2000;
     while (!released && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.noteSelfDeleted(1000);
@@ -448,7 +448,7 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    adapter.startEvents(() => {}, undefined, undefined, inTurn((c) => { changes.push(c); }));
     const deadline = Date.now() + 2000;
     while (changes.length < 4 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     await new Promise((r) => setTimeout(r, 30));
@@ -487,7 +487,7 @@ test('a change to the bot\'s own DM message is judged by whom it was sent to', a
     const original = console.error;
     console.error = () => {};
     try {
-      adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+      adapter.startEvents(() => {}, undefined, undefined, inTurn((c) => { changes.push(c); }));
       await new Promise((r) => setTimeout(r, 60));
       adapter.stopEvents();
     } finally {
@@ -530,7 +530,7 @@ test('a message from a stream created after startup carries its descriptor, with
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m, d) => { seen.push({ id: m.messageId, key: m.key, newChannel: d?.id, address: d?.address }); });
+    adapter.startEvents(inTurn(({ message: m, newChannel: d }) => { seen.push({ id: m.messageId, key: m.key, newChannel: d?.id, address: d?.address }); }));
     const deadline = Date.now() + 2000;
     while (!seen.some((s) => s.id === '14') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
@@ -580,10 +580,10 @@ test('a stream the directory does not hold costs one list read for that stream, 
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m) => {
+    adapter.startEvents(inTurn(({ message: m }) => {
       seen.push(`${m.messageId}@${m.key}`);
       if (m.messageId === '31') streams.push({ name: 'south', stream_id: 12 });
-    });
+    }));
     streams.push({ name: 'north', stream_id: 11 });
     const deadline = Date.now() + 2000;
     while (!seen.some((s) => s.startsWith('35@')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
@@ -749,3 +749,38 @@ test('a stopped event loop\'s registration that answers late leaves the director
   }
 });
 
+test('while a change waits for the lookup that places it, later reactions and changes without a stream id are placed after it, in arrival order', async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let polls = 0;
+  const { api: client, calls } = standInApi({
+    'GET /messages/:id': async () => { await held; return { result: 'success', message: dm(30, 7) }; },
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls > 1) return new Promise(() => {});
+      return { events: [
+        { id: 1, type: 'message', flags: [], message: dm(31, 7) },
+        { id: 2, type: 'update_message', message_id: 30, message_ids: [30], user_id: 7, edit_timestamp: 1_700_002_000, orig_content: 'm30', content: 'm30 fixed', flags: [] },
+        { id: 3, type: 'reaction', op: 'add', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: 31, user_id: 42 },
+        { id: 4, type: 'update_message', message_id: 31, message_ids: [31], user_id: 7, edit_timestamp: 1_700_002_001, orig_content: 'm31', content: 'm31 fixed', flags: [] },
+        { id: 5, type: 'delete_message', message_ids: [30], message_type: 'private' },
+      ] };
+    },
+  });
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const placed: string[] = [];
+  adapter.startEvents(() => {}, undefined,
+    (r) => { placed.push(`reaction ${r.messageId}`); },
+    (entry) => {
+      const at = placed.push('change') - 1;
+      void entry.ready().then((c) => { placed[at] = c ? `${c.kind} ${c.messageId}` : 'none'; });
+    });
+  try {
+    const deadline = Date.now() + 2000;
+    while (!calls.some((c) => c.path === '/messages/30') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    release();
+    while ((placed.length < 4 || placed.includes('change')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(placed, ['edit 30', 'reaction 31', 'edit 31', 'delete 30']);
+  } finally { adapter.stopEvents(); }
+});

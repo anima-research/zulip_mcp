@@ -16,7 +16,7 @@ export interface Realm {
   staleList: Record<number, string> | null;
   listRefusals: number;
   registrations: number;
-  hold(call: 'POST /register' | 'GET /streams' | 'GET /messages'): () => void;
+  hold(call: 'POST /register' | 'GET /streams' | 'GET /messages' | 'GET /messages/:id'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   /** The bot sees a stream again, under the same id, as Zulip tells a client that regains access to one. */
@@ -24,7 +24,8 @@ export interface Realm {
   create(name: string): number;
   /** The next poll is refused with BAD_EVENT_QUEUE_ID, as Zulip refuses a poll of a queue it has dropped. */
   gap(during: () => void): void;
-  post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean }): number;
+  /** `noStreamId`: its event carries the stream's name alone, as some Zulip versions send it. */
+  post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
 }
 
@@ -76,10 +77,11 @@ export function realm(initial: Record<number, string>): Realm {
     timestamp: m.timestamp,
     flags: m.mentioned ? ['mentioned'] : [],
   });
-  const store = (streamId: number, content: string, senderId: number, topic: string, mentioned: boolean): StoredMessage => {
+  const store = (streamId: number, content: string, senderId: number, topic: string, mentioned: boolean, noStreamId = false): StoredMessage => {
     const m = { id: nextMessageId++, streamId, topic, content, senderId, mentioned, timestamp: 1_700_000_000 + nextMessageId };
     messages.push(m);
-    queue({ type: 'message', message: raw(m), flags: raw(m).flags });
+    const { stream_id: _, ...named } = raw(m);
+    queue({ type: 'message', message: noStreamId ? named : raw(m), flags: raw(m).flags });
     return m;
   };
   /** The narrow's stream, by either of Zulip's forms; a name no stream has refuses the read. */
@@ -145,7 +147,8 @@ export function realm(initial: Record<number, string>): Realm {
       const page = [...(before > 0 ? older : []), ...newer];
       return { result: 'success', messages: page.map(raw), found_newest: newer.length < after || after === 0, found_oldest: true };
     },
-    'GET /messages/:id': (_p, call) => {
+    'GET /messages/:id': async (_p, call) => {
+      await holds.get('GET /messages/:id');
       const m = messages.find((x) => x.id === call.id);
       return m ? { result: 'success', message: raw(m) } : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
     },
@@ -213,7 +216,7 @@ export function realm(initial: Record<number, string>): Realm {
       for (const wake of waiting.splice(0)) wake();
     },
     post(streamId, content, opts = {}) {
-      return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false).id;
+      return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false, opts.noStreamId).id;
     },
     react(messageId, emojiName, emojiCode) {
       queue({ type: 'reaction', op: 'add', message_id: messageId, emoji_name: emojiName, emoji_code: emojiCode, reaction_type: 'unicode_emoji', user_id: PERSON.id, user: { user_id: PERSON.id, full_name: PERSON.full_name, email: PERSON.email } });
