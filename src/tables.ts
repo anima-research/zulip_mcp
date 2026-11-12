@@ -164,9 +164,42 @@ export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
   const above = new Set<number>();
-  // In the order Zulip's block processors take a block: an indented start
-  // (code), a heading, a table, a rule; what none of them takes is a
-  // paragraph, a list or a quote.
+  // How many tables Zulip shows for one block, taking it as its block
+  // processors do, in their order: an indented start (code), a heading, a
+  // table, a rule. What none of them takes holds no table.
+  const tables = (rows: string[]): number => {
+    if (rows.length === 0) return 0;
+    if (CODE.test(rows[0]!)) {
+      const rest = rows.findIndex((row) => !CODE.test(row));
+      return rest === -1 ? 0 : tables(rows.slice(rest));
+    }
+    const split = rows.findIndex((row) => HEADING.test(row));
+    if (split !== -1) return tables(rows.slice(0, split)) + tables(rows.slice(split + 1));
+    if (isTable(rows)) return 1;
+    const rule = rows.findIndex((row) => RULE.test(row));
+    return rule === -1 ? 0 : tables(rows.slice(0, rule)) + tables(rows.slice(rule + 1));
+  };
+  // Whether a block's first line opens a table: the block is one, or what
+  // comes before its first rule, which Zulip splits off when it isn't.
+  const startsTable = (rows: string[]): boolean => {
+    if (isTable(rows)) return true;
+    const rule = rows.findIndex((row) => RULE.test(row));
+    return rule > 0 && startsTable(rows.slice(0, rule));
+  };
+  // The runs of a block that Zulip takes as paragraphs, lists or quotes,
+  // with no heading in the block: what no table takes, split at rules,
+  // past any indented start.
+  const paragraphs = (rows: string[], from: number): [number, number][] => {
+    if (rows.length === 0) return [];
+    if (CODE.test(rows[0]!)) {
+      const rest = rows.findIndex((row) => !CODE.test(row));
+      return rest === -1 ? [] : paragraphs(rows.slice(rest), from + rest);
+    }
+    if (isTable(rows)) return [];
+    const rule = rows.findIndex((row) => RULE.test(row));
+    if (rule === -1) return [[from, from + rows.length]];
+    return [...paragraphs(rows.slice(0, rule), from), ...paragraphs(rows.slice(rule + 1), from + rule + 1)];
+  };
   const walk = (block: number[]): void => {
     if (block.length === 0) return;
     const rows = block.map((i) => lines[i]!);
@@ -181,18 +214,22 @@ export function blankLineAboveTables(text: string): string {
       walk(block.slice(heading + 1));
       return;
     }
-    if (isTable(rows)) return;
-    const rule = rows.findIndex((row) => RULE.test(row));
-    if (rule !== -1) {
-      walk(block.slice(0, rule));
-      walk(block.slice(rule + 1));
-      return;
-    }
-    for (let at = 1; at < rows.length; at += 1) {
-      if (LIST_OR_QUOTE.test(rows[at - 1]!)) return;
-      if (!CODE.test(rows[at]!) && isTable(rows.slice(at))) {
-        above.add(block[at]!);
-        return;
+    // The blank line goes inside a paragraph, above a line that then opens
+    // a table, and only where Zulip then shows more tables: that table
+    // takes the rest of the block as rows, a rule and any table after that
+    // included.
+    const shown = tables(rows);
+    for (const [from, to] of paragraphs(rows, 0)) {
+      for (let at = from + 1; at < to; at += 1) {
+        if (LIST_OR_QUOTE.test(rows[at - 1]!)) break;
+        const rest = rows.slice(at);
+        if (CODE.test(rows[at]!) || !startsTable(rest)) continue;
+        if (tables(rows.slice(0, at)) + tables(rest) > shown) {
+          above.add(block[at]!);
+          walk(block.slice(0, at));
+          walk(block.slice(at));
+          return;
+        }
       }
     }
   };
