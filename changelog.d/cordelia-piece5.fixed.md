@@ -103,6 +103,3 @@
   only a lookup can place are now placed one at a time, in the order Zulip
   sent them, and the reactions, changes and messages without a stream id
   that arrive meanwhile wait behind them.
-- A message whose quote lookup was under way when delivery stopped was
-  dropped. The server now holds it before the lookup, so the next
-  connection offers it.
