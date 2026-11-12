@@ -6,7 +6,7 @@
  *   watermarks   channelId → highest message id forwarded to the host. A
  *                channel the host has accepted nothing on gets one just
  *                below its lowest held message once a hold there is no
- *                longer on its way (`hold`, `failQueued`). The
+ *                longer on its way (`hold`, `refuse`, `failQueued`). The
  *                "since when" anchor for a channel's catch-up at a
  *                connection's start, for gap
  *                recovery after a Zulip event-queue expiry, and for
@@ -442,7 +442,7 @@ export class DeliveryState {
     if (!t || m.id <= t.talliedThrough) return false;
     t.messages += 1;
     t.characters += m.text.length;
-    if (m.id > t.talliedThrough) t.talliedThrough = m.id;
+    t.talliedThrough = m.id;
     return true;
   }
 
