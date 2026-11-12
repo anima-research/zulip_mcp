@@ -61,7 +61,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "unlisten",
     description:
-      "Unsubscribe the bot from one or more Zulip streams. After this, a public stream still sends its new messages, but edits and reactions only for messages that mention the bot. A private stream sends at most the messages that mention the bot. This lasts until the bot is subscribed again, by listen or by opening the stream's channel. Unsubscription persists server-side.",
+      "Unsubscribe the bot from one or more Zulip streams. After this, a public stream still sends its new messages, but edits and reactions only for messages that mention the bot. A private stream sends at most the messages that mention the bot. This lasts until the bot is subscribed again: by listen, by opening the stream's channel, or, for a stream that the operator named in ZULIP_SUBSCRIBE, after the server next starts. Unsubscription persists server-side.",
     inputSchema: {
       type: "object",
       properties: {
