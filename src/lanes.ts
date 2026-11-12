@@ -21,6 +21,7 @@ export type Job<W> = (ctx: JobContext<W>) => void | Promise<void>;
 interface Entry<W> {
   job: Job<W>;
   info: JobInfo;
+  answer?: boolean;
 }
 
 /**
@@ -55,6 +56,13 @@ export class Lane<W> {
   host(job: Job<W>): void {
     if (this.ended) return;
     this.hostQueue.push({ job, info: { kind: 'other' } });
+    this.lanes.changed(this);
+  }
+
+  /** The host's answer to what the lane sent: a job of the host's queue that runs even if the lane ends first. */
+  answer(job: () => void): void {
+    if (this.ended) return job();
+    this.hostQueue.push({ job, info: { kind: 'other' }, answer: true });
     this.lanes.changed(this);
   }
 
@@ -117,12 +125,20 @@ export class Lane<W> {
     return !this.running && this.hostQueue.length === 0 && this.otherQueue.length === 0;
   }
 
-  /** Called by the lanes: what waits goes, and a running job sees the end. */
+  /** Called by the lanes: the host's answers that wait run now, everything else that waits goes, and a running job sees the end. */
   end(): void {
     this.ended = true;
     this.lanes.messagesLeft(this.waitingMessages().length);
+    const answers = this.hostQueue.filter((e) => e.answer);
     this.hostQueue.length = 0;
     this.otherQueue.length = 0;
+    for (const { job } of answers) {
+      try {
+        void job({ w: this.lanes.writer, ended: true });
+      } catch (err) {
+        console.error(`[zulip-mcp] an answer on ${this.key} failed:`, (err as Error).message ?? err);
+      }
+    }
   }
 
   /** Called by the lanes: start the next job, if this lane may. */

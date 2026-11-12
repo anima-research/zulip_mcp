@@ -2916,6 +2916,24 @@ test('shutdown waits for a delivery still fetching its attachment, then flushes 
   await h.close();
 });
 
+test('a batch answer that comes while its channel waits on an attachment still counts when the server shuts down first', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(withLog(streamMsg(2)));
+  await until(() => fetches.started.length === 1 && h.incoming.some((m) => m.messageId === '1'), '1 delivered while 2 waits on its attachment');
+  await h.host.sendRequest('ping');
+  const done = h.server.shutdown();
+  fetches.release();
+  await done;
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2']);
+  assert.equal(h.delivery.watermark('zulip:general'), 2, 'the host accepted both, so the next start offers neither');
+  await h.close();
+});
+
 test('catch-up pages past a page holding nothing but the bot\'s own messages', async () => {
   const h = harness({ history: [streamMsg(101), streamMsg(102), streamMsg(103, { mentioned: true })] });
   // The adapter withholds the bot's own messages after fetching; 101 and

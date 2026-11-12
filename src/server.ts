@@ -1329,7 +1329,7 @@ export class ZulipMcplServer {
   }
 
   private answerOn(lane: Lane<null> | undefined, job: () => void): void {
-    if (lane && !lane.isEnded) lane.host(job);
+    if (lane) lane.answer(job);
     else job();
   }
 
