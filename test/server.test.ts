@@ -41,6 +41,7 @@ import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
+import type { DeliveryState } from '../src/delivery.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
 // individual cases (including the multi-adapter saturation regression).
@@ -223,7 +224,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
 
 const KEY_LISTS = new Set(['watermarkedChannels', 'heldChannels', 'lastOpenChannels', 'talliedChannels']);
 
-function byChannelId(delivery: ZulipMcplServer['delivery'], adapter: FakeAdapter): ZulipMcplServer['delivery'] {
+function byChannelId(delivery: DeliveryState, adapter: FakeAdapter): DeliveryState {
   return new Proxy(delivery, {
     get(target, prop) {
       const value = Reflect.get(target, prop, target);
@@ -270,7 +271,7 @@ const fakeTools = {
 
 interface Harness {
   server: ZulipMcplServer;
-  delivery: ZulipMcplServer['delivery'];
+  delivery: DeliveryState;
   adapter: FakeAdapter;
   host: McplConnection;
   /** Server→host requests the host reactor answered, in order. */
@@ -412,7 +413,7 @@ function harness(opts: HarnessOptions = {}): Harness {
   const served = server.serve(serverConn);
   return {
     server,
-    delivery: byChannelId(server.delivery, adapter),
+    delivery: byChannelId(server.delivery as DeliveryState, adapter),
     adapter,
     host,
     hostSaw,

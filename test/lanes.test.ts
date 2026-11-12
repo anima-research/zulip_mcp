@@ -19,9 +19,16 @@ function gate(): { open: () => void; opened: Promise<void> } {
   return { open, opened };
 }
 
-function lanes(overflow: (lane: Lane<string>) => void = () => {}, max = 5000): Lanes<string> {
-  return new Lanes('writer', { maxWaitingMessages: max, onOverflow: overflow });
+function lanes(overflow: (lane: Lane<string>) => void = () => {}, max = 5000, moments: string[] = []): Lanes<string> {
+  return new Lanes('writer', {
+    entry: (w, key, id) => moments.push(`${w} entry ${key} ${id}`),
+    overflow: (w, lane) => { moments.push(`${w} overflow ${lane.key}`); overflow(lane); },
+    start: (w) => moments.push(`${w} start`),
+    end: (w) => moments.push(`${w} end`),
+  }, { maxWaitingMessages: max });
 }
+
+const settled = async () => {};
 
 test('a lane runs one job at a time, in the order the jobs entered', async () => {
   const l = lanes();
@@ -140,7 +147,7 @@ test('ending the lanes drops what waits, tells a running job, waits for it withi
   l.lane(A).enter(() => { log.push('waiting'); }, { kind: 'message', id: 7 });
   await new Promise((r) => setImmediate(r));
   assert.equal(l.waitingMessages, 1);
-  const ending = l.end(60_000);
+  const ending = l.end(60_000, settled);
   assert.equal(l.waitingMessages, 0, 'what waited is gone');
   l.lane(A).host(() => { log.push('answer after the end'); });
   l.lane(B).enter(() => { log.push('new lane after the end'); });
@@ -155,7 +162,7 @@ test('ending the lanes gives up waiting for a running job at the grace', async (
   const l = lanes();
   l.lane(A).enter(() => new Promise<void>(() => {}));
   await new Promise((r) => setImmediate(r));
-  assert.equal(await l.end(0), 1, 'one job still running');
+  assert.equal(await l.end(0, settled), 1, 'one job still running');
 });
 
 test('quiet settles only when no lane runs or waits', async () => {
@@ -183,12 +190,33 @@ test('a job that throws is logged with its channel, and its lane goes on', async
   assert.deepEqual(logged, [`[zulip-mcp] a delivery job on ${A} failed: boom`]);
 });
 
-test('jobs get the writer', async () => {
+test('jobs get the writer and their lane, an answer after the end too', async () => {
   const l = lanes();
-  let seen: string | null = null;
-  l.lane(A).enter((ctx) => { seen = ctx.w; });
+  const seen: string[] = [];
+  l.lane(A).enter((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
+  l.lane(B).host((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
   await l.quiet();
-  assert.equal(seen, 'writer');
+  await l.end(0, settled);
+  l.lane(A).answer((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
+  assert.deepEqual(seen, [`writer ${A} false`, `writer ${B} false`, `writer ${A} true`]);
+});
+
+test('the lanes write at four moments, with the writer: their making, a message with an id that waits, the cap, and the end after what settles it', async () => {
+  const moments: string[] = [];
+  const l = lanes((lane) => { lane.replaceMessages(() => {}, { kind: 'other' }); }, 1, moments);
+  assert.deepEqual(moments, ['writer start']);
+  const running = gate();
+  l.lane(A).enter(async () => { await running.opened; });
+  l.lane(A).enter(() => {}, { kind: 'message', id: 10 });
+  l.lane(A).enter(() => {}, { kind: 'message' });
+  l.lane(B).enterFirst(() => {}, { kind: 'message', id: 20 });
+  l.lane(A).enter(() => {});
+  assert.deepEqual(moments, ['writer start', `writer entry ${A} 10`, `writer overflow ${A}`, `writer entry ${B} 20`]);
+  moments.length = 0;
+  running.open();
+  await l.quiet();
+  await l.end(0, async () => { moments.push('settle'); });
+  assert.deepEqual(moments, ['settle', 'writer end']);
 });
 
 test('past the cap, the lane with the most waiting messages is given up: its messages leave, and one job takes the place of the first', async () => {
@@ -234,12 +262,13 @@ test('at a give-up, a job about given-up messages alone leaves with them, and on
   assert.deepEqual(log, ['running', 'read', 'about 10 and 5', 'about none']);
 });
 
-test('the place moves up to what a lane decides, and never down', () => {
+test('the place moves up to what a job decides, and never down', async () => {
   const lane = lanes().lane(A);
   assert.equal(lane.place, undefined);
-  lane.decide(5);
-  lane.decide(3);
+  lane.enter((ctx) => { ctx.decide(5); ctx.decide(3); ctx.decide(NaN); });
+  await new Promise((r) => setImmediate(r));
   assert.equal(lane.place, 5);
-  lane.decide(8);
+  lane.enter((ctx) => { ctx.decide(8); });
+  await new Promise((r) => setImmediate(r));
   assert.equal(lane.place, 8);
 });

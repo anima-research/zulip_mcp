@@ -57,8 +57,8 @@ import { ChannelIds } from './channel-ids.js';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { StreamDirectory, type DirectoryChange } from './stream-directory.js';
 import { ContextProvider } from './context.js';
-import { Lanes, type Lane } from './lanes.js';
-import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
+import { Lanes, type JobContext, type Lane, type Moments } from './lanes.js';
+import { DeliveryState, type DeliveryReader, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId, parseDmChannelId } from './history.js';
@@ -152,6 +152,13 @@ interface GapRead {
   answers: Promise<boolean>[];
 }
 
+interface DeliveryWriter {
+  readonly delivery: DeliveryState;
+  readonly channels: Pick<ChannelManager, 'noteConversation' | 'onIncomingMessage'>;
+}
+
+type Ctx = JobContext<DeliveryWriter>;
+
 export class ZulipMcplServer {
   private conn: McplConnection | null = null;
   private mcplActive = false;
@@ -159,22 +166,23 @@ export class ZulipMcplServer {
   readonly adapters: Map<string, PlatformAdapter>;
   readonly grant: CapabilityGrant;
   readonly manifestTracker: ManifestTracker;
-  readonly channelManager: ChannelManager;
+  readonly channelManager: Omit<ChannelManager, 'noteConversation' | 'onIncomingMessage'>;
   readonly contextProvider: ContextProvider;
-  readonly delivery: DeliveryState;
+  readonly delivery: DeliveryReader;
   readonly directory: StreamDirectory;
   readonly ids: ChannelIds;
   readonly stateTracker = new StateTracker();
 
   private detachManifest: (() => void) | null = null;
   private eventsStarted = false;
-  private lanes: Lanes<null> | null = null;
+  private lanes: Lanes<DeliveryWriter> | null = null;
+  private readonly makeLanes: () => Lanes<DeliveryWriter>;
   private starting: Promise<void> | null = null;
   private requestTail: Promise<void> = Promise.resolve();
   private requestsWaiting = 0;
   private readonly pushesOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
-  private readonly heldReadWaiting = new WeakSet<Lane<null>>();
+  private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
@@ -204,7 +212,8 @@ export class ZulipMcplServer {
     this.filters = options.filters ?? null;
     this.directory = options.directory ?? new StreamDirectory();
     this.ids = new ChannelIds(this.directory, (why) => this.adapter.refreshStreams?.(why) ?? Promise.resolve());
-    this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default', this.directory);
+    const delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default', this.directory);
+    this.delivery = delivery;
     this.directory.onChange((change) => this.onDirectoryChange(change));
     // A widened stream allowlist means channels the host has never seen:
     // make them known. A narrowed one is enforced on every delivery surface
@@ -241,17 +250,26 @@ export class ZulipMcplServer {
       channelsChanged: (params, timeoutMs) => this.channelsChangedWithHost(params, timeoutMs),
       sendIncoming: (messages) => this.sendIncomingToHost(messages),
     };
-    this.channelManager = new ChannelManager(host, this.adapters, this.grant, this.ids, options.batchWindowMs, {
+    const channels = new ChannelManager(host, this.adapters, this.grant, this.ids, options.batchWindowMs, {
       // The only place an open channel's watermark moves: on the host's
       // itemized acceptance of a channels/incoming batch.
-      onDelivered: (key, accepted, rejected) => this.answerOn(this.lanes?.lane(key), () => this.onDelivered(key, accepted, rejected)),
+      onDelivered: (key, accepted, rejected) => this.lanes?.lane(key).answer((ctx) => this.onDelivered(ctx.w, key, accepted, rejected)),
       // Policy is rechecked when the batch goes out, not only when it was
       // queued: a mute, a narrowed allowlist or a disabled feature set that
       // landed during the batch window applies to what is still waiting.
       deliverable: (message) => this.mayDeliver(message),
-      onWithheld: (key, messages) => this.answerOn(this.lanes?.lane(key), () => this.onWithheld(key, messages)),
-      onGivenUp: (key, messages) => this.answerOn(this.lanes?.lane(key), () => this.onGivenUp(key, messages)),
+      onWithheld: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onWithheld(ctx.w, key, messages)),
+      onGivenUp: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onGivenUp(ctx.w, key, messages)),
     });
+    this.channelManager = channels;
+    const writer: DeliveryWriter = { delivery, channels };
+    const moments: Moments<DeliveryWriter> = {
+      entry: (w, key, id) => w.delivery.hold(key, id, 'queued'),
+      overflow: (w, lane) => this.giveUp(w, lane),
+      start: (w) => w.delivery.restartReached(),
+      end: (w) => w.delivery.failQueued(),
+    };
+    this.makeLanes = () => new Lanes(writer, moments, { maxWaitingMessages: options.maxWaitingMessages ?? MAX_WAITING_MESSAGES });
     this.contextProvider = new ContextProvider(this.channelManager, this.grant, options.contextHistorySize, {
       excludeChannel: (key) => this.isMuted(key) || !this.isAllowed(key),
     });
@@ -309,11 +327,7 @@ export class ZulipMcplServer {
     this.toldAgent.clear();
     this.readWaits.clear();
     this.toldReadWait = false;
-    this.delivery.restartReached();
-    this.lanes = new Lanes(null, {
-      maxWaitingMessages: this.options.maxWaitingMessages ?? MAX_WAITING_MESSAGES,
-      onOverflow: (lane) => this.giveUp(lane),
-    });
+    this.lanes = this.makeLanes();
   }
 
   private async run(conn: McplConnection): Promise<void> {
@@ -419,7 +433,7 @@ export class ZulipMcplServer {
     const key = answer.key;
     if (req.method === method.CHANNELS_CLOSE) {
       const close = req.params as unknown as ChannelsCloseParams;
-      this.serveInLane(conn, req, key, () => this.handleChannelClose(close));
+      this.serveInLane(conn, req, key, (ctx) => this.closeInLane(ctx.w, close));
       return true;
     }
     const open = req.params as unknown as ChannelsOpenParams;
@@ -430,15 +444,15 @@ export class ZulipMcplServer {
       return false;
     }
     if (this.ids.keyOfDescriptor(descriptor) !== key) return false;
-    this.serveInLane(conn, req, key, () => this.openChannel(open, descriptor, key, conn));
+    this.serveInLane(conn, req, key, (ctx) => this.openChannel(ctx, open, descriptor, key, conn));
     return true;
   }
 
-  private serveInLane(conn: McplConnection, req: JsonRpcRequest, key: ChannelKey, serve: () => unknown): void {
-    this.lanes?.lane(key).host(async () => {
+  private serveInLane(conn: McplConnection, req: JsonRpcRequest, key: ChannelKey, serve: (ctx: Ctx) => unknown): void {
+    this.lanes?.lane(key).host(async (ctx) => {
       if (conn.isClosed) return;
       try {
-        const result = await serve();
+        const result = await serve(ctx);
         if (!conn.isClosed) conn.sendResponse(req.id, result);
       } catch (err) {
         if (!conn.isClosed) this.answerError(conn, req, err);
@@ -463,21 +477,24 @@ export class ZulipMcplServer {
       this.adapter.stopEvents();
       this.eventsStarted = false;
     }
-    const stillRunning = (await this.lanes?.end(this.options.shutdownGraceMs ?? SHUTDOWN_INFLIGHT_GRACE_MS)) ?? 0;
+    const settle = async () => {
+      try {
+        await this.channelManager.flush();
+      } catch (error) {
+        console.error('[zulip-mcp] final flush failed:', (error as Error).message ?? error);
+      }
+      this.channelManager.destroy();
+    };
+    let stillRunning = 0;
+    if (this.lanes) stillRunning = await this.lanes.end(this.options.shutdownGraceMs ?? SHUTDOWN_INFLIGHT_GRACE_MS, settle);
+    else await settle();
     if (stillRunning > 0) {
       console.error(`[zulip-mcp] ${stillRunning} job(s) still running on the lanes at shutdown; left for the next catch-up`);
     }
-    try {
-      await this.channelManager.flush();
-    } catch (error) {
-      console.error('[zulip-mcp] final flush failed:', (error as Error).message ?? error);
-    }
-    this.channelManager.destroy();
-    this.delivery.failQueued();
     this.delivery.save();
   }
 
-  private async start(conn: McplConnection, lanes: Lanes<null>, openLanes: () => void): Promise<void> {
+  private async start(conn: McplConnection, lanes: Lanes<DeliveryWriter>, openLanes: () => void): Promise<void> {
     try {
       await this.channelManager.registerChannels();
     } catch (error) {
@@ -494,7 +511,7 @@ export class ZulipMcplServer {
     for (const key of keys) {
       const lane = lanes.lane(key);
       const answers: Promise<boolean>[] = [];
-      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readStart(key, lane, renamed.has(key), answers))), { kind: 'other', turn: true });
+      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(ctx, (c) => this.readStart(c, key, renamed.has(key), answers))), { kind: 'other', turn: true });
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
@@ -641,7 +658,7 @@ export class ZulipMcplServer {
           this.requireMcpl();
           const open = params as unknown as ChannelsOpenParams;
           const { descriptor, key } = await this.openTarget(open);
-          this.serveInLane(conn, req, key, () => this.openChannel(open, descriptor, key, conn));
+          this.serveInLane(conn, req, key, (ctx) => this.openChannel(ctx, open, descriptor, key, conn));
           break;
         }
 
@@ -649,7 +666,7 @@ export class ZulipMcplServer {
           this.requireMcpl();
           const close = params as unknown as ChannelsCloseParams;
           const answer = typeof close.channelId === 'string' ? this.ids.resolve(close.channelId) : null;
-          if (answer && 'key' in answer) this.serveInLane(conn, req, answer.key, () => this.handleChannelClose(close));
+          if (answer && 'key' in answer) this.serveInLane(conn, req, answer.key, (ctx) => this.closeInLane(ctx.w, close));
           else conn.sendResponse(req.id, this.handleChannelClose(close));
           break;
         }
@@ -770,7 +787,7 @@ export class ZulipMcplServer {
     return { descriptor, key };
   }
 
-  private async openChannel(params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey, conn: McplConnection): Promise<ChannelsOpenResult> {
+  private async openChannel(ctx: Ctx, params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey, conn: McplConnection): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
@@ -831,21 +848,21 @@ export class ZulipMcplServer {
     this.channelManager.markOpen(descriptor.id);
     if (page) {
       const newest = Math.max(...page.messages.map((m) => Number(m.messageId)).filter(Number.isFinite));
-      if (Number.isFinite(newest) && (page.sinceLastSeen || this.placeOf(key) === undefined)) this.decide(key, newest);
+      if (Number.isFinite(newest) && (page.sinceLastSeen || this.placeOf(key) === undefined)) ctx.decide(newest);
       const place = this.placeOf(key);
       // Handed to the host in this very response: forwarded, up to the lane's place.
-      for (const m of page.messages) if (place !== undefined && Number(m.messageId) <= place) this.accepted(key, Number(m.messageId));
+      for (const m of page.messages) if (place !== undefined && Number(m.messageId) <= place) this.accepted(ctx.w, key, Number(m.messageId));
       // This history goes to the agent, which answers it through
       // channels/publish, so its newest message gives the topic. A page
       // fetched before a given message is older history, read for context,
       // and moves nothing.
       if (!page.older) {
         for (let i = page.messages.length - 1; i >= 0; i--) {
-          if (this.channelManager.noteConversation(key, page.messages[i])) break;
+          if (ctx.w.channels.noteConversation(key, page.messages[i])) break;
         }
       }
     }
-    this.delivery.markOpen(key);
+    ctx.w.delivery.markOpen(key);
     this.delivery.save();
     return result;
   }
@@ -892,10 +909,14 @@ export class ZulipMcplServer {
     // As with open: the host named a channel, so it has it. agent-framework
     // reconciles a channel it does not want with `channels/close`.
     this.channelManager.confirmAnnounced(params.channelId);
-    const result = this.channelManager.closeChannel(params);
+    return this.channelManager.closeChannel(params);
+  }
+
+  private closeInLane(w: DeliveryWriter, params: ChannelsCloseParams): { closed: boolean } {
+    const result = this.handleChannelClose(params);
     const key = this.channelManager.keyOfHeld(params.channelId);
     if (key !== null && this.ids.channelIdOf(key) === params.channelId) {
-      this.delivery.markClosed(key);
+      w.delivery.markClosed(key);
       this.delivery.save();
     }
     return result;
@@ -945,10 +966,10 @@ export class ZulipMcplServer {
   }
 
   /** The host accepted (or was handed) a message: its hold is released and the watermark may advance. */
-  private accepted(key: ChannelKey, id: number): boolean {
+  private accepted(w: DeliveryWriter, key: ChannelKey, id: number): boolean {
     if (!Number.isFinite(id) || id <= 0) return false;
-    const released = this.delivery.release(key, id);
-    return this.delivery.advance(key, id) || released;
+    const released = w.delivery.release(key, id);
+    return w.delivery.advance(key, id) || released;
   }
 
   /**
@@ -958,37 +979,37 @@ export class ZulipMcplServer {
    * queued behind, or one given up on earlier. A rejected message stays
    * below the watermark until something delivers it again.
    */
-  private onDelivered(key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]): void {
+  private onDelivered(w: DeliveryWriter, key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]): void {
     let moved = false;
     let high = 0;
     for (const m of accepted) {
       const id = numericId(m);
       if (id === null) continue;
-      moved = this.delivery.release(key, id) || moved;
+      moved = w.delivery.release(key, id) || moved;
       high = Math.max(high, id);
     }
     for (const m of rejected) {
       const id = numericId(m);
-      if (id !== null) this.notAccepted(key, id, 'rejected', m);
+      if (id !== null) this.notAccepted(w, key, id, 'rejected', m);
     }
-    if (high > 0) moved = this.delivery.advance(key, high) || moved;
+    if (high > 0) moved = w.delivery.advance(key, high) || moved;
     if (moved) this.delivery.save();
     if (accepted.length > 0) this.enterHeldReads();
   }
 
   /** A batch outlived its transport retry: the host never answered. Held for replay. */
-  private onGivenUp(key: ChannelKey, messages: KeyedMessage[]): void {
+  private onGivenUp(w: DeliveryWriter, key: ChannelKey, messages: KeyedMessage[]): void {
     for (const m of messages) {
       const id = numericId(m);
-      if (id !== null) this.notAccepted(key, id, 'failed', m);
+      if (id !== null) this.notAccepted(w, key, id, 'failed', m);
     }
   }
 
-  private notAccepted(key: ChannelKey, id: number, status: 'failed' | 'rejected', message?: KeyedMessage): void {
+  private notAccepted(w: DeliveryWriter, key: ChannelKey, id: number, status: 'failed' | 'rejected', message?: KeyedMessage): void {
     if (this.isMuted(key) || !this.isAllowed(key, message)) {
-      this.letGo(key, id);
+      this.letGo(w, key, id);
     } else {
-      this.delivery.hold(key, id, status);
+      w.delivery.hold(key, id, status);
     }
   }
 
@@ -997,24 +1018,24 @@ export class ZulipMcplServer {
    * they may never reach the agent: let them go. A disabled feature set
    * means "not now": they stay held, replayed once it is enabled again.
    */
-  private onWithheld(key: ChannelKey, messages: KeyedMessage[]): void {
+  private onWithheld(w: DeliveryWriter, key: ChannelKey, messages: KeyedMessage[]): void {
     let moved = false;
     for (const m of messages) {
       const id = numericId(m);
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
-        moved = this.delivery.release(key, id) || moved;
-      } else this.delivery.hold(key, id, 'failed');
+        moved = w.delivery.release(key, id) || moved;
+      } else w.delivery.hold(key, id, 'failed');
     }
     if (moved) this.delivery.save();
   }
 
   /** Queue a message for an open channel, holding its id until the host accepts it. */
-  private deliverToOpen(key: ChannelKey, message: KeyedMessage): boolean {
+  private deliverToOpen(w: DeliveryWriter, key: ChannelKey, message: KeyedMessage): boolean {
     if (!this.channelManager.isKeyOpen(key)) return false;
     const id = numericId(message);
-    if (id !== null) this.delivery.hold(key, id, 'queued');
-    this.channelManager.onIncomingMessage(key, message);
+    if (id !== null) w.delivery.hold(key, id, 'queued');
+    w.channels.onIncomingMessage(key, message);
     return true;
   }
 
@@ -1027,23 +1048,22 @@ export class ZulipMcplServer {
     const id = numericId(entry);
     const place = this.placeOf(key);
     if (id !== null && place !== undefined && id <= place) return;
-    if (id !== null) this.delivery.hold(key, id, 'queued');
-    lane.enter(async () => {
+    lane.enter(async (ctx) => {
       const ready = await entry.ready();
-      if (lane.isEnded) return;
+      if (ctx.ended) return;
       if (ready === null) {
         if (id === null) return;
-        this.decide(key, id);
-        return this.letGo(key, id);
+        ctx.decide(id);
+        return this.letGo(ctx.w, key, id);
       }
       const { message, newChannel } = ready;
-      if (id !== null && (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true) this.delivery.verifyReply(key, id);
-      return this.route(message, newChannel, lane);
+      if (id !== null && (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true) ctx.w.delivery.verifyReply(key, id);
+      return this.route(ctx, message, newChannel);
     }, { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
-  private letGo(key: ChannelKey, id: number): void {
-    if (this.delivery.release(key, id)) this.delivery.save();
+  private letGo(w: DeliveryWriter, key: ChannelKey, id: number): void {
+    if (w.delivery.release(key, id)) this.delivery.save();
   }
 
   private placeOf(key: ChannelKey): number | undefined {
@@ -1053,17 +1073,13 @@ export class ZulipMcplServer {
     return watermark === undefined ? own : Math.max(own, watermark);
   }
 
-  private decide(key: ChannelKey, id: number): void {
-    if (Number.isFinite(id)) this.lanes?.lane(key).decide(id);
-  }
-
   /**
    * Route one message. See the delivery model in the file header. A forward
    * advances the watermark once the host has accepted it; an ambient message
    * dropped on a closed channel does not, so the next start's catch-up can still find
    * it if the host opens the channel meanwhile.
    */
-  private async route(message: KeyedMessage, newChannel?: ChannelDescriptor, lane?: Lane<null>, gap?: GapRead): Promise<void> {
+  private async route(ctx: Ctx, message: KeyedMessage, newChannel?: ChannelDescriptor, gap?: GapRead): Promise<void> {
     const key = message.key;
     const id = Number(message.messageId);
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
@@ -1073,16 +1089,16 @@ export class ZulipMcplServer {
     // ambient AND mentions — and nothing is tallied, before any other
     // routing. Rechecked here (not only at the event) for what was held.
     if (this.isMuted(key) || !this.isAllowed(key, message)) {
-      this.decide(key, id);
-      return this.letGo(key, id);
+      ctx.decide(id);
+      return this.letGo(ctx.w, key, id);
     }
 
     // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
     // and push alike. Held, not let go: the host asked not to hear it now,
     // which is not the same as having heard it.
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
-      this.decide(key, id);
-      return this.delivery.hold(key, id, 'failed');
+      ctx.decide(id);
+      return ctx.w.delivery.hold(key, id, 'failed');
     }
 
     // A channel the host has never seen — a DM from someone new, or a stream
@@ -1090,13 +1106,10 @@ export class ZulipMcplServer {
     // first, so the host can open it and route a reply back to it. The
     // message that arrived is itself the proof that the channel is reachable.
     if (newChannel && this.ids.heldIdOf(key) === undefined) {
-      if (lane) {
-        void this.channelManager.registerAdditional([newChannel]);
-        const entryId = numericId(message);
-        lane.enterFirst(() => this.route(message, undefined, lane), { kind: 'message', ...(entryId !== null ? { id: entryId } : {}) });
-        return;
-      }
-      await this.channelManager.registerAdditional([newChannel]);
+      void this.channelManager.registerAdditional([newChannel]);
+      const entryId = numericId(message);
+      ctx.lane.enterFirst((c) => this.route(c, message), { kind: 'message', ...(entryId !== null ? { id: entryId } : {}) });
+      return;
     }
 
     // Live delivery shows what was shared: images downsampled to model-max,
@@ -1107,7 +1120,7 @@ export class ZulipMcplServer {
       const conn = this.conn;
       const { source, inline, deadline = () => AbortSignal.timeout(ATTACHMENT_DEADLINE_MS) } = this.options.attachments;
       const blocks = await buildAttachmentBlocks(refs, source, inline, deadline());
-      if (lane && (conn === null || conn.isClosed || this.conn !== conn)) return;
+      if (conn === null || conn.isClosed || this.conn !== conn) return;
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
@@ -1129,35 +1142,34 @@ export class ZulipMcplServer {
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
 
-    this.decide(key, id);
-    if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
+    ctx.decide(id);
+    if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(ctx.w, key, id);
 
     // The watermark moves in onDelivered, once the host has accepted it.
-    if (this.deliverToOpen(key, message)) {
+    if (this.deliverToOpen(ctx.w, key, message)) {
       if (gap) gap.tally.recovered++;
       return;
     }
 
     if (addressed) {
-      const answered = (delivered: boolean) => {
+      const answered = (w: DeliveryWriter, delivered: boolean) => {
         if (delivered) {
           // The agent's answer goes back through channels/publish, so it goes
           // to this message's topic, as an answer on an open channel does.
-          this.channelManager.noteConversation(key, message);
-          if (this.accepted(key, id)) this.delivery.save();
+          w.channels.noteConversation(key, message);
+          if (this.accepted(w, key, id)) this.delivery.save();
           this.enterHeldReads();
         } else {
-          this.notAccepted(key, id, 'failed', message);
+          this.notAccepted(w, key, id, 'failed', message);
         }
       };
       const sent = this.pushEvent(message, `zulip_msg_${message.messageId}`);
-      if (lane) void sent.then((delivered) => this.answerOn(lane, () => answered(delivered)));
-      else answered(await sent);
+      void sent.then((delivered) => ctx.lane.answer((c) => answered(c.w, delivered)));
       return;
     }
 
-    this.letGo(key, id);
-    if (this.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
+    this.letGo(ctx.w, key, id);
+    if (ctx.w.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
   }
 
   private enterHeldReads(): void {
@@ -1170,14 +1182,14 @@ export class ZulipMcplServer {
       this.heldReadWaiting.add(lane);
       lane.enter((ctx) => {
         this.heldReadWaiting.delete(lane);
-        if (!ctx.ended) return this.readHeld(key, lane);
+        if (!ctx.ended) return this.readHeld(ctx, key);
       }, { kind: 'other', turn: true });
     }
   }
 
-  private async readHeld(key: ChannelKey, lane: Lane<null>, gap?: GapRead): Promise<void> {
+  private async readHeld(ctx: Ctx, key: ChannelKey, gap?: GapRead): Promise<void> {
     if (this.isMuted(key) || !this.isAllowed(key)) {
-      this.delivery.releaseAll(key);
+      ctx.w.delivery.releaseAll(key);
       this.delivery.save();
       return;
     }
@@ -1188,14 +1200,14 @@ export class ZulipMcplServer {
     if (ids.length === 0) return;
     try {
       if (this.channelManager.isKeyOpen(key)) {
-        this.delivery.markReplayed(key, ids);
-        await this.replayHeld(key, ids, lane, gap);
+        ctx.w.delivery.markReplayed(key, ids);
+        await this.replayHeld(ctx, key, ids, gap);
       } else {
         const watermark = this.delivery.watermark(key);
         const after = (this.delivery.floor(key) ?? ids[0]) < ids[0] ? ids[0] - 1 : watermark ?? ids[0] - 1;
-        await this.catchUpClosedChannel(key, this.delivery.wasOpen(key), after, undefined,
-          (through) => this.delivery.markReplayed(key, ids.filter((id) => id <= through)),
-          { through: () => place, lane, answers: gap?.answers });
+        await this.catchUpClosedChannel(ctx, key, this.delivery.wasOpen(key), after, undefined,
+          (through) => ctx.w.delivery.markReplayed(key, ids.filter((id) => id <= through)),
+          { through: () => place, answers: gap?.answers });
       }
     } catch (err) {
       console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
@@ -1203,39 +1215,34 @@ export class ZulipMcplServer {
     this.delivery.save();
   }
 
-  private async replayHeld(key: ChannelKey, ids: number[], lane: Lane<null>, gap?: GapRead): Promise<void> {
+  private async replayHeld(ctx: Ctx, key: ChannelKey, ids: number[], gap?: GapRead): Promise<void> {
     if (!this.adapter.fetchHistory || ids.length === 0) return;
     const wanted = new Set(ids);
     const fetched = await this.fetchAfter(key, ids[0] - 1, ids[ids.length - 1]);
-    if (lane.isEnded) return;
+    if (ctx.ended) return;
     const msgs = fetched.messages.filter((m) => {
       const id = numericId(m);
       return id !== null && wanted.has(id);
     });
-    this.letGoUnfound(key, ids, fetched);
+    this.letGoUnfound(ctx.w, key, ids, fetched);
     const rows = this.projectHistoryReactions(msgs);
     for (const m of rows) {
-      if (lane.isEnded) return;
-      await this.route(recovered(m), undefined, lane, gap);
+      if (ctx.ended) return;
+      await this.route(ctx, recovered(m), undefined, gap);
     }
     if (rows.length > 0) console.error(`[zulip-mcp] ${this.label(key)}: replaying ${rows.length} undelivered message(s) from history`);
   }
 
-  private letGoUnfound(key: ChannelKey, ids: number[], fetched: { messages: KeyedMessage[]; scannedThrough: number | null; complete: boolean }): void {
+  private letGoUnfound(w: DeliveryWriter, key: ChannelKey, ids: number[], fetched: { messages: KeyedMessage[]; scannedThrough: number | null; complete: boolean }): void {
     const found = new Set(fetched.messages.map((m) => numericId(m)));
     const scanned = fetched.scannedThrough ?? 0;
     const gone = ids.filter((id) => !found.has(id) && (id <= scanned || fetched.complete));
-    for (const id of gone) this.delivery.release(key, id);
+    for (const id of gone) w.delivery.release(key, id);
     if (gone.length > 0) this.delivery.save();
   }
 
   private heldBetween(key: ChannelKey, after: number, through: number): number[] {
     return this.delivery.heldIds(key).filter((id) => id > after && id <= through);
-  }
-
-  private answerOn(lane: Lane<null> | undefined, job: () => void): void {
-    if (lane) lane.answer(job);
-    else job();
   }
 
   /**
@@ -1311,15 +1318,15 @@ export class ZulipMcplServer {
    * verification can split a channel into multiple `<missed>` pushes. On a
    * closed channel the tally's backfill follows.
    */
-  private async readStart(key: ChannelKey, lane: Lane<null>, renamed: boolean, answers: Promise<boolean>[]): Promise<void> {
+  private async readStart(ctx: Ctx, key: ChannelKey, renamed: boolean, answers: Promise<boolean>[]): Promise<void> {
     if (this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
         this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
       const place = this.placeOf(key);
       if (place !== undefined) {
-        await this.catchUpClosedChannel(key, this.delivery.wasOpen(key), place, undefined, undefined,
-          { through: () => this.firstWaiting(key) - 1, lane, answers, fill: true });
+        await this.catchUpClosedChannel(ctx, key, this.delivery.wasOpen(key), place, undefined, undefined,
+          { through: () => this.firstWaiting(key) - 1, answers, fill: true });
       }
-      if (!lane.isEnded && this.delivery.tally(key)) await this.backfillTally(key, lane);
+      if (!ctx.ended && this.delivery.tally(key)) await this.backfillTally(ctx, key);
     }
     if (answers.length > 0) {
       void Promise.all(answers).then((oks) => {
@@ -1327,13 +1334,13 @@ export class ZulipMcplServer {
       });
     }
     if (renamed) {
-      const closeUnlessOpen = () => {
-        if (lane.isEnded || this.channelManager.isKeyOpen(key)) return;
-        this.delivery.markClosed(key);
+      const closeUnlessOpen = (c: Ctx) => {
+        if (c.ended || this.channelManager.isKeyOpen(key)) return;
+        c.w.delivery.markClosed(key);
         this.delivery.save();
       };
-      if (answers.length === 0) closeUnlessOpen();
-      else void Promise.all(answers).then(() => this.answerOn(lane, closeUnlessOpen));
+      if (answers.length === 0) closeUnlessOpen(ctx);
+      else void Promise.all(answers).then(() => ctx.lane.answer(closeUnlessOpen));
     }
     this.delivery.save();
   }
@@ -1396,12 +1403,13 @@ export class ZulipMcplServer {
    * host has accepted the push. Returns true when something was delivered.
    */
   private async catchUpClosedChannel(
+    ctx: Ctx,
     key: ChannelKey,
     keepAllHint: boolean,
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
     onAttempt?: (through: number) => void,
-    opts: { through?: () => number; lane?: Lane<null>; answers?: Promise<boolean>[]; ceiling?: { reached: boolean }; fill?: boolean } = {},
+    opts: { through?: () => number; answers?: Promise<boolean>[]; ceiling?: { reached: boolean }; fill?: boolean } = {},
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (this.ids.heldIdOf(key) === undefined) return false;
@@ -1427,9 +1435,9 @@ export class ZulipMcplServer {
     } finally {
       budget.remainingMs -= startedWith - passBudget.remainingMs;
     }
-    if (opts.lane?.isEnded) return false;
+    if (ctx.ended) return false;
     if (fetched.scannedThrough === null) {
-      this.letGoUnfound(key, this.heldBetween(key, after, bound ?? Infinity), fetched);
+      this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, bound ?? Infinity), fetched);
       onAttempt?.(Infinity);
       return false;
     }
@@ -1446,19 +1454,19 @@ export class ZulipMcplServer {
     if (newestId <= after) return false;
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
-    const retry = (cursor: number) => this.catchUpClosedChannel(key, keepAllHint, cursor, window, onAttempt, opts);
+    const retry = (cursor: number) => this.catchUpClosedChannel(ctx, key, keepAllHint, cursor, window, onAttempt, opts);
     if (blocked !== undefined) {
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
       if (newestId <= after) return retry(after);
     }
-    if (opts.lane) this.decide(key, newestId);
+    ctx.decide(newestId);
     const views = msgs.map(viewOf);
     const keepAll = keepAllHint || isDmKey(key);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
       onAttempt?.(Infinity);
-      this.delivery.advanceThrough(key, newestId, after);
+      ctx.w.delivery.advanceThrough(key, newestId, after);
       return blocked !== undefined ? retry(newestId) : false;
     }
     const addressedCount = views.filter(isAddressed).length;
@@ -1496,8 +1504,7 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    const lane = opts.lane;
-    if (lane) this.delivery.hold(key, firstId, 'queued');
+    ctx.w.delivery.hold(key, firstId, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
       reason,
@@ -1507,51 +1514,41 @@ export class ZulipMcplServer {
       offered = true;
       onAttempt?.(newestId);
     });
-    const answered = (ok: boolean) => {
+    const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
         // Advance past everything scanned, not just what was delivered, so a
         // mention-only channel does not re-surface its non-mention tail; the
         // block covered every held id in the range, so their holds go too.
-        this.delivery.advanceThrough(key, newestId, after);
+        w.delivery.advanceThrough(key, newestId, after);
         // The agent answers the block through channels/publish too, so the
         // conversation is where its newest message that addresses the agent
         // is (in a backscroll, its newest message), as live pushes or an open
         // channel's deliveries would have left it.
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
-          if (this.channelManager.noteConversation(key, msgs[i])) break;
+          if (w.channels.noteConversation(key, msgs[i])) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
-        this.delivery.releaseAll(key);
+        w.delivery.releaseAll(key);
       } else if (offered) {
-        this.delivery.hold(key, firstId, 'rejected');
-        this.delivery.refuse(key, after, newestId);
-      } else if (lane) {
-        this.delivery.hold(key, firstId, 'failed');
+        w.delivery.hold(key, firstId, 'rejected');
+        w.delivery.refuse(key, after, newestId);
+      } else {
+        w.delivery.hold(key, firstId, 'failed');
       }
       this.delivery.save();
     };
-    if (lane) {
-      const answer = sent.then((ok) => new Promise<boolean>((resolve) => this.answerOn(lane, () => {
-        answered(ok);
-        resolve(ok);
-      })));
-      opts.answers?.push(answer);
-      if (blocked !== undefined) await retry(newestId);
-      return true;
-    }
-    const ok = await sent;
-    answered(ok);
-    if (blocked !== undefined) {
-      // A refused prefix must be re-offered too; an accepted prefix need not.
-      const retried = await retry(ok ? newestId : after);
-      return ok || retried;
-    }
-    return ok;
+    const answer = sent.then((ok) => new Promise<boolean>((resolve) => ctx.lane.answer((c) => {
+      answered(c.w, ok);
+      resolve(ok);
+    })));
+    opts.answers?.push(answer);
+    if (blocked !== undefined) await retry(newestId);
+    return true;
   }
 
   /** Count the ambient that arrived on a tallied channel during downtime. */
-  private async backfillTally(key: ChannelKey, lane: Lane<null>): Promise<void> {
+  private async backfillTally(ctx: Ctx, key: ChannelKey): Promise<void> {
     if (!this.adapter.fetchHistory || this.isMuted(key) || !this.isAllowed(key)) return;
     const tally = this.delivery.tally(key);
     if (!tally?.talliedThrough) return;
@@ -1561,11 +1558,11 @@ export class ZulipMcplServer {
     } catch {
       return;
     }
-    if (lane.isEnded || fetched.scannedThrough === null) return;
+    if (ctx.ended || fetched.scannedThrough === null) return;
     const views = fetched.messages.map(viewOf);
     // Only ambient counts as missed: addressed messages are delivered by the catch-up.
     const ambient = views.filter((v) => !isAddressed(v));
-    this.delivery.backfillMissed(key, ambient, fetched.scannedThrough);
+    ctx.w.delivery.backfillMissed(key, ambient, fetched.scannedThrough);
   }
 
   /**
@@ -1598,7 +1595,7 @@ export class ZulipMcplServer {
       reads.push(new Promise((done) => lane.enter(async (ctx) => {
         const read: GapRead = { tally, answers: [] };
         try {
-          if (!ctx.ended) await this.readGap(key, lane, read);
+          if (!ctx.ended) await this.readGap(ctx, key, read);
         } finally {
           void Promise.all(read.answers).then((oks) => {
             if (oks.includes(true)) tally.caughtUp.add(key);
@@ -1627,49 +1624,50 @@ export class ZulipMcplServer {
     return keys;
   }
 
-  private async readGap(key: ChannelKey, lane: Lane<null>, gap: GapRead): Promise<void> {
-    this.delivery.clearReplayed(key);
-    await this.readHeld(key, lane, gap);
-    await this.fillRead(lane, () => this.readFill(key, lane, gap));
+  private async readGap(ctx: Ctx, key: ChannelKey, gap: GapRead): Promise<void> {
+    ctx.w.delivery.clearReplayed(key);
+    await this.readHeld(ctx, key, gap);
+    await this.fillRead(ctx, (c) => this.readFill(c, key, gap));
   }
 
-  private giveUp(lane: Lane<null>): void {
+  private giveUp(w: DeliveryWriter, lane: Lane<DeliveryWriter>): void {
     const key = lane.key;
-    const ids = lane.replaceMessages((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readGivenUp(key, lane))), { kind: 'other', turn: true });
+    const ids = lane.replaceMessages((ctx) => (ctx.ended ? undefined : this.fillRead(ctx, (c) => this.readGivenUp(c, key))), { kind: 'other', turn: true });
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
       const first = Math.min(...held);
-      for (const id of held) if (id !== first) this.delivery.release(key, id);
-      this.delivery.hold(key, first, 'failed');
+      for (const id of held) if (id !== first) w.delivery.release(key, id);
+      w.delivery.hold(key, first, 'failed');
       this.delivery.save();
     }
     console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; a read from history takes their place`);
   }
 
-  private async readGivenUp(key: ChannelKey, lane: Lane<null>): Promise<void> {
+  private async readGivenUp(ctx: Ctx, key: ChannelKey): Promise<void> {
     const before = this.placeOf(key);
-    const atCeiling = await this.readFill(key, lane, undefined, true);
+    const atCeiling = await this.readFill(ctx, key, undefined, true);
     const after = this.placeOf(key);
-    if (lane.isEnded || !atCeiling || after === undefined || after === before || after >= this.firstWaiting(key) - 1) return;
-    lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readGivenUp(key, lane))), { kind: 'other', turn: true });
+    if (ctx.ended || !atCeiling || after === undefined || after === before || after >= this.firstWaiting(key) - 1) return;
+    ctx.lane.enterFirst((c) => (c.ended ? undefined : this.fillRead(c, (c2) => this.readGivenUp(c2, key))), { kind: 'other', turn: true });
   }
 
-  private async fillRead(lane: Lane<null>, read: () => Promise<unknown>, tries = 0, since = this.now()): Promise<void> {
+  private async fillRead(ctx: Ctx, read: (ctx: Ctx) => Promise<unknown>, tries = 0, since = this.now()): Promise<void> {
+    const lane = ctx.lane;
     try {
-      await read();
+      await read(ctx);
     } catch (err) {
       if (!triesAgain(err)) {
         if (tries > 0) this.readWaitEnded(lane);
         throw err;
       }
-      if (lane.isEnded) return;
+      if (ctx.ended) return;
       const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
       const ms = err instanceof ZulipRefused ? Math.max(step, (err.retryAfterSeconds ?? 0) * 1000) : step;
       console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
       if (!this.toldReadWait && (ranOut || this.now() - since >= READ_WAIT_LINE_MS)) this.tellReadWait();
-      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, read, tries + 1, since)), { kind: 'other', turn: true });
+      lane.enterFirst((c) => (c.ended ? undefined : this.fillRead(c, read, tries + 1, since)), { kind: 'other', turn: true });
       lane.holdOtherUntil((this.options.readRetryWait ?? waitMs)(ms));
       return;
     }
@@ -1690,7 +1688,7 @@ export class ZulipMcplServer {
     );
   }
 
-  private readWaitEnded(lane: Lane<null>): void {
+  private readWaitEnded(lane: Lane<DeliveryWriter>): void {
     if (lane.isEnded || !this.readWaits.delete(lane.key)) return;
     if (!this.toldReadWait || this.readWaits.size > 0) return;
     this.toldReadWait = false;
@@ -1706,15 +1704,15 @@ export class ZulipMcplServer {
     for (const key of open) this.channelManager.notifyChannel(key, text, metadata);
   }
 
-  private async readFill(key: ChannelKey, lane: Lane<null>, gap?: GapRead, inPasses = false): Promise<boolean> {
-    if (lane.isEnded || this.isMuted(key) || !this.isAllowed(key)) return false;
+  private async readFill(ctx: Ctx, key: ChannelKey, gap?: GapRead, inPasses = false): Promise<boolean> {
+    if (ctx.ended || this.isMuted(key) || !this.isAllowed(key)) return false;
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return false;
     const place = this.placeOf(key);
     const below = () => this.firstWaiting(key) - 1;
     if (place === undefined || below() <= place) return false;
     if (!this.channelManager.isKeyOpen(key)) {
       const ceiling = inPasses ? { reached: false } : undefined;
-      await this.catchUpClosedChannel(key, false, place, undefined, undefined, { through: below, lane, answers: gap?.answers, ceiling, fill: true });
+      await this.catchUpClosedChannel(ctx, key, false, place, undefined, undefined, { through: below, answers: gap?.answers, ceiling, fill: true });
       return ceiling?.reached ?? false;
     }
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
@@ -1726,13 +1724,13 @@ export class ZulipMcplServer {
       console.error(`[zulip-mcp] reading ${this.label(key)}'s history to fill a hole failed:`, (err as Error).message);
       return false;
     }
-    if (lane.isEnded) return false;
-    this.letGoUnfound(key, this.heldBetween(key, place, bound), fetched);
+    if (ctx.ended) return false;
+    this.letGoUnfound(ctx.w, key, this.heldBetween(key, place, bound), fetched);
     for (const m of this.projectHistoryReactions(fetched.messages)) {
       const id = numericId(m);
       if (id === null) continue;
-      if (lane.isEnded || id > below()) break;
-      await this.route(recovered(m), undefined, lane, gap);
+      if (ctx.ended || id > below()) break;
+      await this.route(ctx, recovered(m), undefined, gap);
     }
     return fetched.truncated;
   }
@@ -1854,9 +1852,9 @@ export class ZulipMcplServer {
         const verdict = answer.get(fresh);
         if (verdict === 'accepted') this.ids.move(key, fresh);
         if (wasOpen.get(key)) {
-          this.answerOn(lanes?.lane(key), () => {
+          lanes?.lane(key).answer((c) => {
             if (this.channelManager.isKeyOpen(key)) return;
-            this.delivery.markClosed(key);
+            c.w.delivery.markClosed(key);
             this.delivery.save();
           });
         }
@@ -1869,7 +1867,7 @@ export class ZulipMcplServer {
     }
   }
 
-  private passJob(lanes: Lanes<null> | null, key: ChannelKey, answered: Promise<void>, line: () => void): Promise<void> {
+  private passJob(lanes: Lanes<DeliveryWriter> | null, key: ChannelKey, answered: Promise<void>, line: () => void): Promise<void> {
     const lane = lanes?.lane(key);
     if (!lane) {
       line();
@@ -2271,13 +2269,12 @@ export class ZulipMcplServer {
       },
       (reaction) => {
         const unnamed = !isDmKey(reaction.key) && this.streamNameOf(reaction.key) === null;
-        if (unnamed || this.reactionShown(reaction)) this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction));
+        if (unnamed || this.reactionShown(reaction)) this.lanes?.lane(reaction.key).enter((ctx) => this.onReaction(ctx.w, reaction));
       },
       (entry) => {
-        const lane = this.lanes?.lane(entry.key);
-        lane?.enter(async () => {
+        this.lanes?.lane(entry.key).enter(async (ctx) => {
           const change = await entry.ready();
-          if (change !== null && !lane.isEnded) return this.onMessageChange(change, lane);
+          if (change !== null && !ctx.ended) return this.onMessageChange(ctx, change);
         }, { kind: 'other', about: entry.messageIds });
       },
     );
@@ -2291,7 +2288,7 @@ export class ZulipMcplServer {
    * turn. Suppression is decided before any model-visible text or the event
    * id exists, so a suppressed reaction leaves no glyph or name anywhere.
    */
-  private async onReaction(ev: ReactionEvent): Promise<void> {
+  private async onReaction(w: DeliveryWriter, ev: ReactionEvent): Promise<void> {
     if (!this.reactionShown(ev)) return;
     const verb = ev.action === 'add' ? 'reacted' : 'removed a reaction';
     const target = ev.onOwnMessage ? 'your message' : `message ${ev.messageId}`;
@@ -2316,7 +2313,7 @@ export class ZulipMcplServer {
       },
     };
     if (this.channelManager.isKeyOpen(ev.key)) {
-      this.channelManager.onIncomingMessage(ev.key, message);
+      w.channels.onIncomingMessage(ev.key, message);
     } else {
       void this.pushEvent(message, `zulip_reaction_${ev.action}_${ev.messageId}_${ev.reactorId}_${ev.timestamp.getTime()}`, {
         reaction: true,
@@ -2344,8 +2341,8 @@ export class ZulipMcplServer {
    * already changed if it arrives at all. The synthetic id never advances a
    * watermark; the line carries the message's own id for fetch_around.
    */
-  private async onMessageChange(ev: MessageChangeEvent, lane: Lane<null>, announce = true): Promise<void> {
-    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.delivery.forgetReply(ev.key, Number(ev.messageId));
+  private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true): Promise<void> {
+    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
@@ -2358,7 +2355,7 @@ export class ZulipMcplServer {
       const descriptor = await this.unheldDescriptor(ev.key);
       if (descriptor) {
         void this.channelManager.registerAdditional([descriptor]);
-        lane.enterFirst(() => this.onMessageChange(ev, lane, false));
+        ctx.lane.enterFirst((c) => this.onMessageChange(c, ev, false));
         return;
       }
     }
@@ -2445,7 +2442,7 @@ export class ZulipMcplServer {
       },
     };
     if (open) {
-      this.channelManager.onIncomingMessage(ev.key, message);
+      ctx.w.channels.onIncomingMessage(ev.key, message);
     } else {
       void this.pushEvent(message, `zulip_${ev.kind}_${ev.messageId}_${stamp}`, {
         change: ev.kind,

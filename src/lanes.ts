@@ -14,11 +14,30 @@ export interface JobInfo {
 export interface JobContext<W> {
   /** What a job may write with. Only the lanes hand it out. */
   readonly w: W;
+  /** The lane the job runs on. */
+  readonly lane: Lane<W>;
   /** True once the lane's connection has ended. A job that waited on Zulip then writes and sends nothing. */
   readonly ended: boolean;
+  /** The lane has decided on message `id`: its place moves up to it, and never down. */
+  decide(id: number): void;
 }
 
 export type Job<W> = (ctx: JobContext<W>) => void | Promise<void>;
+
+/**
+ * The writes the lanes make outside any job, each at a moment that they own,
+ * with the writer they were made with.
+ */
+export interface Moments<W> {
+  /** A message with an id waits in a lane, from here until it is decided. */
+  entry(w: W, key: ChannelKey, id: number): void;
+  /** More messages wait than the cap allows: the lane with the most gives them up. */
+  overflow(w: W, lane: Lane<W>): void;
+  /** A connection's lanes are made. */
+  start(w: W): void;
+  /** A connection's lanes have ended, and what they sent has had its answer. */
+  end(w: W): void;
+}
 
 interface Entry<W> {
   job: Job<W>;
@@ -38,20 +57,35 @@ export class Lane<W> {
   private waitingForTurn = false;
   private ended = false;
   private decidedThrough: number | undefined;
+  readonly #w: W;
 
   constructor(
     readonly key: ChannelKey,
     private readonly lanes: Lanes<W>,
-  ) {}
+    w: W,
+  ) {
+    this.#w = w;
+  }
 
   /** The highest message id this lane has decided on in its connection, if any. */
   get place(): number | undefined {
     return this.decidedThrough;
   }
 
-  /** A message was decided on: the place moves up to it, and never down. */
-  decide(id: number): void {
-    if (this.decidedThrough === undefined || id > this.decidedThrough) this.decidedThrough = id;
+  #decide(id: number): void {
+    if (Number.isFinite(id) && (this.decidedThrough === undefined || id > this.decidedThrough)) this.decidedThrough = id;
+  }
+
+  #context(): JobContext<W> {
+    const lane = this;
+    return {
+      w: this.#w,
+      lane,
+      get ended() {
+        return lane.ended;
+      },
+      decide: (id) => this.#decide(id),
+    };
   }
 
   /** What the host sent about this channel: taken before anything in the other queue. */
@@ -62,8 +96,8 @@ export class Lane<W> {
   }
 
   /** The host's answer to what the lane sent: a job of the host's queue that runs even if the lane ends first. */
-  answer(job: () => void): void {
-    if (this.ended) return job();
+  answer(job: Job<W>): void {
+    if (this.ended) return this.#runAnswer(job);
     this.hostQueue.push({ job, info: { kind: 'other' }, answer: true });
     this.lanes.changed(this);
   }
@@ -71,6 +105,7 @@ export class Lane<W> {
   /** Everything else, in the order it enters. */
   enter(job: Job<W>, info: JobInfo = { kind: 'other' }): void {
     if (this.ended) return;
+    if (info.kind === 'message' && info.id !== undefined) this.lanes.entered(this, info.id);
     this.otherQueue.push({ job, info });
     if (info.kind === 'message') this.lanes.messageEntered(this);
     this.lanes.changed(this);
@@ -91,6 +126,7 @@ export class Lane<W> {
   /** A job that goes ahead of everything waiting in the other queue, such as a read to try again. */
   enterFirst(job: Job<W>, info: JobInfo = { kind: 'other' }): void {
     if (this.ended) return;
+    if (info.kind === 'message' && info.id !== undefined) this.lanes.entered(this, info.id);
     this.otherQueue.unshift({ job, info });
     if (info.kind === 'message') this.lanes.messageEntered(this);
     this.lanes.changed(this);
@@ -137,12 +173,14 @@ export class Lane<W> {
     const answers = this.hostQueue.filter((e) => e.answer);
     this.hostQueue.length = 0;
     this.otherQueue.length = 0;
-    for (const { job } of answers) {
-      try {
-        void job({ w: this.lanes.writer, ended: true });
-      } catch (err) {
-        console.error(`[zulip-mcp] an answer on ${this.key} failed:`, (err as Error).message ?? err);
-      }
+    for (const { job } of answers) this.#runAnswer(job);
+  }
+
+  #runAnswer(job: Job<W>): void {
+    try {
+      void job(this.#context());
+    } catch (err) {
+      console.error(`[zulip-mcp] an answer on ${this.key} failed:`, (err as Error).message ?? err);
     }
   }
 
@@ -162,13 +200,7 @@ export class Lane<W> {
     }
     if (!entry) return null;
     this.running = true;
-    const lane = this;
-    const ctx: JobContext<W> = {
-      w: this.lanes.writer,
-      get ended() {
-        return lane.ended;
-      },
-    };
+    const ctx = this.#context();
     const turn = entry.info.turn === true;
     return (async () => {
       try {
@@ -188,14 +220,17 @@ export class Lane<W> {
   }
 }
 
-export interface LanesOptions<W> {
+export interface LanesOptions {
   /** At most this many messages wait in all lanes together. */
   maxWaitingMessages: number;
-  /** Past the cap: the lane with the most waiting messages, for the server to give them up. */
-  onOverflow(lane: Lane<W>): void;
 }
 
-/** Every lane of one connection, and what they share: the writer, the cap on waiting messages, and the turn at Zulip. */
+/**
+ * Every lane of one connection, and what they share: the writer, the cap on
+ * waiting messages, and the turn at Zulip. Making them is the connection's
+ * start, and nothing outside the lanes gets the writer: a job gets it in its
+ * context, and the moments get it from the lanes.
+ */
 export class Lanes<W> {
   private readonly lanes = new Map<ChannelKey, Lane<W>>();
   private readonly runningJobs = new Set<Promise<void>>();
@@ -204,17 +239,20 @@ export class Lanes<W> {
   private waitingMessageCount = 0;
   private quietWaiters: (() => void)[] = [];
   private ended = false;
+  readonly #w: W;
+  readonly #moments: Moments<W>;
 
-  constructor(
-    readonly writer: W,
-    private readonly options: LanesOptions<W>,
-  ) {}
+  constructor(w: W, moments: Moments<W>, private readonly options: LanesOptions) {
+    this.#w = w;
+    this.#moments = moments;
+    moments.start(w);
+  }
 
   /** The lane of a channel, made at its first use. After the end, a lane that is already ended. */
   lane(key: ChannelKey): Lane<W> {
     let lane = this.lanes.get(key);
     if (!lane) {
-      lane = new Lane(key, this);
+      lane = new Lane(key, this, this.#w);
       if (this.ended) lane.end();
       else if (this.heldUntil) lane.holdOtherUntil(this.heldUntil);
       this.lanes.set(key, lane);
@@ -243,20 +281,32 @@ export class Lanes<W> {
     return new Promise((resolve) => this.quietWaiters.push(resolve));
   }
 
-  /** Ends every lane. Settles when the jobs still running have ended, or at `graceMs`, whichever is first. */
-  async end(graceMs: number): Promise<number> {
+  /**
+   * Ends every lane, and waits for the jobs still running until they have
+   * ended or `graceMs` has passed. Then `settle` runs, and after it the
+   * connection's end. Returns how many jobs were still running at the grace.
+   */
+  async end(graceMs: number, settle: () => Promise<void>): Promise<number> {
     this.ended = true;
     for (const lane of this.lanes.values()) lane.end();
     this.wakeQuietWaiters();
-    if (this.runningJobs.size === 0) return 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const grace = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, graceMs);
-      (timer as { unref?: () => void }).unref?.();
-    });
-    await Promise.race([Promise.allSettled([...this.runningJobs]), grace]);
-    clearTimeout(timer);
-    return this.runningJobs.size;
+    let running = 0;
+    if (this.runningJobs.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const grace = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, graceMs);
+        (timer as { unref?: () => void }).unref?.();
+      });
+      await Promise.race([Promise.allSettled([...this.runningJobs]), grace]);
+      clearTimeout(timer);
+      running = this.runningJobs.size;
+    }
+    try {
+      await settle();
+    } finally {
+      this.#moments.end(this.#w);
+    }
+    return running;
   }
 
   get waitingMessages(): number {
@@ -275,6 +325,10 @@ export class Lanes<W> {
     });
   }
 
+  entered(lane: Lane<W>, id: number): void {
+    this.#moments.entry(this.#w, lane.key, id);
+  }
+
   messageEntered(_lane: Lane<W>): void {
     this.waitingMessageCount++;
     if (this.waitingMessageCount <= this.options.maxWaitingMessages) return;
@@ -287,7 +341,7 @@ export class Lanes<W> {
         mostCount = n;
       }
     }
-    if (most) this.options.onOverflow(most);
+    if (most) this.#moments.overflow(this.#w, most);
   }
 
   messagesLeft(n: number): void {

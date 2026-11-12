@@ -456,6 +456,27 @@ export class DeliveryState {
   }
 }
 
+/**
+ * Delivery state as the server holds it outside its lanes: what it reads,
+ * whether a save persists, and the save, which changes no state.
+ */
+export type DeliveryReader = Pick<
+  DeliveryState,
+  | 'writes'
+  | 'save'
+  | 'directoryCopy'
+  | 'watermark'
+  | 'watermarkedChannels'
+  | 'floor'
+  | 'heldChannels'
+  | 'heldIds'
+  | 'verifiedReply'
+  | 'wasOpen'
+  | 'lastOpenChannels'
+  | 'tally'
+  | 'talliedChannels'
+>;
+
 function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
