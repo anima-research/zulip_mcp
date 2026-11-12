@@ -261,6 +261,7 @@ export class ZulipEventLoop {
       );
     }
 
+    if (this.stopped) return;
     this.queueId = registration.queue_id;
     let lastEventId = registration.last_event_id;
     if (Array.isArray(registration.streams)) this.directory?.registration(registration.streams);

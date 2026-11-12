@@ -286,7 +286,8 @@ export class ZulipAdapter implements PlatformAdapter {
         include_public: true,
         include_subscribed: true,
       });
-      const streams = result.streams || [];
+      if (!Array.isArray(result.streams)) throw new Error('the answer carried no stream list');
+      const streams = result.streams;
       this.directory.list(streams);
       for (const stream of streams) {
         if (typeof stream.stream_id !== 'number' || !this.streamAllowed(stream.stream_id)) continue;
@@ -802,7 +803,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
   async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
     const now = Date.now();
-    if (!force && now - (this.listReadFor.get(why) ?? -Infinity) < STREAM_REFRESH_HOLDOFF_MS) return;
+    if (!force && this.listRead === null && now - (this.listReadFor.get(why) ?? -Infinity) < STREAM_REFRESH_HOLDOFF_MS) return;
     const started = this.listRead === null;
     this.listRead ??= this.readStreamList(why).finally(() => { this.listRead = null; });
     if (!(await this.listRead) || !started) return;
@@ -815,7 +816,8 @@ export class ZulipAdapter implements PlatformAdapter {
       const result = await this.api.request<{ streams?: unknown[] }>(
         'GET', '/streams', 'refreshing the stream list', { include_public: true, include_subscribed: true }, { timeoutMs: LOCATE_TIMEOUT_MS },
       );
-      this.directory.list(result.streams ?? []);
+      if (!Array.isArray(result.streams)) throw new Error('the answer carried no stream list');
+      this.directory.list(result.streams);
       return true;
     } catch (err) {
       console.error(`[zulip-mcp] could not refresh the stream list for ${why}:`, (err as Error).message);

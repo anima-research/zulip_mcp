@@ -349,6 +349,7 @@ export class ZulipMcplServer {
         } catch (error) {
           console.error('Failed to register channels after initial policy:', error);
         }
+        if (this.conn !== conn) return;
         const renamed = await this.pushRenamedUnannounced();
         void this.reconcileHostIds();
         try {
@@ -356,6 +357,7 @@ export class ZulipMcplServer {
         } catch (error) {
           console.error('[zulip-mcp] Reconnect catch-up sweep failed:', error);
         }
+        if (this.conn !== conn) return;
         this.closeRenamed(renamed);
         await this.goLive();
       });
