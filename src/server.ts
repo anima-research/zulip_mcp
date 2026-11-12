@@ -57,6 +57,7 @@ import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewO
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
+import { LONG_TIMEOUT_MS } from './zulip-api.js';
 import type { FiltersPlane } from './filters.js';
 import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
 import type { AttachmentRef } from './content.js';
@@ -90,7 +91,6 @@ const MISSED_VICINITY = 7;
 const CATCHUP_HARD_CAP = 10_000;
 export const DEFAULT_CATCHUP_LIMIT = 3000;
 const HISTORY_ON_OPEN_CAP = 500;
-const RECOVERY_READ_TIMEOUT_MS = 90_000;
 /** Live events received before the catch-up sweep has run are held, so the
  *  sweep's "everything after the watermark" is not pre-empted by a live
  *  delivery that would jump the watermark over the offline gap. Beyond the
@@ -1235,7 +1235,7 @@ export class ZulipMcplServer {
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget, timeoutMs: RECOVERY_READ_TIMEOUT_MS });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget, timeoutMs: LONG_TIMEOUT_MS });
       if (page.scannedThrough === null) {
         complete = true;
         break;

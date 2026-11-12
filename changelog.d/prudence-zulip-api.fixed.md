@@ -2,11 +2,13 @@
   shorter budget, ends with an error, also where a slower answer would have
   come. It used to wait as long as the answer took, and without end when none
   came, until the server restarted. The error says whether the request may have
-  been applied. File uploads and `fetch_attachment`'s download have no bound
-  yet.
+  been applied. File uploads and `fetch_attachment`'s download have no bound.
 - A history page that the server reads to recover messages it missed, or to
   count them, waits up to 90 s. Past that it fails, where it used to wait
   without end.
+- At start, the reads of the bot's own profile and of the realm's settings wait
+  up to 90 s. Past that the start goes on without them, as when they fail. They
+  used to wait without end.
 - An event long poll that gets no answer for 90 s fails. The loop asks again
   with its backoff and counts it toward its `degraded` marker, as for other
   failures. It used to wait without end.
@@ -28,9 +30,10 @@
   show the HTTP library's own text. A JSON refusal with a 5xx status on any
   request other than a GET gains the same sentence.
 - A delete that the bot asked for, and that may have been applied, still
-  counts as the bot's own for 10 minutes: Zulip gave no JSON answer once it was
-  sent, or refused it with a 5xx status. If Zulip applied it, its deletion
-  doesn't reach the agent as a change. It used to.
+  counts as the bot's own for up to 10 minutes: Zulip gave no JSON answer once
+  it was sent, or refused it with a 5xx status. If Zulip applied it, its
+  deletion doesn't reach the agent as a change, unless the bot made 500 more
+  deletes before it came. It used to.
 - `get_channel_history`, the per-channel errors of `start_monitoring` and
   `get_unread_messages`, and a channel's resource text show
   `Zulip refused <what>: <Zulip's message>` where Zulip refuses. They used to
@@ -38,4 +41,6 @@
 - A zuliprc file with no `[api]` section fails at start with a message that says
   so. A zuliprc file without `email` or `key` takes them from `ZULIP_EMAIL` and
   `ZULIP_API_KEY` for its API calls too. Those calls used to send "undefined"
-  in place of the missing value.
+  in place of the missing value. A `site`, `email` or `key` in another section
+  of the file is no longer used. It used to reach only attachment fetches and
+  uploads.

@@ -15,7 +15,7 @@
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
-import { isRefusal, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, LONG_TIMEOUT_MS, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 
 export interface ZulipEventMessage {
   id: number;
@@ -120,7 +120,6 @@ export type ZulipMessageChange =
 
 export type OnZulipMessageChange = (change: ZulipMessageChange) => void;
 
-/** The events in a successful answer to `GET /events`. */
 export interface ZulipRetrieveResponse {
   events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] }
     & Partial<ZulipReactionEvent>
@@ -137,14 +136,12 @@ export interface ZulipEventLoopOptions {
   degradedThreshold?: number;
   /** Injectable sleep for tests. */
   sleep?: (ms: number) => Promise<void>;
-  /** The bound on one long poll. Default 90000ms. */
   pollTimeoutMs?: number;
 }
 
 const DEFAULT_BASE_BACKOFF_MS = 2000;
 const DEFAULT_MAX_BACKOFF_MS = 60_000;
 const DEFAULT_DEGRADED_THRESHOLD = 3;
-const DEFAULT_POLL_TIMEOUT_MS = 90_000;
 
 export class ZulipEventLoop {
   private stopped = false;
@@ -182,7 +179,7 @@ export class ZulipEventLoop {
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
     this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
-    this.pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+    this.pollTimeoutMs = options.pollTimeoutMs ?? LONG_TIMEOUT_MS;
   }
 
   /**

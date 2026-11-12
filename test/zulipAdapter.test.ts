@@ -323,6 +323,7 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
           { id: 5, type: 'delete_message', message_ids: [6], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // delete tool
           { id: 6, type: 'delete_message', message_ids: [7], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // someone else: the bot's delete failed
           { id: 7, type: 'delete_message', message_ids: [8], message_type: 'stream', stream_id: 7, topic: 'deploys' },
+          { id: 8, type: 'delete_message', message_ids: [9], message_type: 'stream', stream_id: 7, topic: 'deploys' },
         ] };
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -343,13 +344,12 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
     await assert.rejects(adapter.deleteMessage('zulip:general', '7'));
     await assert.rejects(adapter.deleteMessage('zulip:general', '8'));
     released!();
-    while (changes.length < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
-    await new Promise((r) => setTimeout(r, 30));
+    while (!changes.some((c) => c.messageId === '9') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
   }
-  assert.deepEqual(changes.map((c) => [c.kind, c.messageId]), [['delete', '7']], 'only the deletion the bot did not make surfaces');
+  assert.deepEqual(changes.map((c) => [c.kind, c.messageId]), [['delete', '7'], ['delete', '9']], 'only the deletions the bot did not make surface');
 });
 
 test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22 round 2)', async () => {

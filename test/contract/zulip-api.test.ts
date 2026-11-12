@@ -129,7 +129,7 @@ test('delete_message deletes the message', async () => {
   const stream = await newStream(env, 'delete');
   const sent = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, topic: 'deletes', content: 'delete me' })) as { id: number };
   await tools.handleToolCall('delete_message', { message_id: sent.id });
-  await assert.rejects(user.message(sent.id));
+  await assert.rejects(user.message(sent.id), /Invalid message\(s\)/);
 });
 
 test('send_message to a person with no topic sends none, and Zulip takes it', async () => {
@@ -151,7 +151,7 @@ test('send_message with reply_to, and fetch_around, find the message they name',
   assert.equal(around.count, 2);
 });
 
-test('no call in this file came back saying Zulip ignored a parameter', () => {
+test('no call this file made through the request function came back saying Zulip ignored a parameter', () => {
   assert.ok(answers.length > 10, `answers recorded: ${answers.length}`);
   const ignored = answers
     .filter(({ answer }) => (answer as { ignored_parameters_unsupported?: unknown[] }).ignored_parameters_unsupported?.length)

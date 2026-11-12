@@ -7,9 +7,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { once } from 'node:events';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { initializeZulipClient } from '../src/zulip-client.ts';
+import { httpTransport, zulipApi } from '../src/zulip-api.ts';
 
 interface Recorded {
   method: string;
+  rawPath: string;
   path: string;
   query: URLSearchParams;
   body: string;
@@ -19,7 +21,7 @@ interface Recorded {
 }
 
 type Answer =
-  | { json: unknown; status?: number }
+  | { json: unknown; status?: number; delayMs?: number }
   | { html: string; status: number }
   | 'hang';
 
@@ -33,6 +35,7 @@ async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>
       const path = url.pathname.replace(/^\/api\/v1/, '');
       const recorded: Recorded = {
         method: req.method ?? '',
+        rawPath: url.pathname,
         path,
         query: url.searchParams,
         body: Buffer.concat(chunks).toString(),
@@ -53,9 +56,13 @@ async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>
         res.setHeader('content-type', 'text/html');
         res.end(answer.html);
       } else {
-        res.statusCode = answer.status ?? 200;
-        res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify(answer.json));
+        const send = () => {
+          res.statusCode = answer.status ?? 200;
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify(answer.json));
+        };
+        if (answer.delayMs) setTimeout(send, answer.delayMs);
+        else send();
       }
     });
   });
@@ -124,18 +131,18 @@ test('delete_message sends no parameter, and remove_reaction and unlisten send t
   } finally { s.done(); z.close(); }
 });
 
-test('a call that gets no answer ends with an error at its bound, and its connection is closed', { timeout: 10_000 }, async () => {
+test('a call that gets no answer ends with an error at its bound, and its connection is closed', { timeout: 20_000 }, async () => {
   const z = await realm({ 'GET /streams': 'hang' });
-  const s = await serverOn(z.url, {}, { timeoutMs: 300 });
+  const s = await serverOn(z.url, {}, { timeoutMs: 2_000 });
   try {
     const started = Date.now();
     await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
       assert.match(err.message, /no answer/i);
-      assert.match(err.message, /300 ?ms|0\.3 ?s/);
+      assert.match(err.message, /within 2 s/);
       assert.equal(err.kind, 'timeout');
       return true;
     });
-    assert.ok(Date.now() - started < 5_000, 'it ended at its bound, not later');
+    assert.ok(Date.now() - started < 10_000, 'it ended at its bound, not later');
     const hung = z.requests.find((r) => r.path === '/streams');
     assert.ok(hung);
     await hung.closed;
@@ -267,6 +274,8 @@ test('a password login makes one exchange for a key at start, and no error shows
     const exchanges = z.requests.filter((r) => r.path === '/fetch_api_key');
     assert.equal(exchanges.length, 1);
     assert.equal(exchanges[0].method, 'POST');
+    assert.equal(new URLSearchParams(exchanges[0].body).get('username'), 'bot@example.com');
+    assert.equal(new URLSearchParams(exchanges[0].body).get('password'), password);
     const after = z.requests.filter((r) => r.path === '/streams');
     assert.equal(after[0].authorization, 'Basic ' + Buffer.from('bot@example.com:exchanged-key').toString('base64'));
   } finally { s.done(); z.close(); }
@@ -286,6 +295,62 @@ test('a password exchange that gets no JSON answer fails the start, and its erro
     );
     assert.equal(z.requests.filter((r) => r.path === '/fetch_api_key').length, 1);
   } finally { z.close(); }
+});
+
+test('a call with no bound of its own ends at 15 s', async () => {
+  const z = await realm({ 'GET /streams': 'hang' });
+  const s = await serverOn(z.url);
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 50 : ms, ...rest)) as typeof setTimeout;
+  try {
+    await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
+      assert.match(err.message, /within 15 s\./);
+      assert.equal(err.kind, 'timeout');
+      return true;
+    });
+  } finally { globalThis.setTimeout = original; s.done(); z.close(); }
+});
+
+test('the start reads the bot\'s profile and the realm\'s settings past the default bound, up to 90 s', async () => {
+  const z = await realm({
+    'GET /users/me': { json: { result: 'success', user_id: 790, email: 'bot@example.com' }, delayMs: 400 },
+    'GET /server_settings': { json: { result: 'success', max_file_upload_size_mib: 25 }, delayMs: 400 },
+  });
+  const s = await serverOn(z.url, {}, { timeoutMs: 100 });
+  try {
+    assert.equal(s.session.selfUserId, 790);
+    assert.equal(s.session.maxUploadBytes, 25 * 1024 * 1024);
+  } finally { s.done(); z.close(); }
+});
+
+test('a request that fails before a connection is made says it was not sent', async () => {
+  const plain = await realm({});
+  try {
+    for (const apiUrl of [`https://${plain.url.slice('http://'.length)}/api/v1`, 'http://[bad/api/v1']) {
+      const api = zulipApi(httpTransport({ apiUrl, authHeader: '' }));
+      await assert.rejects(api.request('DELETE', '/messages/5', 'deleting message 5'), (err: Error & { mayHaveBeenApplied?: boolean; kind?: string }) => {
+        assert.equal(err.kind, 'network', apiUrl);
+        assert.equal(err.mayHaveBeenApplied, false, apiUrl);
+        assert.match(err.message, /was not sent/);
+        return true;
+      });
+    }
+  } finally { plain.close(); }
+});
+
+test('a zuliprc value comes from [api] or the environment, never from another section', async () => {
+  const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, `[api]\nemail=bot@example.com\nsite=${z.url}\n\n[other]\nkey=other-key\n`);
+  const s = await serverOn('', { ZULIP_RC_PATH: rc, ZULIP_EMAIL: '', ZULIP_API_KEY: '' });
+  try {
+    await s.tools.handleToolCall('list_streams', {});
+    const call = z.requests.find((r) => r.path === '/streams');
+    assert.ok(call);
+    assert.equal(call.authorization, 'Basic ' + Buffer.from('bot@example.com:').toString('base64'));
+    assert.equal(s.session.authHeader, '');
+  } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('a zuliprc is read from its [api] section, quoted values unquoted', async () => {
@@ -330,7 +395,7 @@ test('a realm that ends with /api is addressed at /api/v1', async () => {
   const s = await serverOn(`${z.url}/api`);
   try {
     await s.tools.handleToolCall('list_streams', {});
-    assert.ok(z.requests.some((r) => r.path === '/streams'), 'the call reached /api/v1/streams');
+    assert.deepEqual(z.requests.filter((r) => r.path === '/streams').map((r) => r.rawPath), ['/api/v1/streams']);
   } finally { s.done(); z.close(); }
 });
 

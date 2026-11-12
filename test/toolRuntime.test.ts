@@ -283,7 +283,7 @@ test('listen does not register anything when Zulip refused the subscription (#20
   }
 });
 
-test('delete_message notes the id before the call and un-notes it when the call fails (#22)', async () => {
+test('delete_message notes the id before the call and un-notes it when Zulip refuses the delete (#22)', async () => {
   const noted: string[] = [];
   const failed: string[] = [];
   const { tools } = runtime(standInApi({

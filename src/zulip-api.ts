@@ -1,11 +1,9 @@
 export type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 export interface RequestOptions {
-  /** Ends the request after this long, in milliseconds. */
   timeoutMs?: number;
 }
 
-/** Zulip's answer when it refused the request. */
 export interface ZulipRefusal {
   result: 'error';
   msg: string;
@@ -13,40 +11,28 @@ export interface ZulipRefusal {
   [field: string]: unknown;
 }
 
-/** A successful answer, with the fields a call site reads. */
 export type ZulipSuccess<T extends object> = T & { result: 'success' };
 
 export interface ZulipApi {
-  /**
-   * Zulip's answer. Throws ZulipRefused, `Zulip refused <what>: <msg>`, when
-   * its `result` is "error", and ZulipNoAnswer when Zulip gave no JSON answer.
-   */
   request<T extends object = Record<string, unknown>>(
     method: Method, path: string, what: string, params?: Record<string, unknown>, opts?: RequestOptions,
   ): Promise<ZulipSuccess<T>>;
-  /**
-   * Zulip's JSON answer whatever its `result`, for a site that reads a refusal
-   * itself. Throws ZulipNoAnswer when Zulip gave no JSON answer.
-   */
   requestAnswer<T extends object = Record<never, never>>(
     method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions,
   ): Promise<ZulipSuccess<T> | ZulipRefusal>;
 }
 
-/** What a transport hands back: the HTTP status and the parsed JSON body. */
 export interface TransportAnswer {
   status: number;
   body: unknown;
 }
 
-/** Sends one request and parses its JSON answer, or throws ZulipNoAnswer. */
 export type Transport = (
   method: Method, path: string, params: Record<string, unknown> | undefined, opts: RequestOptions | undefined,
 ) => Promise<TransportAnswer>;
 
 export type NoAnswerKind = 'timeout' | 'network' | 'not-json';
 
-/** Zulip gave no JSON answer: the request timed out, the connection failed, or the body wasn't JSON. */
 export class ZulipNoAnswer extends Error {
   constructor(
     readonly kind: NoAnswerKind,
@@ -110,18 +96,16 @@ function encodeParams(params: Record<string, unknown> | undefined): URLSearchPar
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+export const LONG_TIMEOUT_MS = 90_000;
 
 export interface HttpTransportConfig {
-  /** The API's address, such as `https://chat.example.com/api/v1`. */
   apiUrl: string;
-  /** `Basic …`, or empty to send no Authorization header. */
   authHeader: string;
-  /** The bound for a call that passes none; 15 s by default. */
   timeoutMs?: number;
 }
 
-/** Error codes from Node's fetch that mean the request was never sent. */
-const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_INVALID_URL', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
+const notSent = (code: string) => NOT_SENT_CODES.has(code) || /^ERR_(TLS|SSL)_|CERT/.test(code);
 
 function causeCode(err: unknown): string | undefined {
   let current: unknown = err;
@@ -164,9 +148,9 @@ export function httpTransport(config: HttpTransportConfig): Transport {
         throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`);
       }
       const code = causeCode(err);
-      const notSent = code !== undefined && NOT_SENT_CODES.has(code);
-      throw new ZulipNoAnswer('network', method, path, write && !notSent,
-        notSent
+      const unsent = code !== undefined && notSent(code);
+      throw new ZulipNoAnswer('network', method, path, write && !unsent,
+        unsent
           ? `Couldn't reach Zulip for ${method} ${path} (${code}).`
           : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`);
     } finally {

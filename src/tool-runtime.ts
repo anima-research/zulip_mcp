@@ -240,8 +240,6 @@ export class ZulipToolRuntime {
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
-  /** Called when that delete_message surely failed: the message still exists, and
-   *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
   /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
