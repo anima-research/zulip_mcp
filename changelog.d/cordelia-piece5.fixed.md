@@ -88,3 +88,8 @@
   not verify the quote, the catch-up offered it without its reply tag, or on
   a closed channel didn't offer it. The verdict now lasts as long as the
   message is held, within one process.
+- Past 5,000 messages received while a connection started, the oldest were
+  offered again later, after newer ones. Now, past 5,000 messages waiting in
+  all channels together, the channel with the most gives them up, and a read
+  from history brings them in order, in passes of at most the catch-up limit,
+  before the messages that arrived after them.

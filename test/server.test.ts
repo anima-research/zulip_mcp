@@ -284,6 +284,7 @@ interface HarnessOptions {
   attributeDelivery?: boolean;
   announceTimeoutMs?: number;
   shutdownGraceMs?: number;
+  maxWaitingMessages?: number;
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
   visible?: ChannelDescriptor[];
@@ -309,6 +310,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 100,
     shutdownGraceMs: opts.shutdownGraceMs,
+    maxWaitingMessages: opts.maxWaitingMessages,
     filters: opts.filters,
     attachments: opts.attachments,
     attributeDelivery: opts.attributeDelivery,
@@ -4618,5 +4620,109 @@ test("two streams renamed in one pass: the job running on the first stream's lan
   const lineBatch = h.hostSaw.findIndex((r) => r.method === method.CHANNELS_INCOMING &&
     (r.params as ChannelsIncomingParams).messages.some((m) => m.channelId === 'zulip:general' && isLine(m)));
   assert.ok(lineBatch >= 0 && lineBatch < h.hostSaw.indexOf(changed[0]), 'the line reaches the host before the announcement');
+  await h.close();
+});
+
+const offeredIds = (h: Harness) => h.pushed.flatMap((p) => p.tags?.includes('zulip:missed')
+  ? [...(p.payload.content[0] as { text: string }).text.matchAll(/id=(\d+)\]/g)].map((m) => m[1])
+  : [(p.origin as { messageId: string }).messageId]);
+
+test('messages past the cap that wait while the registration is unanswered each reach the host once, in order', async () => {
+  const h = harness({ maxWaitingMessages: 3 });
+  h.policy.holdRegister = true;
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.policy.heldRegister.length === 1 && h.adapter.emit !== null, 'the registration to be with the host');
+  const all = [1, 2, 3, 4, 5].map((id) => streamMsg(id, { mentioned: true }));
+  h.adapter.history = all;
+  for (const m of all) h.adapter.emit!(m);
+  await h.host.sendRequest('ping');
+  assert.equal(h.pushed.length, 0);
+  h.policy.heldRegister.shift()!();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['1', '2', '3', '4', '5']);
+  await h.close();
+});
+
+test('past the cap, a lane gives its waiting messages up, and they reach the host by a read, in order and marked recovered, before a message that arrived after them', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2', '3', '4', '5', '6']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
+test('a lane that gives up more rows than the catch-up ceiling, twice before its read runs, reads them in passes of at most the ceiling, with another lane read between two passes', async () => {
+  const fetches = heldFetches();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 60, visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:other') === 500, "#other's watermark, so a break reads it");
+  const ids = Array.from({ length: 124 }, (_, i) => i + 1);
+  h.adapter.history = ids.map((id) => streamMsg(id));
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let broke = false;
+  h.adapter.fetchHistory = async (key, query) => {
+    if (!broke && h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '1') {
+      broke = true;
+      breakQueue(h);
+    }
+    return real(key, query);
+  };
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of ids.slice(1)) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.channelId === 'zulip:general' && !m.messageId.startsWith('system:')).map((m) => Number(m.messageId)), ids, 'each once, in order');
+  const reads = h.adapter.historyCalls.map((c, i) => ({ ...c, i }));
+  const general = reads.filter((c) => c.channelId === 'zulip:general');
+  assert.ok(general.every((c) => c.query.limit <= 100), 'no pass asks for more than the ceiling');
+  const first = general.find((c) => c.query.afterMessageId === '1')!;
+  const second = general.find((c) => c.query.afterMessageId === '101')!;
+  assert.ok(first && second, 'a second pass from where the first stopped');
+  const other = reads.find((c) => c.channelId === 'zulip:other')!;
+  assert.ok(other && other.i > first.i && other.i < second.i, "another lane's read runs between two passes");
+  await h.close();
+});
+
+test('on a closed channel, a lane that gives up more rows than the ceiling at once pushes an addressed row past it in a later pass\'s block, and no block of that read says the ceiling was reached', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 110 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  const ids = Array.from({ length: 112 }, (_, i) => i + 2);
+  const rows = ids.map((id) => streamMsg(id, { mentioned: id === 50 || id === 105 }));
+  h.adapter.history = [streamMsg(1, { mentioned: true }), ...rows];
+  h.adapter.emit!(withLog(streamMsg(2, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  for (const m of rows.slice(1)) h.adapter.emit!(m);
+  fetches.release();
+  await h.server.quiet();
+  const blocks = h.pushed.filter((p) => p.tags?.includes('zulip:missed'));
+  assert.ok(blocks.some((p) => /id=50\]/.test((p.payload.content[0] as { text: string }).text)), 'the first pass, cut at the ceiling, sends its block');
+  assert.ok(blocks.some((p) => /id=105\]/.test((p.payload.content[0] as { text: string }).text)), 'the mention past the ceiling, in a later block');
+  assert.ok(blocks.every((p) => !/catch-up ceiling was reached/.test((p.payload.content[0] as { text: string }).text)));
+  assert.ok(blocks.every((p) => (p.origin as { truncated?: boolean }).truncated !== true));
+  assert.equal(offeredIds(h).filter((id) => id === '105').length, 1);
+  assert.equal(offeredIds(h).filter((id) => id === '50').length, 1);
+  assert.equal(h.delivery.watermark('zulip:general'), 113);
   await h.close();
 });

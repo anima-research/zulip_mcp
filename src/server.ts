@@ -95,6 +95,7 @@ const MISSED_VICINITY = 7;
 const CATCHUP_HARD_CAP = 10_000;
 export const DEFAULT_CATCHUP_LIMIT = 3000;
 const HISTORY_ON_OPEN_CAP = 500;
+const MAX_WAITING_MESSAGES = 5000;
 /** How long shutdown waits for deliveries still building their content
  *  (attachment fetches) before flushing what has been queued. */
 const SHUTDOWN_INFLIGHT_GRACE_MS = 5000;
@@ -129,6 +130,8 @@ export interface ZulipMcplServerOptions {
   attributeDelivery?: boolean;
   /** How long shutdown waits for a delivery still running, such as one fetching its attachments (default 5 s). */
   shutdownGraceMs?: number;
+  /** At most this many messages wait in all channels' lanes together; past it, the channel with the most gives them up to a read from history (default 5,000). */
+  maxWaitingMessages?: number;
   directory?: StreamDirectory;
 }
 
@@ -296,7 +299,10 @@ export class ZulipMcplServer {
     this.channelManager.reset();
     this.toldAgent.clear();
     this.delivery.restartReached();
-    this.lanes = new Lanes(null, { maxWaitingMessages: Infinity, onOverflow: () => {} });
+    this.lanes = new Lanes(null, {
+      maxWaitingMessages: this.options.maxWaitingMessages ?? MAX_WAITING_MESSAGES,
+      onOverflow: (lane) => this.giveUp(lane),
+    });
   }
 
   private async run(conn: McplConnection): Promise<void> {
@@ -1373,7 +1379,7 @@ export class ZulipMcplServer {
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
     onAttempt?: (through: number) => void,
-    opts: { through?: () => number; lane?: Lane<null>; answers?: Promise<boolean>[] } = {},
+    opts: { through?: () => number; lane?: Lane<null>; answers?: Promise<boolean>[]; ceiling?: { reached: boolean } } = {},
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (this.ids.heldIdOf(key) === undefined) return false;
@@ -1403,6 +1409,7 @@ export class ZulipMcplServer {
       onAttempt?.(Infinity);
       return false;
     }
+    if (opts.ceiling && !retryWindow) opts.ceiling.reached = fetched.truncated;
     // The one retry stays inside the first walk's ceiling. Any quote still
     // unverified on that pass fails closed rather than starting another walk.
     const window = retryWindow ?? {
@@ -1444,7 +1451,7 @@ export class ZulipMcplServer {
       count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
-      moreBeyond: fetched.truncated || blocked !== undefined,
+      moreBeyond: (fetched.truncated && !opts.ceiling) || blocked !== undefined,
       newestScannedId: newestId,
     });
     const synthetic: KeyedMessage = {
@@ -1471,7 +1478,7 @@ export class ZulipMcplServer {
       missed: true,
       reason,
       messages: kept.length,
-      ...(fetched.truncated || blocked !== undefined ? { truncated: true } : {}),
+      ...((fetched.truncated && !opts.ceiling) || blocked !== undefined ? { truncated: true } : {}),
     }, () => {
       offered = true;
       onAttempt?.(newestId);
@@ -1599,22 +1606,48 @@ export class ZulipMcplServer {
   private async readGap(key: ChannelKey, lane: Lane<null>, gap: GapRead): Promise<void> {
     this.delivery.clearReplayed(key);
     await this.readHeld(key, lane, gap);
-    if (lane.isEnded || this.isMuted(key) || !this.isAllowed(key)) return;
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    await this.readFill(key, lane, gap);
+  }
+
+  private giveUp(lane: Lane<null>): void {
+    const key = lane.key;
+    const ids = lane.replaceMessages((ctx) => (ctx.ended ? undefined : this.readGivenUp(key, lane)), { kind: 'other', turn: true });
+    const held = ids.filter(Number.isFinite);
+    if (held.length > 0) {
+      const first = Math.min(...held);
+      for (const id of held) if (id !== first) this.delivery.release(key, id);
+      this.delivery.hold(key, first, 'failed');
+      this.delivery.save();
+    }
+    console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; a read from history takes their place`);
+  }
+
+  private async readGivenUp(key: ChannelKey, lane: Lane<null>): Promise<void> {
+    const before = this.placeOf(key);
+    const atCeiling = await this.readFill(key, lane, undefined, true);
+    const after = this.placeOf(key);
+    if (lane.isEnded || !atCeiling || after === undefined || after === before || after >= this.firstWaiting(key) - 1) return;
+    lane.enterFirst((ctx) => (ctx.ended ? undefined : this.readGivenUp(key, lane)), { kind: 'other', turn: true });
+  }
+
+  private async readFill(key: ChannelKey, lane: Lane<null>, gap?: GapRead, inPasses = false): Promise<boolean> {
+    if (lane.isEnded || this.isMuted(key) || !this.isAllowed(key)) return false;
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return false;
     const place = this.placeOf(key);
     const below = () => this.firstWaiting(key) - 1;
-    if (place === undefined || below() <= place) return;
+    if (place === undefined || below() <= place) return false;
     if (!this.channelManager.isKeyOpen(key)) {
-      await this.catchUpClosedChannel(key, false, place, undefined, undefined, { through: below, lane, answers: gap.answers });
-      return;
+      const ceiling = inPasses ? { reached: false } : undefined;
+      await this.catchUpClosedChannel(key, false, place, undefined, undefined, { through: below, lane, answers: gap?.answers, ceiling });
+      return ceiling?.reached ?? false;
     }
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
     try {
       const bound = below();
       fetched = await this.fetchAfter(key, place, Number.isFinite(bound) ? bound : undefined);
     } catch (err) {
-      console.error(`[zulip-mcp] gap recovery failed for ${this.label(key)}:`, (err as Error).message);
-      return;
+      console.error(`[zulip-mcp] reading ${this.label(key)}'s history to fill a hole failed:`, (err as Error).message);
+      return false;
     }
     for (const m of this.projectHistoryReactions(fetched.messages)) {
       const id = numericId(m);
@@ -1622,6 +1655,7 @@ export class ZulipMcplServer {
       if (lane.isEnded || id > below()) break;
       await this.route(recovered(m), undefined, lane, gap);
     }
+    return fetched.truncated;
   }
 
   private onDirectoryChange(change: DirectoryChange): void {
