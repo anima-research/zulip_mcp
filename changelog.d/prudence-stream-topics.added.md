@@ -5,4 +5,4 @@
   into the request's path as written. `topic_count` still counts every
   topic, and the list's first line says when `limit` cut it. `send_message`'s
   `topic` text now points to it, so an agent can see a stream's recent topics
-  before it starts one (#45).
+  before it starts one (#51).
