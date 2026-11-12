@@ -116,7 +116,9 @@ function expandTabs(line: string): string {
 
 /**
  * The runs of lines that Zulip's parser reads as blocks: lines between blank
- * lines, outside every fence. A fence's lines belong to no block.
+ * lines, outside code fences. Zulip reads the inside of a quote, quoted or
+ * spoiler fence as Markdown, so its lines make blocks too. A fence's own
+ * lines belong to no block.
  */
 function blocks(lines: string[]): number[][] {
   const out: number[][] = [];
@@ -128,14 +130,12 @@ function blocks(lines: string[]): number[][] {
   const stack: { fence: string; nests: boolean }[] = [];
   lines.forEach((line, i) => {
     const top = stack.at(-1);
-    if (top !== undefined) {
-      if (line.trimEnd() === top.fence) stack.pop();
-      else if (top.nests) {
-        const m = FENCE.exec(line);
-        if (m) stack.push({ fence: m[1]!, nests: NESTING.has((m[2] ?? '').toLowerCase()) });
-      }
+    if (top !== undefined && line.trimEnd() === top.fence) {
+      end();
+      stack.pop();
       return;
     }
+    if (top !== undefined && !top.nests) return;
     const m = FENCE.exec(line);
     if (m) {
       end();
