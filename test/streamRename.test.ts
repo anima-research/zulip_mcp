@@ -303,13 +303,13 @@ scenario('3. a stream whose reactions are visible, renamed, keeps them visible: 
   const reactionOn = (messageId: number) => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${messageId}`));
   try {
     const before = r.post(17, 'before the rename');
-    r.react(before, 'thumbs_up');
+    r.react(before, 'thumbs_up', '1f44d');
     await until(() => reactionOn(before) !== undefined, 'the reaction before the rename');
     assert.equal(origin(reactionOn(before)!).mcplChannelId, 'zulip:general');
     r.rename(17, 'lobby');
     await until(() => JSON.stringify(readJson(dir, 'filters.json')?.reactionChannels) === '["zulip:lobby","zulip:random"]', 'the filters file rewritten');
     const after = r.post(17, 'after the rename');
-    r.react(after, 'thumbs_up');
+    r.react(after, 'thumbs_up', '1f44d');
     await until(() => reactionOn(after) !== undefined, 'the reaction after the rename');
     assert.equal(origin(reactionOn(after)!).mcplChannelId, 'zulip:lobby');
   } finally { await run.close(); }
