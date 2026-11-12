@@ -203,11 +203,6 @@ export function blankLineAboveTables(text: string): string {
   const walk = (block: number[]): void => {
     if (block.length === 0) return;
     const rows = block.map((i) => lines[i]!);
-    if (CODE.test(rows[0]!)) {
-      const rest = rows.findIndex((row) => !CODE.test(row));
-      if (rest !== -1) walk(block.slice(rest));
-      return;
-    }
     const heading = rows.findIndex((row) => HEADING.test(row));
     if (heading !== -1) {
       walk(block.slice(0, heading));
