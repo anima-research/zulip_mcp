@@ -11,16 +11,15 @@
 - A channel id under a stream's former name is refused by `channels/open`,
   `channels/publish`, `channels/typing`, `channels/acknowledge`,
   `channel_missed` and, with MCPL, `fetch_history`, and the refusal names
-  the new channel id. An id the host still holds isn't refused: the host
-  holds the old id until it answers the rename. With MCPL, `send_message`,
-  `listen` and `unlisten` given a former name refuse the call, naming the
-  new name, and send nothing to Zulip. So do `mute_channel`,
-  `unmute_channel`, `filters_update` and `set_reaction_visibility`, which
-  write nothing to the filters file then. Such a request used to go to Zulip
-  by the old name, so it failed, reached a new stream that had taken the
-  name, or, from `channels/open` or `listen` where the bot may create
-  streams, created an empty stream of the old name. A name another stream
-  has taken since is that stream's.
+  the new channel id. Before the host has answered the rename, the old id
+  isn't refused. With MCPL, `send_message`, `listen` and `unlisten` given
+  a former name refuse the call, naming the new name, and send nothing to
+  Zulip. So do `mute_channel`, `unmute_channel`, `filters_update` and
+  `set_reaction_visibility`, which write nothing to the filters file then.
+  Such a request used to go to Zulip by the old name, so it failed,
+  reached a new stream that had taken the name, or, from `channels/open`
+  or `listen` where the bot may create streams, created an empty stream of
+  the old name. A name another stream has taken since is that stream's.
 - `channels/publish` and the history reads behind context, backscroll and,
   with MCPL, `fetch_history` reach a stream the server knows by its id, so
   one made during a rename reaches the stream. They used to go by its name.
