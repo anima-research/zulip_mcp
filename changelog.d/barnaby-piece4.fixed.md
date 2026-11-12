@@ -1,11 +1,12 @@
-- A renamed stream keeps its place. The agent gets one line on the channel,
-  if it is open, naming the old and the new channel id, and the host gets one
-  `channels/changed` that removes `zulip:<old name>` and adds
-  `zulip:<new name>`. The watermark, the missed count, the mute, the allowlist
-  entry and the reaction setting carry to the new name. A stream that was open
-  at last sight and was renamed while the server was down gets one push from
-  its new channel when a host next connects. A rename used to go unnoticed:
-  the channel went quiet, and its place and its filters entries were lost.
+- With MCPL, a renamed stream keeps its place. The agent gets one line on
+  the channel, if it is open, naming the old and the new channel id, and the
+  host gets one `channels/changed` that removes `zulip:<old name>` and adds
+  `zulip:<new name>`. The watermark, the missed count, the mute, the
+  allowlist entry and the reaction setting carry to the new name. A stream
+  that was open at last sight and was renamed while the server was down gets
+  one push from its new channel when a host next connects. A rename used to
+  go unnoticed: the channel went quiet, and its place and its filters
+  entries were lost.
 - A channel id under a stream's former name is refused by `channels/open`,
   `channels/publish` and, with MCPL, `fetch_history`, and the refusal names
   the new channel id. It used to go to Zulip by the old name, so it failed,
