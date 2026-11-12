@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { contractEnv } from './env.ts';
 import { apis, newStream, uniqueName, until, type PlainApi } from './zulip.ts';
+import { StreamDirectory } from '../../src/stream-directory.ts';
 
 const env = contractEnv();
 const { user, bot } = apis(env);
@@ -199,11 +200,12 @@ test('C9: the registration\'s streams are the streams the bot\'s stream list hol
   const [openId, closedId] = [await idOf(open), await idOf(closed)];
   const queue = await Queue.register(bot);
   try {
-    const registered = new Set((queue.answer.streams as { stream_id: number }[]).map((s) => s.stream_id));
-    const listed = new Set(((await bot.ok('GET', 'streams', { include_public: true, include_subscribed: true })).streams as { stream_id: number }[]).map((s) => s.stream_id));
-    assert.ok(registered.has(openId), 'the public stream the bot isn\'t subscribed to');
-    assert.ok(registered.has(closedId), 'the private stream the bot is subscribed to');
-    assert.deepEqual([...registered].sort((a, b) => a - b), [...listed].sort((a, b) => a - b));
+    const byId = (streams: unknown) => (streams as { stream_id: number; name: string }[]).map((s) => [s.stream_id, s.name] as const).sort((a, b) => a[0] - b[0]);
+    const registered = byId(queue.answer.streams);
+    const listed = byId((await bot.ok('GET', 'streams', { include_public: true, include_subscribed: true })).streams);
+    assert.deepEqual(registered.filter(([id]) => id === openId), [[openId, open]], 'the public stream the bot isn\'t subscribed to');
+    assert.deepEqual(registered.filter(([id]) => id === closedId), [[closedId, closed]], 'the private stream the bot is subscribed to');
+    assert.deepEqual(registered, listed);
   } finally {
     await queue.close();
   }
@@ -220,11 +222,17 @@ test('C10: a private stream the bot is added to gives a stream event with op "cr
     await user.ok('POST', 'users/me/subscriptions', { subscriptions: [{ name: stream }], principals: [botId] });
     const created = await queue.next(`the create of stream ${id}`, (e) => e.type === 'stream' && e.op === 'create' && (e.streams ?? []).some((s: { stream_id: number }) => s.stream_id === id));
     assert.deepEqual(created.streams.filter((s: { stream_id: number }) => s.stream_id === id).map((s: { name: string }) => s.name), [stream]);
+    const directory = new StreamDirectory();
+    directory.registration(queue.answer.streams);
+    directory.applyEvent(created);
+    assert.equal(directory.nameOf(id), stream, 'the create puts the stream in the directory');
     await user.ok('DELETE', 'users/me/subscriptions', { subscriptions: [stream], principals: [botId] });
-    await queue.next(
+    const deleted = await queue.next(
       `the delete of stream ${id}`,
       (e) => e.type === 'stream' && e.op === 'delete' && ((e.streams ?? []).some((s: { stream_id: number }) => s.stream_id === id) || (e.stream_ids ?? []).includes(id)),
     );
+    directory.applyEvent(deleted);
+    assert.equal(directory.nameOf(id), undefined, 'the delete takes the stream out of the directory');
   } finally {
     await queue.close();
   }

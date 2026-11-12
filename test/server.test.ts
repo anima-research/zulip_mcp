@@ -3241,7 +3241,7 @@ for (const beforeGrant of [false, true]) {
         second.adapter.emit!({
           ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
           metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-        }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+        }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
         second.adapter.emit!(reply);
       }
       releaseSweep();
@@ -3350,7 +3350,7 @@ for (const failure of ['messaging disable', 'attributed exception'] as const) {
       second.adapter.emit!({
         ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
         metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
       second.adapter.emit!(reply);
       releaseSweep();
       await until(() => fetching, 'earlier buffered route waits on attachment');
@@ -3452,7 +3452,7 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
       second.adapter.emit!({
         ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
         metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other' });
+      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
       second.adapter.emit!(reply);
       releaseSweep();
       await until(() => fetching, 'earlier buffered route waits on attachment');
