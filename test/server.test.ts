@@ -2554,6 +2554,47 @@ test("a message that arrives while the registration is unanswered reaches the ho
   }
 });
 
+test("at a connection's start, a channel with nothing to catch up goes on while another channel's catch-up read waits", async () => {
+  const DEV = { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } };
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-start-own-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'own', visible: [DESCRIPTOR, DEV] });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.incoming.length === 1, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const mention = streamMsg(20, { channelId: 'zulip:dev', mentioned: true, text: '@bot meanwhile' });
+    const second = harness({ stateDir: dir, sessionId: 'own', visible: [DESCRIPTOR, DEV], history: [streamMsg(4, { mentioned: true }), mention] });
+    let letRead!: () => void;
+    const gate = new Promise<void>((resolve) => { letRead = resolve; });
+    let readingGeneral = false;
+    const read = second.adapter.fetchHistory!.bind(second.adapter);
+    second.adapter.fetchHistory = async (key, query) => {
+      if (second.adapter.wireOf(key) === 'zulip:general') {
+        readingGeneral = true;
+        await gate;
+      }
+      return read(key, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => readingGeneral, "general's catch-up read to start");
+    second.adapter.emit!(mention);
+    await until(() => second.pushed.some((p) => p.eventId === 'zulip_msg_20'), "dev's mention while general's catch-up read waits");
+    assert.equal(second.pushed.some((p) => p.eventId.startsWith('zulip_missed_zulip:general')), false, "general's block waits for its read");
+    letRead();
+    await until(() => second.pushed.some((p) => p.eventId === 'zulip_missed_zulip:general_4'), "general's block once its read answers");
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('gap recovery also catches up closed channels, paging through history up to the ceiling', async () => {
   // Two mentions, an older one in "billing" and the newest in "triage",
   // among talk in "deploys".
