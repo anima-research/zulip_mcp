@@ -1,5 +1,5 @@
 /**
- * ZulipAdapter against a fake zulip-js client — what the allowlists do to
+ * ZulipAdapter against a stand-in for Zulip's API — what the allowlists do to
  * history reads, what a history page reports about what it scanned, and
  * that opening a channel asks Zulip about the subscription every time.
  *
@@ -12,6 +12,7 @@ import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
 import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
+import { standInApi } from './zulip-stand-in.ts';
 
 const SELF = 790;
 
@@ -33,30 +34,29 @@ function dm(id: number, senderId: number): ZulipRawMessage {
   return raw(id, { type: 'private', display_recipient: people, sender_id: senderId, sender_full_name: sender.full_name, sender_email: sender.email });
 }
 
-function fakeClient(rows: ZulipRawMessage[]) {
+function fakeClient(rows: ZulipRawMessage[], routes: Parameters<typeof standInApi>[0] = {}) {
   const calls: { retrieve: Record<string, unknown>[]; subscribe: unknown[] } = { retrieve: [], subscribe: [] };
-  const client = {
-    messages: {
-      async retrieve(params: Record<string, unknown>) {
-        calls.retrieve.push(params);
-        const after = typeof params.anchor === 'number' && params.num_after ? params.anchor : null;
-        const matching = rows
-          .filter((m) => after === null || m.id > after)
-          .filter((m) => {
-            const narrow = params.narrow as unknown[][];
-            const stream = narrow.find((n) => n[0] === 'stream')?.[1];
-            const dmIds = narrow.find((n) => n[0] === 'dm')?.[1] as number[] | undefined;
-            if (stream) return m.type === 'stream' && m.display_recipient === stream;
-            if (dmIds) return m.type === 'private';
-            return true;
-          });
-        const limit = Number(params.num_after || params.num_before);
-        const page = after !== null ? matching.slice(0, limit) : matching.slice(-limit);
-        return { result: 'success', messages: page, found_newest: page[page.length - 1] === matching[matching.length - 1], found_oldest: false };
-      },
+  const client = standInApi({
+    'GET /messages': async (params: Record<string, unknown>) => {
+      calls.retrieve.push(params);
+      const after = typeof params.anchor === 'number' && params.num_after ? params.anchor : null;
+      const matching = rows
+        .filter((m) => after === null || m.id > after)
+        .filter((m) => {
+          const narrow = params.narrow as unknown[][];
+          const stream = narrow.find((n) => n[0] === 'stream')?.[1];
+          const dmIds = narrow.find((n) => n[0] === 'dm')?.[1] as number[] | undefined;
+          if (stream) return m.type === 'stream' && m.display_recipient === stream;
+          if (dmIds) return m.type === 'private';
+          return true;
+        });
+      const limit = Number(params.num_after || params.num_before);
+      const page = after !== null ? matching.slice(0, limit) : matching.slice(-limit);
+      return { result: 'success', messages: page, found_newest: page[page.length - 1] === matching[matching.length - 1], found_oldest: false };
     },
-    users: { me: { subscriptions: { add: async (p: unknown) => { calls.subscribe.push(p); return { result: 'success', subscribed: {}, already_subscribed: { 'bot@example.com': ['general'] } }; } } } },
-  };
+    'POST /users/me/subscriptions': async (p: unknown) => { calls.subscribe.push(p); return { result: 'success', subscribed: {}, already_subscribed: { 'bot@example.com': ['general'] } }; },
+    ...routes,
+  }).api;
   return { client, calls };
 }
 
@@ -114,7 +114,9 @@ test('ensureSubscribed asks Zulip every time — a subscription dropped by unlis
 
 test('publish uploads image blocks and links them after the text; without an uploader they are dropped as before', async () => {
   const sends: Record<string, unknown>[] = [];
-  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 77 }; } } };
+  const client = standInApi({
+    'POST /messages': async (p: Record<string, unknown>) => { sends.push(p); return { result: 'success', id: 77 }; },
+  }).api;
   const uploaded: string[] = [];
   const uploader = {
     async upload(i: { name: string; data: Buffer }) {
@@ -154,20 +156,16 @@ test('publish uploads image blocks and links them after the text; without an upl
 /** A client whose event queue delivers `events` once, then parks. `visible`
  *  is what stream discovery answers. */
 function eventingClient(rows: ZulipRawMessage[], events: { message: Record<string, unknown>; flags?: string[] }[], visible: { name: string; stream_id: number }[] = []) {
-  const { client } = fakeClient(rows);
   let served = false;
-  return {
-    ...client,
-    streams: { retrieve: async () => ({ result: 'success', streams: visible }) },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: {
-      retrieve: async () => {
-        if (served) return new Promise(() => {}); // park: the test is done polling
-        served = true;
-        return { result: 'success', events: events.map((e, i) => ({ id: i + 1, type: 'message', message: e.message, flags: e.flags ?? [] })) };
-      },
+  return fakeClient(rows, {
+    'GET /streams': async () => ({ result: 'success', streams: visible }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      if (served) return new Promise(() => {}); // park: the test is done polling
+      served = true;
+      return { result: 'success', events: events.map((e, i) => ({ id: i + 1, type: 'message', message: e.message, flags: e.flags ?? [] })) };
     },
-  };
+  }).client;
 }
 
 function streamEvent(id: number, stream: string, streamId: number | undefined, over: Record<string, unknown> = {}) {
@@ -246,28 +244,24 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   ];
   let polls = 0;
   const getById: number[] = [];
-  const client = {
-    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 1 }] }) },
-    messages: {
-      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-      getById: async ({ message_id }: { message_id: number }) => {
-        getById.push(message_id);
-        // A slow GET must not let later changes overtake this one.
-        if (message_id === 6) await new Promise((r) => setTimeout(r, 40));
-        return { result: 'success', message: message_id === 700 ? raw(700, { display_recipient: 'secret', stream_id: 8 }) : raw(message_id) };
-      },
-      deleteById: async () => ({ result: 'success' }),
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 1 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+      getById.push(message_id);
+      // A slow GET must not let later changes overtake this one.
+      if (message_id === 6) await new Promise((r) => setTimeout(r, 40));
+      return { result: 'success', message: message_id === 700 ? raw(700, { display_recipient: 'secret', stream_id: 8 }) : raw(message_id) };
     },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: {
-      retrieve: async () => {
-        polls++;
-        if (polls === 1) return { events };
-        await new Promise((r) => setTimeout(r, 5));
-        return { events: [] };
-      },
+    'DELETE /messages/:id': async () => ({ result: 'success' }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
     },
-  };
+  }).api;
   const filters: FilterView = { streamAllowed: (s) => s === 'general', dmAllowed: () => true };
   const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
@@ -316,32 +310,28 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
   ];
   let polls = 0;
   let released: (() => void) | null = null;
-  const client = {
-    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }) },
-    messages: {
-      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-      getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id) }),
-      deleteById: async ({ message_id }: { message_id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id) }),
+    'DELETE /messages/:id': async ({ message_id }: { message_id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      if (polls === 2) {
+        // The second batch waits for the test to delete first.
+        await new Promise<void>((r) => { released = r; });
+        return { events: [
+          { id: 4, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // rollback
+          { id: 5, type: 'delete_message', message_ids: [6], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // delete tool
+          { id: 6, type: 'delete_message', message_ids: [7], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // someone else: the bot's delete failed
+        ] };
+      }
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
     },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: {
-      retrieve: async () => {
-        polls++;
-        if (polls === 1) return { events };
-        if (polls === 2) {
-          // The second batch waits for the test to delete first.
-          await new Promise<void>((r) => { released = r; });
-          return { events: [
-            { id: 4, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // rollback
-            { id: 5, type: 'delete_message', message_ids: [6], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // delete tool
-            { id: 6, type: 'delete_message', message_ids: [7], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // someone else: the bot's delete failed
-          ] };
-        }
-        await new Promise((r) => setTimeout(r, 5));
-        return { events: [] };
-      },
-    },
-  };
+  }).api;
   const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
@@ -384,22 +374,18 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
   ];
   let polls = 0;
   let listCalls = 0;
-  const client = {
-    streams: { retrieve: async () => { listCalls++; return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'secret', stream_id: 8 }] }; } },
-    messages: {
-      retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-      getById: async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'secret', stream_id: 8 }) }),
+  const client = standInApi({
+    'GET /streams': async () => { listCalls++; return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'secret', stream_id: 8 }] }; },
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'secret', stream_id: 8 }) }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
     },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: {
-      retrieve: async () => {
-        polls++;
-        if (polls === 1) return { events };
-        await new Promise((r) => setTimeout(r, 5));
-        return { events: [] };
-      },
-    },
-  };
+  }).api;
   const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
@@ -431,12 +417,13 @@ test('a change to the bot\'s own DM message is judged by whom it was sent to', a
     { id: 2, type: 'update_message', message_id: 30, message_ids: [30], user_id: 42, edit_timestamp: 1_700_002_000, orig_subject: '', subject: 'renamed', stream_id: undefined },
   ];
   let polls = 0;
-  const client = {
-    streams: { retrieve: async () => ({ result: 'success', streams: [] }) },
-    messages: { retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }), getById: async () => ({ result: 'error' }) },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: { retrieve: async () => { polls++; if (polls === 1) return { events }; await new Promise((r) => setTimeout(r, 5)); return { events: [] }; } },
-  };
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async () => ({ result: 'error' }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => { polls++; if (polls === 1) return { events }; await new Promise((r) => setTimeout(r, 5)); return { events: [] }; },
+  }).api;
   const run = async (filters: FilterView) => {
     polls = 0;
     const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, filters });
@@ -467,19 +454,17 @@ test('a message from a stream created after startup carries its descriptor, with
     { id: 4, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
   ];
   let polls = 0;
-  const client = {
-    streams: { retrieve: async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }) },
-    messages: { retrieve: async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }) },
-    queues: { register: async () => ({ queue_id: 'q1', last_event_id: -1 }) },
-    events: {
-      retrieve: async () => {
-        polls++;
-        if (polls === 1) return { events };
-        await new Promise((r) => setTimeout(r, 5));
-        return { events: [] };
-      },
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
     },
-  };
+  }).api;
   const filters: FilterView = { streamAllowed: (s) => s !== 'secret', dmAllowed: () => true };
   const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();

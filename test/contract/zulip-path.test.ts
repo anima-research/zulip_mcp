@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { ZulipEventLoop } from '../../src/platforms/zulip-events.ts';
 import { ZulipToolRuntime } from '../../src/tool-runtime.ts';
 import { initializeZulipClient, type ZulipSession } from '../../src/zulip-client.ts';
+import type { Method, RequestOptions, ZulipApi } from '../../src/zulip-api.ts';
 import { contractEnv } from './env.ts';
 import { apis, newStream, until } from './zulip.ts';
 
@@ -69,16 +70,15 @@ test('the event loop registers a queue and a second user\'s message arrives on t
   const arrived: { id: number; content: string }[] = [];
   const loop = new ZulipEventLoop();
   let registered = false;
-  const realRegister = session.client.queues.register.bind(session.client.queues);
-  const client = {
-    ...session.client,
-    queues: { register: async (params: Record<string, unknown>) => {
-      const answer = await realRegister(params);
-      registered = typeof answer?.queue_id === 'string';
+  const api: ZulipApi = {
+    request: session.api.request,
+    requestAnswer: (async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) => {
+      const answer = await session.api.requestAnswer<{ queue_id?: unknown }>(method, path, params, opts);
+      if (method === 'POST' && path === '/register') registered = answer.result === 'success' && typeof answer.queue_id === 'string';
       return answer;
-    } },
+    }) as ZulipApi['requestAnswer'],
   };
-  void loop.start(client, async (_stream, msg) => {
+  void loop.start(api, async (_stream, msg) => {
     arrived.push({ id: msg.id as number, content: msg.content as string });
   });
   try {

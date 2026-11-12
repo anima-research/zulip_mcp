@@ -141,8 +141,6 @@ export interface ZulipRetrieveResponse {
     & Partial<ZulipDeleteMessageEvent>)[];
 }
 
-export const LONG_POLL_TIMEOUT_MS = 90_000;
-
 export interface ZulipEventLoopOptions {
   /** First retry delay after a poll failure. Default 2000ms. */
   baseBackoffMs?: number;
@@ -152,11 +150,14 @@ export interface ZulipEventLoopOptions {
   degradedThreshold?: number;
   /** Injectable sleep for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** The bound on one long poll. Default 90000ms. */
+  pollTimeoutMs?: number;
 }
 
 const DEFAULT_BASE_BACKOFF_MS = 2000;
 const DEFAULT_MAX_BACKOFF_MS = 60_000;
 const DEFAULT_DEGRADED_THRESHOLD = 3;
+const DEFAULT_POLL_TIMEOUT_MS = 90_000;
 
 export class ZulipEventLoop {
   private stopped = false;
@@ -187,12 +188,14 @@ export class ZulipEventLoop {
   private readonly maxBackoffMs: number;
   private readonly degradedThreshold: number;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly pollTimeoutMs: number;
 
   constructor(options: ZulipEventLoopOptions = {}) {
     this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
     this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    this.pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
   }
 
   /**
@@ -304,7 +307,7 @@ export class ZulipEventLoop {
     while (!this.stopped) {
       try {
         const response = await api.requestAnswer<ZulipRetrieveResponse>(
-          'GET', '/events', { queue_id: this.queueId, last_event_id: lastEventId }, { timeoutMs: LONG_POLL_TIMEOUT_MS },
+          'GET', '/events', { queue_id: this.queueId, last_event_id: lastEventId }, { timeoutMs: this.pollTimeoutMs },
         );
 
         // Queue died server-side: Zulip answers with a JSON refusal. Classify

@@ -1,5 +1,5 @@
 /**
- * The tool runtime against a fake zulip-js client — DM conversations in
+ * The tool runtime against a stand-in for Zulip's API — DM conversations in
  * fetch_history, reaction suppression on the legacy raw format, and API
  * errors that surface as errors.
  *
@@ -13,15 +13,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import zulipInit from 'zulip-js';
 import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
 import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
+import { httpTransport, zulipApi, type ZulipApi } from '../src/zulip-api.ts';
+import { standInApi } from './zulip-stand-in.ts';
 
-function runtime(client: Record<string, unknown>): { tools: ZulipToolRuntime; dir: string } {
+function runtime(api: ZulipApi): { tools: ZulipToolRuntime; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
-  const session: ZulipSession = { client, selfUserId: 790, realm: 'https://z.example.com', authHeader: '', sessionId: 't' };
+  const session: ZulipSession = { api, selfUserId: 790, realm: 'https://z.example.com', authHeader: '', sessionId: 't' };
   const original = console.error;
   console.error = () => {};
   try {
@@ -33,14 +34,12 @@ function runtime(client: Record<string, unknown>): { tools: ZulipToolRuntime; di
 
 test('fetch_history reads a DM conversation by its channel id, the form every catch-up note quotes', async () => {
   const calls: Record<string, unknown>[] = [];
-  const client = {
-    messages: {
-      async retrieve(params: Record<string, unknown>) {
-        calls.push(params);
-        return { result: 'success', messages: [], found_newest: true, found_oldest: true };
-      },
+  const client = standInApi({
+    'GET /messages': async (params: Record<string, unknown>) => {
+      calls.push(params);
+      return { result: 'success', messages: [], found_newest: true, found_oldest: true };
     },
-  };
+  }).api;
   const { tools, dir } = runtime(client);
   try {
     const dm = await tools.handleToolCall('fetch_history', { channel: 'zulip:dm:7+42', after: 100 });
@@ -69,16 +68,14 @@ test('suppressed reactions are withheld from the raw format too', () => {
 });
 
 test('get_channel_history hands the model a raw payload with suppressed reactions removed', async () => {
-  const client = {
-    messages: {
-      async retrieve() {
-        return { result: 'success', messages: [{ id: 5, subject: 'x', sender_full_name: 'Ann', content: 'hi', timestamp: 1_700_000_000, reactions: [
-          { emoji_name: 'biohazard', emoji_code: '2623', reaction_type: 'unicode_emoji', user_id: 1 },
-          { emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', user_id: 2 },
-        ] }] };
-      },
+  const client = standInApi({
+    'GET /messages': async () => {
+      return { result: 'success', messages: [{ id: 5, subject: 'x', sender_full_name: 'Ann', content: 'hi', timestamp: 1_700_000_000, reactions: [
+        { emoji_name: 'biohazard', emoji_code: '2623', reaction_type: 'unicode_emoji', user_id: 1 },
+        { emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', user_id: 2 },
+      ] }] };
     },
-  };
+  }).api;
   const { tools, dir } = runtime(client);
   try {
     tools.setReactionPolicy({ suppressed: (name) => name === 'biohazard' });
@@ -91,10 +88,10 @@ test('get_channel_history hands the model a raw payload with suppressed reaction
 });
 
 test('find_user and list_emojis report a Zulip API error as an error, never as an empty result', async () => {
-  const client = {
-    users: { async retrieve() { return { result: 'error', msg: 'Invalid API key' }; } },
-    emojis: { async retrieve() { return { result: 'error', msg: 'Invalid API key' }; } },
-  };
+  const client = standInApi({
+    'GET /users': async () => { return { result: 'error', msg: 'Invalid API key' }; },
+    'GET /realm/emoji': async () => { return { result: 'error', msg: 'Invalid API key' }; },
+  }).api;
   const { tools, dir } = runtime(client);
   try {
     await assert.rejects(tools.handleToolCall('find_user', { query: 'ann' }), /Zulip refused listing users: Invalid API key/);
@@ -117,9 +114,9 @@ function fakeUploader() {
   return { uploader, uploaded };
 }
 
-function runtimeWithUploads(client: Record<string, unknown>, uploader: { upload: (i: any) => Promise<any> }, roots = new Map<string, string>(), selfUserId: number | null = 790) {
+function runtimeWithUploads(api: ZulipApi, uploader: { upload: (i: any) => Promise<any> }, roots = new Map<string, string>(), selfUserId: number | null = 790) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
-  const session: ZulipSession = { client, selfUserId, realm: 'https://z.example.com', authHeader: 'Basic x', sessionId: 't' };
+  const session: ZulipSession = { api, selfUserId, realm: 'https://z.example.com', authHeader: 'Basic x', sessionId: 't' };
   const uploadPolicy: UploadPolicy = { roots, maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
   const original = console.error;
   console.error = () => {};
@@ -132,7 +129,9 @@ function runtimeWithUploads(client: Record<string, unknown>, uploader: { upload:
 
 test('send_message uploads attachments first and links them after the text; content may be empty with files', async () => {
   const sends: Record<string, unknown>[] = [];
-  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 500 + sends.length }; } } };
+  const client = standInApi({
+    'POST /messages': async (p: Record<string, unknown>) => { sends.push(p); return { result: 'success', id: 500 + sends.length }; },
+  }).api;
   const { uploader, uploaded } = fakeUploader();
   const { tools, dir } = runtimeWithUploads(client, uploader);
   const sent: unknown[] = [];
@@ -162,10 +161,10 @@ test('send_message uploads attachments first and links them after the text; cont
 
 test('send_dm resolves recipients, then uploads, then sends with the links; upload_file returns the markdown', async () => {
   const sends: Record<string, unknown>[] = [];
-  const client = {
-    messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 9 }; } },
-    users: { async retrieve() { return { result: 'success', members: [{ user_id: 42, full_name: 'Bo', email: 'bo@example.com', is_active: true, is_bot: false }] }; } },
-  };
+  const client = standInApi({
+    'POST /messages': async (p: Record<string, unknown>) => { sends.push(p); return { result: 'success', id: 9 }; },
+    'GET /users': async () => { return { result: 'success', members: [{ user_id: 42, full_name: 'Bo', email: 'bo@example.com', is_active: true, is_bot: false }] }; },
+  }).api;
   const { uploader, uploaded } = fakeUploader();
   const { tools, dir } = runtimeWithUploads(client, uploader);
   try {
@@ -185,7 +184,9 @@ test('send_dm resolves recipients, then uploads, then sends with the links; uplo
 
 test('upload_file and the send tools read local files only through a configured root', { skip: LOCAL_FILES_SUPPORTED ? false : 'local-file attachments are Linux-only' }, async () => {
   const sends: Record<string, unknown>[] = [];
-  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 3 }; } } };
+  const client = standInApi({
+    'POST /messages': async (p: Record<string, unknown>) => { sends.push(p); return { result: 'success', id: 3 }; },
+  }).api;
   const { uploader, uploaded } = fakeUploader();
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'zulip-root-')));
   writeFileSync(join(root, 'chart.png'), 'PNG');
@@ -206,9 +207,11 @@ test('upload_file and the send tools read local files only through a configured 
 
 test('without a realm there is no uploader: attachments error clearly and plain sends still work', async () => {
   const sends: Record<string, unknown>[] = [];
-  const client = { messages: { async send(p: Record<string, unknown>) { sends.push(p); return { result: 'success', id: 1 }; } } };
+  const client = standInApi({
+    'POST /messages': async (p: Record<string, unknown>) => { sends.push(p); return { result: 'success', id: 1 }; },
+  }).api;
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
-  const session: ZulipSession = { client, selfUserId: 790, realm: '', authHeader: '', sessionId: 't' };
+  const session: ZulipSession = { api: client, selfUserId: 790, realm: '', authHeader: '', sessionId: 't' };
   const original = console.error;
   console.error = () => {};
   const tools = new ZulipToolRuntime(session, dir);
@@ -229,12 +232,12 @@ test('without a realm there is no uploader: attachments error clearly and plain 
 
 test('listen reports subscriptions to the server and carries the registration outcome back to the agent (#20)', async () => {
   const calls: unknown[] = [];
-  const client = {
-    users: { me: { subscriptions: { add: async (p: Record<string, unknown>) => {
+  const client = standInApi({
+    'POST /users/me/subscriptions': async (p: Record<string, unknown>) => {
       calls.push(p);
       return { result: 'success', subscribed: { '790': ['ops'] }, already_subscribed: {}, unauthorized: ['secret'] };
-    } } } },
-  };
+    },
+  }).api;
   const { tools, dir } = runtime(client);
   const seen: string[][] = [];
   try {
@@ -263,9 +266,9 @@ test('listen reports subscriptions to the server and carries the registration ou
 });
 
 test('listen does not register anything when Zulip refused the subscription (#20)', async () => {
-  const client = {
-    users: { me: { subscriptions: { add: async () => ({ result: 'success', subscribed: {}, already_subscribed: {}, unauthorized: ['secret'] }) } } },
-  };
+  const client = standInApi({
+    'POST /users/me/subscriptions': async () => ({ result: 'success', subscribed: {}, already_subscribed: {}, unauthorized: ['secret'] }),
+  }).api;
   const { tools, dir } = runtime(client);
   let called = 0;
   try {
@@ -276,7 +279,9 @@ test('listen does not register anything when Zulip refused the subscription (#20
     assert.deepEqual(out.unauthorized, ['secret']);
 
     // An error from Zulip is reported as such, and registers nothing.
-    const failing = runtime({ users: { me: { subscriptions: { add: async () => { throw new Error('nope'); } } } } });
+    const failing = runtime(standInApi({
+      'POST /users/me/subscriptions': async () => { throw new Error('nope'); },
+    }).api);
     failing.tools.onSubscribed = () => { called++; };
     assert.match((await failing.tools.handleToolCall('listen', { channels: ['ops'] })).error, /nope/);
     assert.equal(called, 0);
@@ -289,12 +294,10 @@ test('listen does not register anything when Zulip refused the subscription (#20
 test('delete_message notes the id before the call and un-notes it when the call fails (#22)', async () => {
   const noted: string[] = [];
   const failed: string[] = [];
-  const { tools } = runtime({
-    messages: {
-      deleteById: async ({ message_id }: { message_id: number }) =>
-        message_id === 7 ? { result: 'error', msg: 'You don\'t have permission to delete this message' } : { result: 'success' },
-    },
-  });
+  const { tools } = runtime(standInApi({
+    'DELETE /messages/:id': async ({ message_id }: { message_id: number }) =>
+      message_id === 7 ? { result: 'error', msg: 'You don\'t have permission to delete this message' } : { result: 'success' },
+  }).api);
   tools.onDeleted = (id) => noted.push(id);
   tools.onDeleteFailed = (id) => failed.push(id);
   await tools.handleToolCall('delete_message', { message_id: 5 });
@@ -318,10 +321,11 @@ function replyRuntime(message: Record<string, unknown>, error?: Record<string, u
   const sends: unknown[] = [];
   const { uploader, uploaded } = fakeUploader();
   const result = { result: 'success', id: 501 };
-  const client = { messages: {
-    async getById(params: unknown) { gets.push(params); return error ?? { result: 'success', message }; },
-    async send(params: unknown) { sends.push(params); return result; },
-  }, users: { async retrieve(params: unknown) { userLookups.push(params); return { result: 'success', members: [] }; } } };
+  const client = standInApi({
+    'GET /messages/:id': async (params: unknown) => { gets.push(params); return error ?? { result: 'success', message }; },
+    'POST /messages': async (params: unknown) => { sends.push(params); return result; },
+    'GET /users': async (params: unknown) => { userLookups.push(params); return { result: 'success', members: [] }; },
+  }).api;
   return { ...runtimeWithUploads(client, uploader, new Map(), selfUserId), gets, userLookups, sends, uploaded, result };
 }
 
@@ -491,7 +495,7 @@ test('send_message reply_to supports a canonical stream name fallback and an emp
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('send_message reply_to uses the real client with numeric strings and aliases before POST and propagates HTTP API errors', async () => {
+test('send_message reply_to over HTTP takes numeric strings and aliases before POST and propagates HTTP API errors', async () => {
   const requests: { method?: string; url?: string; body: string }[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -514,17 +518,18 @@ test('send_message reply_to uses the real client with numeric strings and aliase
   const port = (server.address() as { port: number }).port;
   let dir: string | undefined;
   try {
-    const client = await zulipInit({ realm: `http://127.0.0.1:${port}`, username: 'bot@example.com', apiKey: 'test-only' });
-    const state = runtime(client);
+    const api = zulipApi(httpTransport({ apiUrl: `http://127.0.0.1:${port}/api/v1`, authHeader: 'Basic ' + Buffer.from('bot@example.com:test-only').toString('base64') }));
+    const state = runtime(api);
     dir = state.dir;
     await state.tools.handleToolCall('send_message', { type: 'channel', reply_to: '123', content: 'reply' });
     assert.deepEqual(requests.map(({ method, url }) => ({ method, url })), [
       { method: 'GET', url: '/api/v1/messages/123?message_id=123' },
       { method: 'POST', url: '/api/v1/messages' },
     ]);
-    assert.match(requests[1].body, /name="to"\r\n\r\n12\r\n/);
-    assert.match(requests[1].body, /name="topic"\r\n\r\nDeploy status\r\n/);
-    assert.doesNotMatch(requests[1].body, /name="reply_to"/);
+    const posted = new URLSearchParams(requests[1].body);
+    assert.equal(posted.get('to'), '12');
+    assert.equal(posted.get('topic'), 'Deploy status');
+    assert.equal(posted.has('reply_to'), false);
     await assert.rejects(state.tools.handleToolCall('send_message', { type: 'stream', reply_to: 999, content: 'reply' }), /BAD_REQUEST.*Invalid message/);
     assert.equal(requests.length, 3, 'the failed lookup never posts');
   } finally {
@@ -582,14 +587,16 @@ test('send_message keeps the bot in self-DM channel IDs and recipients', async (
 for (const failure of ['transport', 'api'] as const) {
   test(`user resolution retries after a ${failure} error and caches only a successful directory`, async () => {
     let lookups = 0;
-    const { tools, dir } = runtime({ users: { async retrieve() {
-      lookups++;
-      if (lookups === 1) {
-        if (failure === 'transport') throw new Error('directory unavailable');
-        return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'Too many requests' };
-      }
-      return { result: 'success', members: [{ user_id: 42, email: 'bo@example.com' }] };
-    } } });
+    const { tools, dir } = runtime(standInApi({
+      'GET /users': async () => {
+        lookups++;
+        if (lookups === 1) {
+          if (failure === 'transport') throw new Error('directory unavailable');
+          return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'Too many requests' };
+        }
+        return { result: 'success', members: [{ user_id: 42, email: 'bo@example.com' }] };
+      },
+    }).api);
     try {
       await assert.rejects(tools.resolveUserId('bo@example.com'),
         failure === 'transport' ? /directory unavailable/ : /Zulip refused listing users: Too many requests/);

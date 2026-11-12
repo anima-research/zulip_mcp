@@ -1,7 +1,7 @@
 /**
  * History — the one message shape every reader shares, the RFC-001 tags it
- * carries, and the cursor semantics of the fetch helpers against a fake
- * zulip-js client.
+ * carries, and the cursor semantics of the fetch helpers against a stand-in
+ * for Zulip's API.
  *
  * Run: node --import tsx --test test/history.test.ts
  */
@@ -25,6 +25,7 @@ import {
   toIncoming,
   type ZulipRawMessage,
 } from '../src/history.ts';
+import { standInApi } from './zulip-stand-in.ts';
 
 function raw(over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
   return {
@@ -105,32 +106,29 @@ test('toIncoming renders the incoming shape, with the attachment note as a secon
   assert.equal((anon.metadata as Record<string, unknown>).botUserId, 'sess');
 });
 
-/** A zulip-js stand-in that records the query and answers with a fixed page. */
+/** A stand-in for Zulip's API that records the query and answers with a fixed page. */
 function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}) {
   const calls: Record<string, unknown>[] = [];
   const byId: Record<string, unknown>[] = [];
-  return {
-    calls,
-    byId,
-    messages: {
-      async retrieve(params: Record<string, unknown>) {
-        calls.push(params);
-        return { messages: rows, ...extra };
-      },
-      async getById(params: Record<string, unknown>) {
-        byId.push(params);
-        const found = rows.find((r) => r.id === params.message_id);
-        return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
-      },
+  const { api } = standInApi({
+    'GET /messages': (params) => {
+      calls.push(params);
+      return { result: 'success', messages: rows, ...extra };
     },
-  };
+    'GET /messages/:id': (params) => {
+      byId.push(params);
+      const found = rows.find((r) => r.id === params.message_id);
+      return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
+    },
+  });
+  return { calls, byId, api };
 }
 
 test('fetchHistory: newest page by default, exclusive cursors, raw markdown, oldest first', async () => {
   const rows = [raw({ id: 3 }), raw({ id: 1 }), raw({ id: 2 })];
   const client = fakeClient(rows, { found_newest: true, found_oldest: false });
 
-  const page = await fetchHistory(client, { streamName: 'general', topic: 'deploys', limit: 50 });
+  const page = await fetchHistory(client.api, { streamName: 'general', topic: 'deploys', limit: 50 });
   assert.deepEqual(page.messages.map((m) => m.id), [1, 2, 3]);
   assert.equal(page.foundNewest, true);
   assert.equal(page.foundOldest, false);
@@ -143,27 +141,27 @@ test('fetchHistory: newest page by default, exclusive cursors, raw markdown, old
     include_anchor: true,
   });
 
-  await fetchHistory(client, { streamName: 'general', limit: 10, after: 100 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 10, after: 100 });
   assert.deepEqual(client.calls[1], {
     anchor: 100, num_before: 0, num_after: 10, narrow: [['stream', 'general']], apply_markdown: false, include_anchor: false,
   });
 
-  await fetchHistory(client, { streamName: 'general', limit: 10, before: 100 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 10, before: 100 });
   assert.deepEqual(client.calls[2], {
     anchor: 100, num_before: 10, num_after: 0, narrow: [['stream', 'general']], apply_markdown: false, include_anchor: false,
   });
 
   // limit 0 never hits the API; oversize limits are clamped to Zulip's page cap.
-  const empty = await fetchHistory(client, { streamName: 'general', limit: 0 });
+  const empty = await fetchHistory(client.api, { streamName: 'general', limit: 0 });
   assert.deepEqual(empty.messages, []);
   assert.equal(client.calls.length, 3);
-  await fetchHistory(client, { streamName: 'general', limit: 99_999 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 99_999 });
   assert.equal(client.calls[3].num_before, 5000);
 });
 
 test('fetchAround centres a window on the anchor within its own conversation', async () => {
   const client = fakeClient([raw({ id: 41 }), raw({ id: 42 }), raw({ id: 43 })]);
-  const page = await fetchAround(client, 42, 50);
+  const page = await fetchAround(client.api, 42, 50);
   assert.deepEqual(page.messages.map((m) => m.id), [41, 42, 43]);
   assert.deepEqual(client.byId[0], { message_id: 42, apply_markdown: false });
   assert.deepEqual(client.calls[0], {
@@ -172,11 +170,11 @@ test('fetchAround centres a window on the anchor within its own conversation', a
 
   // A DM anchor narrows on its conversation.
   const dm = fakeClient([raw({ id: 5, type: 'private', display_recipient: [{ id: 790, full_name: 'Bot', email: 'b' }, { id: 42, full_name: 'Bo', email: 'bo' }] })]);
-  await fetchAround(dm, 5, 10);
+  await fetchAround(dm.api, 5, 10);
   assert.deepEqual(dm.calls[0].narrow, [{ operator: 'dm', operand: [790, 42] }]);
 
   // An unreadable anchor fails loudly instead of widening to the realm timeline.
-  await assert.rejects(fetchAround(client, 999, 10), /Invalid message/);
+  await assert.rejects(fetchAround(client.api, 999, 10), /Invalid message/);
 });
 
 test('DM channel ids are the sorted counterpart ids, bot excluded, and round-trip', () => {
@@ -216,7 +214,7 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
 
 test('fetchHistory narrows on a DM conversation when asked', async () => {
   const client = fakeClient([]);
-  await fetchHistory(client, { dmUserIds: [7, 42], limit: 5 });
+  await fetchHistory(client.api, { dmUserIds: [7, 42], limit: 5 });
   // The object form: a pair with a list operand is refused by Zulip.
   assert.deepEqual(client.calls[0].narrow, [{ operator: 'dm', operand: [7, 42] }]);
 });
