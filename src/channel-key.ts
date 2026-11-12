@@ -2,7 +2,6 @@ import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
 
 declare const channelKeyBrand: unique symbol;
 
-/** A channel inside the server: `s:<stream id>` for a stream, `d:<sorted user ids joined by +>` for a direct-message conversation. */
 export type ChannelKey = string & { readonly [channelKeyBrand]: true };
 
 export type ParsedKey = { kind: 'stream'; streamId: number } | { kind: 'dm'; userIds: number[] };
@@ -24,15 +23,12 @@ export function isDmKey(key: ChannelKey): boolean {
   return key.startsWith('d:');
 }
 
-/** The stream id behind a key; null for a direct-message conversation. */
 export function streamIdOfKey(key: ChannelKey): number | null {
   return key.startsWith('s:') ? Number(key.slice(2)) : null;
 }
 
-/** An incoming message as the server keeps it: keyed, with no channel id. */
 export type KeyedMessage = Omit<IncomingChannelMessage, 'channelId'> & {
   key: ChannelKey;
-  /** The stream's name as Zulip sent it with the message, for its message line only. */
   streamNameShown?: string;
 };
 

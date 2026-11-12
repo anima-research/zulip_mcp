@@ -82,10 +82,9 @@ import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './
  *  this is outstanding. Timing out fast keeps the channel usable, lets the
  *  host's own `channels/open` be answered, and leaves the re-announcement to
  *  the next refresh. */
-/** What `toldAgent` holds for a key whose removal line went out. */
-const REMOVED_LINE = '';
-
 const ANNOUNCE_TIMEOUT_MS = 5_000;
+
+const REMOVED_LINE = '';
 
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const FALLBACK_MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -133,7 +132,6 @@ export interface ZulipMcplServerOptions {
   announceTimeoutMs?: number;
   /** Render `[time id=N] [#stream > topic] Author: ` into delivered bodies (live, push, recovered replays; default true). `false` for a host that renders the structured fields itself. */
   attributeDelivery?: boolean;
-  /** Stream ids and names, shared with the adapter. Default: an empty one of the server's own. */
   directory?: StreamDirectory;
 }
 
@@ -179,11 +177,7 @@ export class ZulipMcplServer {
   private readonly attributeDelivery: boolean;
   private readonly announceTimeoutMs: number;
   private readonly filters: FiltersPlane | null;
-  /** Streams renamed while the host held no id for them, which were open at
-   *  last sight: each gets one push from its new channel once channels are
-   *  registered. */
   private renamedUnannounced = new Map<ChannelKey, { from: string; to: string }>();
-  /** For a key whose change the host hasn't answered: the id its line named, or REMOVED_LINE. */
   private toldAgent = new Map<ChannelKey, string>();
   private reconciling = false;
   private reconcileAgain = false;
@@ -836,12 +830,10 @@ export class ZulipMcplServer {
     return this.attributeDelivery ? attributeMessage(message, message.streamNameShown ?? this.streamNameOf(message.key), this.formatTime) : message;
   }
 
-  /** A key as the operator knows it, for a log line: the channel id the host holds or would be told, else the key. */
   private label(key: ChannelKey): string {
     return this.ids.channelIdOf(key) ?? this.ids.freshIdOf(key) ?? key;
   }
 
-  /** A stream's current name; null for a direct-message conversation or a stream the directory does not hold. */
   private streamNameOf(key: ChannelKey): string | null {
     const streamId = streamIdOfKey(key);
     return streamId === null ? null : this.directory.nameOf(streamId) ?? null;
@@ -1523,13 +1515,6 @@ export class ZulipMcplServer {
     });
   }
 
-  // ── Streams renamed or gone ──
-
-  /**
-   * The directory took Zulip's word about a stream. With MCPL, a rename
-   * rewrites the filters in this same tick, and then the host's view is
-   * brought to match.
-   */
   private onDirectoryChange(change: DirectoryChange): void {
     if (!this.mcplActive) return;
     this.rewriteFilters(change.renamed);
@@ -1547,7 +1532,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /** Each entry of `streams` or `mutedStreams` that matches no stream, named in the log. */
   private logUnmatchedFilters(): void {
     if (!this.filters) return;
     const f = this.filters.current();
@@ -1560,7 +1544,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /** Each filters entry that held a renamed stream's old name, or its old channel id, holds the new one: all of one change at once. */
   private rewriteFilters(renamed: { from: string; to: string }[]): void {
     if (!this.filters || renamed.length === 0) return;
     const names = new Map(renamed.map(({ from, to }) => [from, to]));
@@ -1587,10 +1570,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /**
-   * Bring the host's view to the directory's: each key whose id at the host
-   * differs from `zulip:` and its current name gets one pass.
-   */
   private async reconcileHostIds(): Promise<void> {
     if (!this.conn || !this.mcplActive) return;
     if (this.reconciling) {
@@ -1610,12 +1589,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /**
-   * One pass at the host for every key whose id there is stale: a line to
-   * each open channel, then one `channels/changed` that removes every held id
-   * and adds every new descriptor. Until the host's answer lands, each old id
-   * is still its stream's id, and a request that names it is served.
-   */
   private async changeAtHost(): Promise<void> {
     const renames: { key: ChannelKey; held: string; fresh: string; descriptor: ChannelDescriptor }[] = [];
     const removals: { key: ChannelKey; held: string }[] = [];
@@ -1674,7 +1647,6 @@ export class ZulipMcplServer {
     this.delivery.save();
   }
 
-  /** What a renamed stream's old channel id is now: gone, or another stream's, which took the old name. */
   private oldIdNow(key: ChannelKey, oldName: string): string {
     const holder = this.directory.idOf(oldName);
     return holder !== undefined && holder !== streamIdOfKey(key)
@@ -1682,11 +1654,6 @@ export class ZulipMcplServer {
       : `zulip:${oldName} is gone`;
   }
 
-  /**
-   * One push from the new channel for each stream open at last sight that
-   * was renamed while the host held no id for it. Returns the keys pushed
-   * for, which count as closed once the sweep has offered their backlog.
-   */
   private async pushRenamedUnannounced(): Promise<ChannelKey[]> {
     const pushedFor: ChannelKey[] = [];
     for (const [key, { from, to }] of this.renamedUnannounced) {
@@ -1710,7 +1677,6 @@ export class ZulipMcplServer {
     return pushedFor;
   }
 
-  /** A renamed stream's backlog has been offered: it counts as closed, unless the host has opened it since. */
   private closeRenamed(keys: ChannelKey[]): void {
     if (keys.length === 0) return;
     for (const key of keys) if (!this.channelManager.isKeyOpen(key)) this.delivery.markClosed(key);

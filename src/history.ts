@@ -89,9 +89,7 @@ export interface ZulipRecipient {
 /** The normalized, model-facing view of one message. */
 export interface ZulipMessage {
   id: number;
-  /** The stream's id; null for a direct message, or a stream message that carried none. */
   streamId: number | null;
-  /** The stream's name as Zulip sent it with the message, for display only. */
   streamNameShown: string | null;
   topic: string;
   isDm: boolean;
@@ -122,7 +120,6 @@ export interface ZulipMessage {
 export interface HistoryQuery {
   /** Stream to read, by id; omit for a cross-stream window (fetch_around). */
   streamId?: number;
-  /** Stream to read by the name as given, for a name the stream directory does not hold. */
   streamName?: string;
   topic?: string;
   /** The other parties of a DM conversation (user ids); reads that conversation instead of a stream. */

@@ -153,7 +153,6 @@ export interface ZulipEventLoopOptions {
   sleep?: (ms: number) => Promise<void>;
   /** The bound on one long poll. Default 90000ms. */
   pollTimeoutMs?: number;
-  /** Takes each registration's stream list and each `stream` event, in queue order. */
   directory?: StreamDirectory;
 }
 

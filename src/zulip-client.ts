@@ -131,12 +131,8 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
- * Subscribe to the streams named in ZULIP_SUBSCRIBE (comma-separated), once
- * the stream directory is first filled, or a read of the stream list got no
- * answer and the directory holds its copy alone. A stream's former name is logged and
- * nothing is subscribed for it, since Zulip's subscribe call creates a stream
- * for a name that no stream has. Any other name is subscribed, and created
- * where Zulip lets the bot.
+ * A former name isn't subscribed, since Zulip's subscribe call creates a
+ * stream for a name that no stream has.
  */
 export async function subscribeConfigured(api: ZulipApi, directory: StreamDirectory, setting: string | undefined): Promise<void> {
   const named = (setting ?? "").split(",").map((s) => s.trim()).filter(Boolean);

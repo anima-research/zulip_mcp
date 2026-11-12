@@ -19,12 +19,6 @@
  *                reopen them); every other watermarked channel gets only its
  *                addressed messages, with vicinity.
  *
- * In memory each table is keyed by channel key. In the file each key is a
- * channel id (`zulip:<current name>`, `zulip:dm:<ids>`), and the file also
- * carries the stream directory's copy (`streams`, `formerNames`). At a load,
- * a key is resolved by the file's own `streams`; a file without them is
- * resolved by name when the directory is first filled.
- *
  * File: `<stateDir>/<session>.delivery.json`, alongside the tool layer's
  * monitoring state. Best-effort: a failed save is logged, never fatal.
  */
@@ -54,7 +48,6 @@ interface DeliveryFile {
   formerNames?: Record<string, number>;
 }
 
-/** Entries of a file without `streams`, held by stream name until the directory is first filled. */
 interface Unresolved {
   watermark?: number;
   missed?: MissedTally;
@@ -77,11 +70,8 @@ interface Held {
 const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
-  /** Whether `save` writes the file. */
   writes = true;
-  /** Called with the keys a file from before stream ids gave a watermark, once the directory resolved their names. */
   onResolved: ((keys: ChannelKey[]) => void) | null = null;
-  /** The directory's copy as this process last loaded or wrote it. */
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
@@ -169,7 +159,6 @@ export class DeliveryState {
     }
   }
 
-  /** A file from before stream ids: its entries carry by name, once the directory knows the names. */
   private resolveByName(): void {
     const resolved: ChannelKey[] = [];
     for (const [name, u] of this.unresolved) {
@@ -191,12 +180,10 @@ export class DeliveryState {
     this.save();
   }
 
-  /** The directory's copy as this process last loaded or wrote it; null where it has neither. */
   directoryCopy(): DirectorySnapshot | null {
     return this.copy;
   }
 
-  /** The channel id a key is written under: the stream's current name, or the DM's user ids. */
   private fileKey(key: ChannelKey): string | null {
     const parsed = parseKey(key);
     if (parsed.kind === 'dm') return dmChannelIdFor(parsed.userIds);
