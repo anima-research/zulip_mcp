@@ -2,8 +2,9 @@
  * Content helpers — Zulip message formatting and attachment handling.
  *
  * Pure functions shared by the MCP tool layer (index.ts) and the Zulip
- * adapter (src/platforms/zulip.ts). Kept free of client/SDK dependencies so both
- * sides can import without cycles.
+ * adapter (src/platforms/zulip.ts). Kept free of client/SDK code so both
+ * sides can import without cycles: it takes only a constant from zulip-api.ts,
+ * which imports nothing.
  */
 
 import { realpathSync } from "node:fs";
