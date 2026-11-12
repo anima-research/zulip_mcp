@@ -324,21 +324,41 @@ test('the start reads the bot\'s profile and the realm\'s settings past the defa
 });
 
 test('a request that fails before a connection is made says it was not sent', async () => {
-  const plain = await realm({});
-  try {
-    for (const apiUrl of [`https://${plain.url.slice('http://'.length)}/api/v1`, 'http://[bad/api/v1']) {
-      const api = zulipApi(httpTransport({ apiUrl, authHeader: '' }));
-      await assert.rejects(api.request('DELETE', '/messages/5', 'deleting message 5'), (err: Error & { mayHaveBeenApplied?: boolean; kind?: string }) => {
-        assert.equal(err.kind, 'network', apiUrl);
-        assert.equal(err.mayHaveBeenApplied, false, apiUrl);
-        assert.match(err.message, /was not sent/);
-        return true;
-      });
-    }
-  } finally { plain.close(); }
+  const api = zulipApi(httpTransport({ apiUrl: 'http://[bad/api/v1', authHeader: '' }));
+  await assert.rejects(api.request('DELETE', '/messages/5', 'deleting message 5'), (err: Error & { mayHaveBeenApplied?: boolean; kind?: string }) => {
+    assert.equal(err.kind, 'network');
+    assert.equal(err.mayHaveBeenApplied, false);
+    assert.match(err.message, /was not sent/);
+    return true;
+  });
 });
 
-test('a zuliprc value comes from [api] or the environment, never from another section', async () => {
+async function failingWith(code: string) {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error(code), { code }) }); }) as typeof fetch;
+  try {
+    const api = zulipApi(httpTransport({ apiUrl: 'https://chat.example/api/v1', authHeader: '' }));
+    return await api.request('DELETE', '/messages/5', 'deleting message 5').then(() => undefined, (err: Error & { mayHaveBeenApplied?: boolean; kind?: string }) => err);
+  } finally { globalThis.fetch = original; }
+}
+
+test('a certificate that fails verification means the request was not sent', async () => {
+  const err = await failingWith('DEPTH_ZERO_SELF_SIGNED_CERT');
+  assert.equal(err?.kind, 'network');
+  assert.equal(err?.mayHaveBeenApplied, false);
+  assert.match(err?.message ?? '', /was not sent/);
+});
+
+test('a TLS failure that can come after the request was written leaves a write uncertain', async () => {
+  for (const code of ['ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC', 'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_TLS_SESSION_ATTACK']) {
+    const err = await failingWith(code);
+    assert.equal(err?.kind, 'network', code);
+    assert.equal(err?.mayHaveBeenApplied, true, code);
+    assert.match(err?.message ?? '', /may have been applied/, code);
+  }
+});
+
+test('a zuliprc value in a section other than [api] isn\'t used', async () => {
   const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
   const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
   const rc = join(dir, 'zuliprc');

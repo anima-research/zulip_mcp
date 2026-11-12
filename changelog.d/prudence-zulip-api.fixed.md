@@ -42,5 +42,6 @@
   so. A zuliprc file without `email` or `key` takes them from `ZULIP_EMAIL` and
   `ZULIP_API_KEY` for its API calls too. Those calls used to send "undefined"
   in place of the missing value. A `site`, `email` or `key` in another section
-  of the file is no longer used. It used to reach only attachment fetches and
-  uploads.
+  of the file is no longer used. It used to reach attachment fetches and
+  uploads, and an `email` there also named the server's state files when
+  `ZULIP_SESSION_ID` was unset.

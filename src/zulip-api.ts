@@ -105,7 +105,7 @@ export interface HttpTransportConfig {
 }
 
 const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_INVALID_URL', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
-const notSent = (code: string) => NOT_SENT_CODES.has(code) || /^ERR_(TLS|SSL)_|CERT/.test(code);
+const notSent = (code: string) => NOT_SENT_CODES.has(code) || code.includes('CERT');
 
 function causeCode(err: unknown): string | undefined {
   let current: unknown = err;
