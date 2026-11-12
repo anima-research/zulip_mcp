@@ -1,7 +1,7 @@
 - `send_message` and `send_dm` split a long message at `ZULIP_MAX_MESSAGE_LENGTH`,
   as a plain answer already did. They split at 10,000 characters whatever it
-  said, so where the server's limit was below 10,000, Zulip cut a longer
-  message off.
+  said, so where it was set to a server limit below 10,000, Zulip cut a tool's
+  longer message off.
 - A rollback deletes the parts of a plain answer that went out before Zulip
   refused it, or stopped answering, partway, as it already did for the tools'
   sends.
