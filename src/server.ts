@@ -1835,7 +1835,6 @@ export class ZulipMcplServer {
     return this.filters;
   }
 
-  /** With MCPL, a former stream name is refused, each with its new name, before anything is written. */
   private refuseFormerNames(names: string[]): void {
     if (!this.mcplActive) return;
     const renamed = names.flatMap((name) => {

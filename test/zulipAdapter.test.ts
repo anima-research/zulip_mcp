@@ -549,9 +549,6 @@ test('a message from a stream created after startup carries its descriptor, with
 });
 
 test('a stream the directory does not hold costs one list read for that stream, so another unknown stream within the minute is read for too, and a failed read holds nothing off', async () => {
-  // #north is created after the bot's queue registered, and no create event
-  // reaches it; #south likewise, a little later. The first read of the list
-  // fails.
   const events = [
     { id: 1, type: 'message', flags: [], message: raw(30, { display_recipient: 'north', stream_id: 11 }) },
     { id: 2, type: 'message', flags: [], message: raw(31, { display_recipient: 'north', stream_id: 11 }) },
@@ -579,7 +576,6 @@ test('a stream the directory does not hold costs one list read for that stream, 
     },
   }).api;
   const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
-  // The first read fails before #north exists; the second finds #north only.
   const seen: string[] = [];
   const original = console.error;
   console.error = () => {};
@@ -596,14 +592,10 @@ test('a stream the directory does not hold costs one list read for that stream, 
     console.error = original;
   }
   assert.deepEqual(seen, [
-    // 30: the failed read holds nothing off, so 31's miss reads again and finds #north.
     `31@${streamKey(11)}`,
-    // #south is read for, though #north was read for a moment ago.
     `32@${streamKey(12)}`,
     `35@${GENERAL}`,
   ]);
-  // One read each for 30, 31 and 32, and one for 33. 34 is #east again
-  // within the minute: no read.
   assert.equal(listCalls, 4);
 });
 

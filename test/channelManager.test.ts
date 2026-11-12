@@ -614,7 +614,6 @@ function announcing(answer: () => unknown) {
     sendIncoming: async () => {},
   } as never;
   const { adapter, ids } = fakeAdapter('zulip', []);
-  // The streams these tests announce, as the queue's registration lists them.
   ids.directory.registration(['ops', 'dev', 'gone', ...Array.from({ length: 200 }, (_, i) => `s${i}`)].map((name) => ({ stream_id: streamIdFor(name), name })));
   const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
   return { manager, sent };
