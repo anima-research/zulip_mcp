@@ -19,8 +19,9 @@
   which used to send the text "undefined" as the content, and one whose
   `message_id` isn't a positive integer (#50).
 - `delete_message`, `add_reaction` and `remove_reaction` refuse a `message_id`,
-  and `get_stream_topics` a `stream_id`, that isn't a positive integer or a
-  string of digits, before Zulip is asked. They used to send it as given.
+  and `get_stream_topics` a `stream_id`, that isn't a positive integer given as
+  a number or as a string of digits, before Zulip is asked. They used to send
+  it as given.
 - Where Zulip gives no JSON answer, the error says what happened: no answer
   within the bound, a failed connection, or an answer that isn't JSON, with its
   HTTP status. It says whether the request may have been applied. It used to
