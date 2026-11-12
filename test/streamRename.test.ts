@@ -1082,3 +1082,13 @@ scenario('41. a stream removed, seen again, and removed again: the agent gets a 
     await until(() => lines() === 2, 'the second line');
   } finally { await run.close(); }
 });
+
+scenario('42. a reactionChannels entry that matches no stream is named in the log when the directory is first filled, and a DM\'s entry is not', async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:nowhere', 'zulip:dm:42', 'zulip:general'] });
+  const run = await start(r, dir);
+  try {
+    await until(() => run.logs.some((l) => l.includes('reactionChannels') && l.includes('#nowhere')), 'the log line');
+    assert.equal(run.logs.filter((l) => l.includes('reactionChannels') && /matches no stream/.test(l)).length, 1);
+  } finally { await run.close(); }
+});

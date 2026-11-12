@@ -622,6 +622,8 @@ function announcing(answer: () => unknown) {
     sendIncoming: async () => {},
   } as never;
   const { adapter, ids } = fakeAdapter('zulip', []);
+  // The streams these tests announce, as the queue's registration lists them.
+  ids.directory.registration(['ops', 'dev', 'gone', ...Array.from({ length: 200 }, (_, i) => `s${i}`)].map((name) => ({ stream_id: streamIdFor(name), name })));
   const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
   return { manager, sent };
 }
@@ -761,6 +763,30 @@ test('a stream renamed while its first announcement waits to be retried: a retry
   answer = undefined;
   await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'zulip:a is stream 17\'s old id');
+});
+
+test('a stream archived while its first announcement waits to be retried: a retry of the backlog doesn\'t offer it', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown = new Error('timed out');
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }]);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17)])).local, ['zulip:a']);
+
+  ids.directory.applyEvent({ op: 'delete', streams: [{ stream_id: 17, name: 'a' }] });
+  answer = undefined;
+  await manager.registerAdditional([], { retryBacklog: true });
+  assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'stream 17 is gone');
 });
 
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {

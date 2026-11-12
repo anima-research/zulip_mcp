@@ -551,3 +551,62 @@ test('a message from a stream created after startup carries its descriptor, with
     { id: '14', key: GENERAL, newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: 7 } },
   ]);
 });
+
+test('a stream the directory does not hold costs one list read for that stream, so another unknown stream within the minute is read for too, and a failed read holds nothing off', async () => {
+  // #north is created after the bot's queue registered, and no create event
+  // reaches it; #south likewise, a little later. The first read of the list
+  // fails.
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(30, { display_recipient: 'north', stream_id: 11 }) },
+    { id: 2, type: 'message', flags: [], message: raw(31, { display_recipient: 'north', stream_id: 11 }) },
+    { id: 3, type: 'message', flags: [], message: raw(32, { display_recipient: 'south', stream_id: 12 }) },
+    { id: 4, type: 'message', flags: [], message: raw(33, { display_recipient: 'east', stream_id: 13 }) },
+    { id: 5, type: 'message', flags: [], message: raw(34, { display_recipient: 'east', stream_id: 13 }) },
+    { id: 6, type: 'message', flags: [], message: raw(35) },
+  ];
+  let polls = 0;
+  let listCalls = 0;
+  const streams = [{ name: 'general', stream_id: 7 }];
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) return { result: 'error', code: 'BAD_REQUEST', msg: 'try again' };
+      return { result: 'success', streams: [...streams] };
+    },
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  // The first read fails before #north exists; the second finds #north only.
+  const seen: string[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents((m) => {
+      seen.push(`${m.messageId}@${m.key}`);
+      if (m.messageId === '31') streams.push({ name: 'south', stream_id: 12 });
+    });
+    streams.push({ name: 'north', stream_id: 11 });
+    const deadline = Date.now() + 2000;
+    while (!seen.some((s) => s.startsWith('35@')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(seen, [
+    // 30: the failed read holds nothing off, so 31's miss reads again and finds #north.
+    `31@${streamKey(11)}`,
+    // #south is read for, though #north was read for a moment ago.
+    `32@${streamKey(12)}`,
+    `35@${GENERAL}`,
+  ]);
+  // One read each for 30, 31 and 32, and one for 33. 34 is #east again
+  // within the minute: no read.
+  assert.equal(listCalls, 4);
+});
