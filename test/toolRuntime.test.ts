@@ -334,7 +334,8 @@ test('send_message reply_to derives the current stream and topic', async () => {
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
   try {
-    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), result);
+    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }),
+      { ...result, channelId: 'zulip:General', channel: 'General', topic: 'Deploy status' });
     assert.deepEqual(gets, [{ id: 123 }]);
     assert.deepEqual(sends, [{ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }]);
     assert.deepEqual(sent[0], { messageId: '501', channelId: 'zulip:General', content: 'reply' });
@@ -348,7 +349,9 @@ for (const participants of [replyParticipants.slice(0, 2), replyParticipants]) {
     tools.onSent = (s) => sent.push(s);
     try {
       const ids = participants.map((p) => p.id);
-      await tools.handleToolCall('send_message', { type: 'private', reply_to: 123, content: 'reply' });
+      const others = ids.filter((id) => id !== 790).sort((a, b) => a - b);
+      assert.deepEqual(await tools.handleToolCall('send_message', { type: 'private', reply_to: 123, content: 'reply' }),
+        { result: 'success', id: 501, channelId: `zulip:dm:${others.join('+')}`, to_user_ids: others });
       assert.equal(gets.length, 1);
       assert.deepEqual(sends, [{ type: 'private', to: ids, topic: undefined, content: 'reply' }]);
       assert.deepEqual(sent.map((s) => s.channelId), [`zulip:dm:${ids.filter((id) => id !== 790).sort((a, b) => a - b).join('+')}`]);
@@ -361,12 +364,9 @@ for (const [label, message, destination] of [
   ['numeric-string stream ID', replyStream, { to: '12' }],
   ['matching stream name', replyStream, { to: 'general' }],
   ['different stream', replyStream, { to: 'Other' }],
-  ['matching topic', replyStream, { topic: 'Deploy status' }],
-  ['different topic', replyStream, { topic: 'Other' }],
   ['matching DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [790, 42, 7] }],
   ['partial DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [42] }],
   ['DM email', { type: 'private', display_recipient: replyParticipants }, { to: 'bo@example.com' }],
-  ['empty DM topic', { type: 'private', display_recipient: replyParticipants }, { topic: '' }],
   ['empty self-DM recipients', { type: 'private', display_recipient: [replyParticipants[0]] }, { to: [] }],
 ] as const) {
   test(`send_message reply_to refuses supplied ${label} before lookups, uploads or sends`, async () => {
@@ -374,7 +374,7 @@ for (const [label, message, destination] of [
     try {
       await assert.rejects(tools.handleToolCall('send_message', {
         ...destination, reply_to: 123, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
-      }), { message: 'reply_to sets the destination; omit to/topic' });
+      }), { message: 'reply_to sets the destination; omit to' });
       assert.deepEqual(gets, []);
       assert.deepEqual(userLookups, []);
       assert.deepEqual(sends, []);
@@ -382,6 +382,52 @@ for (const [label, message, destination] of [
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test('send_message reply_to with a topic sends to that message\'s stream in the given topic, and the result names no topic', async () => {
+  for (const topic of ['New thread', '']) {
+    const { tools, dir, gets, sends, result } = replyRuntime(replyStream);
+    try {
+      assert.deepEqual(await tools.handleToolCall('send_message', { reply_to: 123, topic, content: 'reply' }),
+        { ...result, channelId: 'zulip:General', channel: 'General' });
+      assert.deepEqual(gets, [{ id: 123 }]);
+      assert.deepEqual(sends, [{ type: 'stream', to: 12, topic, content: 'reply' }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message reply_to with a topic on a direct message is refused before uploads or sends', async () => {
+  for (const topic of ['New thread', '']) {
+    const { tools, dir, sends, uploaded } = replyRuntime({ type: 'private', display_recipient: replyParticipants });
+    try {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        reply_to: 123, topic, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), /direct message.*no topic/);
+      assert.deepEqual(sends, []);
+      assert.deepEqual(uploaded, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message to a stream with neither a topic nor reply_to is refused before uploads or sends, and says to name one', async () => {
+  for (const args of [{ type: 'stream' }, { type: 'channel' }, { type: 'stream', topic: null }]) {
+    const { tools, dir, sends, uploaded } = replyRuntime(replyStream);
+    try {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        ...args, to: 'general', content: 'hello', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), (err: Error) => /topic/.test(err.message) && /reply_to/.test(err.message));
+      assert.deepEqual(sends, []);
+      assert.deepEqual(uploaded, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message with an empty topic sends it to Zulip as given', async () => {
+  const { tools, dir, sends } = replyRuntime(replyStream);
+  try {
+    await tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: '', content: 'hello' });
+    assert.deepEqual(sends, [{ type: 'stream', to: 'general', topic: '', content: 'hello' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
   test(`send_message reply_to preserves API error code ${code} for missing/deleted/inaccessible ids`, async () => {
@@ -484,7 +530,7 @@ test('send_message schema leaves destination requirements to the runtime', () =>
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
   assert.equal(properties.reply_to.type, 'integer');
-  assert.match(properties.reply_to.description, /Omit to\/topic/);
+  assert.match(properties.reply_to.description, /Omit to;/);
 });
 
 test('send_message reply_to supports a canonical stream name fallback and an empty topic', async () => {

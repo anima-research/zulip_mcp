@@ -95,11 +95,19 @@ async function topicsPolicy(): Promise<string> {
   return (await user.ok('POST', 'register', { fetch_event_types: ['realm'] })).realm_topics_policy;
 }
 
-test('the server\'s send path: send_message to a stream with no topic lands in the topic "undefined"', async (t) => {
+async function postedTo(stream: string): Promise<string[]> {
+  const page = await user.ok('GET', 'messages', { anchor: 'newest', num_before: 20, num_after: 0, narrow: [['stream', stream]], apply_markdown: false });
+  return page.messages.map((m: { content: string }) => m.content);
+}
+
+test('the server\'s send path: send_message to a stream with no topic is refused, and nothing is posted', async (t) => {
   t.diagnostic(`realm_topics_policy: ${await topicsPolicy()}`);
   const stream = await newStream(env, 'notopic');
-  const sent = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, content: 'no topic given' })) as { id: number };
-  assert.equal((await user.message(sent.id)).subject, 'undefined');
+  await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: stream, content: 'no topic given' }), /topic is required for a stream message/);
+  await bot.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'after', content: 'sent after the refusal' });
+  const posted = await postedTo(stream);
+  assert.ok(posted.includes('sent after the refusal'));
+  assert.equal(posted.includes('no topic given'), false);
 });
 
 test('Zulip itself: a stream message with no topic parameter is refused, and one with an empty topic is accepted', async (t) => {
@@ -112,14 +120,17 @@ test('Zulip itself: a stream message with no topic parameter is refused, and one
   assert.equal((await user.message(empty.id)).subject, '');
 });
 
-test('with empty topics disabled: the server\'s send path still lands in "undefined", and Zulip refuses both no topic and an empty one', async (t) => {
+test('with empty topics disabled: the server\'s send path refuses a stream message with no topic, and Zulip refuses both no topic and an empty one', async (t) => {
   const before = await topicsPolicy();
   try {
     await user.ok('PATCH', 'realm', { topics_policy: 'disable_empty_topic' });
     t.diagnostic(`realm_topics_policy: ${await topicsPolicy()}`);
     const stream = await newStream(env, 'notopic-required');
-    const sent = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, content: 'no topic given' })) as { id: number };
-    assert.equal((await user.message(sent.id)).subject, 'undefined');
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: stream, content: 'no topic given' }), /topic is required for a stream message/);
+    await bot.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'after', content: 'sent after the refusal' });
+    const posted = await postedTo(stream);
+    assert.ok(posted.includes('sent after the refusal'));
+    assert.equal(posted.includes('no topic given'), false);
     const missing = await bot.call('POST', 'messages', { type: 'stream', to: stream, content: 'no topic parameter' });
     assert.equal(missing.result, 'error');
     assert.equal(missing.msg, 'Missing topic');
