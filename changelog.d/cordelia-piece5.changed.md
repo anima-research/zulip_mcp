@@ -9,3 +9,10 @@
   `zulip.messaging` was disabled. So a later direct message of that
   conversation carries no reply note, and a `sinceLastSeen` open reads
   forward from that message, where it read the newest messages.
+- After a reconnect within one process, a channel's watermark follows only
+  what the new connection's host accepts. It used to jump, once a held
+  message was settled, to the newest message that an earlier connection's
+  host had accepted. In one sequence the next catch-up now repeats messages
+  that the host already has: the host refused a message and reconnected, a
+  `sinceLastSeen` open whose limit cut its history settled that message, and
+  the connection ended before the host accepted the catch-up block.

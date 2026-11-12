@@ -15,8 +15,8 @@
  *                                                 or a read without MCPL got no answer
  *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
  *                                                 (default ~/.zulip_mcp_state)
- *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
- *                                                 catch-up sweep and gap recovery (3000)
+ *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for each channel's
+ *                                                 catch-up and gap recovery (3000)
  *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
  *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
  *   ZULIP_FILTERS_FILE                          - the filters plane file (default

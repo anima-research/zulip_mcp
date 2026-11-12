@@ -84,6 +84,25 @@ test("a hold keeps the other queue back until it settles, and the host's queue r
   }
 });
 
+test("holding all lanes keeps each other queue back until it settles, a lane made meanwhile included, and the host's queues run", async () => {
+  const l = lanes();
+  const log: string[] = [];
+  const start = gate();
+  l.lane(A).enter(() => { log.push('A message'); });
+  l.holdAll(start.opened);
+  l.lane(B).enter(() => { log.push('B message'); });
+  l.lane(B).host(() => { log.push('B open'); });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(log, ['B open']);
+  assert.equal(l.allHeld, true);
+  l.lane(A).enterFirst(() => { log.push('A read'); });
+  start.open();
+  await l.quiet();
+  assert.deepEqual(log.filter((s) => s.startsWith('A')), ['A read', 'A message']);
+  assert.deepEqual(log.filter((s) => s.startsWith('B')), ['B open', 'B message']);
+  assert.equal(l.allHeld, false);
+});
+
 test('enterFirst goes ahead of what waits in the other queue', async () => {
   const l = lanes();
   const log: string[] = [];

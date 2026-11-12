@@ -64,3 +64,22 @@
   that history, if the host had accepted nothing there since. Those messages
   had been counted as missed while the channel was closed. The recovery now
   starts above the newest message its channel has dealt with.
+- At a connection's start, every channel waited until all channels' catch-up
+  was done, and a message that arrived meanwhile could arrive inside its
+  channel's catch-up block instead of as itself. Each channel's catch-up now
+  reads only up to the first message waiting on that channel, that message
+  follows the block as itself, and each channel goes on as soon as its own
+  catch-up is done.
+- A `sinceLastSeen` open at a connection's start, before its channel's
+  catch-up, had its history repeated in the catch-up block. The catch-up now
+  starts above what the open returned.
+- At a connection's start, an ambient message of a closed channel that
+  arrived after the channel's catch-up read, and before the read of its
+  missed count, was counted as missed twice. It is now counted once.
+- An open whose connection ended while it read its history counted that
+  history as seen, so the next connection didn't offer it. It now counts
+  nothing, and the next connection's catch-up offers it.
+- A message whose attachments were still being fetched when shutdown's
+  grace ran out could reach the next connection's host twice: in that
+  connection's catch-up, and again when the fetch ended. It now reaches it
+  once, in the catch-up.

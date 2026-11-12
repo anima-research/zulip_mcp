@@ -46,8 +46,8 @@ type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: str
 const MAX_PENDING_ANNOUNCEMENTS = 100;
 
 /** A batch that failed as a whole is retried this many times before it is
- *  given up on (the watermark then stays put and the next catch-up sweep
- *  re-fetches what was lost). */
+ *  given up on (the watermark then stays put and a later read from history
+ *  fetches what was lost again). */
 const MAX_BATCH_ATTEMPTS = 2;
 
 interface Queued {
@@ -743,7 +743,7 @@ export class ChannelManager {
    * Awaits an in-flight flush first so batches never interleave. Used at
    * shutdown so a message received in the last window is not stranded with
    * its watermark unadvanced — and, if the connection is already gone, the
-   * failure leaves the watermark alone for the next sweep.
+   * failure leaves the watermark alone for the next start's catch-up.
    */
   async flush(): Promise<void> {
     if (this.batchTimer) {
@@ -788,7 +788,7 @@ export class ChannelManager {
    * Forget everything that belonged to a connection: the descriptors the
    * peer accepted, what it had open, what was buffered for it. A new peer
    * registers and opens afresh; whatever was buffered is re-offered by the
-   * catch-up sweep, not sent to a host that never asked for it.
+   * new connection's catch-up, not sent to a host that never asked for it.
    */
   reset(): void {
     this.destroy();

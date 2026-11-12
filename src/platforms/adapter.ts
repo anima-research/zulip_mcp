@@ -241,8 +241,8 @@ export interface PlatformAdapter {
 
   /**
    * Channel history as incoming-shaped messages, oldest first. Optional —
-   * without it channels/open cannot return backscroll and the reconnect
-   * sweep has nothing to scan.
+   * without it channels/open cannot return backscroll and no catch-up
+   * has anything to read.
    */
   fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 

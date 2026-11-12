@@ -79,6 +79,9 @@ interface StartOptions {
   grantLater?: boolean;
   /** Record channels/register but never answer it. */
   holdRegister?: boolean;
+  /** Answer channels/register once this settles. */
+  beforeRegisterAnswer?: () => Promise<void>;
+  shutdownGraceMs?: number;
 }
 
 async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Run> {
@@ -104,6 +107,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     catchupLimit: 100,
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 300,
+    shutdownGraceMs: opts.shutdownGraceMs,
     filters,
     directory,
   } as ConstructorParameters<typeof ZulipMcplServer>[2]);
@@ -121,7 +125,11 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     if (req.method === method.CHANNELS_REGISTER) {
       const p = req.params as ChannelsRegisterParams;
       registered.push(...p.channels);
-      if (!opts.holdRegister) host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
+      if (!opts.holdRegister) {
+        void Promise.resolve(opts.beforeRegisterAnswer?.()).then(() => {
+          try { host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) }); } catch { /* closed */ }
+        });
+      }
     } else if (req.method === method.CHANNELS_INCOMING) {
       const p = req.params as ChannelsIncomingParams;
       incoming.push(...p.messages);
@@ -147,7 +155,8 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
   host.sendNotification('notifications/initialized');
   const grant = async () => {
     await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
-    await until(() => registered.length > 0 && server.isLive, 'registration and live delivery');
+    await until(() => registered.length > 0, 'registration');
+    await server.quiet();
   };
   if (mcpl && !opts.grantLater) {
     if (opts.noWait) await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
@@ -1165,7 +1174,7 @@ scenario('46. one process: a host that leaves while its start reads the stream l
     release();
     await until(() => third.registered.length > 0, 'the second host\'s start, resumed, reaching the third host with its registration');
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    assert.deepEqual([...third.pushed.map(payloadText), ...third.incoming.map((m) => m.messageId)], [], 'nothing reaches the third host before its policy');
     await third.grant();
     await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
   } finally { await third.close(); }
@@ -1189,7 +1198,7 @@ scenario('47. one process: a host that leaves while its catch-up reads leaves th
   try {
     release();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    assert.deepEqual([...third.pushed.map(payloadText), ...third.incoming.map((m) => m.messageId)], [], 'nothing reaches the third host before its policy');
     await third.grant();
     await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
   } finally { await third.close(); }
@@ -1256,7 +1265,7 @@ scenario('50. one process: a host that leaves while its catch-up reads, and a ne
     await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     await until(() => r.reads.length > readsHeld, 'the third host\'s own catch-up reading');
     release();
-    await until(() => third.server.isLive && named(third, away) && named(third, awayRandom), 'the third host\'s catch-up of both streams');
+    await until(() => named(third, away) && named(third, awayRandom), 'the third host\'s catch-up of both streams');
     await deliveriesSettled(third);
     for (const id of [away, awayRandom]) {
       const catchUps = third.pushed.filter((p) => payloadText(p).includes(`id=${id}]`));
@@ -1330,7 +1339,7 @@ scenario('53. one process: a sweep whose host leaves during its last stream\'s r
   assert.deepEqual(r.reads.slice(readsHeld).map(streamOfRead), [], 'no read of dev\'s tally after the host left');
 });
 
-scenario('54. one process: a host that leaves while a rename\'s push waits for its answer leaves the other renames\' pushes to the next host', async (dir) => {
+scenario('54. one process: a host that leaves while its start\'s rename pushes wait for their answers was offered each push once, and the next host isn\'t offered them again', async (dir) => {
   const r = realm({ 17: 'general', 18: 'random' });
   const first = await start(r, dir);
   try {
@@ -1341,15 +1350,14 @@ scenario('54. one process: a host that leaves while a rename\'s push waits for i
   r.rename(18, 'lounge');
   const renamePush = (p: PushEventParams) => /was renamed/.test(payloadText(p));
   const second = await start(r, dir, { reuse: first, noWait: true, beforePushAnswer: (p) => (renamePush(p) ? new Promise<void>(() => {}) : Promise.resolve()) });
-  await until(() => second.pushed.some(renamePush), 'the first rename\'s push, which gets no answer');
-  const told = second.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId);
-  assert.equal(told.length, 1);
+  await until(() => second.pushed.filter(renamePush).length === 2, 'both renames\' pushes, which get no answer');
+  assert.deepEqual(second.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId).sort(), ['zulip:lobby', 'zulip:lounge']);
+  await second.open('zulip:lobby');
   await second.end();
   const third = await start(r, dir, { reuse: first });
   try {
-    await until(() => third.pushed.some(renamePush), 'the other rename\'s push at the next start');
     await deliveriesSettled(third);
-    assert.deepEqual(third.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId), ['zulip:lobby', 'zulip:lounge'].filter((id) => !told.includes(id)));
+    assert.deepEqual(third.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId), [], 'no push again, zulip:lobby open at last sight included');
   } finally { await third.close(); }
 });
 
@@ -1375,7 +1383,37 @@ scenario('55. one process: a backfill of missed tallies whose host leaves during
     await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     await until(() => r.reads.length > readsHeld, 'the third host\'s backfill reading dev');
     release();
-    await until(() => third.server.isLive, 'the third host live');
+    await third.server.quiet();
     assert.equal(await missedOn(third, 'zulip:dev'), 2, 'one ambient message counted live and one backfilled, each once');
+  } finally { await third.close(); }
+});
+
+scenario('56. one process: a host that leaves while a rename\'s push waits behind its open on the stream\'s lane leaves the push to the next host', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir, { shutdownGraceMs: 20 });
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on random');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  let answerRegister!: () => void;
+  const registerAnswered = new Promise<void>((resolve) => { answerRegister = resolve; });
+  const second = await start(r, dir, { reuse: first, noWait: true, beforeRegisterAnswer: () => registerAnswered });
+  await until(() => second.registered.length > 0, 'the second host asked to register');
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  try {
+    second.open('zulip:lobby', { limit: 50, sinceLastSeen: true }).catch(() => {});
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 17), 'the open of zulip:lobby reading its page');
+    answerRegister();
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 18), 'the lanes open: random\'s catch-up reading');
+    assert.deepEqual(second.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'the push waits behind the open');
+    await second.end();
+  } finally { release(); }
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
   } finally { await third.close(); }
 });

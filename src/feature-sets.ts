@@ -23,8 +23,8 @@
  *                        /complete terminators (finalize-only: delivery is
  *                        never a side effect of a lifecycle event, §14.5)
  *   pushEvents         — server.ts sends push/event for addressed messages on
- *                        channels the host has not opened, and for the
- *                        reconnect catch-up sweep
+ *                        channels the host has not opened, and for each
+ *                        channel's catch-up at a connection's start
  *   tools              — the MCP tool surface of this server
  *   contextHooks.beforeInference.inject.beforeUser
  *                      — ContextProvider returns injections, all at

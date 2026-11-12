@@ -195,6 +195,7 @@ export class Lanes<W> {
   private readonly lanes = new Map<ChannelKey, Lane<W>>();
   private readonly runningJobs = new Set<Promise<void>>();
   private turnHolder: Lane<W> | null = null;
+  private heldUntil: Promise<unknown> | null = null;
   private waitingMessageCount = 0;
   private quietWaiters: (() => void)[] = [];
   private ended = false;
@@ -210,9 +211,25 @@ export class Lanes<W> {
     if (!lane) {
       lane = new Lane(key, this);
       if (this.ended) lane.end();
+      else if (this.heldUntil) lane.holdOtherUntil(this.heldUntil);
       this.lanes.set(key, lane);
     }
     return lane;
+  }
+
+  /** Every lane's other queue waits until `until` settles, however it settles, a lane made meanwhile included. The host's queues run meanwhile. */
+  holdAll(until: Promise<unknown>): void {
+    this.heldUntil = until;
+    for (const lane of this.lanes.values()) lane.holdOtherUntil(until);
+    const release = () => {
+      if (this.heldUntil === until) this.heldUntil = null;
+    };
+    until.then(release, release);
+  }
+
+  /** True from `holdAll` until its promise settles. */
+  get allHeld(): boolean {
+    return this.heldUntil !== null;
   }
 
   /** Settles once no job runs or waits in any lane. A job that a hold or the turn keeps back is waiting. */

@@ -64,8 +64,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   quote-lookup waiting across all pages and both walks. The initial walk
   waits at most three seconds; the retry walk uses whatever remains of the
   shared six-second allowance. Only time awaiting quote GETs spends it, not
-  history HTTP or host acceptance. Go-live can wait about six seconds per
-  channel with uncached quote targets, in addition to those other waits.
+  history HTTP or host acceptance. A channel's catch-up at a connection's
+  start can wait about six seconds with uncached quote targets, in addition
+  to those other waits, and the channels' catch-ups take turns at Zulip.
   Other channels have separate call allowances.
   Cache/page matches remain usable after exhaustion. All uncached quote-target GETs, live and
   history, also share a process-wide token bucket: a burst of 30 and refill
@@ -99,13 +100,7 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). During the pre-live sweep, scan advancement is staged while
-  buffered live replies are reconciled; it is committed at go-live, graceful
-  shutdown, or before a new connection resets the staged state, preserving
-  accepted catch-up progress while refused replies retain their holds and
-  pending replies without a delivery hold cap the committed scan below their
-  ids; held replies preserve the scanned target while flooring the watermark. It
-  never advances past a message the host was offered but did not
+  `push/event`). It never advances past a message the host was offered but did not
   accept — a refusal, a batch lost to a transport failure — which is
   replayed from history once the host answers again. On the next connection
   one or more `<missed>` blocks per channel deliver what arrived meanwhile (full
@@ -120,9 +115,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   addressed message is a mention, otherwise `reason="addressed"`; full
   backscroll uses `reason="backscroll"`. Blocks are paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
   event-queue expiry is healed the same way — open channels replayed, closed
-  channels' addressed messages pushed — not merely reported. Live events
-  that arrive before the sweep has run are held and released in order after it, so a
-  live delivery can never jump the watermark over the offline gap.
+  channels' addressed messages pushed — not merely reported. A message
+  that arrives before its channel's catch-up has run waits for it and
+  follows it, as a message, so a live delivery can never jump the watermark
+  over the offline gap.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
   policy. Images are inlined on live delivery and on messages recovered onto
