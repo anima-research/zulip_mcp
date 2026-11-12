@@ -139,7 +139,7 @@ const FAILED_LOOKUP_TTL_MS = 3 * 60_000;
 /** How long the bot's own deletion is remembered so its echo is dropped. */
 const SELF_DELETE_TTL_MS = 10 * 60_000;
 const SELF_DELETE_CAP = 500;
-/** How long a stream id that the list did not resolve is not asked about again. */
+/** How long the stream list isn't read again for the same stream id or name. */
 const STREAM_REFRESH_HOLDOFF_MS = 60_000;
 /** How long "moved to a stream the bot cannot see" explains a following delete event. */
 const MOVED_AWAY_TTL_MS = 60_000;
@@ -222,8 +222,10 @@ export class ZulipAdapter implements PlatformAdapter {
    *  bot's own deletion is recognised here and dropped. Bounded and expiring
    *  — a failed delete never echoes. */
   private selfDeleted = new Map<number, number>();
-  /** When the stream list was last read for a stream the directory did not hold. */
-  private streamsRefreshedAt = 0;
+  /** What the stream list was last read for, a stream id or a name the
+   *  directory did not hold, and when. */
+  private readonly listReadFor = new Map<string, number>();
+  private listRead: Promise<boolean> | null = null;
   /** Messages just moved to a stream the bot cannot see, by id → when: the
    *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
   private movedAway = new Map<number, number>();
@@ -799,15 +801,24 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
-    if (!force && Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return;
-    this.streamsRefreshedAt = Date.now();
+    const now = Date.now();
+    if (!force && now - (this.listReadFor.get(why) ?? -Infinity) < STREAM_REFRESH_HOLDOFF_MS) return;
+    this.listRead ??= this.readStreamList(why).finally(() => { this.listRead = null; });
+    if (!(await this.listRead)) return;
+    for (const [what, at] of this.listReadFor) if (now - at >= STREAM_REFRESH_HOLDOFF_MS) this.listReadFor.delete(what);
+    this.listReadFor.set(why, now);
+  }
+
+  private async readStreamList(why: string): Promise<boolean> {
     try {
       const result = await this.api.request<{ streams?: unknown[] }>(
         'GET', '/streams', 'refreshing the stream list', { include_public: true, include_subscribed: true }, { timeoutMs: LOCATE_TIMEOUT_MS },
       );
       this.directory.list(result.streams ?? []);
+      return true;
     } catch (err) {
       console.error(`[zulip-mcp] could not refresh the stream list for ${why}:`, (err as Error).message);
+      return false;
     }
   }
 

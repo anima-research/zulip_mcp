@@ -196,7 +196,7 @@ export class ZulipMcplServer {
     this.announceTimeoutMs = options.announceTimeoutMs ?? ANNOUNCE_TIMEOUT_MS;
     this.filters = options.filters ?? null;
     this.directory = options.directory ?? new StreamDirectory();
-    this.ids = new ChannelIds(this.directory, () => this.adapter.refreshStreams?.() ?? Promise.resolve());
+    this.ids = new ChannelIds(this.directory, (why) => this.adapter.refreshStreams?.(why) ?? Promise.resolve());
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default', this.directory);
     this.directory.onChange((change) => this.onDirectoryChange(change));
     this.delivery.onResolved = (keys) => {
@@ -1536,7 +1536,8 @@ export class ZulipMcplServer {
   private logUnmatchedFilters(): void {
     if (!this.filters) return;
     const f = this.filters.current();
-    for (const [list, names] of [['streams', f.streams], ['mutedStreams', f.mutedStreams]] as const) {
+    const reactionStreams = (f.reactionChannels ?? []).filter((id) => id.startsWith('zulip:') && !isDmChannelId(id)).map((id) => id.slice('zulip:'.length));
+    for (const [list, names] of [['streams', f.streams], ['mutedStreams', f.mutedStreams], ['reactionChannels', reactionStreams]] as const) {
       for (const name of names ?? []) {
         if (this.directory.idOf(name) !== undefined) continue;
         const former = this.directory.formerOf(name);
@@ -1810,7 +1811,8 @@ export class ZulipMcplServer {
     }
     if (!this.adapter.describeChannels) return empty;
     try {
-      if (streams.some((name) => this.directory.idOf(name) === undefined)) await this.adapter.refreshStreams?.();
+      const unknown = streams.filter((name) => this.directory.idOf(name) === undefined);
+      if (unknown.length > 0) await this.adapter.refreshStreams?.(unknown.map((name) => `#${name}`).join(', '));
       const keys = streams.map((name) => this.directory.idOf(name)).filter((id): id is number => id !== undefined).map((id) => streamKey(id));
       const descriptors = await this.adapter.describeChannels(keys);
       const allowed = descriptors.filter((d) => {

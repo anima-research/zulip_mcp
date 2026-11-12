@@ -14,7 +14,7 @@ export class ChannelIds {
 
   constructor(
     readonly directory: StreamDirectory,
-    private readonly refreshStreams?: () => Promise<void>,
+    private readonly refreshStreams?: (why: string) => Promise<void>,
   ) {}
 
   channelIdOf(key: ChannelKey): string | null {
@@ -124,7 +124,7 @@ export class ChannelIds {
   async keyOf(channelId: string, opts: { byName?: boolean } = {}): Promise<KeyAnswer> {
     const first = this.resolve(channelId, opts);
     if (first) return first;
-    await this.refreshStreams?.();
+    await this.refreshStreams?.(`#${channelId.slice(PREFIX.length)}`);
     const second = this.resolve(channelId, opts);
     if (second) return second;
     return { unknownName: channelId.slice(PREFIX.length) };

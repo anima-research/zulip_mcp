@@ -227,8 +227,7 @@ export class ChannelManager {
       for (const [id, d] of this.unannounced) {
         if (queued.has(id) || this.announcing.has(id)) continue;
         const key = this.ids.keyOfDescriptor(d);
-        const fresh = key === null ? null : this.ids.freshIdOf(key);
-        if (fresh !== null && fresh !== id) continue;
+        if (key !== null && this.ids.freshIdOf(key) !== id) continue;
         before.set(id, 'pending');
         added.push(d);
       }
