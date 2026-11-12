@@ -50,6 +50,22 @@ test('a message with no table under a line of text is posted byte for byte', () 
   ]) assert.equal(prepareOutgoing(text), text, text);
 });
 
+test('a table directly under a hash heading or a horizontal rule is posted byte for byte, since Zulip shows it already', () => {
+  for (const text of [
+    `# Results\n${table}`,
+    `Before.\n## Results\n${table}`,
+    `Before.\n---\n${table}`,
+    `Before.\n* * *\n${table}`,
+  ]) assert.equal(prepareOutgoing(text), text, text);
+});
+
+test('the lines that Zulip splits off a block, at a heading, a rule or the end of an indented start, are judged as their own block', () => {
+  assert.equal(prepareOutgoing(`Results:\n| a |\n| --- |\n---`), `Results:\n\n| a |\n| --- |\n---`, 'a one-column table that a rule ends');
+  assert.equal(prepareOutgoing(`Results:\n| a |\n| --- |\n# Next`), `Results:\n\n| a |\n| --- |\n# Next`, 'a one-column table that a heading ends');
+  assert.equal(prepareOutgoing(`    code\nResults:\n${table}`), `    code\nResults:\n\n${table}`, 'after an indented start');
+  assert.equal(prepareOutgoing(`${table}\n---\nMore:\n| c | d |\n|---|---|`), `${table}\n---\nMore:\n| c | d |\n|---|---|`, 'a block that is a table from its first line keeps its rule and the rows after it');
+});
+
 test('nothing inside a fence is read, and a fence closes only at a line equal to its opening', () => {
   for (const text of [
     `\`\`\`\n${underText}\n\`\`\``,
