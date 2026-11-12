@@ -750,8 +750,13 @@ export class ChannelManager {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
-    if (this.flushing) await this.flushing;
-    await this.flushBatch();
+    while (this.flushing) await this.flushing;
+    const flushing: Promise<void> = this.flushBatch().finally(() => {
+      if (this.flushing === flushing) this.flushing = null;
+      this.wakeIdleWaiters();
+    });
+    this.flushing = flushing;
+    await flushing;
   }
 
   /** No batch waits for its window and no flush is on the wire. */
