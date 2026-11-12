@@ -343,23 +343,24 @@ export class ZulipMcplServer {
       // only after the sweep, so nothing received meanwhile can advance a
       // watermark over the offline gap the sweep is about to fetch.
       void this.grant.whenReady().then(async () => {
-        if (this.conn !== conn) return;
+        if (conn.isClosed) return;
         try {
           await this.channelManager.registerChannels();
         } catch (error) {
           console.error('Failed to register channels after initial policy:', error);
         }
-        if (this.conn !== conn) return;
-        const renamed = await this.pushRenamedUnannounced();
+        if (conn.isClosed) return;
+        const renamed = await this.pushRenamedUnannounced(conn);
+        if (conn.isClosed) return;
         void this.reconcileHostIds();
         try {
-          await this.runReconnectSweep();
+          await this.runReconnectSweep(conn);
         } catch (error) {
           console.error('[zulip-mcp] Reconnect catch-up sweep failed:', error);
         }
-        if (this.conn !== conn) return;
+        if (conn.isClosed) return;
         this.closeRenamed(renamed);
-        await this.goLive();
+        await this.goLive(conn);
       });
 
       // The event queue is registered at once — Zulip delivers nothing that
@@ -427,7 +428,7 @@ export class ZulipMcplServer {
    * attachment fetch) joins the queue behind the held ones instead of
    * overtaking them and burying them under its own acceptance.
    */
-  private async goLive(): Promise<void> {
+  private async goLive(conn: McplConnection | null = this.conn): Promise<void> {
     if (this.live) return;
     const boundary = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
     for (const [channelId, through] of this.preLiveScanned) {
@@ -458,6 +459,7 @@ export class ZulipMcplServer {
           this.delivery.hold(message.key, id, 'failed');
         }
       }
+      if (conn?.isClosed) return;
     }
     this.commitScannedCatchUp();
     this.delivery.save();
@@ -1239,7 +1241,7 @@ export class ZulipMcplServer {
    * quote verification can split a channel into multiple `<missed>` pushes.
    * Runs at most once per connection.
    */
-  private async runReconnectSweep(): Promise<void> {
+  private async runReconnectSweep(conn: McplConnection): Promise<void> {
     if (this.sweepDone) return;
     this.sweepDone = true;
     if (!this.conn || !this.mcplActive || !this.adapter.fetchHistory || this.catchupLimit === 0) return;
@@ -1251,13 +1253,15 @@ export class ZulipMcplServer {
     ]);
     let delivered = 0;
     for (const key of candidates) {
+      if (conn.isClosed) return;
       // From the watermark as it stood when this connection began: a
       // channel_open with backscroll answered meanwhile has moved the live
       // one past the offline gap this sweep exists to deliver.
-      if (await this.catchUpClosedChannel(key, this.delivery.wasOpen(key), this.sweepAnchors.get(key))) delivered++;
+      if (await this.catchUpClosedChannel(key, this.delivery.wasOpen(key), this.sweepAnchors.get(key), undefined, undefined, conn)) delivered++;
     }
 
-    await this.backfillMissedTallies();
+    if (conn.isClosed) return;
+    await this.backfillMissedTallies(conn);
     this.delivery.save();
     if (delivered > 0) {
       console.error(`[zulip-mcp] Reconnect catch-up: delivered missed messages from ${delivered} channel(s)`);
@@ -1337,6 +1341,7 @@ export class ZulipMcplServer {
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
     onAttempt?: (through: number) => void,
+    conn: McplConnection | null = this.conn,
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (this.ids.heldIdOf(key) === undefined) return false;
@@ -1360,6 +1365,7 @@ export class ZulipMcplServer {
     } finally {
       budget.remainingMs -= startedWith - passBudget.remainingMs;
     }
+    if (conn?.isClosed) return false;
     if (fetched.scannedThrough === null) {
       onAttempt?.(Infinity);
       return false;
@@ -1375,7 +1381,7 @@ export class ZulipMcplServer {
     let newestId = Math.min(fetched.scannedThrough, window.through);
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
-    const retry = (cursor: number) => this.catchUpClosedChannel(key, keepAllHint, cursor, window, onAttempt);
+    const retry = (cursor: number) => this.catchUpClosedChannel(key, keepAllHint, cursor, window, onAttempt, conn);
     if (blocked !== undefined) {
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
@@ -1453,7 +1459,7 @@ export class ZulipMcplServer {
   }
 
   /** Count the ambient that arrived on tallied channels during downtime. */
-  private async backfillMissedTallies(): Promise<void> {
+  private async backfillMissedTallies(conn: McplConnection): Promise<void> {
     if (!this.adapter.fetchHistory) return;
     for (const key of this.delivery.talliedChannels()) {
       if (this.isMuted(key) || !this.isAllowed(key)) continue;
@@ -1465,6 +1471,7 @@ export class ZulipMcplServer {
       } catch {
         continue;
       }
+      if (conn.isClosed) return;
       if (fetched.scannedThrough === null) continue;
       const views = fetched.messages.map(viewOf);
       // Only ambient counts as missed: addressed messages are delivered by the sweep.
@@ -1659,9 +1666,10 @@ export class ZulipMcplServer {
       : `zulip:${oldName} is gone`;
   }
 
-  private async pushRenamedUnannounced(): Promise<ChannelKey[]> {
+  private async pushRenamedUnannounced(conn: McplConnection): Promise<ChannelKey[]> {
     const pushedFor: ChannelKey[] = [];
     for (const [key, { from, to }] of this.renamedUnannounced) {
+      if (conn.isClosed) break;
       this.renamedUnannounced.delete(key);
       if (!this.delivery.wasOpen(key) || !this.isAllowed(key)) continue;
       const fresh = this.ids.channelIdOf(key);
