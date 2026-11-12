@@ -1,0 +1,130 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { prepareOutgoing } from '../src/outgoing.ts';
+import { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { ZulipAdapter } from '../src/platforms/zulip.ts';
+import type { ZulipSession } from '../src/zulip-client.ts';
+import type { UploadPolicy } from '../src/uploads.ts';
+import { standInApi, type StandInCall } from './zulip-stand-in.ts';
+
+const table = '| a | b |\n| --- | --- |\n| 1 | 2 |';
+const underText = `Results:\n${table}`;
+const repaired = `Results:\n\n${table}`;
+
+test('a table directly under a line of text gets one blank line above its header row, and nothing else changes', () => {
+  assert.equal(prepareOutgoing(underText), repaired);
+  assert.equal(prepareOutgoing(`Before.\nResults:\n${table}\nAfter the table.`), `Before.\nResults:\n\n${table}\nAfter the table.`);
+  assert.equal(
+    prepareOutgoing(`Intro:\n${table}\n\nMore:\n| c | d |\n|---|---|`),
+    `Intro:\n\n${table}\n\nMore:\n\n| c | d |\n|---|---|`,
+    'each such table in a message',
+  );
+});
+
+test('the tables that the parser Zulip pins takes as tables are repaired, as a description of rows would miss', () => {
+  for (const rows of [
+    '| a | b |\n| : | - |',
+    '| a | b |\n|   | --- |',
+    '`x|y` | b\n---|---',
+    'a | b\n     ---|---',
+  ]) assert.equal(prepareOutgoing(`Results:\n${rows}`), `Results:\n\n${rows}`, rows);
+});
+
+test('a message with no table under a line of text is posted byte for byte', () => {
+  for (const text of [
+    `Results:\n\n${table}`,
+    table,
+    `${table}\nAfter the table.`,
+    `${table}\n\nAfter the table.`,
+    'a | b\n---',
+    `Results:\na | b\n|---|---|\n1 | 2`,
+    `Results:\n| a |\n| --- |\n| 1 |\nmore`,
+    `Results:\n    | a | b |\n    | --- | --- |`,
+    `Results:\n\t| a | b |\n\t| --- | --- |`,
+    `| a | b |\n|---|---|\n| x | y |\n|---|---|\n| 1 | 2 |`,
+    'plain text\nwith two lines',
+    '',
+  ]) assert.equal(prepareOutgoing(text), text, text);
+});
+
+test('nothing inside a fence is read, and a fence closes only at a line equal to its opening', () => {
+  for (const text of [
+    `\`\`\`\n${underText}\n\`\`\``,
+    `~~~\n${underText}\n~~~`,
+    `\`\`\`\n${underText}`,
+    `\`\`\`\n\`\`\`js\n${underText}\n\`\`\``,
+    `\`\`\`\`\n\`\`\`\n${underText}\n\`\`\`\``,
+    `\`\`\`quote\n~~~\n\`\`\`\n${underText}\n~~~\n\`\`\``,
+  ]) assert.equal(prepareOutgoing(text), text, text);
+  assert.equal(prepareOutgoing(`\`\`\`\ncode\n\`\`\`\n${underText}`), `\`\`\`\ncode\n\`\`\`\n${repaired}`, 'after the fence closes, the rule reads again');
+});
+
+test('a table directly under a list item or a quoted line is left as it is', () => {
+  for (const above of ['- item', '* item', '+ item', '1. item', '2) item', '> quote']) {
+    for (const text of [`${above}\n${table}`, `${above}\nmore\n${table}`]) assert.equal(prepareOutgoing(text), text, text);
+  }
+});
+
+const uploader = {
+  async upload(i: { name: string }) {
+    return { name: i.name, path: `/user_uploads/1/ab/${i.name}`, url: `https://z/user_uploads/1/ab/${i.name}` };
+  },
+};
+const uploadPolicy: UploadPolicy = { roots: new Map(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
+
+function tools(api: ZulipSession['api'], maxMessageLength?: number) {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-tables-'));
+  const session: ZulipSession = { api, selfUserId: 790, realm: 'https://z', authHeader: 'Basic x', sessionId: 't' };
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const runtime = new ZulipToolRuntime(session, dir, { uploader, uploadPolicy, ...(maxMessageLength ? { maxMessageLength } : {}) } as never);
+    return { runtime, done: () => rmSync(dir, { recursive: true, force: true }) };
+  } finally {
+    console.error = original;
+  }
+}
+
+const posted = (calls: StandInCall[], method: string) => calls.filter((c) => c.method === method).map((c) => c.params.content);
+
+test('send_message, send_dm and a plain answer each post the table with the blank line above it', async () => {
+  const sm = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
+  const t1 = tools(sm.api);
+  await t1.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: underText });
+  t1.done();
+  const dm = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
+  const t2 = tools(dm.api);
+  await t2.runtime.handleToolCall('send_dm', { to: ['42'], content: underText });
+  t2.done();
+  const pub = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
+  await new ZulipAdapter(pub.api, 790, 's', {} as never).publish('zulip:general', undefined, [{ type: 'text', text: underText }], { threadId: 't' });
+  assert.deepEqual(posted(sm.calls, 'POST'), [repaired], 'send_message');
+  assert.deepEqual(posted(dm.calls, 'POST'), [repaired], 'send_dm');
+  assert.deepEqual(posted(pub.calls, 'POST'), [repaired], 'plain answer');
+});
+
+test('with an upload, the links come after the prepared text, untouched', async () => {
+  const { api, calls } = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
+  const t = tools(api);
+  await t.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: underText, attachments: [{ data: 'aGk=', name: 'hi.txt' }] });
+  t.done();
+  assert.deepEqual(posted(calls, 'POST'), [`${repaired}\n\n[hi.txt](/user_uploads/1/ab/hi.txt)`]);
+});
+
+test('edit_message prepares its text before its length check', async () => {
+  const z = standInApi({ 'PATCH /messages/:id': { result: 'success', msg: '' } });
+  const t = tools(z.api);
+  await t.runtime.handleToolCall('edit_message', { message_id: 55, content: underText });
+  t.done();
+  assert.deepEqual(posted(z.calls, 'PATCH'), [repaired]);
+
+  const limit = [...underText].length;
+  const refusing = standInApi({ 'PATCH /messages/:id': { result: 'success', msg: '' } });
+  const tight = tools(refusing.api, limit);
+  await assert.rejects(tight.runtime.handleToolCall('edit_message', { message_id: 55, content: underText }), new RegExp(`content is ${limit + 1} characters`));
+  tight.done();
+  assert.equal(refusing.calls.length, 0, 'Zulip is not asked');
+});
