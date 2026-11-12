@@ -1,27 +1,7 @@
 /*
- * FENCE and the fence rule in blocks are ported from Zulip 12.4,
- * zerver/lib/markdown/fenced_code.py (FENCE_RE, generic_handler and the
- * handlers' handle_line), and HEADING from its HashHeaderProcessor.RE
- * (zerver/lib/markdown/__init__.py). Its notice:
- *
- * Copyright 2012–2015 Dropbox, Inc., 2015–2021 Kandra Labs, Inc., and contributors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this project except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
  * isTable, splitRow and split are ported from Python-Markdown 3.10.3,
  * markdown/extensions/tables.py (TableProcessor.test, _split_row, _split),
- * the version Zulip 12.4 pins, and RULE from its HRProcessor.RE
- * (markdown/blockprocessors.py). Its licence:
+ * the version Zulip 12.4 pins. Its licence:
  *
  * BSD 3-Clause License
  *
@@ -55,6 +35,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from './markdown-blocks.js';
+
 const RE_CODE_PIPES = /(\\\\)|(\\`+)|(`+)|(\\\|)|(\|)/g;
 const RE_END_BORDER = /(?<!\\)(?:\\\\)*\|$/;
 
@@ -74,6 +56,16 @@ function isTable(lines: string[], from: number, to: number, nextUnbordered: numb
   if (separator.length !== width || !/^[|:\- ]*$/.test(separator.join(''))) return false;
   if (width > 1) return true;
   return border && nextUnbordered[from + 1]! >= to;
+}
+
+/** TableProcessor.test for any block of `lines`, with the lookup it needs built once. */
+export function tableTest(lines: string[]): (from: number, to: number) => boolean {
+  const nextUnbordered = new Array<number>(lines.length + 1).fill(lines.length);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const row = lines[i]!.replace(/^ +| +$/g, '');
+    nextUnbordered[i] = row.startsWith('|') || RE_END_BORDER.test(row) ? nextUnbordered[i + 1]! : i;
+  }
+  return (from, to) => isTable(lines, from, to, nextUnbordered);
 }
 
 function splitRow(row: string, border: boolean): string[] {
@@ -137,57 +129,7 @@ function split(row: string): string[] {
   return cells;
 }
 
-/** Zulip 12.4's FENCE_RE (zerver/lib/markdown/fenced_code.py), with PLAYGROUND_LANGUAGE_REGEX in place. */
-const FENCE = /^(~{3,}|`{3,})[ ]*(?:\{?\.?([a-zA-Z0-9_+-.\/#]+)[ ]*([^ ~`][^~`]*)?\}?)?$/;
-const NESTING = new Set(['quote', 'quoted', 'spoiler']);
 const LIST_OR_QUOTE = /^[ ]*(?:>|(?:[-*+]|\d+[.)])(?:[ ]|$))/;
-
-function expandTabs(line: string): string {
-  let out = '';
-  for (const ch of line) out += ch === '\t' ? ' '.repeat(4 - (out.length % 4)) : ch;
-  return out;
-}
-
-/**
- * The runs of lines that Zulip's parser reads as blocks: lines between blank
- * lines, outside code fences. Zulip reads the inside of a quote, quoted or
- * spoiler fence as Markdown, so its lines make blocks too. A fence's own
- * lines belong to no block.
- */
-function blocks(lines: string[]): number[][] {
-  const out: number[][] = [];
-  let current: number[] = [];
-  const end = () => {
-    if (current.length > 0) out.push(current);
-    current = [];
-  };
-  const stack: { fence: string; nests: boolean }[] = [];
-  lines.forEach((line, i) => {
-    const top = stack.at(-1);
-    if (top !== undefined && line.trimEnd() === top.fence) {
-      end();
-      stack.pop();
-      return;
-    }
-    if (top !== undefined && !top.nests) return;
-    const m = FENCE.exec(line);
-    if (m) {
-      end();
-      stack.push({ fence: m[1]!, nests: NESTING.has((m[2] ?? '').toLowerCase()) });
-      return;
-    }
-    if (/^ *$/.test(line)) end();
-    else current.push(i);
-  });
-  end();
-  return out;
-}
-
-/** Zulip 12.4's HashHeaderProcessor.RE (zerver/lib/markdown/__init__.py), for one line. */
-const HEADING = /^#{1,6}\s/;
-/** Python-Markdown 3.10.3's HRProcessor.RE (markdown/blockprocessors.py). */
-const RULE = /^[ ]{0,3}(?=((?:-+[ ]{0,2}){3,}|(?:_+[ ]{0,2}){3,}|(?:\*+[ ]{0,2}){3,}))\1[ ]*$/;
-const CODE = /^ {4}/;
 
 /**
  * Puts one blank line above the header row of each table that sits directly
@@ -197,19 +139,11 @@ const CODE = /^ {4}/;
 export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
-  // The next heading, the next rule and the next line with no pipe at
-  // either end, at or after each line, so that no reading of a block
-  // searches its lines again.
-  const nextHeading = new Array<number>(lines.length + 1).fill(lines.length);
-  const nextRule = new Array<number>(lines.length + 1).fill(lines.length);
-  const nextUnbordered = new Array<number>(lines.length + 1).fill(lines.length);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const row = lines[i]!.replace(/^ +| +$/g, '');
-    nextHeading[i] = HEADING.test(lines[i]!) ? i : nextHeading[i + 1]!;
-    nextRule[i] = RULE.test(lines[i]!) ? i : nextRule[i + 1]!;
-    nextUnbordered[i] = row.startsWith('|') || RE_END_BORDER.test(row) ? nextUnbordered[i + 1]! : i;
-  }
-  const table = (from: number, to: number): boolean => isTable(lines, from, to, nextUnbordered);
+  // The next heading and the next rule at or after each line, so that no
+  // reading of a block searches its lines again.
+  const nextHeading = nextMatching(lines, HEADING);
+  const nextRule = nextMatching(lines, RULE);
+  const table = tableTest(lines);
   const pastCode = (from: number, to: number): number => {
     while (from < to && CODE.test(lines[from]!)) from += 1;
     return from;
@@ -261,7 +195,7 @@ export function blankLineAboveTables(text: string): string {
     return table(at, to) || (rule > at && rule < to && table(at, rule));
   };
   const above = new Set<number>();
-  const todo: [number, number][] = blocks(lines).map((block) => [block[0]!, block.at(-1)! + 1]);
+  const todo: [number, number][] = markdownBlocks(lines).map((block) => [block[0]!, block.at(-1)! + 1]);
   while (todo.length > 0) {
     const [from, to] = todo.pop()!;
     const heading = nextHeading[from]!;
