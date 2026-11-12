@@ -611,6 +611,7 @@ scenario('19. a client without MCPL between the rename and the next host leaves 
   try {
     await until(() => run.directory?.isFilled === true && run.directory.nameOf(17) === 'lobby', 'the stream list read, with the rename');
   } finally { await run.close(); }
+  assert.deepEqual(readJson(dir, 'filters.json')?.mutedStreams, ['general'], 'the run without MCPL left the filters file as it was');
   run = await start(r, dir);
   try {
     await until(() => run.pushed.some((p) => /zulip:general/.test(payloadText(p)) && /zulip:lobby/.test(payloadText(p))), 'the push');
@@ -710,6 +711,7 @@ scenario('23. two streams swap names while the server is down: each keeps its ow
     const to18 = r.post(18, '@bot to 18', { mentioned: true });
     const after = r.post(17, '@bot after 18\'s', { mentioned: true });
     await until(() => arrivedOn(run, to17) !== null && arrivedOn(run, after) !== null, 'the mentions in 17, the second posted after 18\'s');
+    await until(() => (run.server as unknown as { inFlight: Set<unknown> }).inFlight.size === 0, 'no delivery in flight');
     assert.equal(arrivedOn(run, to17), 'zulip:b');
     assert.equal(named(run, to18), false, 'stream 18 is still muted');
   } finally { await run.close(); }
@@ -974,11 +976,11 @@ scenario('35. one process: a client without MCPL between a rename and the next h
   writeFilters(dir, { mutedStreams: ['general'] });
   await savedAsGeneral(r, dir);
   r.rename(17, 'lobby');
-  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
   const plain = await start(r, dir, { mcpl: false });
   try {
-    await until(() => lists() > 0, 'the read of the stream list without MCPL');
+    await until(() => plain.directory?.isFilled === true && plain.directory.nameOf(17) === 'lobby', 'the stream list read, with the rename');
   } finally { await plain.end(); }
+  assert.deepEqual(readJson(dir, 'filters.json')?.mutedStreams, ['general'], 'the client without MCPL left the filters file as it was');
   const run = await start(r, dir, { reuse: plain });
   try {
     await until(() => toldRename(run).length > 0, 'the push');
