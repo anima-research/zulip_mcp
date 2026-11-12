@@ -8,6 +8,9 @@
  *
  * Zulip offers no gap recovery for a dead queue (code BAD_EVENT_QUEUE_ID):
  * events between the last delivered message and re-registration are lost.
+ * An event id is local to its queue, and means nothing to the new queue or to
+ * the messages API, so a gap is anchored on the last delivered message's id
+ * and time.
  * Zulip answers a long poll with a heartbeat at least every 45 s.
  */
 
