@@ -8,7 +8,6 @@ import { parse as parseIni } from 'ini';
 import { httpTransport, LONG_TIMEOUT_MS, zulipApi, type ZulipApi } from './zulip-api.js';
 
 export interface ZulipSession {
-  /** Zulip's API, with the session's credentials. */
   api: ZulipApi;
   /** Numeric bot user id when the profile fetch succeeded; null = no self-filter. */
   selfUserId: number | null;
