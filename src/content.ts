@@ -8,6 +8,7 @@
 
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_TIMEOUT_MS } from "./zulip-api.js";
 
 /**
  * Run-as-main detection that survives npm bin symlinks. Node resolves the
@@ -50,7 +51,25 @@ export async function fetchAttachmentBytes(
   fallbackName: string,
   opts: { headers?: Record<string, string> } = {},
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: "follow" });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  try {
+    return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal);
+  } catch (err) {
+    if (controller.signal.aborted) throw new Error(`The download of ${fallbackName} didn't finish within ${DEFAULT_TIMEOUT_MS / 1000} s.`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readAttachment(
+  url: string,
+  fallbackName: string,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+): Promise<FetchedAttachment> {
+  const resp = await fetch(url, { headers, redirect: "follow", signal });
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
   // Pre-check Content-Length so an oversized declared body never starts buffering.

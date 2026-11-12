@@ -95,7 +95,7 @@ function encodeParams(params: Record<string, unknown> | undefined): URLSearchPar
   return encoded;
 }
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+export const DEFAULT_TIMEOUT_MS = 15_000;
 export const LONG_TIMEOUT_MS = 90_000;
 
 export interface HttpTransportConfig {

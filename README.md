@@ -541,7 +541,8 @@ environment). Under connectome-host, point it into the data volume, e.g.
   reads of the bot's profile and the realm's settings.
   A call that reaches it is ended and fails. A send, an edit or a delete that
   may have reached Zulip without an answer fails with an error saying so.
-  File uploads and `fetch_attachment`'s download have no bound.
+  `fetch_attachment`'s download ends after 15 s too. File uploads have no
+  bound.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

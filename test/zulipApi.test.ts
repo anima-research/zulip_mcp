@@ -329,6 +329,21 @@ test('a bound also ends a call whose answer stalls after its headers', { timeout
   } finally { z.close(); }
 });
 
+test('fetch_attachment ends a download that gets no answer, or stalls after its headers, at 15 s', { timeout: 10_000 }, async () => {
+  const z = await realm({ 'GET /user_uploads/2/ab/never.png': 'hang', 'GET /user_uploads/2/ab/stalls.png': 'stall-body' });
+  const s = await serverOn(z.url);
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 50 : ms, ...rest)) as typeof setTimeout;
+  try {
+    for (const name of ['never.png', 'stalls.png']) {
+      await assert.rejects(s.tools.handleToolCall('fetch_attachment', { path: `/user_uploads/2/ab/${name}` }), (err: Error) => {
+        assert.equal(err.message, `The download of ${name} didn't finish within 15 s.`);
+        return true;
+      }, name);
+    }
+  } finally { globalThis.setTimeout = original; s.done(); z.close(); }
+});
+
 test('a call with no bound of its own ends at 15 s', async () => {
   const z = await realm({ 'GET /streams': 'hang' });
   const s = await serverOn(z.url);
