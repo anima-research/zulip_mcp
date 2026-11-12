@@ -284,6 +284,16 @@ scenario('3. an allowlisted stream renamed stays admitted, and the filters file 
   } finally { await run.close(); }
 });
 
+scenario('3. a stream whose reactions are visible, renamed, keeps them visible: the filters file holds the new channel id', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  writeFilters(dir, { reactionChannels: ['zulip:general', 'zulip:random'] });
+  const run = await start(r, dir);
+  try {
+    r.rename(17, 'lobby');
+    await until(() => JSON.stringify(readJson(dir, 'filters.json')?.reactionChannels) === '["zulip:lobby","zulip:random"]', 'the filters file rewritten');
+  } finally { await run.close(); }
+});
+
 scenario('4. an open or a publish of the old id is refused with the new id in its words, and no stream is created', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir);
