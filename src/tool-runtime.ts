@@ -292,7 +292,7 @@ export class ZulipToolRuntime {
   private async replyDestination(args: Record<string, any>) {
     const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
-    if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
+    if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to");
     const result = await this.api.requestAnswer<{ message?: any }>("GET", `/messages/${id}`);
     if (result.result === "error") {
       // Keep the API code as well as its wording: missing/deleted/inaccessible
@@ -309,15 +309,21 @@ export class ZulipToolRuntime {
     if (message.type === "stream") {
       const name = message.display_recipient;
       if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
-      return { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: `zulip:${name}` };
+      const channelId = `zulip:${name}`;
+      return args.topic === undefined
+        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId, receipt: { channelId, channel: name, topic: message.subject } }
+        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId, receipt: { channelId, channel: name } };
     }
+    if (args.topic !== undefined) throw new Error(`reply_to ${id} is a direct message, which has no topic; omit topic`);
 
     const recipients: ZulipRecipient[] = message.display_recipient;
     if (!Array.isArray(recipients) || recipients.length === 0 || recipients.some((r) => !Number.isSafeInteger(r?.id))) {
       throw unreadable();
     }
     const ids = recipients.map((r) => r.id);
-    return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
+    const others = dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id);
+    const channelId = dmChannelIdFor(others);
+    return { type: message.type, to: ids, topic: undefined, channelId, receipt: { channelId, to_user_ids: others } };
   }
 
   // ── Persistent monitoring state ──
@@ -690,19 +696,20 @@ export class ZulipToolRuntime {
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
+        if (args.reply_to === undefined && args.topic === undefined && (args.type === "stream" || args.type === "channel")) {
+          throw new Error("topic is required for a stream message: name one, or use reply_to to answer a message where it is");
+        }
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
         const uploaded = await this.uploadFor(args);
         const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
-        const isDm = args.type === "private" || args.type === "direct";
-        // A stream send with no topic keeps sending the topic text "undefined", as it did through zulip-js, until #44 decides what it should do.
-        const topic = args.topic === undefined && !isDm ? "undefined" : args.topic;
-        const { chunks, last } = await this.send({ type: args.type, to: args.to, topic }, hasText ? args.content : "", uploaded, channelId);
+        const { chunks, last } = await this.send({ type: args.type, to: args.to, topic: args.topic }, hasText ? args.content : "", uploaded, channelId);
         const ids = chunks.map((c) => c.id);
         return {
           ...last,
+          ...(reply ? reply.receipt : {}),
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(ids.length > 1 ? { ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : {}),
         };
