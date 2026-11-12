@@ -303,10 +303,7 @@ export class Lanes<W> {
     let running = 0;
     if (this.runningJobs.size > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const grace = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, graceMs);
-        (timer as { unref?: () => void }).unref?.();
-      });
+      const grace = new Promise<void>((resolve) => { timer = setTimeout(resolve, graceMs); });
       await Promise.race([Promise.allSettled([...this.runningJobs]), grace]);
       clearTimeout(timer);
       running = this.runningJobs.size;
