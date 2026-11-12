@@ -184,3 +184,43 @@ test('C8: a bot\'s send to a name no stream has is refused with STREAM_DOES_NOT_
   assert.equal(read.result, 'error');
   assert.equal(read.code, 'BAD_NARROW');
 });
+
+test('C9: the registration\'s streams are the streams the bot\'s stream list holds, a public stream it isn\'t subscribed to and a private one it is subscribed to among them', async () => {
+  const botId = await bot.myId();
+  const open = uniqueName('c9-public');
+  await user.ok('POST', 'users/me/subscriptions', { subscriptions: [{ name: open }] });
+  const closed = uniqueName('c9-private');
+  await user.ok('POST', 'users/me/subscriptions', { subscriptions: [{ name: closed }], invite_only: true, principals: [await user.myId(), botId] });
+  const [openId, closedId] = [await idOf(open), await idOf(closed)];
+  const queue = await Queue.register(bot);
+  try {
+    const registered = new Set((queue.answer.streams as { stream_id: number }[]).map((s) => s.stream_id));
+    const listed = new Set(((await bot.ok('GET', 'streams', { include_public: true, include_subscribed: true })).streams as { stream_id: number }[]).map((s) => s.stream_id));
+    assert.ok(registered.has(openId), 'the public stream the bot isn\'t subscribed to');
+    assert.ok(registered.has(closedId), 'the private stream the bot is subscribed to');
+    assert.deepEqual([...registered].sort((a, b) => a - b), [...listed].sort((a, b) => a - b));
+  } finally {
+    await queue.close();
+  }
+});
+
+test('C10: a private stream the bot is added to gives a stream event with op "create" naming it, and its removal from the stream gives one with op "delete"', async () => {
+  const botId = await bot.myId();
+  const stream = uniqueName('c10');
+  await user.ok('POST', 'users/me/subscriptions', { subscriptions: [{ name: stream }], invite_only: true, principals: [await user.myId()] });
+  const id = await idOf(stream);
+  const queue = await Queue.register(bot);
+  try {
+    assert.ok(!(queue.answer.streams as { stream_id: number }[]).some((s) => s.stream_id === id), 'not the bot\'s before it is added');
+    await user.ok('POST', 'users/me/subscriptions', { subscriptions: [{ name: stream }], principals: [botId] });
+    const created = await queue.next(`the create of stream ${id}`, (e) => e.type === 'stream' && e.op === 'create' && (e.streams ?? []).some((s: { stream_id: number }) => s.stream_id === id));
+    assert.deepEqual(created.streams.filter((s: { stream_id: number }) => s.stream_id === id).map((s: { name: string }) => s.name), [stream]);
+    await user.ok('DELETE', 'users/me/subscriptions', { subscriptions: [stream], principals: [botId] });
+    await queue.next(
+      `the delete of stream ${id}`,
+      (e) => e.type === 'stream' && e.op === 'delete' && ((e.streams ?? []).some((s: { stream_id: number }) => s.stream_id === id) || (e.stream_ids ?? []).includes(id)),
+    );
+  } finally {
+    await queue.close();
+  }
+});
