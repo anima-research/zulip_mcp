@@ -230,9 +230,14 @@ const fakeTools = {
   onSent: null as null | ((sent: { messageId: string; channelId: string; content: string }) => void),
   /** Set by the server; the real runtime reports streams `listen` subscribed to. */
   onSubscribed: null as null | ((streams: string[]) => unknown),
+  hold: null as Promise<unknown> | null,
   async handleToolCall(name: string, args: Record<string, unknown>) {
     fakeTools.calls.push({ name, args });
     if (name === 'explode') throw new Error('boom');
+    if (name === 'slow') {
+      await fakeTools.hold;
+      fakeTools.calls.push({ name: 'slow:end', args });
+    }
     if (name === 'send_message') fakeTools.onSent?.({ messageId: '99', channelId: 'zulip:general', content: String(args.content ?? '') });
     if (name === 'listen') {
       // The real runtime subscribes, then awaits onSubscribed and reports it.
@@ -260,6 +265,7 @@ interface Harness {
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   served: Promise<void>;
+  serverSide: McplConnection;
   /** How the host answers channels/incoming: per-message rejections (for
    *  good, or once), and whole batches that error out (counted down per batch). */
   policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string> };
@@ -381,6 +387,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     incoming,
     pushed,
     served,
+    serverSide: serverConn,
     policy,
     async close() {
       // EOF on the server's stdin analog: readline closes on 'end', not on
@@ -482,6 +489,33 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   // Events are never started for a plain-MCP client.
   assert.equal(h.adapter.emit, null);
   await h.close();
+});
+
+test('requests are served one at a time, in the order they arrive', async () => {
+  const h = harness({ mcpl: false });
+  await initialize(h, false);
+  fakeTools.calls.length = 0;
+  fakeTools.hold = new Promise((resolve) => setTimeout(resolve, 50));
+  const first = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+  const second = h.host.sendRequest('tools/call', { name: 'send_message', arguments: { content: 'two' } });
+  await Promise.all([first, second]);
+  assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow', 'slow:end', 'send_message']);
+  await h.close();
+});
+
+test('when the connection ends, the request being served finishes before serve returns, and one waiting behind it is not carried out', async () => {
+  const h = harness({ mcpl: false });
+  await initialize(h, false);
+  fakeTools.calls.length = 0;
+  let release!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { release = resolve; });
+  void h.host.sendRequest('tools/call', { name: 'slow', arguments: {} }).catch(() => {});
+  await until(() => fakeTools.calls.length === 1, 'the first call to begin');
+  void h.host.sendRequest('tools/call', { name: 'send_message', arguments: { content: 'late' } }).catch(() => {});
+  h.serverSide.once('close', () => setTimeout(release, 50));
+  const atServed = h.served.then(() => fakeTools.calls.map((c) => c.name));
+  await h.close();
+  assert.deepEqual(await atServed, ['slow', 'slow:end']);
 });
 
 test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing definition alone', async () => {

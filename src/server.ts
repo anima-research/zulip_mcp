@@ -370,13 +370,19 @@ export class ZulipMcplServer {
       this.startEvents();
     }
 
-    while (!conn.isClosed) {
-      const msg = await conn.nextMessage();
-      if (msg.type === 'request') {
-        await this.handleRequest(conn, msg.request);
-      } else {
-        await this.handleNotification(conn, msg.notification);
+    let requests: Promise<void> = Promise.resolve();
+    try {
+      while (!conn.isClosed) {
+        const msg = await conn.nextMessage();
+        requests = requests.then(() => {
+          if (conn.isClosed) return;
+          return msg.type === 'request'
+            ? this.handleRequest(conn, msg.request)
+            : this.handleNotification(conn, msg.notification);
+        });
       }
+    } finally {
+      await requests;
     }
   }
 
