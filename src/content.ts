@@ -53,11 +53,15 @@ export async function fetchAttachmentBytes(
   opts: { headers?: Record<string, string> } = {},
 ): Promise<FetchedAttachment> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  let timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const progressed = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  };
   try {
-    return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal);
+    return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal, progressed);
   } catch (err) {
-    if (controller.signal.aborted) throw new Error(`The download of ${fallbackName} didn't finish within ${DEFAULT_TIMEOUT_MS / 1000} s.`);
+    if (controller.signal.aborted) throw new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`);
     throw err;
   } finally {
     clearTimeout(timer);
@@ -69,8 +73,10 @@ async function readAttachment(
   fallbackName: string,
   headers: Record<string, string>,
   signal: AbortSignal,
+  progressed: () => void,
 ): Promise<FetchedAttachment> {
   const resp = await fetch(url, { headers, redirect: "follow", signal });
+  progressed();
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
   // Pre-check Content-Length so an oversized declared body never starts buffering.
@@ -97,6 +103,7 @@ async function readAttachment(
       const { value, done } = await reader.read();
       if (done) break;
       if (!value) continue;
+      progressed();
       total += value.byteLength;
       if (total > MAX_ATTACHMENT_BYTES) {
         reader.cancel().catch(() => {});

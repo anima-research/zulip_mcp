@@ -3,9 +3,10 @@
   come. It used to wait as long as the answer took, and without end when none
   came, until the server restarted. The error says whether the request may have
   been applied. File uploads have no bound.
-- `fetch_attachment`'s download ends after 15 s, headers and body together,
-  with an error saying the download didn't finish. It used to wait as long as
-  the download took, and without end when it stalled.
+- `fetch_attachment`'s download ends when it gets no data for 15 s, before its
+  headers or between two parts of its body, with an error that says so. A slow
+  download that keeps moving still finishes. It used to wait without end when
+  it stalled.
 - A history page that the server reads to recover messages it missed, or to
   count them, waits up to 90 s. Past that it fails, where it used to wait
   without end.

@@ -24,7 +24,8 @@ type Answer =
   | { json: unknown; status?: number; delayMs?: number }
   | { html: string; status: number }
   | 'hang'
-  | 'stall-body';
+  | 'stall-body'
+  | { slow: string[]; everyMs: number };
 
 async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>) {
   const requests: Recorded[] = [];
@@ -56,6 +57,17 @@ async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>
         res.statusCode = 200;
         res.setHeader('content-type', 'application/json');
         res.write('{"result":"success","streams":[');
+      } else if ('slow' in answer) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/plain');
+        const parts = [...answer.slow];
+        const next = () => {
+          const part = parts.shift();
+          if (part === undefined) { res.end(); return; }
+          res.write(part);
+          setTimeout(next, answer.everyMs);
+        };
+        next();
       } else if ('html' in answer) {
         res.statusCode = answer.status;
         res.setHeader('content-type', 'text/html');
@@ -329,18 +341,27 @@ test('a bound also ends a call whose answer stalls after its headers', { timeout
   } finally { z.close(); }
 });
 
-test('fetch_attachment ends a download that gets no answer, or stalls after its headers, at 15 s', { timeout: 10_000 }, async () => {
-  const z = await realm({ 'GET /user_uploads/2/ab/never.png': 'hang', 'GET /user_uploads/2/ab/stalls.png': 'stall-body' });
+test('fetch_attachment ends a download that gets no data for 15 s, and a slow one that keeps moving finishes', { timeout: 10_000 }, async () => {
+  const slow = ['one ', 'two ', 'three ', 'four ', 'five ', 'six'];
+  const z = await realm({
+    'GET /user_uploads/2/ab/never.png': 'hang',
+    'GET /user_uploads/2/ab/stalls.png': 'stall-body',
+    'GET /user_uploads/2/ab/slow.txt': { slow, everyMs: 100 },
+  });
   const s = await serverOn(z.url);
   const original = globalThis.setTimeout;
-  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 50 : ms, ...rest)) as typeof setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 200 : ms, ...rest)) as typeof setTimeout;
   try {
     for (const name of ['never.png', 'stalls.png']) {
       await assert.rejects(s.tools.handleToolCall('fetch_attachment', { path: `/user_uploads/2/ab/${name}` }), (err: Error) => {
-        assert.equal(err.message, `The download of ${name} didn't finish within 15 s.`);
+        assert.equal(err.message, `The download of ${name} got no data for 15 s.`);
         return true;
       }, name);
     }
+    const started = Date.now();
+    const fetched = await s.tools.handleToolCall('fetch_attachment', { path: '/user_uploads/2/ab/slow.txt' }) as { content_text?: string };
+    assert.equal(fetched.content_text, slow.join(''));
+    assert.ok(Date.now() - started > 400, 'the download took longer than the bound as a whole');
   } finally { globalThis.setTimeout = original; s.done(); z.close(); }
 });
 
