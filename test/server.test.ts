@@ -2604,11 +2604,11 @@ test('the reconnect catch-up and the missed-tally backfill wait 90 s for each hi
       await initialize(first, true);
       await settled(first);
       first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'the addressed message accepted');
+      await until(() => first.delivery.watermark('zulip:general') === 1, 'the addressed message accepted');
       await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
       await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
       first.adapter.emit!(streamMsg(2));
-      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'ambient tally seeded');
+      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'ambient tally seeded');
     } finally { await first.close(); }
     const bounds: (number | undefined)[] = [];
     const { api } = standInApi({ 'GET /messages': { result: 'success', messages: [], found_newest: true, found_oldest: true } });
@@ -2618,7 +2618,7 @@ test('the reconnect catch-up and the missed-tally backfill wait 90 s for each hi
         if (path === '/messages') bounds.push(opts?.timeoutMs);
         return api.request(verb, path, what, params, opts);
       }) as typeof api.request,
-    }, 100, 'session');
+    }, 100, 'session', { directory: historyStreams() });
     second = harness({ stateDir: dir, sessionId: 'bound' });
     second.adapter.fetchHistory = (channelId, query) => history.fetchHistory(channelId, query);
     await initialize(second, true);
