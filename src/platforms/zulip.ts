@@ -189,6 +189,8 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly identity: ZulipIdentity;
   private readonly backscrollDefault: number;
   private readonly backscrollLimits: ReadonlyMap<string, number>;
+  /** For each backscroll entry, the rename its log line last named. */
+  private backscrollFormerSaid = new Map<string, string | undefined>();
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
   private readonly maxMessageLength: number;
@@ -244,13 +246,21 @@ export class ZulipAdapter implements PlatformAdapter {
     this.uploadPolicy = options.uploadPolicy ?? null;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
     this.directory = options.directory ?? new StreamDirectory();
-    if (this.backscrollLimits.size > 0) void this.directory.whenFilled().then(() => this.logFormerBackscrollNames());
+    if (this.backscrollLimits.size > 0) {
+      void this.directory.whenFilled().then(() => this.logFormerBackscrollNames());
+      this.directory.onChange((change) => {
+        if (change.renamed.length > 0 && this.directory.isFilled) this.logFormerBackscrollNames();
+      });
+    }
     if (this.uploader && !this.uploadPolicy) throw new Error('ZulipAdapter: uploader needs an uploadPolicy');
   }
 
   private logFormerBackscrollNames(): void {
     for (const name of this.backscrollLimits.keys()) {
       const former = this.directory.formerOf(name);
+      const said = former ? `${former.id}:${former.current}` : undefined;
+      if (this.backscrollFormerSaid.get(name) === said) continue;
+      this.backscrollFormerSaid.set(name, said);
       if (former) console.error(`[zulip-mcp] ZULIP_BACKSCROLL_CHANNELS names #${name}, which Zulip stream ${former.id} had before it was renamed #${former.current}; the default cap applies to it`);
     }
   }
@@ -419,7 +429,10 @@ export class ZulipAdapter implements PlatformAdapter {
       if (!Number.isSafeInteger(raw.sender_id) || raw.sender_id <= 0) throw new Error('response contained no valid sender_id');
       const m = normalizeMessage(raw);
       const key = await this.keyFor(m, raw);
-      if (key === null) return null;
+      if (key === null) {
+        if (quoteLookup) throw new Error(`the stream of message ${messageId} is not in the stream list yet`);
+        return null;
+      }
       this.remember(key, m);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
@@ -794,8 +807,9 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * One read of the stream list, which only adds to the directory: at most
-   * one a minute, unless `force`.
+   * One read of the stream list into the directory, which takes it whole
+   * while no queue is registered, and otherwise adds only what it does not
+   * hold: at most one a minute, unless `force`.
    */
   async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
     if (!force && Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return;

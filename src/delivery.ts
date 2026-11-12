@@ -34,7 +34,7 @@ import { join } from 'node:path';
 import type { TextContent } from '@animalabs/mcpl-core';
 import { dmKey, isDmKey, parseKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
 import { dmChannelIdFor, parseDmChannelId } from './history.js';
-import type { StreamDirectory } from './stream-directory.js';
+import type { DirectorySnapshot, StreamDirectory } from './stream-directory.js';
 import { messageLineHead } from './message-line.js';
 
 export interface MissedTally {
@@ -79,6 +79,10 @@ const HELD_CAP_PER_CHANNEL = 50_000;
 export class DeliveryState {
   /** Whether `save` writes the file. */
   writes = true;
+  /** Called with the keys a file from before stream ids gave a watermark, once the directory resolved their names. */
+  onResolved: ((keys: ChannelKey[]) => void) | null = null;
+  /** The directory's copy as this process last loaded or wrote it. */
+  private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
   private lastOpen = new Set<ChannelKey>();
@@ -118,7 +122,10 @@ export class DeliveryState {
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8')) as DeliveryFile;
       const saved = parsed.streams && typeof parsed.streams === 'object' ? parsed.streams : null;
-      if (saved) this.directory.load({ streams: saved, formerNames: parsed.formerNames ?? {} });
+      if (saved) {
+        this.directory.load({ streams: saved, formerNames: parsed.formerNames ?? {} });
+        this.copy = this.directory.snapshot();
+      }
       const idBySavedName = new Map<string, number>();
       for (const [id, name] of Object.entries(saved ?? {})) if (typeof name === 'string') idBySavedName.set(name, Number(id));
       const keyOf = (chan: string): ChannelKey | null => {
@@ -164,6 +171,7 @@ export class DeliveryState {
 
   /** A file from before stream ids: its entries carry by name, once the directory knows the names. */
   private resolveByName(): void {
+    const resolved: ChannelKey[] = [];
     for (const [name, u] of this.unresolved) {
       const id = this.directory.idOf(name);
       if (id === undefined) {
@@ -171,12 +179,21 @@ export class DeliveryState {
         continue;
       }
       const key = streamKey(id);
-      if (u.watermark !== undefined && !this.watermarks.has(key)) this.watermarks.set(key, u.watermark);
+      if (u.watermark !== undefined && !this.watermarks.has(key)) {
+        this.watermarks.set(key, u.watermark);
+        resolved.push(key);
+      }
       if (u.missed && !this.missed.has(key)) this.missed.set(key, u.missed);
       if (u.lastOpen) this.lastOpen.add(key);
     }
     this.unresolved.clear();
+    if (resolved.length > 0) this.onResolved?.(resolved);
     this.save();
+  }
+
+  /** The directory's copy as this process last loaded or wrote it; null where it has neither. */
+  directoryCopy(): DirectorySnapshot | null {
+    return this.copy;
   }
 
   /** The channel id a key is written under: the stream's current name, or the DM's user ids. */
@@ -206,17 +223,19 @@ export class DeliveryState {
       };
       const lastOpen = [...this.lastOpen].map((key) => this.fileKey(key)).filter((c): c is string => c !== null);
       for (const [name, u] of this.unresolved) if (u.lastOpen) lastOpen.push(`zulip:${name}`);
+      const copy = this.copy !== null || this.directory.isFilled ? this.directory.snapshot() : null;
       const out: DeliveryFile = {
         watermarks: Object.fromEntries(entries(this.watermarks)),
         missed: Object.fromEntries(entries(this.missed)),
         lastOpen: lastOpen.sort(),
-        ...this.directory.snapshot(),
+        ...(copy ?? {}),
       };
       // tmp + rename: a crash mid-write must not leave a truncated file that
       // the next start reads as "no watermarks" and sweeps from nowhere.
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
       renameSync(tmp, path);
+      if (copy) this.copy = copy;
     } catch (err) {
       console.error('[zulip-mcp] Failed to save delivery state:', (err as Error).message);
     }
@@ -289,7 +308,7 @@ export class DeliveryState {
       // Keep the lowest ids: the floor protects everything above it anyway.
       const highest = Math.max(...held.keys());
       if (messageId >= highest) {
-        console.error(`[zulip-mcp] ${key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
+        console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
         return;
       }
       held.delete(highest);

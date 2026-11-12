@@ -243,6 +243,30 @@ export class ZulipToolRuntime {
   /** Set by the server while its client speaks MCPL; while it is null, a stream name goes to Zulip as given. */
   channelIds: ChannelIds | null = null;
 
+  /**
+   * With MCPL, each stream name a tool was given, by the directory: the
+   * stream's id for a name it holds, and nothing for a name it doesn't know.
+   * A former name refuses the call, before anything goes to Zulip.
+   */
+  private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const ids = this.channelIds;
+    if (!ids) return out;
+    const renamed: string[] = [];
+    for (const name of names) {
+      const answer = await ids.keyOf(`zulip:${name}`, { byName: true });
+      if ("key" in answer) {
+        const parsed = parseKey(answer.key);
+        if (parsed.kind === "stream") out.set(name, parsed.streamId);
+        continue;
+      }
+      const former = "refusal" in answer ? ids.directory.formerOf(name) : undefined;
+      if (former) renamed.push(`Zulip stream #${name} was renamed #${former.current}.`);
+    }
+    if (renamed.length > 0) throw new Error(`${renamed.join(" ")} Nothing went to Zulip.`);
+    return out;
+  }
+
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
@@ -487,6 +511,7 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
+          await this.streamIdsByName(channels);
           const result = await api.requestAnswer<any>("POST", "/users/me/subscriptions", {
             subscriptions: channels.map(name => ({ name })),
           });
@@ -530,6 +555,7 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
+          await this.streamIdsByName(channels);
           const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
             subscriptions: channels,
           });
@@ -722,11 +748,18 @@ export class ZulipToolRuntime {
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
-        const uploaded = await this.uploadFor(args);
-        const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
+        const isDm = args.type === "private" || args.type === "direct";
+        let channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
-        const isDm = args.type === "private" || args.type === "direct";
+        if (!reply && !isDm && typeof args.to === "string") {
+          const streamId = (await this.streamIdsByName([args.to])).get(args.to);
+          if (streamId !== undefined) {
+            channelId = this.channelIds?.channelIdOf(streamKey(streamId)) ?? channelId;
+            args = { ...args, to: streamId };
+          }
+        }
+        const uploaded = await this.uploadFor(args);
         // A stream send with no topic keeps sending the topic text "undefined", as it did through zulip-js, until #44 decides what it should do.
         const topic = args.topic === undefined && !isDm ? "undefined" : args.topic;
         const { chunks, last } = await this.send({ type: args.type, to: args.to, topic }, hasText ? args.content : "", uploaded, channelId);

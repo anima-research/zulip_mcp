@@ -2,8 +2,8 @@
  * The stream ids and names Zulip has told this server about:
  *   - a queue registration's own `streams` list replaces it;
  *   - a `stream` event changes it, in queue order;
- *   - any other list (discovery, a refresh, a miss) replaces it until a
- *     queue has registered, and after that only adds ids it does not hold;
+ *   - any other list (discovery, a refresh, a miss) replaces it while no
+ *     queue is registered, and otherwise only adds ids it does not hold;
  *   - a message's `display_recipient` never changes it.
  *
  * A name a stream had and no stream has now is kept as a former name of that
@@ -53,6 +53,8 @@ export class StreamDirectory {
   private filled = false;
   private queueRegistered = false;
   private fillWaiters: (() => void)[] = [];
+  private listed = false;
+  private listedWaiters: (() => void)[] = [];
   private listeners: Listener[] = [];
   private reportedDmLike = new Set<string>();
 
@@ -85,6 +87,36 @@ export class StreamDirectory {
   whenFilled(): Promise<void> {
     if (this.filled) return Promise.resolve();
     return new Promise((resolve) => this.fillWaiters.push(resolve));
+  }
+
+  /** Resolves at the first fill, or once a read of the list got no answer and what waits for one goes on with what the directory holds. */
+  whenListed(): Promise<void> {
+    if (this.listed) return Promise.resolve();
+    return new Promise((resolve) => this.listedWaiters.push(resolve));
+  }
+
+  /** A read of the stream list got no answer: what waits for a list goes on with what the directory holds. */
+  listUnanswered(): void {
+    this.settleListed();
+  }
+
+  private settleListed(): void {
+    if (this.listed) return;
+    this.listed = true;
+    for (const resolve of this.listedWaiters.splice(0)) resolve();
+  }
+
+  /**
+   * Start again from a copy, as a connection does: not filled until its first
+   * list, and no queue registered until its own. Tells no listener.
+   */
+  restart(copy: Partial<DirectorySnapshot> | null): void {
+    this.byId = new Map();
+    this.byName = new Map();
+    this.former = new Map();
+    this.filled = false;
+    this.queueRegistered = false;
+    if (copy) this.load(copy);
   }
 
   /** Called synchronously, in the same tick as the change it reports. */
@@ -141,6 +173,7 @@ export class StreamDirectory {
     this.filled = true;
     this.emit(change);
     if (!wasFilled) for (const resolve of this.fillWaiters.splice(0)) resolve();
+    this.settleListed();
     return change;
   }
 

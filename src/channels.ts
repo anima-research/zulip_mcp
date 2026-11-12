@@ -226,6 +226,9 @@ export class ChannelManager {
       const queued = new Set(added.map((d) => d.id));
       for (const [id, d] of this.unannounced) {
         if (queued.has(id) || this.announcing.has(id)) continue;
+        const key = this.ids.keyOfDescriptor(d);
+        const fresh = key === null ? null : this.ids.freshIdOf(key);
+        if (fresh !== null && fresh !== id) continue;
         before.set(id, 'pending');
         added.push(d);
       }
@@ -701,7 +704,10 @@ export class ChannelManager {
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
     const key = await this.resolveTarget(channelId);
-    if (typeof key !== 'string') return;
+    if (typeof key !== 'string') {
+      console.error(`[zulip-mcp] typing on ${channelId}: no Zulip stream is named #${key.streamName}, so nothing was sent`);
+      return;
+    }
     const descriptor = this.allChannels.get(this.ids.channelIdOf(key) ?? channelId);
     // A topic the host names wins. Like publish, a host that names none means
     // the conversation's current one, the topic of the newest message
