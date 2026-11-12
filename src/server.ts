@@ -1663,7 +1663,7 @@ export class ZulipMcplServer {
       if (!this.delivery.wasOpen(key)) continue;
       const fresh = this.ids.channelIdOf(key);
       if (fresh === null) continue;
-      const text = `Zulip stream #${from} was renamed #${to} while this server was down. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
+      const text = `Zulip stream #${from} was renamed #${to} while no host was connected to this server. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
         `Open ${fresh} to keep hearing it. What you had read stays read.`;
       const pushed = await this.pushEvent({
         key,
@@ -1835,6 +1835,16 @@ export class ZulipMcplServer {
     return this.filters;
   }
 
+  /** With MCPL, a former stream name is refused, each with its new name, before anything is written. */
+  private refuseFormerNames(names: string[]): void {
+    if (!this.mcplActive) return;
+    const renamed = names.flatMap((name) => {
+      const former = this.directory.formerOf(name);
+      return former ? [`Zulip stream #${name} was renamed #${former.current}.`] : [];
+    });
+    if (renamed.length > 0) throw new Error(`${renamed.join(' ')} Nothing was written.`);
+  }
+
   private streamArg(value: unknown): string {
     const raw = String(value ?? '').trim().replace(/^#/, '');
     if (!raw) throw new Error('channel is required');
@@ -1868,6 +1878,7 @@ export class ZulipMcplServer {
         if (addStreams.length === 0 && removeStreams.length === 0 && setDmUsers === undefined) {
           throw new Error('Nothing to change: pass addStreams, removeStreams, and/or setDmUsers.');
         }
+        this.refuseFormerNames([...addStreams, ...removeStreams]);
         let materialized = false;
         const result = plane.update((f) => {
           let streams = f.streams ? [...f.streams] : null;
@@ -1916,6 +1927,7 @@ export class ZulipMcplServer {
       case 'unmute_channel': {
         const plane = this.requireFilters();
         const stream = this.streamArg(args.channel);
+        this.refuseFormerNames([stream]);
         const mute = name === 'mute_channel';
         const result = plane.update((f) => {
           const muted = new Set(f.mutedStreams ?? []);
@@ -1936,6 +1948,7 @@ export class ZulipMcplServer {
       case 'set_reaction_visibility': {
         const plane = this.requireFilters();
         const channelId = this.channelIdArg(args.channel);
+        if (!isDmChannelId(channelId)) this.refuseFormerNames([channelId.slice('zulip:'.length)]);
         const visible = args.visible === true;
         const result = plane.update((f) => {
           const set = new Set(f.reactionChannels ?? []);
