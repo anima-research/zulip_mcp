@@ -20,7 +20,7 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import type { ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { chunkMessage } from "./content.js";
+import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from "./content.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -248,15 +248,17 @@ export class ZulipToolRuntime {
   private readonly uploadPolicy: UploadPolicy;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
   private readonly formatTime: (d: Date) => string;
+  private readonly maxMessageLength: number;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string; maxMessageLength?: number } = {},
   ) {
     this.api = session.api;
     this.sessionId = session.sessionId;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
+    this.maxMessageLength = options.maxMessageLength ?? ZULIP_MAX_MESSAGE_LENGTH;
     this.uploader = options.uploader ?? (session.realm ? createZulipUploader(session) : null);
     this.uploadPolicy = options.uploadPolicy ?? resolveUploadPolicy(process.env, session.maxUploadBytes);
     this.loadState();
@@ -746,7 +748,14 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        return api.request("PATCH", `/messages/${args.message_id}`, `editing message ${args.message_id}`, {
+        const messageId = numberOrUndefined(args.message_id);
+        if (messageId === undefined || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error("message_id must be a positive integer");
+        if (typeof args.content !== "string") throw new Error("content must be a string");
+        const length = [...args.content].length;
+        if (length > this.maxMessageLength) {
+          throw new Error(`content is ${length} characters, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
+        }
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, {
           message_id: args.message_id,
           content: args.content,
         });

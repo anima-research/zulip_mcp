@@ -115,6 +115,16 @@ test('a long edit_message, above 8,000 characters, is applied', async () => {
   assert.equal((await user.message(sent.id)).content, long);
 });
 
+test('Zulip itself cuts an edit above its limit to its length and marks the cut, which is why edit_message refuses one', async (t) => {
+  const stream = await newStream(env, 'over-limit');
+  const sent = await api.request<{ id: number }>('POST', '/messages', 'a stream message', { type: 'stream', to: stream, topic: 'edits', content: 'short' });
+  await api.request('PATCH', `/messages/${sent.id}`, 'an edit above the limit', { content: 'b'.repeat(10_050) });
+  const stored = (await user.message(sent.id)).content;
+  t.diagnostic(`stored ${[...stored].length} code points, ending ${JSON.stringify(stored.slice(-24))}`);
+  assert.equal([...stored].length, 10_000);
+  assert.match(stored, /\[message truncated\]$/);
+});
+
 test('send_message to a person with no topic sends none, and Zulip takes it', async () => {
   const sent = (await tools.handleToolCall('send_message', { type: 'private', to: [userId], content: 'no topic for a direct message' })) as { id: number };
   const read = await user.message(sent.id);

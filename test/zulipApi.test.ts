@@ -253,3 +253,32 @@ test('listen and unlisten return Zulip\'s refusal as data, as they do today', as
     assert.equal(left.msg, 'Invalid stream name');
   } finally { s.done(); z.close(); }
 });
+
+test('edit_message refuses an edit with no content, or a message_id that is not a positive integer, before asking Zulip', async () => {
+  const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
+  const s = await serverOn(z.url);
+  try {
+    await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 55 }), /content/);
+    for (const message_id of [0, -3, 1.5, 'abc', undefined]) {
+      await assert.rejects(s.tools.handleToolCall('edit_message', { message_id, content: 'x' }), /message_id/, `message_id ${String(message_id)}`);
+    }
+    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 0, 'Zulip was never asked');
+    await s.tools.handleToolCall('edit_message', { message_id: '55', content: 'a numeric string still names the message' });
+    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 1);
+  } finally { s.done(); z.close(); }
+});
+
+test('edit_message refuses content above the message length, counted in code points, with both lengths, before asking Zulip', async () => {
+  const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
+  const s = await serverOn(z.url);
+  try {
+    await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 55, content: 'a'.repeat(10_001) }), (err: Error) => {
+      assert.match(err.message, /10001/);
+      assert.match(err.message, /10000/);
+      return true;
+    });
+    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 0, 'Zulip was never asked');
+    await s.tools.handleToolCall('edit_message', { message_id: 55, content: '😀'.repeat(10_000) });
+    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 1, '10,000 code points are 20,000 UTF-16 units, and fit');
+  } finally { s.done(); z.close(); }
+});

@@ -112,6 +112,7 @@ async function main(): Promise<void> {
   }
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
+  const maxMessageLength = process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined;
   const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
     formatTime,
     uploader,
@@ -119,9 +120,9 @@ async function main(): Promise<void> {
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
-    maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
+    maxMessageLength,
   });
-  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
