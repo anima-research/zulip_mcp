@@ -711,6 +711,34 @@ test('two callers announcing the same new channel send one announcement (#20)', 
   assert.deepEqual([a.announced, b.announced].flat(), ['zulip:ops']);
 });
 
+test('an id that an unanswered change added stays at the host once a new stream holds it: the next change does not remove it', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown;
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  await manager.registerAdditional([on('zulip:a', 17)]);
+
+  answer = new Error('timed out');
+  assert.equal(await manager.announceChanges(['zulip:a'], [on('zulip:tmp', 17)]), 'unanswered');
+
+  // A new stream takes #tmp, and the host is told of it under zulip:tmp.
+  answer = undefined;
+  assert.deepEqual((await manager.registerAdditional([on('zulip:tmp', 101)])).announced, ['zulip:tmp']);
+
+  await manager.announceChanges(['zulip:a'], [on('zulip:b', 17)]);
+  assert.deepEqual(sent.at(-1)?.removed, ['zulip:a'], 'stream 101 holds zulip:tmp at the host');
+});
+
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
   // The descriptor is recorded before the announcement, so "already in
   // allChannels" cannot mean "the host accepted it" — only a verdict can.

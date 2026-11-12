@@ -50,6 +50,8 @@ interface Run {
   logs: string[];
   /** Answer the `channels/changed` requests held so far. */
   answerChanged(): void;
+  /** Answer the held `channels/changed` requests, and every later one at once. */
+  releaseChanged(): void;
   open(channelId: string, history?: Record<string, unknown>): Promise<{ channel?: ChannelDescriptor; history?: IncomingChannelMessage[] }>;
   tool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }>;
   close(): Promise<void>;
@@ -103,6 +105,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
   const changed: Run['changed'] = [];
   const registered: ChannelDescriptor[] = [];
   const held: (() => void)[] = [];
+  let holding = opts.holdChanged ?? false;
   host.on('request', (req) => {
     if (req.method === method.CHANNELS_REGISTER) {
       const p = req.params as ChannelsRegisterParams;
@@ -119,7 +122,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
       const p = req.params as Run['changed'][number];
       changed.push(p);
       const answer = () => { try { host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) }); } catch { /* closed */ } };
-      if (opts.holdChanged) held.push(answer); else answer();
+      if (holding) held.push(answer); else answer();
     } else {
       host.sendError(req.id, -32601, `unexpected ${req.method}`);
     }
@@ -138,6 +141,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
   return {
     server, host, incoming, pushed, changed, logs,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
+    releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
       return (await host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {}, ...(history ? { history } : {}) })) as { channel?: ChannelDescriptor; history?: IncomingChannelMessage[] };
     },
@@ -589,4 +593,198 @@ scenario('21. a ZULIP_BACKSCROLL_CHANNELS entry under a former name is named in 
   try {
     await until(() => run.logs.some((l) => l.includes('ZULIP_BACKSCROLL_CHANNELS') && l.includes('#general')), 'the log line');
   } finally { await run.close(); }
+});
+
+/** Where a stream's mention reached the host: the channel id it came on, or null. */
+function arrivedOn(run: Run, id: number): string | null {
+  const incoming = run.incoming.find((m) => m.messageId === String(id));
+  if (incoming) return incoming.channelId;
+  const pushed = run.pushed.find((p) => origin(p).messageId === String(id));
+  return pushed ? origin(pushed).mcplChannelId : null;
+}
+
+scenario('22. two streams swap names while the host holds its answers: it never holds one id for two streams, and each stream ends on its own new id', async (dir) => {
+  const r = realm({ 17: 'a', 18: 'b' });
+  const run = await start(r, dir, { holdChanged: true });
+  try {
+    await run.open('zulip:a');
+    await run.open('zulip:b');
+    r.rename(17, 'tmp');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:a')), 'the first announcement');
+    r.rename(18, 'a');
+    r.rename(17, 'b');
+    await new Promise((res) => setTimeout(res, 800));
+    run.releaseChanged();
+    await run.tool('refresh_channels', {});
+    await new Promise((res) => setTimeout(res, 800));
+    const held = new Map<string, number | undefined>([['zulip:a', 17], ['zulip:b', 18]]);
+    for (const c of run.changed) {
+      for (const id of c.removed ?? []) held.delete(id);
+      for (const d of c.added ?? []) {
+        const stream = (d.address as { stream_id?: number }).stream_id;
+        assert.ok(!held.has(d.id) || held.get(d.id) === stream, `${d.id} added for stream ${stream} while the host holds it for stream ${held.get(d.id)}`);
+        held.set(d.id, stream);
+      }
+    }
+    const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
+    assert.deepEqual(listed.channels.map((c) => [c.id, (c.address as { stream_id?: number }).stream_id]).sort(), [['zulip:a', 18], ['zulip:b', 17]]);
+    const lineOn = (held: string, fresh: string) => run.incoming.some((m) => m.channelId === held && textOf(m).includes(`Its channel is now ${fresh}`));
+    assert.ok(lineOn('zulip:a', 'zulip:b'), 'stream 17\'s open channel was told of zulip:b');
+    assert.ok(lineOn('zulip:b', 'zulip:a'), 'stream 18\'s open channel was told of zulip:a');
+    const to17 = r.post(17, '@bot to 17', { mentioned: true });
+    const to18 = r.post(18, '@bot to 18', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null && arrivedOn(run, to18) !== null, 'both mentions');
+    assert.equal(arrivedOn(run, to17), 'zulip:b');
+    assert.equal(arrivedOn(run, to18), 'zulip:a');
+  } finally { run.answerChanged(); await run.close(); }
+});
+
+scenario('23. two streams swap names while the server is down: each keeps its own filters entry, and each gets its push', async (dir) => {
+  const r = realm({ 17: 'a', 18: 'b' });
+  writeFilters(dir, { mutedStreams: ['b'] });
+  let run = await start(r, dir);
+  try {
+    await run.open('zulip:a');
+    await run.open('zulip:b');
+  } finally { await run.close(); }
+  r.rename(17, 'tmp');
+  r.rename(18, 'a');
+  r.rename(17, 'b');
+  run = await start(r, dir);
+  try {
+    await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["a"]', 'the mute on stream 18 under its new name');
+    await until(() => run.pushed.some((p) => origin(p).mcplChannelId === 'zulip:a') && run.pushed.some((p) => origin(p).mcplChannelId === 'zulip:b'), 'a push from each new channel');
+    const pushText = (channelId: string) => run.pushed.filter((p) => origin(p).mcplChannelId === channelId).map((p) => JSON.stringify(p)).join('\n');
+    assert.match(pushText('zulip:b'), /zulip:a now belongs to another stream, which took the name #a\./, 'stream 17\'s push says its old id is another stream\'s now');
+    assert.match(pushText('zulip:a'), /zulip:b now belongs to another stream, which took the name #b\./, 'stream 18\'s push says its old id is another stream\'s now');
+    assert.doesNotMatch(pushText('zulip:a') + pushText('zulip:b'), /is gone/);
+    const to17 = r.post(17, '@bot to 17', { mentioned: true });
+    const to18 = r.post(18, '@bot to 18', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null, 'the mention in 17');
+    assert.equal(arrivedOn(run, to17), 'zulip:b');
+    assert.equal(named(run, to18), false, 'stream 18 is still muted');
+  } finally { await run.close(); }
+});
+
+scenario('24. renamed while the server was down, beside a new stream that took the old name: the rename is seen, the mute follows it, and the push goes', async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { mutedStreams: ['general'] });
+  await savedAsGeneral(r, dir);
+  r.rename(17, 'lobby');
+  const reused = r.create('general');
+  const run = await start(r, dir);
+  try {
+    await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["lobby"]', 'the mute under the new name');
+    await until(() => run.logs.some((l) => l.includes('Zulip stream 17 was renamed #general -> #lobby')), 'the rename in the log');
+    const fromNew = r.post(reused, '@bot from the new #general', { mentioned: true });
+    await until(() => arrivedOn(run, fromNew) !== null, 'the new #general\'s mention');
+    assert.equal(arrivedOn(run, fromNew), 'zulip:general');
+  } finally { await run.close(); }
+});
+
+/**
+ * What a host holds after it applies each `channels/changed` in order, from
+ * `initial`: each channel id and its stream. A removal comes before an
+ * addition, and an added id replaces what the host held under it. `skip`
+ * leaves out one change, as a host that never received it.
+ */
+function hostView(run: Run, initial: Record<string, number>, skip?: number): Record<string, number> {
+  const held = new Map(Object.entries(initial));
+  run.changed.forEach((c, i) => {
+    if (i === skip) return;
+    for (const id of c.removed ?? []) held.delete(id);
+    for (const d of c.added ?? []) held.set(d.id, (d.address as { stream_id: number }).stream_id);
+  });
+  return Object.fromEntries([...held].sort(([x], [y]) => (x < y ? -1 : 1)));
+}
+
+/** What `channels/list` answers: each id and its stream. */
+async function listed(run: Run): Promise<Record<string, number>> {
+  const answer = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
+  return Object.fromEntries(answer.channels.map((c) => [c.id, (c.address as { stream_id: number }).stream_id] as const).sort(([x], [y]) => (x < y ? -1 : 1)));
+}
+
+/** Wait until `read` gives `expected`; past the bound, fail on what it gives then. */
+async function settles<T>(read: () => T | Promise<T>, expected: T, what: string, ms = 3000): Promise<void> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const actual = await read();
+    try {
+      assert.deepEqual(actual, expected, what);
+      return;
+    } catch (error) {
+      if (Date.now() > deadline) throw error;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** Rename stream 17 from #a to #tmp, and let the host's answer to that announcement miss its bound. Returns the announcement's index in `changed`. */
+async function unansweredRename(r: Realm, run: Run): Promise<number> {
+  const before = run.changed.length;
+  r.rename(17, 'tmp');
+  await until(() => run.logs.some((l) => l.includes('got no answer')), 'the announcement of #tmp left unanswered');
+  const first = run.changed.findIndex((c, i) => i >= before && (c.added ?? []).some((d) => d.id === 'zulip:tmp'));
+  assert.ok(first >= 0, 'the host was offered zulip:tmp');
+  run.releaseChanged();
+  return first;
+}
+
+scenario('25. two open streams swap names while the event queue is lost: the registration\'s list shows it, each id ends on its own stream, and each open channel is told that another stream took its old name', async (dir) => {
+  const r = realm({ 17: 'a', 18: 'b', 19: 'other' });
+  const run = await start(r, dir);
+  try {
+    await run.open('zulip:a');
+    await run.open('zulip:b');
+    r.gap(() => {
+      r.rename(17, 'tmp');
+      r.rename(18, 'a');
+      r.rename(17, 'b');
+    });
+    const after = { 'zulip:a': 18, 'zulip:b': 17, 'zulip:other': 19 };
+    await settles(() => hostView(run, { 'zulip:a': 17, 'zulip:b': 18, 'zulip:other': 19 }), after, 'what the host holds');
+    assert.deepEqual(await listed(run), after);
+    const line = (channelId: string) => run.incoming.filter((m) => m.channelId === channelId && textOf(m).includes('was renamed')).map(textOf).join('\n');
+    assert.match(line('zulip:a'), /Its channel is now zulip:b, and zulip:a now belongs to another stream, which took the name #a\./);
+    assert.match(line('zulip:b'), /Its channel is now zulip:a, and zulip:b now belongs to another stream, which took the name #b\./);
+    const to17 = r.post(17, '@bot to 17', { mentioned: true });
+    const to18 = r.post(18, '@bot to 18', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null && arrivedOn(run, to18) !== null, 'both mentions');
+    assert.equal(arrivedOn(run, to17), 'zulip:b');
+    assert.equal(arrivedOn(run, to18), 'zulip:a');
+  } finally { await run.close(); }
+});
+
+scenario('26. a rename whose announcement gets no answer, then a second rename: the host ends holding the newest id alone, whether or not it applied the first', async (dir) => {
+  const r = realm({ 17: 'a' });
+  const run = await start(r, dir, { holdChanged: true });
+  try {
+    await run.open('zulip:a');
+    const first = await unansweredRename(r, run);
+    r.rename(17, 'b');
+    await settles(() => hostView(run, { 'zulip:a': 17 }), { 'zulip:b': 17 }, 'a host that applied the unanswered announcement');
+    assert.deepEqual(hostView(run, { 'zulip:a': 17 }, first), { 'zulip:b': 17 }, 'a host that never received it');
+    assert.deepEqual(await listed(run), { 'zulip:b': 17 });
+    const to17 = r.post(17, '@bot to 17', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null, 'the mention');
+    assert.equal(arrivedOn(run, to17), 'zulip:b');
+  } finally { run.answerChanged(); await run.close(); }
+});
+
+scenario('27. a rename whose announcement gets no answer, then a rename back: the host is told the old id again and ends holding it alone, whether or not it applied the first, and the agent gets no line for it', async (dir) => {
+  const r = realm({ 17: 'a' });
+  const run = await start(r, dir, { holdChanged: true });
+  try {
+    await run.open('zulip:a');
+    const first = await unansweredRename(r, run);
+    r.rename(17, 'a');
+    await until(() => run.changed.slice(first + 1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), 'the host told zulip:a again');
+    await settles(() => hostView(run, { 'zulip:a': 17 }), { 'zulip:a': 17 }, 'a host that applied the unanswered announcement');
+    assert.deepEqual(hostView(run, { 'zulip:a': 17 }, first), { 'zulip:a': 17 }, 'a host that never received it');
+    assert.deepEqual(await listed(run), { 'zulip:a': 17 });
+    assert.equal(run.incoming.some((m) => textOf(m).includes('was renamed #a.')), false, 'no line for an id that did not change');
+    const to17 = r.post(17, '@bot to 17', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null, 'the mention');
+    assert.equal(arrivedOn(run, to17), 'zulip:a');
+  } finally { run.answerChanged(); await run.close(); }
 });

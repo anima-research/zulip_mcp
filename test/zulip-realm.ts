@@ -5,7 +5,8 @@ import { standInApi, type StandInCall } from './zulip-stand-in.ts';
  * A stand-in for one Zulip realm with state: streams that can be renamed,
  * archived and created, the messages in them, and an event queue that
  * hears each change in order, as Zulip 12.4's API describes them. Messages
- * carry their stream's current name, as Zulip's `display_recipient` does.
+ * carry their stream's current name, as Zulip's `display_recipient` does,
+ * and a stream list comes sorted by name, as Zulip 12.4's does.
  */
 export interface Realm {
   api: ZulipApi;
@@ -24,6 +25,12 @@ export interface Realm {
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   create(name: string): number;
+  /**
+   * The bot's event queue is lost while `during` changes the realm: nothing
+   * `during` does reaches a queue, and the next poll is refused with
+   * BAD_EVENT_QUEUE_ID, as Zulip refuses a poll of a queue it has dropped.
+   */
+  gap(during: () => void): void;
   /** A message from someone else; returns its id. */
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean }): number;
 }
@@ -54,12 +61,14 @@ export function realm(initial: Record<number, string>): Realm {
   let nextMessageId = 1000;
   let nextEventId = 0;
   let queues = 0;
+  let dropped = false;
 
   const queue = (event: Record<string, unknown>) => {
+    if (dropped) return;
     events.push({ ...event, id: nextEventId++ });
     for (const wake of waiting.splice(0)) wake();
   };
-  const list = () => [...streams].map(([stream_id, name]) => ({ stream_id, name, invite_only: false, subscriber_count: 2 }));
+  const list = () => [...streams].sort((x, y) => (x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0)).map(([stream_id, name]) => ({ stream_id, name, invite_only: false, subscriber_count: 2 }));
   const idOf = (name: string) => [...streams].find(([, n]) => n === name)?.[0];
   const raw = (m: StoredMessage) => ({
     id: m.id,
@@ -98,6 +107,7 @@ export function realm(initial: Record<number, string>): Realm {
     'GET /users/me': { result: 'success', user_id: SELF },
     'POST /register': (p) => {
       const types = p.event_types as string[] | undefined;
+      dropped = false;
       return {
         result: 'success',
         queue_id: `q${++queues}`,
@@ -107,7 +117,8 @@ export function realm(initial: Record<number, string>): Realm {
     },
     'GET /events': async (p) => {
       const after = Number(p.last_event_id);
-      while (!events.some((e) => (e.id as number) > after)) await new Promise<void>((r) => waiting.push(r));
+      while (!dropped && !events.some((e) => (e.id as number) > after)) await new Promise<void>((r) => waiting.push(r));
+      if (dropped) return { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: `Bad event queue ID: ${String(p.queue_id)}` };
       return { result: 'success', events: events.filter((e) => (e.id as number) > after) };
     },
     'DELETE /events': { result: 'success' },
@@ -182,6 +193,11 @@ export function realm(initial: Record<number, string>): Realm {
       streams.set(id, name);
       queue({ type: 'stream', op: 'create', streams: [{ stream_id: id, name }] });
       return id;
+    },
+    gap(during) {
+      dropped = true;
+      during();
+      for (const wake of waiting.splice(0)) wake();
     },
     post(streamId, content, opts = {}) {
       return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false).id;
