@@ -100,6 +100,7 @@ export class ChannelManager {
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
   private flushing: Promise<void> | null = null;
+  private idleWaiters: (() => void)[] = [];
   /** Per-channel routing hints from the newest message noteConversation
    *  took, so publishes can land in the active thread/topic, with the id of
    *  the message they came from, so an older message delivered late doesn't
@@ -751,6 +752,17 @@ export class ChannelManager {
     await this.flushBatch();
   }
 
+  /** No batch waits for its window and no flush is on the wire. */
+  isIdle(): boolean {
+    return this.batchTimer === null && this.flushing === null;
+  }
+
+  /** Settles once the batch is idle. */
+  idle(): Promise<void> {
+    if (this.isIdle()) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.push(resolve));
+  }
+
   /** Buffered messages not yet delivered (for tests and diagnostics). */
   pendingCount(): number {
     let n = 0;
@@ -767,6 +779,7 @@ export class ChannelManager {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
+    this.wakeIdleWaiters();
   }
 
   /**
@@ -816,8 +829,16 @@ export class ChannelManager {
       }
       this.flushing = this.flushBatch().finally(() => {
         this.flushing = null;
+        this.wakeIdleWaiters();
       });
     }, this.batchWindowMs);
+  }
+
+  private wakeIdleWaiters(): void {
+    if (this.idleWaiters.length === 0 || !this.isIdle()) return;
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   /**

@@ -171,6 +171,9 @@ export class ZulipMcplServer {
    *  backscroll in the first seconds must not hide the offline gap). */
   private sweepAnchors = new Map<ChannelKey, number>();
   private lanes: Lanes<null> | null = null;
+  private requestTail: Promise<void> = Promise.resolve();
+  private requestsWaiting = 0;
+  private healDone: Promise<void> = Promise.resolve();
   private healing = false;
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
@@ -372,20 +375,46 @@ export class ZulipMcplServer {
       this.startEvents();
     }
 
-    let requests: Promise<void> = Promise.resolve();
+    this.requestTail = Promise.resolve();
     try {
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
-        requests = requests.then(() => {
-          if (conn.isClosed) return;
-          return msg.type === 'request'
-            ? this.handleRequest(conn, msg.request)
-            : this.handleNotification(conn, msg.notification);
+        this.requestsWaiting++;
+        this.requestTail = this.requestTail.then(async () => {
+          try {
+            if (conn.isClosed) return;
+            await (msg.type === 'request'
+              ? this.handleRequest(conn, msg.request)
+              : this.handleNotification(conn, msg.notification));
+          } finally {
+            this.requestsWaiting--;
+          }
         });
       }
     } finally {
-      await requests;
+      await this.requestTail;
     }
+  }
+
+  /**
+   * Settles once nothing is under way: no delivery job runs or waits, no
+   * request waits to be served, no batch waits for its window or is on the
+   * wire, and no replay runs. For tests and diagnostics.
+   */
+  async quiet(): Promise<void> {
+    while (!this.isQuiet()) {
+      await Promise.all([
+        this.lanes?.quiet(),
+        this.requestTail,
+        this.channelManager.idle(),
+        this.healDone,
+      ]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  private isQuiet(): boolean {
+    return (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.channelManager.isIdle() && !this.healing;
   }
 
   /**
@@ -1116,6 +1145,8 @@ export class ZulipMcplServer {
     const channels = this.delivery.heldChannels();
     if (channels.length === 0) return;
     this.healing = true;
+    let healed!: () => void;
+    this.healDone = new Promise((resolve) => { healed = resolve; });
     try {
       for (const key of channels) {
         if (this.isMuted(key) || !this.isAllowed(key)) {
@@ -1146,6 +1177,7 @@ export class ZulipMcplServer {
       this.delivery.save();
     } finally {
       this.healing = false;
+      healed();
     }
   }
 

@@ -655,7 +655,7 @@ test('open → incoming with tags → publish routes to the topic of the convers
     content: [{ type: 'text', text: 'before open' }],
     tags: ['chat:ambient'],
   });
-  await new Promise((r) => setTimeout(r, 20));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 0);
 
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} })) as {
@@ -732,7 +732,6 @@ test('context/beforeInference injects history for open channels under zulip.cont
 
   // Disabling the feature set by Notification is a reduction, honoured at once.
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.context'] });
-  await new Promise((r) => setTimeout(r, 10));
   const reduced = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, params)) as { contextInjections: unknown[] };
   assert.deepEqual(reduced.contextInjections, []);
   await h.close();
@@ -790,7 +789,7 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
 
   h.adapter.emit!(streamMsg(2, { text: 'chatter' }));
   h.adapter.emit!(streamMsg(3, { text: 'more chatter' }));
-  await new Promise((r) => setTimeout(r, 20));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 1, 'ambient on a closed channel is not delivered');
   assert.equal(h.pushed.length, 0);
   assert.equal(h.delivery.watermark('zulip:general'), 1, 'a dropped message does not advance the watermark');
@@ -1188,7 +1187,7 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
 
     h.adapter.emit!(streamMsg(1, { mentioned: true, text: '@bot?' }));
     h.adapter.emit!(streamMsg(2));
-    await new Promise((r) => setTimeout(r, 25));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0, 'muted: not even a mention on an open channel gets through');
     assert.equal(h.pushed.length, 0);
 
@@ -1429,6 +1428,31 @@ test('a message still waiting in its channel when the connection ends is offered
   await second.close();
 });
 
+test('quiet() settles once what the server was handed has reached the host: delivery jobs, the batch window, a replay, and a request being served', async () => {
+  const h = harness({ attachments: heldFetches(30).options, batchWindowMs: 30, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return read(key, query);
+  };
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withLog(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['2', '1']);
+
+  fakeTools.calls.length = 0;
+  fakeTools.hold = new Promise((resolve) => setTimeout(resolve, 30));
+  void h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+  await until(() => fakeTools.calls.length === 1, 'the call to begin');
+  await h.server.quiet();
+  assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow', 'slow:end']);
+  await h.close();
+});
+
 test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-wire-'));
   const original = console.error;
@@ -1450,7 +1474,7 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
 
     // Default off: nothing surfaces.
     reaction();
-    await new Promise((r) => setTimeout(r, 20));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0);
 
     const on = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } })) as { content: { text: string }[] }).content[0].text);
@@ -1474,7 +1498,7 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
     // codepoints a glyph-shaped baseline entry is matched on.
     reaction({ emoji: 'biohazard' });
     reaction({ emoji: 'octagonal_sign', emojiCode: '1f6d1', emojiType: 'unicode_emoji' });
-    await new Promise((r) => setTimeout(r, 20));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 2);
 
     // Closed channel with visibility on → push/event.
@@ -1560,7 +1584,7 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
   // Streaming notifications are accepted and deliver nothing.
   h.host.sendNotification(method.CHANNELS_OUTGOING_CHUNK, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', index: 0, delta: 'never sent' });
   h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'never sent' }] });
-  await new Promise((r) => setTimeout(r, 20));
+  await h.host.sendRequest('ping');
   assert.equal(h.adapter.published.length, 3);
   await h.close();
 });
@@ -1778,7 +1802,7 @@ test('live events received before the catch-up sweep are held, so a live deliver
     assert.equal(second.server.isLive, false);
     second.adapter.emit!(streamMsg(6, { mentioned: true, text: 'live @bot' }));
     second.adapter.emit!(streamMsg(5, { mentioned: true }));
-    await new Promise((r) => setTimeout(r, 20));
+    await second.server.quiet();
     assert.equal(second.pushed.length, 0, 'held until the sweep has run');
     release();
     await until(() => second.pushed.length === 2, 'the sweep block, then the live mention');
@@ -1788,7 +1812,7 @@ test('live events received before the catch-up sweep are held, so a live deliver
     assert.match(block, /id=5\]/);
     assert.equal(second.pushed[1].eventId, 'zulip_msg_6');
     assert.equal(second.delivery.watermark('zulip:general'), 6);
-    await new Promise((r) => setTimeout(r, 20));
+    await second.server.quiet();
     assert.equal(second.pushed.length, 2, 'the duplicate of 5 was dropped, not pushed twice');
     await second.close();
   } finally {
@@ -1856,10 +1880,10 @@ test('disabling zulip.messaging stops incoming delivery and its tools until re-e
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
 
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
-  await new Promise((r) => setTimeout(r, 10));
+  await h.host.sendRequest('ping');
   h.adapter.emit!(streamMsg(1));
   h.adapter.emit!(streamMsg(2, { mentioned: true }));
-  await new Promise((r) => setTimeout(r, 25));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 0, 'no channels/incoming under a disabled feature set');
   assert.equal(h.pushed.length, 0);
   assert.equal(h.delivery.watermark('zulip:general'), undefined, 'and nothing is pretended forwarded');
@@ -1886,10 +1910,11 @@ test('a live message landing mid-drain queues behind the held ones instead of bu
     const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
     let releaseFetch!: () => void;
     const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+    let fetchStarted = false;
     const second = harness({
       stateDir: dir, sessionId: 'dr',
       attachments: {
-        source: { async fetch() { await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
+        source: { async fetch() { fetchStarted = true; await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
         inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
       },
     });
@@ -1908,10 +1933,10 @@ test('a live message landing mid-drain queues behind the held ones instead of bu
     assert.equal(second.server.isLive, false);
     releaseSweep();
     // The drain is now stalled on 20's attachment fetch when a live message lands.
-    await new Promise((r) => setTimeout(r, 25));
+    await until(() => fetchStarted, 'the drain reaching the held fetch');
     assert.equal(second.server.isLive, false, 'delivery stays gated until the buffer is empty');
     second.adapter.emit!(streamMsg(22));
-    await new Promise((r) => setTimeout(r, 25));
+    await second.server.quiet();
     assert.equal(second.incoming.length, 0, 'nothing overtakes the held messages');
     releaseFetch();
     await until(() => second.incoming.length === 3, 'all three, in order');
@@ -1951,7 +1976,7 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     // Live: dropped; a mention: not pushed; nothing tallied or watermarked.
     h.adapter.emit!(streamMsg(2, { mentioned: true }));
     h.adapter.emit!(streamMsg(3));
-    await new Promise((r) => setTimeout(r, 25));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 1);
     assert.equal(h.pushed.length, 0);
     assert.equal(h.delivery.watermark('zulip:general'), 1);
@@ -2008,7 +2033,7 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
       },
     ];
     second.adapter.emit!(...dmFrom(7));
-    await new Promise((r) => setTimeout(r, 25));
+    await second.server.quiet();
     assert.equal(second.pushed.length, 1, 'a DM from an excluded sender goes nowhere');
     assert.ok(!second.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:dm:7')), 'and is not even announced');
     second.adapter.emit!(...dmFrom(42));
@@ -2032,7 +2057,8 @@ test('a feature set disabled while a message waits in the batch window withholds
 
     h.adapter.emit!(streamMsg(1));
     h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
-    await new Promise((r) => setTimeout(r, 200));
+    await h.host.sendRequest('ping');
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0, 'withheld at send time, not only at enqueue');
     assert.equal(h.delivery.watermark('zulip:general'), undefined);
     assert.equal(h.delivery.floor('zulip:general'), 1, 'held, not forgotten: not heard is not the same as heard');
@@ -2145,9 +2171,10 @@ test('a host that leaves while the go-live drain waits on an attachment leaves t
 test('shutdown waits for a delivery still fetching its attachment, then flushes it', async () => {
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
+  let fetchStarted = false;
   const h = harness({
     attachments: {
-      source: { async fetch() { await gate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
+      source: { async fetch() { fetchStarted = true; await gate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
       inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
     },
   });
@@ -2158,10 +2185,9 @@ test('shutdown waits for a delivery still fetching its attachment, then flushes 
     ...streamMsg(1, { text: 'see the log' }),
     metadata: { topic: 'deploys', mentioned: false, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
   });
-  await new Promise((r) => setTimeout(r, 10));
+  await until(() => fetchStarted, 'the fetch to start');
   assert.equal(h.server.channelManager.pendingCount(), 0, 'still building its content');
   const done = h.server.shutdown();
-  await new Promise((r) => setTimeout(r, 20));
   assert.equal(h.incoming.length, 0);
   release();
   await done;
@@ -2462,7 +2488,7 @@ test('an edit, move or deletion is as visible as its message: open channels see 
 
   // A message the host never accepted: its edit is noise.
   h.adapter.change!(change({ messageId: '11', messageIds: ['11'] }));
-  await new Promise((r) => setTimeout(r, 30));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 2);
 
   // ...unless the edit now mentions the bot, or the message is the bot's own.
@@ -2500,7 +2526,7 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   // Closed channel: an ambient edit is dropped, an addressed one is pushed.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.change!(change());
-  await new Promise((r) => setTimeout(r, 30));
+  await h.server.quiet();
   assert.equal(h.pushed.length, 0);
   h.adapter.change!(change({ mentioned: true, content: 'ship it @Bot' }));
   await until(() => h.pushed.length === 1, 'an addressed edit on a closed channel');
@@ -3807,7 +3833,7 @@ test('R4-1: a held buffered reply preserves scanned progress through 20 across r
     await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
     await internal.goLive(internal.conn);
     await until(() => h.incoming.some((m) => m.messageId === '5'), 'accepted buffered reply');
-    await new Promise((r) => setTimeout(r, 20));
+    await h.server.quiet();
     assert.equal(h.delivery.watermark('zulip:general'), 20);
     await h.close();
     next = harness({ stateDir: dir, sessionId: 'r4', history: h.adapter.history });
@@ -3887,7 +3913,7 @@ for (const outcome of ['empty', 'error', 'ambient'] as const) {
       };
       for (let i = 0; i < 5; i++) {
         await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await new Promise((r) => setTimeout(r, 15));
+        await h.server.quiet();
       }
       assert.equal(reads, 1);
     } finally { await h.close(); }

@@ -257,7 +257,8 @@ export class Lanes<W> {
     for (const other of this.lanes.values()) if (other.isWaitingForTurn) this.changed(other);
   }
 
-  private isQuiet(): boolean {
+  /** No job runs or waits in any lane that hasn't ended. */
+  isQuiet(): boolean {
     for (const lane of this.lanes.values()) if (!lane.isEnded && !lane.isQuiet) return false;
     return true;
   }
