@@ -803,8 +803,9 @@ export class ZulipAdapter implements PlatformAdapter {
   async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - (this.listReadFor.get(why) ?? -Infinity) < STREAM_REFRESH_HOLDOFF_MS) return;
+    const started = this.listRead === null;
     this.listRead ??= this.readStreamList(why).finally(() => { this.listRead = null; });
-    if (!(await this.listRead)) return;
+    if (!(await this.listRead) || !started) return;
     for (const [what, at] of this.listReadFor) if (now - at >= STREAM_REFRESH_HOLDOFF_MS) this.listReadFor.delete(what);
     this.listReadFor.set(why, now);
   }
