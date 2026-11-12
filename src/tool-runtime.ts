@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import type { ZulipApi } from "./zulip-api.js";
+import { ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from "./content.js";
 import { messageLineHead } from "./message-line.js";
@@ -800,13 +800,25 @@ export class ZulipToolRuntime {
         const byName = args.stream !== undefined && args.stream !== null;
         const byId = args.stream_id !== undefined && args.stream_id !== null;
         if (byName === byId) throw new Error("Give exactly one of stream and stream_id.");
+        if (byName && (typeof args.stream !== "string" || args.stream === "")) throw new Error("stream must be a stream's name.");
+        const givenId = typeof args.stream_id === "string" && /^[0-9]+$/.test(args.stream_id) ? Number(args.stream_id) : args.stream_id;
+        if (byId && !(typeof givenId === "number" && Number.isSafeInteger(givenId) && givenId > 0)) {
+          throw new Error("stream_id must be a positive integer.");
+        }
         const limit = args.limit ?? undefined;
-        if (limit !== undefined && !(typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0)) {
+        if (limit !== undefined && !(typeof limit === "number" && Number.isInteger(limit) && limit > 0)) {
           throw new Error("limit must be a positive integer.");
         }
-        const streamId = byName
-          ? (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id
-          : args.stream_id;
+        let streamId = givenId;
+        if (byName) {
+          try {
+            streamId = (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id;
+          } catch (err) {
+            if (err instanceof ZulipNoAnswer) throw err;
+            const text = (err as Error).message;
+            throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
+          }
+        }
         const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];
