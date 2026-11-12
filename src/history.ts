@@ -126,6 +126,7 @@ export interface HistoryQuery {
   before?: number;
   /** Exclusive lower id bound — everything newer than here. */
   after?: number;
+  timeoutMs?: number;
 }
 
 export interface HistoryPage {
@@ -274,7 +275,7 @@ export async function fetchHistory(api: ZulipApi, q: HistoryQuery): Promise<Hist
     apply_markdown: false,
     // Exclusive cursors; 'newest' already excludes nothing real.
     include_anchor: q.after === undefined && q.before === undefined,
-  });
+  }, { timeoutMs: q.timeoutMs });
 
   const messages: ZulipMessage[] = ((result?.messages ?? []) as ZulipRawMessage[])
     .map(normalizeMessage)

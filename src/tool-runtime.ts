@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import type { ZulipApi } from "./zulip-api.js";
+import { mayHaveBeenApplied, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
@@ -163,6 +163,12 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   return Math.max(min, Math.min(max, n));
 }
 
+function positiveIdArg(name: string, value: unknown): number {
+  const id = typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : value;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error(`${name} must be a positive integer`);
+  return id;
+}
+
 function numberOrUndefined(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
@@ -228,8 +234,6 @@ export class ZulipToolRuntime {
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
-  /** Called when that delete_message failed: the message still exists, and
-   *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
   /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
@@ -740,8 +744,7 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        const messageId = typeof args.message_id === "string" && /^[0-9]+$/.test(args.message_id) ? Number(args.message_id) : args.message_id;
-        if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error("message_id must be a positive integer");
+        const messageId = positiveIdArg("message_id", args.message_id);
         if (typeof args.content !== "string") throw new Error("content must be a string");
         const length = [...args.content].length;
         if (length > this.maxMessageLength) {
@@ -752,12 +755,13 @@ export class ZulipToolRuntime {
 
       case "delete_message": {
         // Noted before the call: the delete event can arrive before the
-        // response does. Un-noted on failure: nothing will echo.
+        // response does. Un-noted once the delete surely failed: nothing will echo.
+        const messageId = positiveIdArg("message_id", args.message_id);
         this.onDeleted?.(String(args.message_id));
         try {
-          return await api.request("DELETE", `/messages/${args.message_id}`, `deleting message ${args.message_id}`);
+          return await api.request("DELETE", `/messages/${messageId}`, `deleting message ${args.message_id}`);
         } catch (err) {
-          this.onDeleteFailed?.(String(args.message_id));
+          if (!mayHaveBeenApplied(err)) this.onDeleteFailed?.(String(args.message_id));
           throw err;
         }
       }
@@ -789,7 +793,8 @@ export class ZulipToolRuntime {
       }
 
       case "get_stream_topics": {
-        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${args.stream_id}/topics`, `topics of stream ${args.stream_id}`);
+        const streamId = positiveIdArg("stream_id", args.stream_id);
+        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${args.stream_id}`);
 
         const topics = result.topics || [];
         const formatted = topics
@@ -831,15 +836,17 @@ export class ZulipToolRuntime {
       }
 
       case "add_reaction": {
+        const messageId = positiveIdArg("message_id", args.message_id);
         const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
-        const result = await api.requestAnswer("POST", `/messages/${args.message_id}/reactions`, emoji);
+        const result = await api.requestAnswer("POST", `/messages/${messageId}/reactions`, emoji);
         if (result.result === "error") throw new Error(result.msg ?? "Zulip refused the reaction");
         return result;
       }
 
       case "remove_reaction": {
+        const messageId = positiveIdArg("message_id", args.message_id);
         const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
-        const result = await api.requestAnswer("DELETE", `/messages/${args.message_id}/reactions`, emoji);
+        const result = await api.requestAnswer("DELETE", `/messages/${messageId}/reactions`, emoji);
         if (result.result === "error") throw new Error(result.msg ?? "Zulip refused removing the reaction");
         return result;
       }

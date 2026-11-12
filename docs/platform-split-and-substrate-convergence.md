@@ -197,7 +197,7 @@ C.1 (Zulip slim) ──► C.2 (substrate migrate) ──► C.3 (validate hands
 - **B and C.2 both consume `mcpl-core-ts`** — doing B first surfaces any gaps in mcpl-core's coverage of the messaging/context/history feature sets *before* touching the load-bearing Zulip server.
 - **C.2 is the only step that can break production.** The clerk/miner pipeline depends on the Zulip handshake and the `mcpl:channel-incoming` wake. Gate the merge on a full clerk smoke test (subscribe → DM/post → wake → reply).
 - **Recipe coordination:** cook errors if the same source URL has conflicting refs across recipes. Once `zulip-mcp` is in-house Zulip-only, update `clerk.json` + `knowledge-miner.json` together (drop the `Tengro/zulip_mcp` `ref: slack-integration` pin; point at the new canonical Zulip-only repo/build). Add the new `slack` server only where Slack is actually used.
-- **Known gotchas to preserve** (from project memory): zulip-js FormData quirks (string booleans, raw arrays in `queues.register`); `all_public_streams:true` ≠ auto-subscribe; capture MCPL-child stderr when debugging the handshake.
+- **Known gotchas to preserve** (from project memory): `all_public_streams:true` ≠ auto-subscribe; capture MCPL-child stderr when debugging the handshake.
 
 ## 8. Out of scope / deferred
 - Migrating `discord-mcpl` further (already converged).
