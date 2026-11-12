@@ -41,9 +41,10 @@ const RE_END_BORDER = /(?<!\\)(?:\\\\)*\|$/;
 /**
  * TableProcessor.test for the block of lines `from` to `to`, reading only
  * the lines it needs. It checks the delimiter row before a one-column
- * table's rows, which gives the same answer.
+ * table's rows, which gives the same answer. `nextUnbordered` gives, for
+ * each line, the next line at or after it with no pipe at either end.
  */
-function isTable(lines: string[], from: number, to: number): boolean {
+function isTable(lines: string[], from: number, to: number, nextUnbordered: number[]): boolean {
   if (to - from < 2) return false;
   const row = (i: number) => lines[i]!.replace(/^ +| +$/g, '');
   const header = row(from);
@@ -52,12 +53,7 @@ function isTable(lines: string[], from: number, to: number): boolean {
   const separator = splitRow(row(from + 1), border);
   if (separator.length !== width || !/^[|:\- ]*$/.test(separator.join(''))) return false;
   if (width > 1) return true;
-  if (!border) return false;
-  for (let i = from + 1; i < to; i += 1) {
-    const r = row(i);
-    if (!r.startsWith('|') && !RE_END_BORDER.test(r)) return false;
-  }
-  return true;
+  return border && nextUnbordered[from + 1]! >= to;
 }
 
 function splitRow(row: string, border: boolean): string[] {
@@ -181,14 +177,19 @@ const CODE = /^ {4}/;
 export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
-  // The next heading and the next rule at or after each line, so that no
-  // reading of a block searches its lines again.
+  // The next heading, the next rule and the next line with no pipe at
+  // either end, at or after each line, so that no reading of a block
+  // searches its lines again.
   const nextHeading = new Array<number>(lines.length + 1).fill(lines.length);
   const nextRule = new Array<number>(lines.length + 1).fill(lines.length);
+  const nextUnbordered = new Array<number>(lines.length + 1).fill(lines.length);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const row = lines[i]!.replace(/^ +| +$/g, '');
     nextHeading[i] = HEADING.test(lines[i]!) ? i : nextHeading[i + 1]!;
     nextRule[i] = RULE.test(lines[i]!) ? i : nextRule[i + 1]!;
+    nextUnbordered[i] = row.startsWith('|') || RE_END_BORDER.test(row) ? nextUnbordered[i + 1]! : i;
   }
+  const table = (from: number, to: number): boolean => isTable(lines, from, to, nextUnbordered);
   const pastCode = (from: number, to: number): number => {
     while (from < to && CODE.test(lines[from]!)) from += 1;
     return from;
@@ -212,7 +213,7 @@ export function blankLineAboveTables(text: string): string {
       if (a >= end) continue;
       const heading = nextHeading[a]!;
       if (heading < end) todo.push([a, heading], [heading + 1, end]);
-      else if (isTable(lines, a, end)) count += 1;
+      else if (table(a, end)) count += 1;
       else if (nextRule[a]! < end) todo.push([a, nextRule[a]!], [nextRule[a]! + 1, end]);
     }
     return count;
@@ -225,7 +226,7 @@ export function blankLineAboveTables(text: string): string {
     while (todo.length > 0) {
       const [start, end] = todo.pop()!;
       const a = pastCode(start, end);
-      if (a >= end || isTable(lines, a, end)) continue;
+      if (a >= end || table(a, end)) continue;
       const rule = nextRule[a]!;
       if (rule < end) todo.push([rule + 1, end], [a, rule]);
       else out.push([a, end]);
@@ -237,7 +238,7 @@ export function blankLineAboveTables(text: string): string {
   // off when it isn't.
   const startsTable = (at: number, to: number): boolean => {
     const rule = nextRule[at]!;
-    return isTable(lines, at, to) || (rule > at && rule < to && isTable(lines, at, rule));
+    return table(at, to) || (rule > at && rule < to && table(at, rule));
   };
   const above = new Set<number>();
   const todo: [number, number][] = blocks(lines).map((block) => [block[0]!, block.at(-1)! + 1]);
