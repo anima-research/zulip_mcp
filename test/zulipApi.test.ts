@@ -342,15 +342,15 @@ test('a bound also ends a call whose answer stalls after its headers', { timeout
 });
 
 test('fetch_attachment ends a download that gets no data for 15 s, and a slow one that keeps moving finishes', { timeout: 10_000 }, async () => {
-  const slow = ['one ', 'two ', 'three ', 'four ', 'five ', 'six'];
+  const slow = Array.from({ length: 15 }, (_, i) => `part ${i + 1}; `);
   const z = await realm({
     'GET /user_uploads/2/ab/never.png': 'hang',
     'GET /user_uploads/2/ab/stalls.png': 'stall-body',
-    'GET /user_uploads/2/ab/slow.txt': { slow, everyMs: 100 },
+    'GET /user_uploads/2/ab/slow.txt': { slow, everyMs: 50 },
   });
   const s = await serverOn(z.url);
   const original = globalThis.setTimeout;
-  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 200 : ms, ...rest)) as typeof setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 500 : ms, ...rest)) as typeof setTimeout;
   try {
     for (const name of ['never.png', 'stalls.png']) {
       await assert.rejects(s.tools.handleToolCall('fetch_attachment', { path: `/user_uploads/2/ab/${name}` }), (err: Error) => {
@@ -361,7 +361,7 @@ test('fetch_attachment ends a download that gets no data for 15 s, and a slow on
     const started = Date.now();
     const fetched = await s.tools.handleToolCall('fetch_attachment', { path: '/user_uploads/2/ab/slow.txt' }) as { content_text?: string };
     assert.equal(fetched.content_text, slow.join(''));
-    assert.ok(Date.now() - started > 400, 'the download took longer than the bound as a whole');
+    assert.ok(Date.now() - started > 500, 'the download took longer than the bound as a whole');
   } finally { globalThis.setTimeout = original; s.done(); z.close(); }
 });
 
