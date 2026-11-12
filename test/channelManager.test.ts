@@ -771,14 +771,16 @@ test('a stream archived while its first announcement waits to be retried: a retr
   } as never;
   const { adapter, ids } = fakeAdapter('zulip', []);
   const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
-  ids.directory.registration([{ stream_id: 17, name: 'a' }]);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }, { stream_id: 18, name: 'c' }]);
   const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
-  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17)])).local, ['zulip:a']);
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17), on('zulip:c', 18)])).local, ['zulip:a', 'zulip:c']);
 
   ids.directory.applyEvent({ op: 'delete', streams: [{ stream_id: 17, name: 'a' }] });
   answer = undefined;
   await manager.registerAdditional([], { retryBacklog: true });
-  assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'stream 17 is gone');
+  const retried = sent.slice(1).flatMap((c) => (c.added ?? []).map((d) => d.id));
+  assert.ok(retried.includes('zulip:c'), 'stream 18\'s descriptor, unchanged, is retried');
+  assert.equal(retried.includes('zulip:a'), false, 'stream 17 is gone');
 });
 
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {

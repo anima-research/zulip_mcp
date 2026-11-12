@@ -91,6 +91,7 @@ test('injections are returned under the claimed feature set (§6.5)', async () =
   assert.equal(result.featureSet, 'zulip.context');
   assert.equal(result.contextInjections.length, 1);
   assert.equal(result.contextInjections[0].position, 'beforeUser');
+  assert.equal(result.contextInjections[0].namespace, 'zulip:general');
   manager.destroy();
 });
 
