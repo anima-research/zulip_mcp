@@ -745,7 +745,8 @@ export class ZulipToolRuntime {
         const content = prepareOutgoing(args.content);
         const length = [...content].length;
         if (length > this.maxMessageLength) {
-          throw new Error(`content is ${length} characters, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
+          const posted = content === args.content ? "" : ` as it would be posted, with a blank line above each table under a line of text (${[...args.content].length} as written)`;
+          throw new Error(`content is ${length} characters${posted}, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
         }
         return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content });
       }

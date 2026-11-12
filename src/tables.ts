@@ -38,22 +38,26 @@
 const RE_CODE_PIPES = /(\\\\)|(\\`+)|(`+)|(\\\|)|(\|)/g;
 const RE_END_BORDER = /(?<!\\)(?:\\\\)*\|$/;
 
-function isTable(block: string[]): boolean {
-  const rows = block.map((row) => row.replace(/^ +| +$/g, ''));
-  if (rows.length < 2) return false;
-  const header = rows[0]!;
+/**
+ * TableProcessor.test for the block of lines `from` to `to`, reading only
+ * the lines it needs. It checks the delimiter row before a one-column
+ * table's rows, which gives the same answer.
+ */
+function isTable(lines: string[], from: number, to: number): boolean {
+  if (to - from < 2) return false;
+  const row = (i: number) => lines[i]!.replace(/^ +| +$/g, '');
+  const header = row(from);
   const border = header.startsWith('|') || RE_END_BORDER.test(header);
   const width = splitRow(header, border).length;
-  let table = width > 1;
-  if (!table && width === 1 && border) {
-    for (const row of rows.slice(1)) {
-      table = row.startsWith('|') || RE_END_BORDER.test(row);
-      if (!table) break;
-    }
+  const separator = splitRow(row(from + 1), border);
+  if (separator.length !== width || !/^[|:\- ]*$/.test(separator.join(''))) return false;
+  if (width > 1) return true;
+  if (!border) return false;
+  for (let i = from + 1; i < to; i += 1) {
+    const r = row(i);
+    if (!r.startsWith('|') && !RE_END_BORDER.test(r)) return false;
   }
-  if (!table) return false;
-  const separator = splitRow(rows[1]!, border);
-  return separator.length === width && /^[|:\- ]*$/.test(separator.join(''));
+  return true;
 }
 
 function splitRow(row: string, border: boolean): string[] {
@@ -80,22 +84,36 @@ function split(row: string): string[] {
       pipes.push(at);
     }
   }
+  // Where each run length occurs, in order, so that the next run of a
+  // length is found without searching the runs between.
+  const at = new Map<number, number[]>();
+  tics.forEach((size, i) => {
+    const runs = at.get(size);
+    if (runs) runs.push(i);
+    else at.set(size, [i]);
+  });
+  const seen = new Map<number, number>();
   const regions: [number, number][] = [];
   for (let pos = 0; pos < tics.length; ) {
     const size = tics[pos]! - ticPoints[pos]![2];
-    const index = size === 0 ? -1 : tics.slice(pos + 1).indexOf(size);
-    if (index === -1) {
+    const runs = at.get(size) ?? [];
+    let next = seen.get(size) ?? 0;
+    while (next < runs.length && runs[next]! <= pos) next += 1;
+    seen.set(size, next);
+    if (size === 0 || next === runs.length) {
       pos += 1;
       continue;
     }
-    regions.push([ticPoints[pos]![0], ticPoints[pos + index + 1]![1]]);
-    pos += index + 2;
+    const close = runs[next]!;
+    regions.push([ticPoints[pos]![0], ticPoints[close]![1]]);
+    pos = close + 1;
   }
   const cells: string[] = [];
   let start = 0;
+  let region = 0;
   for (const pipe of pipes) {
-    const inCode = regions.some(([from, to]) => from <= pipe && pipe <= to);
-    if (inCode) continue;
+    while (region < regions.length && regions[region]![1] < pipe) region += 1;
+    if (region < regions.length && regions[region]![0] <= pipe) continue;
     cells.push(row.slice(start, pipe));
     start = pipe + 1;
   }
@@ -163,72 +181,93 @@ const CODE = /^ {4}/;
 export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
+  // The next heading and the next rule at or after each line, so that no
+  // reading of a block searches its lines again.
+  const nextHeading = new Array<number>(lines.length + 1).fill(lines.length);
+  const nextRule = new Array<number>(lines.length + 1).fill(lines.length);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    nextHeading[i] = HEADING.test(lines[i]!) ? i : nextHeading[i + 1]!;
+    nextRule[i] = RULE.test(lines[i]!) ? i : nextRule[i + 1]!;
+  }
+  const pastCode = (from: number, to: number): number => {
+    while (from < to && CODE.test(lines[from]!)) from += 1;
+    return from;
+  };
+  // Zulip takes the lines from `from` to `to` of one block with the first of
+  // its block processors that wants them: an indented start (code), and the
+  // lines after it as a block of their own; a heading, which splits the
+  // block; a table, which takes the whole block; a rule, which splits what
+  // no table took. What none of them takes is a paragraph, a list or a quote.
+  // Each reading below follows that order, with a list of the blocks still
+  // to read in place of recursion, since a block can hold thousands of
+  // headings or rules.
+
+  // How many tables Zulip shows for those lines.
+  const tables = (from: number, to: number): number => {
+    let count = 0;
+    const todo: [number, number][] = [[from, to]];
+    while (todo.length > 0) {
+      const [start, end] = todo.pop()!;
+      const a = pastCode(start, end);
+      if (a >= end) continue;
+      const heading = nextHeading[a]!;
+      if (heading < end) todo.push([a, heading], [heading + 1, end]);
+      else if (isTable(lines, a, end)) count += 1;
+      else if (nextRule[a]! < end) todo.push([a, nextRule[a]!], [nextRule[a]! + 1, end]);
+    }
+    return count;
+  };
+  // The runs of those lines, with no heading among them, that Zulip takes as
+  // paragraphs, lists or quotes, in order.
+  const paragraphs = (from: number, to: number): [number, number][] => {
+    const out: [number, number][] = [];
+    const todo: [number, number][] = [[from, to]];
+    while (todo.length > 0) {
+      const [start, end] = todo.pop()!;
+      const a = pastCode(start, end);
+      if (a >= end || isTable(lines, a, end)) continue;
+      const rule = nextRule[a]!;
+      if (rule < end) todo.push([rule + 1, end], [a, rule]);
+      else out.push([a, end]);
+    }
+    return out;
+  };
+  // Whether the line `at` opens a table in a block that runs to `to`: the
+  // block is one, or what comes before its first rule, which Zulip splits
+  // off when it isn't.
+  const startsTable = (at: number, to: number): boolean => {
+    const rule = nextRule[at]!;
+    return isTable(lines, at, to) || (rule > at && rule < to && isTable(lines, at, rule));
+  };
   const above = new Set<number>();
-  // How many tables Zulip shows for one block, taking it as its block
-  // processors do, in their order: an indented start (code), a heading, a
-  // table, a rule. What none of them takes holds no table.
-  const tables = (rows: string[]): number => {
-    if (rows.length === 0) return 0;
-    if (CODE.test(rows[0]!)) {
-      const rest = rows.findIndex((row) => !CODE.test(row));
-      return rest === -1 ? 0 : tables(rows.slice(rest));
-    }
-    const split = rows.findIndex((row) => HEADING.test(row));
-    if (split !== -1) return tables(rows.slice(0, split)) + tables(rows.slice(split + 1));
-    if (isTable(rows)) return 1;
-    const rule = rows.findIndex((row) => RULE.test(row));
-    return rule === -1 ? 0 : tables(rows.slice(0, rule)) + tables(rows.slice(rule + 1));
-  };
-  // Whether a block's first line opens a table: the block is one, or what
-  // comes before its first rule, which Zulip splits off when it isn't.
-  const startsTable = (rows: string[]): boolean => {
-    if (isTable(rows)) return true;
-    const rule = rows.findIndex((row) => RULE.test(row));
-    return rule > 0 && startsTable(rows.slice(0, rule));
-  };
-  // The runs of a block that Zulip takes as paragraphs, lists or quotes,
-  // with no heading in the block: what no table takes, split at rules,
-  // past any indented start.
-  const paragraphs = (rows: string[], from: number): [number, number][] => {
-    if (rows.length === 0) return [];
-    if (CODE.test(rows[0]!)) {
-      const rest = rows.findIndex((row) => !CODE.test(row));
-      return rest === -1 ? [] : paragraphs(rows.slice(rest), from + rest);
-    }
-    if (isTable(rows)) return [];
-    const rule = rows.findIndex((row) => RULE.test(row));
-    if (rule === -1) return [[from, from + rows.length]];
-    return [...paragraphs(rows.slice(0, rule), from), ...paragraphs(rows.slice(rule + 1), from + rule + 1)];
-  };
-  const walk = (block: number[]): void => {
-    if (block.length === 0) return;
-    const rows = block.map((i) => lines[i]!);
-    const heading = rows.findIndex((row) => HEADING.test(row));
-    if (heading !== -1) {
-      walk(block.slice(0, heading));
-      walk(block.slice(heading + 1));
-      return;
+  const todo: [number, number][] = blocks(lines).map((block) => [block[0]!, block.at(-1)! + 1]);
+  while (todo.length > 0) {
+    const [from, to] = todo.pop()!;
+    const heading = nextHeading[from]!;
+    if (heading < to) {
+      todo.push([from, heading], [heading + 1, to]);
+      continue;
     }
     // The blank line goes inside a paragraph, above a line that then opens
     // a table, and only where Zulip then shows more tables: that table
     // takes the rest of the block as rows, a rule and any table after that
-    // included.
-    const shown = tables(rows);
-    for (const [from, to] of paragraphs(rows, 0)) {
-      for (let at = from + 1; at < to; at += 1) {
-        if (LIST_OR_QUOTE.test(rows[at - 1]!)) break;
-        const rest = rows.slice(at);
-        if (CODE.test(rows[at]!) || !startsTable(rest)) continue;
-        if (tables(rows.slice(0, at)) + tables(rest) > shown) {
-          above.add(block[at]!);
-          walk(block.slice(0, at));
-          walk(block.slice(at));
-          return;
+    // included. The lines above it and the lines from it are then read as
+    // blocks of their own.
+    const runs = paragraphs(from, to);
+    if (runs.length === 0) continue;
+    const shown = tables(from, to);
+    search: for (const [start, end] of runs) {
+      for (let at = start + 1; at < end; at += 1) {
+        if (LIST_OR_QUOTE.test(lines[at - 1]!)) break;
+        if (CODE.test(lines[at]!) || !startsTable(at, to)) continue;
+        if (tables(from, at) + tables(at, to) > shown) {
+          above.add(at);
+          todo.push([from, at], [at, to]);
+          break search;
         }
       }
     }
-  };
-  for (const block of blocks(lines)) walk(block);
+  }
   if (above.size === 0) return text;
   return raw.flatMap((line, i) => (above.has(i) ? ['', line] : [line])).join('\n');
 }
