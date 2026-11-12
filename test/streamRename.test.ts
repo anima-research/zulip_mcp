@@ -77,6 +77,8 @@ interface StartOptions {
   noWait?: boolean;
   /** Hold the host's policy until `grant()`. */
   grantLater?: boolean;
+  /** Record channels/register but never answer it. */
+  holdRegister?: boolean;
 }
 
 async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Run> {
@@ -119,7 +121,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     if (req.method === method.CHANNELS_REGISTER) {
       const p = req.params as ChannelsRegisterParams;
       registered.push(...p.channels);
-      host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
+      if (!opts.holdRegister) host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
     } else if (req.method === method.CHANNELS_INCOMING) {
       const p = req.params as ChannelsIncomingParams;
       incoming.push(...p.messages);
@@ -1161,6 +1163,7 @@ scenario('46. one process: a host that leaves while its start reads the stream l
   const third = await start(r, dir, { reuse: first, grantLater: true });
   try {
     release();
+    await until(() => third.registered.length > 0, 'the second host\'s start, resumed, reaching the third host with its registration');
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
     await third.grant();
@@ -1228,4 +1231,151 @@ scenario('49. a stream outside the allowlist gets no push after a rename, nor at
     await deliveriesSettled(second);
     assert.deepEqual(second.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'no push at a later start either');
   } finally { await second.close(); }
+});
+
+scenario('50. one process: a host that leaves while its catch-up reads, and a next host whose policy comes before that read answers, gets each stream\'s catch-up once', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(17, 'seen while open');
+    const seenRandom = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)) && first.incoming.some((m) => m.messageId === String(seenRandom)), 'delivery on both open channels');
+  } finally { await first.end(); }
+  const away = r.post(17, 'written while no host was connected', { mentioned: true });
+  const awayRandom = r.post(18, 'written in random while no host was connected', { mentioned: true });
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => r.reads.length > readsBefore, 'the second host\'s catch-up reading');
+  await second.end();
+  const readsHeld = r.reads.length;
+  const third = await start(r, dir, { reuse: first, grantLater: true });
+  try {
+    await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
+    await until(() => r.reads.length > readsHeld, 'the third host\'s own catch-up reading');
+    release();
+    await until(() => third.server.isLive && named(third, away) && named(third, awayRandom), 'the third host\'s catch-up of both streams');
+    await deliveriesSettled(third);
+    for (const id of [away, awayRandom]) {
+      const catchUps = third.pushed.filter((p) => payloadText(p).includes(`id=${id}]`));
+      assert.equal(catchUps.length, 1, `one catch-up of message ${id}, not ${catchUps.map((p) => p.eventId).join(', ')}`);
+    }
+  } finally { await third.close(); }
+});
+
+scenario('51. one process: a host that leaves while its channels/register waits leaves the rename\'s push to the next host', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  const second = await start(r, dir, { reuse: first, noWait: true, holdRegister: true });
+  await until(() => second.registered.length > 0, 'the second host asked to register, with no answer');
+  await second.end();
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
+  } finally { await third.close(); }
+});
+
+const streamOfRead = (read: Record<string, unknown>) => ((read.narrow as unknown[]) ?? [])
+  .map((n) => (Array.isArray(n) ? n : [(n as { operator: string }).operator, (n as { operand: unknown }).operand]))
+  .find(([operator]) => operator === 'channel' || operator === 'stream')?.[1];
+
+scenario('52. one process: a sweep whose host leaves during its first stream\'s read reads no other stream', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(17, 'seen while open');
+    const seenRandom = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)) && first.incoming.some((m) => m.messageId === String(seenRandom)), 'delivery on both open channels');
+  } finally { await first.end(); }
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => r.reads.length > readsBefore, 'the second host\'s catch-up reading its first stream');
+  const readsHeld = r.reads.length;
+  await second.end();
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.deepEqual(r.reads.slice(readsHeld).map(streamOfRead), [], 'no read after the host left');
+});
+
+scenario('53. one process: a sweep whose host leaves during its last stream\'s read doesn\'t go on to the missed tallies', async (dir) => {
+  const r = realm({ 17: 'general', 19: 'dev' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+    await first.open('zulip:dev');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:dev' });
+    r.post(19, 'ambient in dev while it is closed');
+    await untilAsync(async () => (await missedOn(first, 'zulip:dev')) === 1, 'dev tallied');
+  } finally { await first.end(); }
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => r.reads.length > readsBefore, 'the second host\'s catch-up reading general');
+  const readsHeld = r.reads.length;
+  assert.deepEqual(r.reads.slice(readsBefore).map(streamOfRead), [17], 'the sweep\'s only stream is general');
+  await second.end();
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.deepEqual(r.reads.slice(readsHeld).map(streamOfRead), [], 'no read of dev\'s tally after the host left');
+});
+
+scenario('54. one process: a host that leaves while a rename\'s push waits for its answer leaves the other renames\' pushes to the next host', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  r.rename(18, 'lounge');
+  const renamePush = (p: PushEventParams) => /was renamed/.test(payloadText(p));
+  const second = await start(r, dir, { reuse: first, noWait: true, beforePushAnswer: (p) => (renamePush(p) ? new Promise<void>(() => {}) : Promise.resolve()) });
+  await until(() => second.pushed.some(renamePush), 'the first rename\'s push, which gets no answer');
+  const told = second.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId);
+  assert.equal(told.length, 1);
+  await second.end();
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some(renamePush), 'the other rename\'s push at the next start');
+    await deliveriesSettled(third);
+    assert.deepEqual(third.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId), ['zulip:lobby', 'zulip:lounge'].filter((id) => !told.includes(id)));
+  } finally { await third.close(); }
+});
+
+scenario('55. one process: a backfill of missed tallies whose host leaves during its read leaves the count to the next host', async (dir) => {
+  const r = realm({ 19: 'dev' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:dev');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:dev' });
+    r.post(19, 'ambient in dev while it is closed');
+    await untilAsync(async () => (await missedOn(first, 'zulip:dev')) === 1, 'dev tallied');
+  } finally { await first.end(); }
+  r.post(19, 'ambient in dev while no host was connected');
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => r.reads.length > readsBefore, 'the second host\'s backfill reading dev');
+  const readsHeld = r.reads.length;
+  assert.deepEqual(r.reads.slice(readsBefore).map(streamOfRead), [19], 'the sweep\'s only read is dev\'s backfill');
+  await second.end();
+  const third = await start(r, dir, { reuse: first, grantLater: true });
+  try {
+    await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
+    await until(() => r.reads.length > readsHeld, 'the third host\'s backfill reading dev');
+    release();
+    await until(() => third.server.isLive, 'the third host live');
+    assert.equal(await missedOn(third, 'zulip:dev'), 2, 'one ambient message counted live and one backfilled, each once');
+  } finally { await third.close(); }
 });

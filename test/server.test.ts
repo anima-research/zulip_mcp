@@ -1935,6 +1935,37 @@ test('a second connection to the same server starts from a fresh grant, registra
   await two.close();
 });
 
+test('a host that leaves while the go-live drain waits on an attachment leaves the next host\'s live delivery to its own start', async () => {
+  let releaseFetch!: () => void;
+  let fetching = false;
+  const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+  const one = harness({
+    attachments: {
+      source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  await initialize(one, true);
+  await until(() => one.adapter.emit !== null, 'event delivery started before the policy');
+  one.adapter.emit!({
+    ...streamMsg(1, { text: 'see the log', mentioned: true }),
+    metadata: { topic: 'deploys', mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
+  });
+  await one.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => fetching, 'the go-live drain waiting on the attachment');
+  await one.close();
+  const two = harness({ reuse: { server: one.server, adapter: one.adapter } });
+  try {
+    await initialize(two, true);
+    releaseFetch();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(two.server.isLive, false, 'no live delivery before the second host\'s policy');
+  } finally {
+    releaseFetch();
+    await two.close();
+  }
+});
+
 test('shutdown waits for a delivery still fetching its attachment, then flushes it', async () => {
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
