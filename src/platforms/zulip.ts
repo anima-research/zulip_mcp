@@ -333,9 +333,10 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Descriptors for stream channels, without enumerating the realm: a
-   * stream the directory does not hold, or one outside the allowlist, is
-   * never described. A DM is described by its first message.
+   * Descriptors for stream channels. A stream the directory does not hold
+   * costs one read of the stream list; one still unknown after it, or one
+   * outside the allowlist, is never described. A DM is described by its
+   * first message.
    */
   async describeChannels(keys: ChannelKey[]): Promise<ChannelDescriptor[]> {
     const out: ChannelDescriptor[] = [];

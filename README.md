@@ -315,7 +315,9 @@ the old id is still the stream's id. A rename the host doesn't answer is
 offered again, and the server can't tell whether the host applied it, so
 the next `channels/changed` also removes each id the unanswered one added,
 unless a stream holds that id now. The watermark, the missed tally and
-the filters entries carry to the new name. Once the host answers, a request
+the filters entries carry to the new name. Where the filters file can't be
+read or written at the rename, the old name stays in it, and the log says
+so. Once the host answers, a request
 for the old id is refused, and the refusal names the new id, unless another
 stream has taken the old name, as in a swap. With MCPL, `send_message`,
 `listen` and `unlisten` given the old name are refused the same way, and

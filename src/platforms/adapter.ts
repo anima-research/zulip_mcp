@@ -12,7 +12,8 @@
  *
  * Everything that crosses this seam names a channel by its key (see
  * channel-key.ts); channel ids are made only where something leaves for the
- * host, and descriptors carry the id the host is told.
+ * host, and descriptors carry the id the host is told. The rollback record
+ * is the exception: `onSent` and `deleteMessage` carry the channel id.
  */
 
 import type {
@@ -210,9 +211,10 @@ export interface PlatformAdapter {
   ): Promise<PublishResult>;
 
   /**
-   * Describe channels without enumerating the platform — for a channel the
-   * bot just joined, whose descriptor the server wants to register without
-   * a full discovery pass. Unknown keys are omitted. Optional.
+   * Describe channels — for a channel the bot just joined, whose descriptor
+   * the server wants to register without a full discovery pass. A key the
+   * adapter doesn't know can cost one read of the platform's channel list.
+   * Unknown keys are omitted. Optional.
    */
   describeChannels?(keys: ChannelKey[]): Promise<ChannelDescriptor[]>;
 

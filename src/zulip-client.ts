@@ -113,8 +113,8 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
- * A former name isn't subscribed, since Zulip's subscribe call creates a
- * stream for a name that no stream has.
+ * Zulip's subscribe call takes names, and where the bot may create streams
+ * it creates one for a name that no stream has.
  */
 export async function subscribeConfigured(api: ZulipApi, directory: StreamDirectory, setting: string | undefined): Promise<void> {
   const named = (setting ?? "").split(",").map((s) => s.trim()).filter(Boolean);
