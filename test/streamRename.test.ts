@@ -48,6 +48,10 @@ interface Run {
   pushed: PushEventParams[];
   changed: { removed?: string[]; added?: ChannelDescriptor[] }[];
   logs: string[];
+  /** `ZULIP_SUBSCRIBE`'s work at this start, settled when it has done all it will. */
+  subscribing: Promise<void>;
+  /** The run's stream directory. */
+  directory: { isFilled: boolean; nameOf(streamId: number): string | undefined } | undefined;
   /** Answer the `channels/changed` requests held so far. */
   answerChanged(): void;
   /** Answer the held `channels/changed` requests, and every later one at once. */
@@ -66,11 +70,11 @@ async function until(predicate: () => boolean, what: string, ms = 3000): Promise
 }
 
 /** `ZULIP_SUBSCRIBE`, as src/index.ts hands it on at a start. */
-function wireSubscribe(r: Realm, directory: unknown, setting: string | undefined): void {
-  if (subscribeConfigured && directory) void subscribeConfigured(r.api, directory, setting);
+function wireSubscribe(r: Realm, directory: unknown, setting: string | undefined): Promise<void> {
+  return subscribeConfigured && directory ? subscribeConfigured(r.api, directory, setting) : Promise.resolve();
 }
 
-async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: string; holdChanged?: boolean; backscroll?: Record<string, number> } = {}): Promise<Run> {
+async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: string; holdChanged?: boolean; announceTimeoutMs?: number; backscroll?: Record<string, number> } = {}): Promise<Run> {
   const mcpl = opts.mcpl ?? true;
   const logs: string[] = [];
   runLogs.push(`--- run ${opts.mcpl === false ? 'without MCPL' : 'with MCPL'}`);
@@ -79,7 +83,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
   const filters = new FiltersPlane(join(dir, 'filters.json'));
   filters.start();
   const directory = directoryModule ? new directoryModule.StreamDirectory() : undefined;
-  wireSubscribe(r, directory, opts.subscribe);
+  const subscribing = wireSubscribe(r, directory, opts.subscribe);
   const backscrollLimits = new Map(Object.entries(opts.backscroll ?? {}));
   const adapter = new ZulipAdapter(r.api, SELF, 's', { directory, filters, backscrollLimits, dmDiscoveryLimit: 0, formatTime: () => 'T' } as ConstructorParameters<typeof ZulipAdapter>[3]);
   const tools = new ZulipToolRuntime({ api: r.api, selfUserId: SELF, realm: '', authHeader: '', sessionId: 's' }, dir, { formatTime: () => 'T' });
@@ -92,7 +96,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
     sessionId: 's',
     catchupLimit: 100,
     formatTime: () => 'T',
-    announceTimeoutMs: 300,
+    announceTimeoutMs: opts.announceTimeoutMs ?? 300,
     filters,
     directory,
   } as ConstructorParameters<typeof ZulipMcplServer>[2]);
@@ -139,7 +143,7 @@ async function start(r: Realm, dir: string, opts: { mcpl?: boolean; subscribe?: 
     await until(() => registered.length > 0 && server.isLive, 'registration and live delivery');
   }
   return {
-    server, host, incoming, pushed, changed, logs,
+    server, host, incoming, pushed, changed, logs, subscribing, directory,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
     releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
@@ -315,11 +319,18 @@ scenario('5. a new stream that takes the old name arrives under the old id, with
   const r = realm({ 17: 'general' });
   const run = await start(r, dir);
   try {
-    await renameWhileOpen(r, run);
+    await run.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => run.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+    assert.equal((await run.tool('mute_channel', { channel: 'zulip:general' })).isError, false);
+    await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["general"]', 'the mute on stream 17');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the host told of the rename');
+    await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["lobby"]', 'the mute under the new name');
     await tookRename(run);
     const reused = r.create('general');
     const first = r.post(reused, '@bot new here', { mentioned: true });
-    await until(() => run.pushed.some((p) => origin(p).messageId === String(first)), 'its first message');
+    await until(() => run.pushed.some((p) => origin(p).messageId === String(first)), 'its first message, not muted');
     assert.equal(origin(run.pushed.find((p) => origin(p).messageId === String(first))!).mcplChannelId, 'zulip:general');
     assert.equal(await missedOn(run, 'zulip:general'), null, 'the renamed stream\'s tally stays with zulip:lobby');
     assert.equal(await missedOn(run, 'zulip:lobby'), 0);
@@ -415,7 +426,8 @@ scenario('10. a stream archived while its channel is open: a line to the agent, 
 
 scenario('11. until the host answers the rename, an addressed message goes out under the old id, nothing goes out under the new one, and a new stream under the old name waits', async (dir) => {
   const r = realm({ 17: 'general' });
-  const run = await start(r, dir, { holdChanged: true });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
   try {
     await run.open('zulip:general');
     r.rename(17, 'lobby');
@@ -434,6 +446,7 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     const intruder = r.post(reused, '@bot from the new #general', { mentioned: true });
     const control = r.post(17, '@bot control', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
+    assert.equal(gaveUp(), false, 'the announcement is still in flight when the new #general\'s message is handled');
     assert.equal(named(run, intruder), false, 'a new #general sends nothing under the id the host holds for stream 17');
     const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
     assert.equal((listed.channels.find((c) => c.id === 'zulip:general')?.address as { stream_id?: number }).stream_id, 17, 'zulip:general stays stream 17\'s');
@@ -471,6 +484,7 @@ scenario('13. ZULIP_SUBSCRIBE with a former name creates no stream and writes on
   const run = await start(r, dir, { subscribe: 'general' });
   try {
     await until(() => run.logs.some((l) => l.includes('ZULIP_SUBSCRIBE') && l.includes('#general')), 'the log line');
+    await run.subscribing;
     assert.equal(run.logs.filter((l) => l.includes('ZULIP_SUBSCRIBE')).length, 1);
     assert.deepEqual(r.created, []);
     assert.deepEqual(r.subscribed.slice(subscribedBefore), []);
@@ -530,6 +544,7 @@ scenario('17. a client without MCPL: ZULIP_SUBSCRIBE subscribes a current name, 
   run = await start(r, dir, { mcpl: false, subscribe: 'general' });
   try {
     await until(() => run.logs.some((l) => l.includes('ZULIP_SUBSCRIBE') && l.includes('#general')), 'the log line');
+    await run.subscribing;
     assert.deepEqual(r.created, []);
   } finally { await run.close(); }
   const fresh = mkdtempSync(join(tmpdir(), 'zulip-rename-nocopy-'));
@@ -551,6 +566,7 @@ scenario('18. a run without MCPL after a rename leaves the filters file and the 
   r.rename(17, 'lobby');
   const run = await start(r, dir, { mcpl: false });
   try {
+    await until(() => run.directory?.isFilled === true && run.directory.nameOf(17) === 'lobby', 'the stream list read, with the rename');
     const around = JSON.parse((await run.tool('fetch_around', { message_id: id })).text) as { channel: string; channelId: string; formatted_history: string };
     assert.equal(around.channel, 'lobby');
     assert.equal(around.channelId, 'zulip:lobby');
@@ -568,7 +584,9 @@ scenario('19. a client without MCPL between the rename and the next host leaves 
   await savedAsGeneral(r, dir);
   r.rename(17, 'lobby');
   let run = await start(r, dir, { mcpl: false });
-  await run.close();
+  try {
+    await until(() => run.directory?.isFilled === true && run.directory.nameOf(17) === 'lobby', 'the stream list read, with the rename');
+  } finally { await run.close(); }
   run = await start(r, dir);
   try {
     await until(() => run.pushed.some((p) => /zulip:general/.test(payloadText(p)) && /zulip:lobby/.test(payloadText(p))), 'the push');
@@ -613,10 +631,17 @@ scenario('22. two streams swap names while the host holds its answers: it never 
     await until(() => run.changed.some((c) => c.removed?.includes('zulip:a')), 'the first announcement');
     r.rename(18, 'a');
     r.rename(17, 'b');
-    await new Promise((res) => setTimeout(res, 800));
+    await until(() => run.directory?.nameOf(18) === 'a' && run.directory.nameOf(17) === 'b', 'both renames in the directory');
+    await until(() => run.logs.some((l) => l.includes('changing zulip:a') && l.includes('got no answer')), 'the first announcement given up while the host holds it');
     run.releaseChanged();
     await run.tool('refresh_channels', {});
-    await new Promise((res) => setTimeout(res, 800));
+    const settledOn = async () => {
+      const { channels } = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
+      const a = channels.find((c) => c.id === 'zulip:a'), b = channels.find((c) => c.id === 'zulip:b');
+      return (a?.address as { stream_id?: number } | undefined)?.stream_id === 18 && (b?.address as { stream_id?: number } | undefined)?.stream_id === 17;
+    };
+    const lineOn = (held: string, fresh: string) => run.incoming.some((m) => m.channelId === held && textOf(m).includes(`Its channel is now ${fresh}`));
+    await untilAsync(async () => lineOn('zulip:a', 'zulip:b') && lineOn('zulip:b', 'zulip:a') && await settledOn(), 'each open channel told, and the host holding each stream on its new id');
     const held = new Map<string, number | undefined>([['zulip:a', 17], ['zulip:b', 18]]);
     for (const c of run.changed) {
       for (const id of c.removed ?? []) held.delete(id);
@@ -628,7 +653,6 @@ scenario('22. two streams swap names while the host holds its answers: it never 
     }
     const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
     assert.deepEqual(listed.channels.map((c) => [c.id, (c.address as { stream_id?: number }).stream_id]).sort(), [['zulip:a', 18], ['zulip:b', 17]]);
-    const lineOn = (held: string, fresh: string) => run.incoming.some((m) => m.channelId === held && textOf(m).includes(`Its channel is now ${fresh}`));
     assert.ok(lineOn('zulip:a', 'zulip:b'), 'stream 17\'s open channel was told of zulip:b');
     assert.ok(lineOn('zulip:b', 'zulip:a'), 'stream 18\'s open channel was told of zulip:a');
     const to17 = r.post(17, '@bot to 17', { mentioned: true });
@@ -660,7 +684,8 @@ scenario('23. two streams swap names while the server is down: each keeps its ow
     assert.doesNotMatch(pushText('zulip:a') + pushText('zulip:b'), /is gone/);
     const to17 = r.post(17, '@bot to 17', { mentioned: true });
     const to18 = r.post(18, '@bot to 18', { mentioned: true });
-    await until(() => arrivedOn(run, to17) !== null, 'the mention in 17');
+    const after = r.post(17, '@bot after 18\'s', { mentioned: true });
+    await until(() => arrivedOn(run, to17) !== null && arrivedOn(run, after) !== null, 'the mentions in 17, the second posted after 18\'s');
     assert.equal(arrivedOn(run, to17), 'zulip:b');
     assert.equal(named(run, to18), false, 'stream 18 is still muted');
   } finally { await run.close(); }
@@ -676,6 +701,9 @@ scenario('24. renamed while the server was down, beside a new stream that took t
   try {
     await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["lobby"]', 'the mute under the new name');
     await until(() => run.logs.some((l) => l.includes('Zulip stream 17 was renamed #general -> #lobby')), 'the rename in the log');
+    await until(() => run.pushed.some((p) => origin(p).mcplChannelId === 'zulip:lobby'), 'the push from the new channel');
+    const pushText = run.pushed.filter((p) => origin(p).mcplChannelId === 'zulip:lobby').map((p) => JSON.stringify(p)).join('\n');
+    assert.match(pushText, /zulip:general now belongs to another stream, which took the name #general\./);
     const fromNew = r.post(reused, '@bot from the new #general', { mentioned: true });
     await until(() => arrivedOn(run, fromNew) !== null, 'the new #general\'s mention');
     assert.equal(arrivedOn(run, fromNew), 'zulip:general');

@@ -471,10 +471,13 @@ test('a message from a stream created after startup carries its descriptor, with
     { id: 4, type: 'message', flags: [], message: raw(12, { display_recipient: 'late-stream', stream_id: 9 }) },
     // Outside the allowlist: filtered before any descriptor is made.
     { id: 5, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
+    // After it, so its arrival shows #secret's message was handled.
+    { id: 6, type: 'message', flags: [], message: raw(14) },
   ];
   let polls = 0;
   const client = standInApi({
-    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }),
+    // #secret is in the list, so only the allowlist keeps its message out.
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 2 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
@@ -493,7 +496,7 @@ test('a message from a stream created after startup carries its descriptor, with
   try {
     adapter.startEvents((m, d) => { seen.push({ id: m.messageId, key: m.key, newChannel: d?.id, address: d?.address }); });
     const deadline = Date.now() + 2000;
-    while (seen.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while (!seen.some((s) => s.id === '14') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
@@ -505,5 +508,6 @@ test('a message from a stream created after startup carries its descriptor, with
     // Its create event put it in the directory before its first message.
     { id: '11', key: streamKey(9), newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
     { id: '12', key: streamKey(9), newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
+    { id: '14', key: GENERAL, newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: 7 } },
   ]);
 });

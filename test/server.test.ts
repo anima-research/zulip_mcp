@@ -1055,7 +1055,7 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     await second.close();
 
     // Session 3: nothing new → nothing pushed, and the sweep runs once.
-    const third = harness({ stateDir: dir, sessionId: 'sw', history: later });
+    const third = harness({ stateDir: dir, sessionId: 'sw', history: later, visible: [DESCRIPTOR, DEV] });
     await initialize(third, true);
     await settled(third);
     await new Promise((r) => setTimeout(r, 30));
@@ -2814,7 +2814,7 @@ for (const reconnect of [false, true]) {
       assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must not persist past the unoffered reply');
       // Exercise beginConnection independently of quiesce: it must cap its own commit too.
       const staged = second.server as unknown as { beginConnection(): void; preLiveScanned: Map<string, number> };
-      staged.preLiveScanned.set('zulip:general', 5);
+      staged.preLiveScanned.set(second.adapter.keyOf('zulip:general'), 5);
       staged.beginConnection();
       assert.ok(second.delivery.watermark('zulip:general')! < 5);
     }
