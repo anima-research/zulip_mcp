@@ -1466,3 +1466,19 @@ scenario('59. two messages without stream_id of a stream the directory doesn\'t 
     assert.deepEqual(order, [String(first), String(second)]);
   } finally { await run.close(); }
 });
+
+scenario("60. a reaction to a new stream's first message, on a channel set to show reactions, reaches the host after its message: it arrived before the directory held the stream's name", async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:north'] });
+  const run = await start(r, dir);
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot one', { mentioned: true });
+    r.react(first, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.findIndex((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${first}`));
+    await until(() => reaction() >= 0, 'the reaction');
+    const message = run.pushed.findIndex((p) => origin(p).messageId === String(first));
+    assert.ok(message >= 0 && message < reaction(), 'the message reaches the host before its reaction');
+    assert.equal(origin(run.pushed[reaction()]).mcplChannelId, 'zulip:north');
+  } finally { await run.close(); }
+});

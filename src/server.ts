@@ -2197,7 +2197,10 @@ export class ZulipMcplServer {
           console.error('[zulip-mcp] system event handling failed:', (err as Error).message);
         }
       },
-      (reaction) => this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction)),
+      (reaction) => {
+        const unnamed = !isDmKey(reaction.key) && this.streamNameOf(reaction.key) === null;
+        if (unnamed || this.reactionShown(reaction)) this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction));
+      },
       (entry) => {
         const lane = this.lanes?.lane(entry.key);
         lane?.enter(async () => {
@@ -2217,10 +2220,7 @@ export class ZulipMcplServer {
    * id exists, so a suppressed reaction leaves no glyph or name anywhere.
    */
   private async onReaction(ev: ReactionEvent): Promise<void> {
-    if (!this.filters || !this.filters.reactionsVisible(this.ids.freshIdOf(ev.key) ?? '')) return;
-    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
-    if (this.filters.reactionSuppressed(ev.emoji, ev.emojiCode, ev.emojiType)) return;
-    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    if (!this.reactionShown(ev)) return;
     const verb = ev.action === 'add' ? 'reacted' : 'removed a reaction';
     const target = ev.onOwnMessage ? 'your message' : `message ${ev.messageId}`;
     const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
@@ -2252,6 +2252,13 @@ export class ZulipMcplServer {
         onOwnMessage: ev.onOwnMessage,
       });
     }
+  }
+
+  private reactionShown(ev: ReactionEvent): boolean {
+    if (!this.filters || !this.filters.reactionsVisible(this.ids.freshIdOf(ev.key) ?? '')) return false;
+    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return false;
+    if (this.filters.reactionSuppressed(ev.emoji, ev.emojiCode, ev.emojiType)) return false;
+    return this.mcplActive && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
   }
 
   /**

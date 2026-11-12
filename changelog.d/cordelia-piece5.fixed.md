@@ -4,7 +4,9 @@
   channel's messages, reactions and changes are now handled one at a time, in
   the order the server received them, so a reaction or an edit follows the
   message it is about. A message waiting for its attachments holds back only
-  its own channel.
+  its own channel. A reaction is checked against the filters when it is
+  placed in its channel and again at its turn. One whose stream the server
+  doesn't know yet is checked at its turn only.
 - A host's `channels/open` or `channels/close` of a channel the server
   already knows no longer waits for the requests ahead of it, such as a tool
   call that waits for the host. It waits for the job running on its own

@@ -4811,3 +4811,61 @@ test('on a closed channel, a lane that gives up more rows than the ceiling at on
   assert.equal(h.delivery.watermark('zulip:general'), 113);
   await h.close();
 });
+
+async function reactionsHarness(dir: string, fetches: ReturnType<typeof heldFetches>) {
+  const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+  plane.start();
+  const h = harness({ filters: plane, attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const react = (emoji: string) => h.adapter.react!({
+    action: 'add', channelId: 'zulip:general', messageId: '1', emoji,
+    reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_000_000),
+  });
+  const show = (visible: boolean) => h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible } });
+  const handed = () => h.incoming.map((m) => (m.metadata as { emoji?: string }).emoji ?? m.messageId);
+  return { plane, h, react, show, handed };
+}
+
+test("while its lane is busy, a reaction that its channel doesn't show doesn't wait in the lane, and one that it shows waits there and goes after the message ahead of it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-lane-'));
+  try {
+    const fetches = heldFetches();
+    const { plane, h, react, show, handed } = await reactionsHarness(dir, fetches);
+    h.adapter.emit!(withLog(streamMsg(1)));
+    await until(() => fetches.started.length === 1, "1's attachment fetch");
+    react('eyes');
+    await show(true);
+    react('thumbs_up');
+    await h.host.sendRequest('ping');
+    assert.deepEqual(handed(), [], 'nothing passes the message ahead');
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(handed(), ['1', 'thumbs_up']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reaction that waits in its lane is checked again at its turn: its channel stopped showing reactions meanwhile, and nothing goes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-turn-'));
+  try {
+    const fetches = heldFetches();
+    const { plane, h, react, show, handed } = await reactionsHarness(dir, fetches);
+    await show(true);
+    h.adapter.emit!(withLog(streamMsg(1)));
+    await until(() => fetches.started.length === 1, "1's attachment fetch");
+    react('thumbs_up');
+    await show(false);
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(handed(), ['1']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
