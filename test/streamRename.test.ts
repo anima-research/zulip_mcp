@@ -1030,3 +1030,23 @@ scenario('38. a ZULIP_BACKSCROLL_CHANNELS entry whose stream is renamed while th
     await until(() => run.logs.some((l) => l.includes('ZULIP_BACKSCROLL_CHANNELS names #general') && l.includes('#lobby')), 'the log line');
   } finally { await run.close(); }
 });
+
+scenario('39. one process, two clients without MCPL, and a rename between them: the second reads its own stream list', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const tallied = await start(r, dir);
+  try {
+    await tallied.open('zulip:general');
+    await tallied.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await untilAsync(async () => (await missedOn(tallied, 'zulip:general')) === 0, 'stream 17 tallied');
+  } finally { await tallied.close(); }
+  const first = await start(r, dir, { mcpl: false });
+  try {
+    await until(() => first.directory?.isFilled === true, 'the first client\'s read of the stream list');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  const second = await start(r, dir, { mcpl: false, reuse: first });
+  try {
+    await until(() => second.directory?.isFilled === true && second.directory.nameOf(17) === 'lobby', 'the second client\'s read of the stream list');
+    assert.equal(await missedOn(second, 'zulip:lobby'), 0);
+  } finally { await second.close(); }
+});
