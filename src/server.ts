@@ -428,7 +428,7 @@ export class ZulipMcplServer {
    * attachment fetch) joins the queue behind the held ones instead of
    * overtaking them and burying them under its own acceptance.
    */
-  private async goLive(conn: McplConnection | null = this.conn): Promise<void> {
+  private async goLive(conn: McplConnection): Promise<void> {
     if (this.live) return;
     const boundary = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
     for (const [channelId, through] of this.preLiveScanned) {
@@ -459,7 +459,7 @@ export class ZulipMcplServer {
           this.delivery.hold(message.key, id, 'failed');
         }
       }
-      if (conn?.isClosed) return;
+      if (conn.isClosed) return;
     }
     this.commitScannedCatchUp();
     this.delivery.save();

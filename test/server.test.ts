@@ -3623,13 +3623,13 @@ test('R4-1: a held buffered reply preserves scanned progress through 20 across r
     await initialize(h, true);
     await settled(h);
     h.delivery.advance('zulip:general', 1);
-    const internal = h.server as unknown as { live: boolean; catchUpClosedChannel(c: string, all: boolean): Promise<boolean>; goLive(): Promise<void> };
+    const internal = h.server as unknown as { live: boolean; conn: unknown; catchUpClosedChannel(c: string, all: boolean): Promise<boolean>; goLive(conn: unknown): Promise<void> };
     internal.live = false;
     h.adapter.history = [streamMsg(5), streamMsg(20, { mentioned: true })];
     await internal.catchUpClosedChannel(h.adapter.keyOf('zulip:general'), false);
     h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
     await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-    await internal.goLive();
+    await internal.goLive(internal.conn);
     await until(() => h.incoming.some((m) => m.messageId === '5'), 'accepted buffered reply');
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(h.delivery.watermark('zulip:general'), 20);
@@ -3669,10 +3669,10 @@ test('R4-2: concurrent connection drains route buffered 20 once', async () => {
   try {
     await initialize(h, true);
     await settled(h);
-    const internal = h.server as unknown as { live: boolean; goLive(): Promise<void> };
+    const internal = h.server as unknown as { live: boolean; conn: unknown; goLive(conn: unknown): Promise<void> };
     internal.live = false;
     h.adapter.emit!(attached(10, 'old'));
-    const oldDrain = internal.goLive();
+    const oldDrain = internal.goLive(internal.conn);
     await until(() => oldWaiting, 'old attachment fetch');
     await h.close();
     next = harness({ reuse: { server: h.server, adapter: h.adapter } });
