@@ -99,7 +99,7 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
 
   const { api, calls } = standInApi({
     'POST /register': async () => { registerCalls++; return { queue_id: 'q1', last_event_id: -1 }; },
-    'GET /events': () => new Promise(() => {}),
+    'GET /events': () => new Promise((resolve) => setTimeout(() => resolve({ result: 'success', events: [] }), 200)),
   });
 
   await loop.start(api, () => {}, (e) => systemEvents.push(e));
