@@ -166,7 +166,6 @@ export interface ZulipAdapterOptions {
   filters?: FilterView;
   /** How many recent DMs to scan for conversations at startup. */
   dmDiscoveryLimit?: number;
-  /** Stream ids and names. Default: an empty directory of the adapter's own. */
   directory?: StreamDirectory;
   /** The realm's max message length; longer publishes are split. */
   maxMessageLength?: number;
@@ -189,7 +188,6 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly identity: ZulipIdentity;
   private readonly backscrollDefault: number;
   private readonly backscrollLimits: ReadonlyMap<string, number>;
-  /** For each backscroll entry, the rename its log line last named. */
   private backscrollFormerSaid = new Map<string, string | undefined>();
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
@@ -270,7 +268,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return this.backscrollLimits.get(streamName) ?? this.backscrollDefault;
   }
 
-  /** The allowlist, by the stream's current name; a stream the directory does not hold is not allowed. */
   private streamAllowed(streamId: number): boolean {
     const name = this.directory.nameOf(streamId);
     return name !== undefined && this.filters.streamAllowed(name);
@@ -507,12 +504,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return this.streamAllowed(parsed.streamId);
   }
 
-  /**
-   * The key of a message's channel. A stream message is keyed by its stream
-   * id, read from the stream list once when the directory does not hold it;
-   * one that carries no id is keyed by its exact name, the same way.
-   * null, with an error line, for a stream no list resolves.
-   */
   private async keyFor(m: ZulipMessage, raw: Pick<ZulipRawMessage, 'display_recipient'>): Promise<ChannelKey | null> {
     if (m.isDm) return keyOfMessage(m, this.identity.selfUserId);
     let streamId = m.streamId;
@@ -806,11 +797,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return this.directory.nameOf(streamId) !== undefined;
   }
 
-  /**
-   * One read of the stream list into the directory, which takes it whole
-   * while no queue is registered, and otherwise adds only what it does not
-   * hold: at most one a minute, unless `force`.
-   */
   async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
     if (!force && Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return;
     this.streamsRefreshedAt = Date.now();

@@ -309,16 +309,6 @@ export class ChannelManager {
     }
   }
 
-  /**
-   * One `channels/changed` with `removed` and `added` together. It also
-   * removes each id that an unanswered change added and no key holds now,
-   * unless it adds that id again. Each added descriptor is recorded here
-   * before it goes out, and an added id that is also removed is closed
-   * first, so the host's state for it is the new stream's. Each key keeps
-   * its old id until the caller applies the answer. Resolves each added id's
-   * verdict once the host has answered, and 'unanswered' when it hasn't,
-   * with what was recorded put back.
-   */
   async announceChanges(removed: string[], added: ChannelDescriptor[], timeoutMs?: number): Promise<Map<string, 'accepted' | 'refused'> | 'unanswered'> {
     if (!this.grant.has('channels.register')) return 'unanswered';
     if (added.some((d) => this.announcing.has(d.id))) return 'unanswered';
@@ -384,26 +374,18 @@ export class ChannelManager {
     this.unrecord(channelId);
   }
 
-  /** A descriptor is registered here, and its key holds its id unless it holds one already. */
   private record(descriptor: ChannelDescriptor): void {
     this.allChannels.set(descriptor.id, descriptor);
     const key = this.ids.keyOfDescriptor(descriptor);
     if (key !== null) this.ids.noteHeld(key, descriptor.id);
   }
 
-  /** A channel id is no longer registered here: it is closed, and its key no longer holds it. */
   private unrecord(channelId: string): void {
     this.allChannels.delete(channelId);
     this.openChannels.delete(channelId);
     this.ids.forget(channelId);
   }
 
-  /**
-   * A channel id the host no longer holds: a stream's old id once the host
-   * has taken its new one, or a stream that is gone. Every fact about the id
-   * goes, without the lifecycle grant a close from the host needs. Returns
-   * whether it was open.
-   */
   retireId(channelId: string): boolean {
     const wasOpen = this.openChannels.has(channelId);
     this.unannounced.delete(channelId);
@@ -538,13 +520,11 @@ export class ChannelManager {
     return this.openChannels.has(channelId);
   }
 
-  /** Open under the id the host holds for the key now. */
   isKeyOpen(key: ChannelKey): boolean {
     const channelId = this.ids.channelIdOf(key);
     return channelId !== null && this.openChannels.has(channelId);
   }
 
-  /** The key behind a channel id the host holds, a DM id or a current name; null otherwise. */
   keyOfHeld(channelId: string): ChannelKey | null {
     const answer = this.ids.resolve(channelId);
     return answer && 'key' in answer ? answer.key : null;
@@ -643,10 +623,6 @@ export class ChannelManager {
     }
   }
 
-  /**
-   * A system line to one open channel, by the path a gap notice takes, under
-   * the id the host holds for the key when the batch goes out.
-   */
   notifyChannel(key: ChannelKey, text: string, metadata: Record<string, unknown>): void {
     if (!this.isKeyOpen(key)) return;
     this.enqueue(key, {
@@ -680,11 +656,6 @@ export class ChannelManager {
     );
   }
 
-  /**
-   * What a channel id the host names stands for: its key; or, for a name the
-   * directory does not hold, the name as given. A former name is refused
-   * with the new id.
-   */
   private async resolveTarget(channelId: string): Promise<ChannelKey | { streamName: string }> {
     const answer = await this.ids.keyOf(channelId);
     if ('refusal' in answer) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, answer.refusal, { channelId });

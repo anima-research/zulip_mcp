@@ -240,14 +240,8 @@ export class ZulipToolRuntime {
    *  host did not confirm is the agent's business, not a stderr line. */
   onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
 
-  /** Set by the server while its client speaks MCPL; while it is null, a stream name goes to Zulip as given. */
   channelIds: ChannelIds | null = null;
 
-  /**
-   * With MCPL, each stream name a tool was given, by the directory: the
-   * stream's id for a name it holds, and nothing for a name it doesn't know.
-   * A former name refuses the call, before anything goes to Zulip.
-   */
   private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
     const out = new Map<string, number>();
     const ids = this.channelIds;
@@ -350,12 +344,6 @@ export class ZulipToolRuntime {
     return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
   }
 
-  /**
-   * Where `fetch_history` reads. A DM conversation goes by its channel id
-   * (`zulip:dm:<ids>`).
-   * With MCPL, a stream the directory holds goes by its id, and a former name
-   * is refused with the new channel id. Any other name goes to Zulip as given.
-   */
   private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string; isDm: boolean }> {
     const asId = channel.startsWith("zulip:") ? channel : `zulip:${channel}`;
     const dmIds = parseDmChannelId(asId);

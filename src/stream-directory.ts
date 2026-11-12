@@ -1,16 +1,3 @@
-/**
- * The stream ids and names Zulip has told this server about:
- *   - a queue registration's own `streams` list replaces it;
- *   - a `stream` event changes it, in queue order;
- *   - any other list (discovery, a refresh, a miss) replaces it while no
- *     queue is registered, and otherwise only adds ids it does not hold;
- *   - a message's `display_recipient` never changes it.
- *
- * A name a stream had and no stream has now is kept as a former name of that
- * stream. A stream whose name reads as a direct-message channel id (`dm:42`)
- * never enters.
- */
-
 import { parseDmChannelId } from './history.js';
 
 export interface StreamEntry {
@@ -24,13 +11,11 @@ export interface DirectoryChange {
   added: { id: number; name: string }[];
 }
 
-/** The directory as the delivery state file keeps it. */
 export interface DirectorySnapshot {
   streams: Record<string, string>;
   formerNames: Record<string, number>;
 }
 
-/** A `stream` event from Zulip's event queue, as far as the directory reads it. */
 export interface ZulipStreamEvent {
   op?: unknown;
   streams?: unknown;
@@ -66,7 +51,6 @@ export class StreamDirectory {
     return this.byName.get(name);
   }
 
-  /** The stream that had `name` before it was renamed, with its name now. */
   formerOf(name: string): { id: number; current: string } | undefined {
     const id = this.former.get(name);
     if (id === undefined) return undefined;
@@ -74,12 +58,10 @@ export class StreamDirectory {
     return current === undefined ? undefined : { id, current };
   }
 
-  /** Every stream id the directory holds. */
   ids(): number[] {
     return [...this.byId.keys()];
   }
 
-  /** True once a stream list has filled it: a queue registration's, or a list read before any registration. */
   get isFilled(): boolean {
     return this.filled;
   }
@@ -89,13 +71,11 @@ export class StreamDirectory {
     return new Promise((resolve) => this.fillWaiters.push(resolve));
   }
 
-  /** Resolves at the first fill, or once a read of the list got no answer and what waits for one goes on with what the directory holds. */
   whenListed(): Promise<void> {
     if (this.listed) return Promise.resolve();
     return new Promise((resolve) => this.listedWaiters.push(resolve));
   }
 
-  /** A read of the stream list got no answer: what waits for a list goes on with what the directory holds. */
   listUnanswered(): void {
     this.settleListed();
   }
@@ -106,10 +86,6 @@ export class StreamDirectory {
     for (const resolve of this.listedWaiters.splice(0)) resolve();
   }
 
-  /**
-   * Start again from a copy, as a connection does: not filled until its first
-   * list, and no queue registered until its own. Tells no listener.
-   */
   restart(copy: Partial<DirectorySnapshot> | null): void {
     this.byId = new Map();
     this.byName = new Map();
@@ -119,12 +95,10 @@ export class StreamDirectory {
     if (copy) this.load(copy);
   }
 
-  /** Called synchronously, in the same tick as the change it reports. */
   onChange(listener: Listener): void {
     this.listeners.push(listener);
   }
 
-  /** Seed it from its copy on disk, before the first registration. */
   load(snapshot: Partial<DirectorySnapshot>): void {
     for (const [id, name] of Object.entries(snapshot.streams ?? {})) {
       const n = Number(id);
@@ -142,13 +116,11 @@ export class StreamDirectory {
     };
   }
 
-  /** A queue registration's own list: it replaces what the directory held. */
   registration(list: unknown): DirectoryChange {
     this.queueRegistered = true;
     return this.replace(list);
   }
 
-  /** A list read outside a registration: it replaces only while no queue has registered. */
   list(list: unknown): DirectoryChange {
     return this.queueRegistered ? this.addMissing(list) : this.replace(list);
   }
@@ -177,7 +149,6 @@ export class StreamDirectory {
     return change;
   }
 
-  /** A `stream` event: create adds, delete removes, a name update renames. */
   applyEvent(event: ZulipStreamEvent): DirectoryChange {
     const change = emptyChange();
     if (event.op === 'create') {
@@ -198,7 +169,6 @@ export class StreamDirectory {
     return change;
   }
 
-  /** Only ids the directory does not hold are added. */
   private addMissing(list: unknown): DirectoryChange {
     const change = emptyChange();
     for (const entry of entries(list)) {
@@ -235,7 +205,6 @@ export class StreamDirectory {
     change.removed.push({ id, name });
   }
 
-  /** A name some stream holds now is no stream's former name. */
   private dropShadowedFormerNames(): void {
     for (const name of [...this.former.keys()]) if (this.byName.has(name)) this.former.delete(name);
   }

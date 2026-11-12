@@ -281,6 +281,5 @@ export interface PlatformAdapter {
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;
 
-  /** Read the platform's stream list once into the stream directory, which takes it whole while no queue is registered, and otherwise adds only what it does not hold. Optional. */
   refreshStreams?(why?: string, force?: boolean): Promise<void>;
 }
