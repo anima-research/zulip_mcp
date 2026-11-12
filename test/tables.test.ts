@@ -83,7 +83,7 @@ test('the blank line goes in only where Zulip then shows more tables, and every 
   );
 });
 
-test('nothing inside a fence is read, and a fence closes only at a line equal to its opening', () => {
+test('nothing inside a code fence is read, and a fence closes only at a line equal to its opening', () => {
   for (const text of [
     `\`\`\`\n${underText}\n\`\`\``,
     `~~~\n${underText}\n~~~`,
@@ -93,6 +93,16 @@ test('nothing inside a fence is read, and a fence closes only at a line equal to
     `\`\`\`quote\n~~~\n\`\`\`\n${underText}\n~~~\n\`\`\``,
   ]) assert.equal(prepareOutgoing(text), text, text);
   assert.equal(prepareOutgoing(`\`\`\`\ncode\n\`\`\`\n${underText}`), `\`\`\`\ncode\n\`\`\`\n${repaired}`, 'after the fence closes, the rule reads again');
+});
+
+test('inside a quote, quoted or spoiler fence, which Zulip reads as Markdown, a table under a line of text gets the blank line', () => {
+  for (const [open, close] of [['```quote', '```'], ['```quoted', '```'], ['~~~ quote', '~~~'], ['```spoiler Results', '```'], ['````quote', '````']]) {
+    assert.equal(prepareOutgoing(`${open}\n${underText}\n${close}`), `${open}\n${repaired}\n${close}`, open);
+  }
+  assert.equal(prepareOutgoing(`\`\`\`\`quote\n\`\`\`spoiler\n${underText}\n\`\`\`\n\`\`\`\``), `\`\`\`\`quote\n\`\`\`spoiler\n${repaired}\n\`\`\`\n\`\`\`\``, 'a spoiler inside a quote');
+  for (const text of [`\`\`\`quote\n${table}\n\`\`\``, `Results:\n\`\`\`quote\n${table}\n\`\`\``, `\`\`\`quote\nResults:\n\`\`\`\n${table}`]) {
+    assert.equal(prepareOutgoing(text), text, `a fence's own lines end the block above them: ${text}`);
+  }
 });
 
 test('a table directly under a list item or a quoted line is left as it is', () => {

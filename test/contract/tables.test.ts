@@ -46,6 +46,9 @@ const cases: [string, string, number, number][] = [
   ['a table above a rule with a table below it', 'Results:\n| a | b |\n| : | - |\n* * *\n| c | d |\n|---|---|', 1, 1],
   ['a table that opens after a rule', 'x\n---\n| 1 | 2 |\n---|---\n1 | 2\n| 3 |\n| --- |', 1, 1],
   ['a one-column table that a cut below it makes whole', 'plain words here\n| 3 |\n| --- |\n| 1 | 2 |\n:-|-:\n| a | b |', 0, 2],
+  ['a table under a line of text inside a quote fence', `\`\`\`quote\nResults:\n${table}\n\`\`\``, 0, 1],
+  ['a table under a line of text inside a spoiler fence', `\`\`\`spoiler Results\nResults:\n${table}\n\`\`\``, 0, 1],
+  ['a table that opens a quote fence', `\`\`\`quote\n${table}\n\`\`\``, 1, 1],
 ];
 
 for (const [name, text, asWritten, asPosted] of cases) {
