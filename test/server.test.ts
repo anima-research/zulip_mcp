@@ -4591,3 +4591,32 @@ for (const kind of ['edit', 'move', 'delete'] as const) {
   });
 }
 
+
+test("two streams renamed in one pass: the job running on the first stream's lane hands its message under the old id before the line, and one channels/changed names both", async () => {
+  const fetches = heldFetches();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ attachments: fetches.options, visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  h.adapter.visible = [
+    { ...DESCRIPTOR, id: 'zulip:lobby', label: '#lobby', address: { stream_name: 'lobby', stream_id: 7 } },
+    { ...OTHER, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } },
+  ];
+  h.server.directory.registration([{ stream_id: 7, name: 'lobby' }, { stream_id: 8, name: 'dev' }]);
+  const isLine = (m: IncomingChannelMessage) => (m.metadata as { kind?: string } | undefined)?.kind === 'stream-renamed';
+  await until(() => h.incoming.some((m) => m.channelId === 'zulip:other' && isLine(m)), "the idle stream's line");
+  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 0, 'no announcement while the first stream\'s job runs');
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.channelId === 'zulip:general').map((m) => (isLine(m) ? 'line' : m.messageId)), ['1', 'line']);
+  const changed = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED);
+  assert.equal(changed.length, 1);
+  assert.deepEqual([...((changed[0].params as { removed?: string[] }).removed ?? [])].sort(), ['zulip:general', 'zulip:other']);
+  const lineBatch = h.hostSaw.findIndex((r) => r.method === method.CHANNELS_INCOMING &&
+    (r.params as ChannelsIncomingParams).messages.some((m) => m.channelId === 'zulip:general' && isLine(m)));
+  assert.ok(lineBatch >= 0 && lineBatch < h.hostSaw.indexOf(changed[0]), 'the line reaches the host before the announcement');
+  await h.close();
+});

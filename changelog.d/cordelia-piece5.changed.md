@@ -16,3 +16,8 @@
   that the host already has: the host refused a message and reconnected, a
   `sinceLastSeen` open whose limit cut its history settled that message, and
   the connection ended before the host accepted the catch-up block.
+- While the host hasn't answered a stream's rename, nothing of that stream
+  goes to the host: agent-framework drops the old id as it reads the
+  announcement, before it answers. A host that doesn't answer delays the
+  stream's messages by the announcement's 5 s bound, after which they go
+  under the old id.

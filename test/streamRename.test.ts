@@ -462,8 +462,8 @@ scenario('10. a stream archived while its channel is open: a line to the agent, 
   } finally { await run.close(); }
 });
 
-scenario('11. until the host answers the rename, an addressed message goes out under the old id, nothing goes out under the new one, and a new stream under the old name waits', async (dir) => {
-  const r = realm({ 17: 'general' });
+scenario('11. until the host answers the rename, nothing of the stream goes out, nothing goes out under the new id, and a new stream under the old name waits; after the answer, the stream\'s message comes from the new id', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
   const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
   try {
@@ -471,8 +471,6 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     r.rename(17, 'lobby');
     await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
     const addressed = r.post(17, '@bot meanwhile', { mentioned: true });
-    await until(() => run.incoming.some((m) => m.messageId === String(addressed)), 'the addressed message');
-    assert.equal(run.incoming.find((m) => m.messageId === String(addressed))!.channelId, 'zulip:general');
     await run.tool('refresh_channels', {});
     const ids = [
       ...run.incoming.map((m) => m.channelId),
@@ -482,15 +480,18 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     assert.equal(ids.filter((id) => id === 'zulip:lobby').length, 1, 'only the held announcement names zulip:lobby');
     const reused = r.create('general');
     const intruder = r.post(reused, '@bot from the new #general', { mentioned: true });
-    const control = r.post(17, '@bot control', { mentioned: true });
+    const control = r.post(18, '@bot control', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
-    await deliveriesSettled(run);
     assert.equal(gaveUp(), false, 'the announcement is still in flight when the new #general\'s message is handled');
+    assert.equal(named(run, addressed), false, 'nothing of the renamed stream goes while the host has the announcement');
     assert.equal(named(run, intruder), false, 'a new #general sends nothing under the id the host holds for stream 17');
     const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
     assert.equal((listed.channels.find((c) => c.id === 'zulip:general')?.address as { stream_id?: number }).stream_id, 17, 'zulip:general stays stream 17\'s');
     run.answerChanged();
-  } finally { await run.close(); }
+    await until(() => arrivedOn(run, addressed) !== null, 'the renamed stream\'s message after the answer');
+    assert.equal(arrivedOn(run, addressed), 'zulip:lobby', 'from the new id, as a push while the host hasn\'t opened it');
+    assert.equal(run.pushed.filter((p) => origin(p).messageId === String(addressed)).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
 });
 
 scenario('12. a stream list read after a rename that still has the old name leaves the new one', async (dir) => {
@@ -1416,4 +1417,22 @@ scenario('56. one process: a host that leaves while a rename\'s push waits behin
   try {
     await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
   } finally { await third.close(); }
+});
+
+scenario('57. a rename whose announcement gets no answer: the stream\'s message waits for the bound, then goes under the old id', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 200 });
+  const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    const addressed = r.post(17, '@bot meanwhile', { mentioned: true });
+    const control = r.post(18, '@bot control', { mentioned: true });
+    await until(() => named(run, control), 'the control mention');
+    assert.equal(named(run, addressed), false, 'it waits while the announcement may still be answered');
+    await until(() => arrivedOn(run, addressed) !== null, 'the message after the bound');
+    assert.equal(gaveUp(), true, 'it went once the announcement was given up');
+    assert.equal(arrivedOn(run, addressed), 'zulip:general');
+  } finally { run.releaseChanged(); await run.close(); }
 });

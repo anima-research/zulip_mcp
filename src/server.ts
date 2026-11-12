@@ -1713,49 +1713,80 @@ export class ZulipMcplServer {
       if (descriptor && descriptor.id === fresh) renames.push({ key, held, fresh, descriptor });
     }
     if (renames.length === 0 && removals.length === 0 && this.ids.inDoubt().length === 0) return;
-    let told = false;
-    for (const { key, held, fresh } of renames) {
-      if (held === fresh || !this.channelManager.isOpen(held) || this.toldAgent.get(key) === fresh) continue;
-      const from = held.slice('zulip:'.length);
-      this.channelManager.notifyChannel(key,
-        `Zulip stream #${from} was renamed #${fresh.slice('zulip:'.length)}. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
-          `Open ${fresh} to keep hearing it, unless it is already open. What you had read stays read.`,
-        { kind: 'stream-renamed', from: held, to: fresh });
-      this.toldAgent.set(key, fresh);
-      told = true;
-    }
-    for (const { key, held } of removals) {
-      if (!this.channelManager.isOpen(held) || this.toldAgent.get(key) === REMOVED_LINE) continue;
-      this.channelManager.notifyChannel(key,
-        `Zulip stream #${held.slice('zulip:'.length)} was archived, or this bot lost access to it. This channel is gone.`,
-        { kind: 'stream-removed', channelId: held });
-      this.toldAgent.set(key, REMOVED_LINE);
-      told = true;
-    }
-    if (told) await this.channelManager.flush();
-    const removed = [...renames, ...removals].map(({ held }) => held);
-    const openBefore = new Set(removed.filter((id) => this.channelManager.isOpen(id)));
-    const answer = await this.channelManager.announceChanges(removed, renames.map(({ descriptor }) => descriptor), this.announceTimeoutMs);
-    if (answer === 'unanswered') return;
-    for (const { key } of [...renames, ...removals]) this.toldAgent.delete(key);
-    const added = new Set(renames.map(({ fresh }) => fresh));
-    const wasOpen = new Map<ChannelKey, boolean>();
-    for (const { key, held } of [...renames, ...removals]) {
-      if (added.has(held)) {
-        wasOpen.set(key, openBefore.has(held));
-        this.ids.forget(held);
-      } else {
-        wasOpen.set(key, this.channelManager.retireId(held));
+    const lanes = this.lanes;
+    let release!: () => void;
+    const answered = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await Promise.all([
+        ...renames.map(({ key, held, fresh }) => this.passJob(lanes, key, answered, () => this.tellRenamed(key, held, fresh))),
+        ...removals.map(({ key, held }) => this.passJob(lanes, key, answered, () => this.tellRemoved(key, held))),
+      ]);
+      await this.channelManager.flush();
+      const removed = [...renames, ...removals].map(({ held }) => held);
+      const openBefore = new Set(removed.filter((id) => this.channelManager.isOpen(id)));
+      const answer = await this.channelManager.announceChanges(removed, renames.map(({ descriptor }) => descriptor), this.announceTimeoutMs);
+      if (answer === 'unanswered') return;
+      for (const { key } of [...renames, ...removals]) this.toldAgent.delete(key);
+      const added = new Set(renames.map(({ fresh }) => fresh));
+      const wasOpen = new Map<ChannelKey, boolean>();
+      for (const { key, held } of [...renames, ...removals]) {
+        if (added.has(held)) {
+          wasOpen.set(key, openBefore.has(held));
+          this.ids.forget(held);
+        } else {
+          wasOpen.set(key, this.channelManager.retireId(held));
+        }
       }
+      for (const { key, held, fresh } of renames) {
+        const verdict = answer.get(fresh);
+        if (verdict === 'accepted') this.ids.move(key, fresh);
+        if (wasOpen.get(key)) {
+          this.answerOn(lanes?.lane(key), () => {
+            if (this.channelManager.isKeyOpen(key)) return;
+            this.delivery.markClosed(key);
+            this.delivery.save();
+          });
+        }
+        console.error(`[zulip-mcp] stream ${streamIdOfKey(key)}: the host ${verdict === 'accepted' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
+      }
+      for (const { key, held } of removals) console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+      this.delivery.save();
+    } finally {
+      release();
     }
-    for (const { key, held, fresh } of renames) {
-      const verdict = answer.get(fresh);
-      if (verdict === 'accepted') this.ids.move(key, fresh);
-      if (wasOpen.get(key) && !this.channelManager.isKeyOpen(key)) this.delivery.markClosed(key);
-      console.error(`[zulip-mcp] stream ${streamIdOfKey(key)}: the host ${verdict === 'accepted' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
+  }
+
+  private passJob(lanes: Lanes<null> | null, key: ChannelKey, answered: Promise<void>, line: () => void): Promise<void> {
+    const lane = lanes?.lane(key);
+    if (!lane) {
+      line();
+      return Promise.resolve();
     }
-    for (const { key, held } of removals) console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
-    this.delivery.save();
+    return new Promise((ran) => lane.answer(() => {
+      if (!lane.isEnded) {
+        lane.holdOtherUntil(answered);
+        line();
+      }
+      ran();
+    }));
+  }
+
+  private tellRenamed(key: ChannelKey, held: string, fresh: string): void {
+    if (held === fresh || !this.channelManager.isOpen(held) || this.toldAgent.get(key) === fresh) return;
+    const from = held.slice('zulip:'.length);
+    this.channelManager.notifyChannel(key,
+      `Zulip stream #${from} was renamed #${fresh.slice('zulip:'.length)}. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
+        `Open ${fresh} to keep hearing it, unless it is already open. What you had read stays read.`,
+      { kind: 'stream-renamed', from: held, to: fresh });
+    this.toldAgent.set(key, fresh);
+  }
+
+  private tellRemoved(key: ChannelKey, held: string): void {
+    if (!this.channelManager.isOpen(held) || this.toldAgent.get(key) === REMOVED_LINE) return;
+    this.channelManager.notifyChannel(key,
+      `Zulip stream #${held.slice('zulip:'.length)} was archived, or this bot lost access to it. This channel is gone.`,
+      { kind: 'stream-removed', channelId: held });
+    this.toldAgent.set(key, REMOVED_LINE);
   }
 
   private oldIdNow(key: ChannelKey, oldName: string): string {
@@ -2326,8 +2357,7 @@ export class ZulipMcplServer {
     const answer = conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs);
     for (const descriptor of params.added ?? []) {
       const key = this.ids.keyOfDescriptor(descriptor);
-      const renamed = key !== null && (params.removed ?? []).includes(this.ids.heldIdOf(key) ?? '');
-      if (key !== null && !renamed) this.lanes?.lane(key).holdOtherUntil(answer);
+      if (key !== null) this.lanes?.lane(key).holdOtherUntil(answer);
     }
     return (await answer) as ChannelsRegisterResult | undefined;
   }
