@@ -170,6 +170,7 @@ export class ZulipMcplServer {
   private lanes: Lanes<null> | null = null;
   private requestTail: Promise<void> = Promise.resolve();
   private requestsWaiting = 0;
+  private readonly pushesOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
   private healDone: Promise<void> = Promise.resolve();
   private healing = false;
@@ -405,13 +406,15 @@ export class ZulipMcplServer {
   /**
    * Settles once nothing is under way: no delivery job runs or waits, no
    * request waits to be served, no batch waits for its window or is on the
-   * wire, and no replay runs. For tests and diagnostics.
+   * wire, no push waits for its answer, and no replay runs. For tests and
+   * diagnostics.
    */
   async quiet(): Promise<void> {
     while (!this.isQuiet()) {
       await Promise.all([
         this.lanes?.quiet(),
         this.requestTail,
+        Promise.allSettled(this.pushesOut),
         this.channelManager.idle(),
         this.healDone,
       ]);
@@ -420,7 +423,7 @@ export class ZulipMcplServer {
   }
 
   private isQuiet(): boolean {
-    return (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.channelManager.isIdle() && !this.healing;
+    return (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.pushesOut.size === 0 && this.channelManager.isIdle() && !this.healing;
   }
 
   private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {
@@ -1176,16 +1179,20 @@ export class ZulipMcplServer {
     if (this.deliverToOpen(key, message)) return;
 
     if (addressed) {
-      const delivered = await this.pushEvent(message, `zulip_msg_${message.messageId}`);
-      if (delivered) {
-        // The agent's answer goes back through channels/publish, so it goes
-        // to this message's topic, as an answer on an open channel does.
-        this.channelManager.noteConversation(key, message);
-        if (this.accepted(key, id)) this.delivery.save();
-        void this.healUndelivered();
-      } else {
-        this.delivery.hold(key, id, 'failed');
-      }
+      const answered = (delivered: boolean) => {
+        if (delivered) {
+          // The agent's answer goes back through channels/publish, so it goes
+          // to this message's topic, as an answer on an open channel does.
+          this.channelManager.noteConversation(key, message);
+          if (this.accepted(key, id)) this.delivery.save();
+          void this.healUndelivered();
+        } else {
+          this.delivery.hold(key, id, 'failed');
+        }
+      };
+      const sent = this.pushEvent(message, `zulip_msg_${message.messageId}`);
+      if (lane) void sent.then((delivered) => lane.host(() => answered(delivered)));
+      else answered(await sent);
       return;
     }
 
@@ -1334,7 +1341,11 @@ export class ZulipMcplServer {
       // Local policy exits above are not offers. Once attempted, a refusal
       // or ambiguous transport failure must still consume the replay.
       beforeOffer?.();
-      const result = (await conn.sendRequest(method.PUSH_EVENT, params)) as { accepted?: boolean; reason?: string } | undefined;
+      const answer = conn.sendRequest(method.PUSH_EVENT, params);
+      this.pushesOut.add(answer);
+      const settled = () => this.pushesOut.delete(answer);
+      answer.then(settled, settled);
+      const result = (await answer) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
         return false;
@@ -2192,7 +2203,7 @@ export class ZulipMcplServer {
     if (this.channelManager.isKeyOpen(ev.key)) {
       this.channelManager.onIncomingMessage(ev.key, message);
     } else {
-      await this.pushEvent(message, `zulip_reaction_${ev.action}_${ev.messageId}_${ev.reactorId}_${ev.timestamp.getTime()}`, {
+      void this.pushEvent(message, `zulip_reaction_${ev.action}_${ev.messageId}_${ev.reactorId}_${ev.timestamp.getTime()}`, {
         reaction: true,
         action: ev.action,
         onOwnMessage: ev.onOwnMessage,
@@ -2314,7 +2325,7 @@ export class ZulipMcplServer {
     if (open) {
       this.channelManager.onIncomingMessage(ev.key, message);
     } else {
-      await this.pushEvent(message, `zulip_${ev.kind}_${ev.messageId}_${stamp}`, {
+      void this.pushEvent(message, `zulip_${ev.kind}_${ev.messageId}_${stamp}`, {
         change: ev.kind,
         targetMessageId: ev.messageId,
       });

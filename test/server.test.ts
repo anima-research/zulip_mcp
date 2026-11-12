@@ -268,7 +268,7 @@ interface Harness {
   serverSide: McplConnection;
   /** How the host answers channels/incoming: per-message rejections (for
    *  good, or once), and whole batches that error out (counted down per batch). */
-  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile' | 'held'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string>; heldChanged: (() => void)[] };
+  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile' | 'held'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string>; heldChanged: (() => void)[]; holdPushes: boolean; heldPushes: (() => void)[] };
   close(): Promise<void>;
 }
 
@@ -326,6 +326,8 @@ function harness(opts: HarnessOptions = {}): Harness {
     reconcileOpens: [] as { channelId: string; ok: boolean; detail: string }[],
     rejectPushes: new Set<string>(),
     heldChanged: [] as (() => void)[],
+    holdPushes: false,
+    heldPushes: [] as (() => void)[],
   };
   // The host reactor: answer every server→host Request the way conhost does.
   host.on('request', (req) => {
@@ -346,7 +348,9 @@ function harness(opts: HarnessOptions = {}): Harness {
     } else if (req.method === method.PUSH_EVENT) {
       const p = req.params as PushEventParams;
       pushed.push(p);
-      host.sendResponse(req.id, { accepted: !policy.rejectPushes.has(String((p.origin as { messageId?: unknown }).messageId)) });
+      const answer = () => host.sendResponse(req.id, { accepted: !policy.rejectPushes.has(String((p.origin as { messageId?: unknown }).messageId)) });
+      if (policy.holdPushes) policy.heldPushes.push(answer);
+      else answer();
     } else if (req.method === method.CHANNELS_CHANGED) {
       const p = req.params as { added?: ChannelDescriptor[] };
       // 'error' stands for every host that does not answer this Request:
@@ -1479,6 +1483,46 @@ test('quiet() settles once what the server was handed has reached the host: deli
   await h.server.quiet();
   assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow', 'slow:end']);
   await h.close();
+});
+
+test('a push the host hasn\'t answered holds back no later message, reaction or edit of its channel, and quiet() waits for the answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-push-answer-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.policy.holdPushes = true;
+
+    h.adapter.emit!(streamMsg(1, { mentioned: true, text: '@bot one' }));
+    await until(() => h.pushed.length === 1, "the first message's push");
+    h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '1', emoji: 'eyes',
+      reactorId: '9', reactorName: 'Ann', onOwnMessage: true, messageSnippet: 'one', timestamp: new Date(1_700_000_002_000),
+    });
+    await until(() => h.pushed.length === 2, "the reaction's push, the first unanswered");
+    h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:general', messageId: '3', messageIds: ['3'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: '@bot three', previousContent: 'three',
+      mentioned: true, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_003_000),
+    });
+    await until(() => h.pushed.length === 3, "the edit's push, two unanswered");
+    h.adapter.emit!(streamMsg(4, { mentioned: true, text: '@bot four' }));
+    await until(() => h.pushed.length === 4, "the last message's push, three unanswered");
+    assert.deepEqual(h.pushed.map((p) => p.eventId.split('_')[1]), ['msg', 'reaction', 'edit', 'msg']);
+
+    h.policy.holdPushes = false;
+    // The answers come a little later, so that a quiet() which didn't wait for them could show it.
+    setTimeout(() => { for (const answer of h.policy.heldPushes.splice(0)) answer(); }, 30);
+    await h.server.quiet();
+    assert.equal(h.delivery.watermark('zulip:general'), 4, 'both messages accepted');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
