@@ -93,16 +93,31 @@ test('nothing inside a code fence is read, and a fence closes only at a line equ
     `\`\`\`quote\n~~~\n\`\`\`\n${underText}\n~~~\n\`\`\``,
   ]) assert.equal(prepareOutgoing(text), text, text);
   assert.equal(prepareOutgoing(`\`\`\`\ncode\n\`\`\`\n${underText}`), `\`\`\`\ncode\n\`\`\`\n${repaired}`, 'after the fence closes, the rule reads again');
+  const unclosed = `\`\`\`\ncode\n  \`\`\`\n${underText}`;
+  assert.equal(prepareOutgoing(unclosed), unclosed, 'an indented line closes no fence');
+  assert.equal(prepareOutgoing(`  \`\`\`\n${underText}`), `  \`\`\`\n${repaired}`, 'an indented line opens no fence');
 });
 
 test('inside a quote, quoted or spoiler fence, which Zulip reads as Markdown, a table under a line of text gets the blank line', () => {
-  for (const [open, close] of [['```quote', '```'], ['```quoted', '```'], ['~~~ quote', '~~~'], ['```spoiler Results', '```'], ['````quote', '````']]) {
+  for (const [open, close] of [['```quote', '```'], ['```quoted', '```'], ['~~~ quote', '~~~'], ['```spoiler Results', '```'], ['````quote', '````'], ['```{.quote}', '```'], ['``` .spoiler', '```'], ['```QUOTE', '```']]) {
     assert.equal(prepareOutgoing(`${open}\n${underText}\n${close}`), `${open}\n${repaired}\n${close}`, open);
   }
   assert.equal(prepareOutgoing(`\`\`\`\`quote\n\`\`\`spoiler\n${underText}\n\`\`\`\n\`\`\`\``), `\`\`\`\`quote\n\`\`\`spoiler\n${repaired}\n\`\`\`\n\`\`\`\``, 'a spoiler inside a quote');
   for (const text of [`\`\`\`quote\n${table}\n\`\`\``, `Results:\n\`\`\`quote\n${table}\n\`\`\``, `\`\`\`quote\nResults:\n\`\`\`\n${table}`]) {
     assert.equal(prepareOutgoing(text), text, `a fence's own lines end the block above them: ${text}`);
   }
+});
+
+test('a repaired message keeps its own bytes: CRLF line ends and tabs stay as written', () => {
+  assert.equal(prepareOutgoing('Results:\r\n| a | b |\r\n|---|---|'), 'Results:\r\n\n| a | b |\r\n|---|---|');
+  assert.equal(prepareOutgoing('Results:\t\n|\ta | b |\n|---|---|'), 'Results:\t\n\n|\ta | b |\n|---|---|');
+});
+
+test('a long message of thousands of headings or rules in one block is prepared, not refused', () => {
+  const headings = Array.from({ length: 5000 }, (_, i) => `# h${i}`).join('\n');
+  assert.equal(prepareOutgoing(headings), headings);
+  const rules = Array.from({ length: 20000 }, (_, i) => (i % 2 ? '---' : 'text')).join('\n');
+  assert.equal(prepareOutgoing(rules), rules);
 });
 
 test('a table directly under a list item or a quoted line is left as it is', () => {
@@ -175,7 +190,10 @@ test('edit_message prepares its text before its length check', async () => {
   const limit = [...underText].length;
   const refusing = standInApi({ 'PATCH /messages/:id': { result: 'success', msg: '' } });
   const tight = tools(refusing.api, limit);
-  await assert.rejects(tight.runtime.handleToolCall('edit_message', { message_id: 55, content: underText }), new RegExp(`content is ${limit + 1} characters`));
+  await assert.rejects(
+    tight.runtime.handleToolCall('edit_message', { message_id: 55, content: underText }),
+    new RegExp(`content is ${limit + 1} characters as it would be posted, with a blank line above each table under a line of text \\(${limit} as written\\), above the message length of ${limit}`),
+  );
   tight.done();
   assert.equal(refusing.calls.length, 0, 'Zulip is not asked');
 });

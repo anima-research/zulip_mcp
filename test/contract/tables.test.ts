@@ -49,6 +49,7 @@ const cases: [string, string, number, number][] = [
   ['a table under a line of text inside a quote fence', `\`\`\`quote\nResults:\n${table}\n\`\`\``, 0, 1],
   ['a table under a line of text inside a spoiler fence', `\`\`\`spoiler Results\nResults:\n${table}\n\`\`\``, 0, 1],
   ['a table that opens a quote fence', `\`\`\`quote\n${table}\n\`\`\``, 1, 1],
+  ['a table directly under a line of text, with CRLF line ends', 'Results:\r\n| a | b |\r\n|---|---|\r\n| 1 | 2 |', 0, 1],
 ];
 
 for (const [name, text, asWritten, asPosted] of cases) {
