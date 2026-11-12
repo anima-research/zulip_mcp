@@ -533,13 +533,9 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
-- **No per-call timeouts** on the Zulip API yet: the serve loop handles one
-  host request at a time, so a hung Zulip call stalls the requests behind
-  it. The host's own timeout abandons its request but does not unstall the
-  loop; a server in that state needs a restart.
-- **zulip-js quirks** (in `platforms/zulip-events.ts`): booleans in POST bodies
-  must be strings, arrays must be raw arrays; API errors come back as values
-  (`result: 'error'`), which this server turns into thrown errors.
+- **Every Zulip call has a bound:** 15 s, and 90 s for the event long poll.
+  A call that reaches it is ended and fails. A send, an edit or a delete that
+  may have reached Zulip without an answer fails with an error saying so.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

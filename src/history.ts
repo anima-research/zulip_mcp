@@ -13,6 +13,7 @@
 import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import { cleanMarkdown, extractZulipAttachments, type AttachmentRef } from './content.js';
+import type { ZulipApi } from './zulip-api.js';
 
 /** A Zulip message as `GET /messages` and the event queue both deliver it. */
 export interface ZulipRawMessage {
@@ -135,20 +136,14 @@ export interface HistoryPage {
   foundOldest: boolean;
 }
 
+interface MessagesPage {
+  messages?: ZulipRawMessage[];
+  found_newest?: boolean;
+  found_oldest?: boolean;
+}
+
 /** Zulip caps a single GET /messages at 5000 rows. */
 export const ZULIP_MAX_PAGE = 5000;
-
-/**
- * zulip-js resolves API errors as values (`{ result: 'error', code, msg }`)
- * rather than rejecting — an unknown stream would otherwise read as "no
- * messages". Turn them into thrown errors with Zulip's own wording.
- */
-export function assertApiSuccess(result: unknown, what: string): void {
-  const r = result as { result?: string; msg?: string; code?: string } | null | undefined;
-  if (r && r.result === 'error') {
-    throw new Error(`Zulip refused ${what}: ${r.msg ?? r.code ?? 'unknown error'}`);
-  }
-}
 
 /**
  * The narrow for a query. Stream and topic use the `[operator, operand]`
@@ -249,7 +244,7 @@ export function editedTrailer(m: Pick<ZulipMessage, 'editedAt' | 'movedAt'>): st
  * Fetch one page of history, oldest first. `before` and `after` are
  * exclusive; with neither the page is the newest `limit` messages.
  */
-export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<HistoryPage> {
+export async function fetchHistory(api: ZulipApi, q: HistoryQuery): Promise<HistoryPage> {
   const limit = Math.max(0, Math.min(ZULIP_MAX_PAGE, Math.floor(q.limit)));
   if (limit === 0) return { messages: [], foundNewest: true, foundOldest: false };
 
@@ -270,7 +265,7 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
     numAfter = 0;
   }
 
-  const result = await zulipClient.messages.retrieve({
+  const result = await api.request<MessagesPage>('GET', '/messages', `history of ${q.streamName ?? 'all'}`, {
     anchor,
     num_before: numBefore,
     num_after: numAfter,
@@ -280,7 +275,6 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
     // Exclusive cursors; 'newest' already excludes nothing real.
     include_anchor: q.after === undefined && q.before === undefined,
   });
-  assertApiSuccess(result, `history of ${q.streamName ?? 'all'}`);
 
   const messages: ZulipMessage[] = ((result?.messages ?? []) as ZulipRawMessage[])
     .map(normalizeMessage)
@@ -301,16 +295,15 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
  * looked up first to learn where it lives; a message that cannot be read
  * fails loudly rather than silently widening to everything.
  */
-export async function fetchAround(zulipClient: any, messageId: number, limit: number): Promise<HistoryPage> {
+export async function fetchAround(api: ZulipApi, messageId: number, limit: number): Promise<HistoryPage> {
   const half = Math.max(0, Math.floor(Math.min(ZULIP_MAX_PAGE, limit) / 2));
-  const single = await zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
-  assertApiSuccess(single, `message ${messageId}`);
+  const single = await api.request<{ message?: ZulipRawMessage }>('GET', `/messages/${messageId}`, `message ${messageId}`, { message_id: messageId, apply_markdown: false });
   const anchorMsg = single?.message ? normalizeMessage(single.message as ZulipRawMessage) : null;
   if (!anchorMsg) throw new Error(`message ${messageId} is not readable by this bot`);
   const narrow = anchorMsg.isDm
     ? narrowFor({ dmUserIds: anchorMsg.recipients.map((r) => r.id) })
     : narrowFor({ streamName: anchorMsg.streamName ?? undefined, topic: anchorMsg.topic || undefined });
-  const result = await zulipClient.messages.retrieve({
+  const result = await api.request<MessagesPage>('GET', '/messages', `messages around ${messageId}`, {
     anchor: messageId,
     num_before: half,
     num_after: half,
@@ -318,7 +311,6 @@ export async function fetchAround(zulipClient: any, messageId: number, limit: nu
     apply_markdown: false,
     include_anchor: true,
   });
-  assertApiSuccess(result, `messages around ${messageId}`);
   const messages: ZulipMessage[] = ((result?.messages ?? []) as ZulipRawMessage[])
     .map(normalizeMessage)
     .sort((a, b) => a.id - b.id);

@@ -112,7 +112,7 @@ async function main(): Promise<void> {
   }
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
-  const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+  const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
     formatTime,
     uploader,
     uploadPolicy,

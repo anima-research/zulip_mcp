@@ -6,36 +6,29 @@
  * each kind through its callback. Handles queue expiry recovery and
  * graceful shutdown.
  *
- * Failure semantics — grounded in what the vendored client stack
- * (`zulip-js@2.1.0` → `isomorphic-fetch` → `node-fetch@2.7.0`) actually does:
+ * Failure semantics:
  *
- *   - Queue expiry (BAD_EVENT_QUEUE_ID) is an HTTP 400 with a *valid* JSON
- *     body `{ result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: ... }`.
- *     node-fetch does NOT throw on 4xx and the body parses fine, so zulip-js
- *     `retrieve` RETURNS this object — it never throws. (zulip-js's own
- *     `events_wrapper.js` checks `res.result === 'error'` for exactly this.)
- *     We classify on the returned `code` field and re-register a fresh queue.
- *     Zulip offers no gap recovery for a dead queue, so any events between the
- *     last delivered message and re-registration are lost — we surface that as
- *     a 'gap' system event anchored on the last delivered *message* id/time
- *     (not the queue-local event id, which is meaningless to the new queue or
- *     the messages API) so the host/agent can consult history from there.
- *   - Transport failures (ECONNRESET, timeouts, and non-JSON proxy/HTML error
- *     bodies) DO throw — as a node-fetch `FetchError`. A 502 HTML page rejects
- *     `response.json()` with `FetchError('invalid json response body at <url>
- *     reason: ...', 'invalid-json')`; a dropped connection rejects with
- *     `FetchError('request to <url> failed, reason: ...', 'system')`. Both
- *     embed the full request URL (including `?queue_id=...`) in the message,
- *     which is precisely why we must NOT sniff the message for 'queue_id' —
- *     doing so misclassifies every transient blip as expiry. These back off
- *     exponentially (base 2s, cap 60s); after several consecutive failures a
- *     'degraded' system event fires, and a 'recovered' event fires when
- *     polling succeeds again.
+ *   - Queue expiry (BAD_EVENT_QUEUE_ID) is an HTTP 400 with a JSON body
+ *     `{ result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: ... }`, which the
+ *     poll reads as an answer. We classify on its `code` field and re-register
+ *     a fresh queue. Zulip offers no gap recovery for a dead queue, so any
+ *     events between the last delivered message and re-registration are lost —
+ *     we surface that as a 'gap' system event anchored on the last delivered
+ *     *message* id/time (not the queue-local event id, which is meaningless to
+ *     the new queue or the messages API) so the host/agent can consult history
+ *     from there.
+ *   - No JSON answer (a dropped connection, a poll unanswered past its bound,
+ *     90 s by default, while Zulip sends a heartbeat at least every 45 s, or a
+ *     non-JSON proxy or HTML error page)
+ *     throws ZulipNoAnswer. These back off exponentially (base 2s, cap 60s);
+ *     after several consecutive failures a 'degraded' system event fires, and
+ *     a 'recovered' event fires when polling succeeds again.
  *   - A malformed but non-throwing response (missing `events` array and not an
  *     error object) also backs off rather than hot-spinning the poll.
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
+import { isRefusal, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 
 export interface ZulipEventMessage {
   id: number;
@@ -140,41 +133,15 @@ export type ZulipMessageChange =
 
 export type OnZulipMessageChange = (change: ZulipMessageChange) => void;
 
-/**
- * The shape zulip-js `events.retrieve` resolves to. On success it carries an
- * `events` array; on a queue-level failure (e.g. BAD_EVENT_QUEUE_ID) it
- * resolves — NOT rejects — to a `{ result: 'error', code, msg }` object.
- */
+/** The events in a successful answer to `GET /events`. */
 export interface ZulipRetrieveResponse {
   events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] }
     & Partial<ZulipReactionEvent>
     & Partial<ZulipUpdateMessageEvent>
     & Partial<ZulipDeleteMessageEvent>)[];
-  result?: string;
-  code?: string;
-  msg?: string;
 }
 
-/**
- * Minimal structural view of the two zulip-js methods this loop drives.
- * zulip-js is untyped; this pins the contract that matters — crucially that
- * `retrieve` *returns* errors rather than throwing them (see file header).
- */
-export interface ZulipEventClient {
-  queues: {
-    register(params: Record<string, unknown>): Promise<{
-      queue_id: string;
-      last_event_id: number;
-      /** Present on a returned (not thrown) error: zulip-js hands 4xx bodies back as values. */
-      result?: string;
-      msg?: string;
-      code?: string;
-    }>;
-  };
-  events: {
-    retrieve(params: { queue_id: string; last_event_id: number }): Promise<ZulipRetrieveResponse>;
-  };
-}
+export const LONG_POLL_TIMEOUT_MS = 90_000;
 
 export interface ZulipEventLoopOptions {
   /** First retry delay after a poll failure. Default 2000ms. */
@@ -240,7 +207,7 @@ export class ZulipEventLoop {
    * are still registered but dropped.
    */
   async start(
-    zulipClient: ZulipEventClient,
+    api: ZulipApi,
     onMessage: OnZulipMessage,
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
@@ -248,7 +215,7 @@ export class ZulipEventLoop {
   ): Promise<void> {
     while (!this.stopped) {
       try {
-        await this.pollLoop(zulipClient, onMessage, onSystemEvent, onReaction, onChange);
+        await this.pollLoop(api, onMessage, onSystemEvent, onReaction, onChange);
       } catch (error) {
         if (this.stopped) return;
         console.error('Zulip event loop error, restarting in 5s:', error);
@@ -265,32 +232,26 @@ export class ZulipEventLoop {
   }
 
   private async pollLoop(
-    zulipClient: ZulipEventClient,
+    api: ZulipApi,
     onMessage: OnZulipMessage,
     onSystemEvent?: OnSystemEvent,
     onReaction?: OnZulipReaction,
     onChange?: OnZulipMessageChange,
   ): Promise<void> {
     // Register event queue.
-    // Two zulip-js quirks to work around:
-    //   - Booleans crash FormData serialization; pass "true"/"false" as strings.
-    //   - Arrays must be raw JS arrays (the library JSON.stringifies them);
-    //     pre-stringified JSON produces "event_types is not a list" at Zulip.
     // Zulip delivers exactly the registered types: without 'update_message'
     // and 'delete_message' an edit to a message the agent was mentioned in
     // never arrived at all (#22).
-    // `client_capabilities` must be pre-stringified: zulip-js JSON-encodes
-    // arrays only, and a raw object goes over the wire as "[object Object]".
     // Without bulk_message_deletion a topic deletion is one event per
     // message. `notification_settings_null` is spelled out at its documented
     // default (false): Zulip 12 validates client_capabilities as a whole
     // model and rejects the registration with "client_capabilities
     // [\"notification_settings_null\"] field is missing" when it is absent.
-    const registration = await zulipClient.queues.register({
+    const registration = await api.requestAnswer<{ queue_id?: unknown; last_event_id: number }>('POST', '/register', {
       event_types: ['message', 'reaction', 'update_message', 'delete_message'],
-      all_public_streams: 'true',
-      apply_markdown: 'false',
-      client_capabilities: JSON.stringify({ notification_settings_null: false, bulk_message_deletion: true }),
+      all_public_streams: true,
+      apply_markdown: false,
+      client_capabilities: { notification_settings_null: false, bulk_message_deletion: true },
     });
 
     // A refused registration comes back as a value, not a throw. Without
@@ -298,10 +259,11 @@ export class ZulipEventLoop {
     // "returned no events array" — every event lost, the cause invisible.
     // Throwing hands it to the outer loop: logged with Zulip's reason and
     // retried after its pause.
-    if (registration?.result === 'error' || typeof registration?.queue_id !== 'string') {
+    if (isRefusal(registration) || typeof registration.queue_id !== 'string') {
+      const refusal = isRefusal(registration) ? registration : undefined;
       throw new Error(
-        `Zulip event queue registration failed: ${registration?.msg ?? 'no queue_id in the response'}` +
-          (registration?.code ? ` (${registration.code})` : ''),
+        `Zulip event queue registration failed: ${refusal?.msg ?? 'no queue_id in the response'}` +
+          (refusal?.code ? ` (${refusal.code})` : ''),
       );
     }
 
@@ -341,17 +303,14 @@ export class ZulipEventLoop {
 
     while (!this.stopped) {
       try {
-        const response = await zulipClient.events.retrieve({
-          queue_id: this.queueId,
-          last_event_id: lastEventId,
-        });
+        const response = await api.requestAnswer<ZulipRetrieveResponse>(
+          'GET', '/events', { queue_id: this.queueId, last_event_id: lastEventId }, { timeoutMs: LONG_POLL_TIMEOUT_MS },
+        );
 
-        // Queue died server-side. This is a *returned* error object, not a
-        // thrown exception — node-fetch doesn't throw on 4xx and the JSON
-        // error body parses cleanly, so zulip-js hands it back as a value.
-        // Classify on the structured `code` before treating the missing
-        // `events` array as a malformed response.
-        if (response?.result === 'error' && response.code === 'BAD_EVENT_QUEUE_ID') {
+        // Queue died server-side: Zulip answers with a JSON refusal. Classify
+        // on the structured `code` before treating the missing `events` array
+        // as a malformed response.
+        if (isRefusal(response) && response.code === 'BAD_EVENT_QUEUE_ID') {
           console.error('Zulip event queue expired, re-registering...');
           this.pendingGap = {
             queueId: this.queueId ?? 'unknown',
@@ -361,7 +320,7 @@ export class ZulipEventLoop {
           return; // Exit inner loop to re-register in the outer loop.
         }
 
-        if (!response || !Array.isArray(response.events)) {
+        if (isRefusal(response) || !Array.isArray(response.events)) {
           // Malformed but non-throwing response — without a delay this
           // would hot-spin the poll and peg a CPU core.
           this.consecutiveFailures++;
@@ -483,17 +442,11 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        // Only transport-level failures reach here — node-fetch `FetchError`s
-        // for dropped connections, timeouts, and non-JSON (HTML/proxy) bodies.
-        // Queue expiry is NOT among them (it's a returned object, handled
-        // above), so there is deliberately no message-sniffing for 'queue_id':
-        // every FetchError embeds the request URL (incl. ?queue_id=...), and
-        // matching on that abandoned healthy queues on every transient blip.
         const errMsg = error instanceof Error ? error.message : String(error);
 
         this.consecutiveFailures++;
         const delay = this.backoffDelay(this.consecutiveFailures);
-        const nonJson = this.isNonJsonError(error, errMsg);
+        const nonJson = error instanceof ZulipNoAnswer && error.kind === 'not-json';
         if (nonJson) {
           console.error(
             `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms: ${errMsg}`,
@@ -514,24 +467,6 @@ export class ZulipEventLoop {
   private backoffDelay(consecutiveFailures: number): number {
     const exp = Math.min(consecutiveFailures - 1, 31); // avoid 2**huge
     return Math.min(this.baseBackoffMs * 2 ** exp, this.maxBackoffMs);
-  }
-
-  /**
-   * Heuristic: did this error come from parsing a non-JSON (HTML/proxy) body?
-   * node-fetch@2 rejects `response.json()` with a `FetchError` (name
-   * 'FetchError', type 'invalid-json') whose message is
-   * `invalid json response body at <url> reason: ...` — NOT a `SyntaxError`
-   * (node-fetch wraps the parse error before it ever escapes). Match that
-   * real shape.
-   */
-  private isNonJsonError(error: unknown, errMsg: string): boolean {
-    const name = (error as { name?: string })?.name;
-    const type = (error as { type?: string })?.type;
-    return (
-      type === 'invalid-json' ||
-      (name === 'FetchError' && /invalid json response body/i.test(errMsg)) ||
-      /invalid json response body|unexpected token|not valid json|<html|<!doctype/i.test(errMsg)
-    );
   }
 
   /** Emit a 'degraded' event exactly once per outage (when crossing the threshold). */

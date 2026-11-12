@@ -38,8 +38,8 @@ import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
+import { isRefusal, refusalError, type ZulipApi } from '../zulip-api.js';
 import {
-  assertApiSuccess,
   channelIdOf,
   dmCounterparts,
   dmDescriptor,
@@ -120,6 +120,13 @@ type QuoteLookup = { authorId: number } | null | 'budget-skipped';
 type QuoteVerdict = 'reply' | 'not-reply' | 'ineligible' | 'unverified' | 'budget-skipped';
 
 /** A recently seen message, as the cache places reactions and changes. */
+interface ZulipStream {
+  stream_id?: number;
+  name: string;
+  subscriber_count?: number;
+  invite_only?: boolean;
+}
+
 interface SeenMessage {
   channelId: string;
   authorId: number;
@@ -155,18 +162,6 @@ const MOVED_AWAY_TTL_MS = 60_000;
  *  Sends, reactions and edit placement do not spend these tokens. */
 const QUOTE_GET_BURST = 30;
 const QUOTE_GET_REFILL_PER_MS = 30 / 60_000;
-
-class LookupTimeoutError extends Error {}
-
-/** Bound the wait only: zulip-js does not pass an AbortSignal to fetch, so
- *  the underlying request can outlive this timer. */
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new LookupTimeoutError(`${what} timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer); });
-}
 
 /** The live filters the adapter consults — the plane, or a stand-in. */
 export interface FilterView {
@@ -248,7 +243,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private movedAway = new Map<number, number>();
 
   constructor(
-    private zulipClient: any,
+    private api: ZulipApi,
     selfUserId: number | null,
     sessionId: string,
     options: ZulipAdapterOptions = {},
@@ -277,7 +272,7 @@ export class ZulipAdapter implements PlatformAdapter {
   async discoverChannels(): Promise<ChannelDescriptor[]> {
     const channels: ChannelDescriptor[] = [];
     try {
-      const result = await this.zulipClient.streams.retrieve({
+      const result = await this.api.request<{ streams?: ZulipStream[] }>('GET', '/streams', 'listing streams', {
         include_public: true,
         include_subscribed: true,
       });
@@ -338,8 +333,8 @@ export class ZulipAdapter implements PlatformAdapter {
       if (!name || !this.filters.streamAllowed(name)) continue;
       let streamId: number | undefined;
       try {
-        const result = await this.zulipClient.streams.getStreamId({ stream: name });
-        if (result?.result === 'success' && typeof result.stream_id === 'number') streamId = result.stream_id;
+        const result = await this.api.requestAnswer<{ stream_id?: unknown }>('GET', '/get_stream_id', { stream: name });
+        if (result.result === 'success' && typeof result.stream_id === 'number') streamId = result.stream_id;
       } catch (error) {
         console.error(`[zulip-mcp] could not resolve the stream id for #${name}:`, (error as Error).message);
       }
@@ -355,7 +350,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private async discoverDmChannels(): Promise<ChannelDescriptor[]> {
     if (this.dmDiscoveryLimit <= 0) return [];
     try {
-      const result = await this.zulipClient.messages.retrieve({
+      const result = await this.api.request<{ messages?: ZulipRawMessage[] }>('GET', '/messages', 'recent direct messages', {
         anchor: 'newest',
         num_before: this.dmDiscoveryLimit,
         num_after: 0,
@@ -363,8 +358,7 @@ export class ZulipAdapter implements PlatformAdapter {
         apply_markdown: false,
         include_anchor: true,
       });
-      assertApiSuccess(result, 'recent direct messages');
-      for (const raw of (result?.messages ?? []) as ZulipRawMessage[]) {
+      for (const raw of result.messages ?? []) {
         const m = normalizeMessage(raw);
         if (!m.isDm) continue;
         if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail }) && m.authorId !== this.identity.selfUserId) continue;
@@ -416,18 +410,15 @@ export class ZulipAdapter implements PlatformAdapter {
     const cached = this.seen.get(messageId);
     if (cached) return cached;
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await withTimeout<any>(
-        this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false }),
-        timeoutMs,
-        `GET message ${messageId}`,
+      const result = await this.api.requestAnswer<{ message?: ZulipRawMessage }>(
+        'GET', `/messages/${messageId}`, { message_id: messageId, apply_markdown: false }, { timeoutMs },
       );
       // This endpoint uses BAD_REQUEST for both missing and inaccessible ids.
       // Older (pre-5.0) servers omit code; only then use the legacy text.
-      if (quoteLookup && result?.result === 'error' &&
+      if (quoteLookup && result.result === 'error' &&
           (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
-      assertApiSuccess(result, `message ${messageId}`);
-      const raw = result?.message as ZulipRawMessage | undefined;
+      if (isRefusal(result)) throw refusalError(`message ${messageId}`, result);
+      const raw = result.message;
       if (!raw) throw new Error('response contained no message');
       if (raw.id !== messageId) throw new Error('response contained a different message id');
       if (!Number.isSafeInteger(raw.sender_id) || raw.sender_id <= 0) throw new Error('response contained no valid sender_id');
@@ -723,8 +714,7 @@ export class ZulipAdapter implements PlatformAdapter {
     // reply goes out as several messages rather than failing whole.
     const messageIds: string[] = [];
     for (const chunk of chunkMessage(textContent, this.maxMessageLength)) {
-      const result = await this.zulipClient.messages.send({ ...target, content: chunk });
-      assertApiSuccess(result, what);
+      const result = await this.api.request<{ id?: number }>('POST', '/messages', what, { ...target, content: chunk });
       messageIds.push(String(result.id));
     }
     return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
@@ -733,8 +723,7 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */
   async acknowledge(_channelId: string, messageId: string, value?: string): Promise<string> {
     const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
-    const result = await this.zulipClient.reactions.add({ message_id: Number(messageId), emoji_name: name, reaction_type: 'unicode_emoji' });
-    assertApiSuccess(result, `acknowledging message ${messageId}`);
+    await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${messageId}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
     return `:${name}:`;
   }
 
@@ -742,8 +731,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const id = Number(messageId);
     this.noteSelfDeleted(id);
     try {
-      const result = await this.zulipClient.messages.deleteById({ message_id: id });
-      assertApiSuccess(result, `deleting message ${messageId}`);
+      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`, { message_id: id });
     } catch (err) {
       this.selfDeleted.delete(id);
       throw err;
@@ -784,13 +772,10 @@ export class ZulipAdapter implements PlatformAdapter {
     if (Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return null;
     this.streamsRefreshedAt = Date.now();
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result = await withTimeout<any>(
-        this.zulipClient.streams.retrieve({ include_public: true, include_subscribed: true }),
-        LOCATE_TIMEOUT_MS,
-        'stream list refresh',
+      const result = await this.api.request<{ streams?: { stream_id?: unknown; name?: unknown }[] }>(
+        'GET', '/streams', 'refreshing the stream list', { include_public: true, include_subscribed: true }, { timeoutMs: LOCATE_TIMEOUT_MS },
       );
-      for (const stream of (result?.streams ?? []) as { stream_id?: unknown; name?: unknown }[]) {
+      for (const stream of result.streams ?? []) {
         if (typeof stream.stream_id === 'number' && typeof stream.name === 'string') {
           this.streamNamesById.set(stream.stream_id, stream.name);
         }
@@ -812,11 +797,6 @@ export class ZulipAdapter implements PlatformAdapter {
    * `op` is passed through: 'start' while the host refreshes (every ~7s
    * during inference), 'stop' when the turn ends. Zulip expires a start that
    * is never stopped on its own, so a missed stop lingers but does not stick.
-   *
-   * Note: zulip-js's `typing.send` unconditionally dereferences `params.to.length`,
-   * so we must pass `to: []` even for the stream form — otherwise the library
-   * throws a TypeError before the HTTP request is made. The Zulip server ignores
-   * `to` when `type:'stream'` is set.
    */
   async sendTyping(
     channelId: string,
@@ -824,10 +804,10 @@ export class ZulipAdapter implements PlatformAdapter {
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
   ): Promise<void> {
-    const send = this.zulipClient.typing.send as (p: unknown) => Promise<{ result?: string; msg?: string }>;
+    const send = (params: Record<string, unknown>) => this.api.requestAnswer('POST', '/typing', params);
     const dmIds = parseDmChannelId(channelId);
     try {
-      let result: { result?: string; msg?: string };
+      let result: Awaited<ReturnType<typeof send>>;
       if (dmIds) {
         result = await send({ type: 'direct', to: dmIds, op });
       } else {
@@ -837,9 +817,9 @@ export class ZulipAdapter implements PlatformAdapter {
           return;
         }
         const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
-        result = await send({ type: 'stream', stream_id: streamId, topic, op, to: [] });
+        result = await send({ type: 'stream', stream_id: streamId, topic, op });
       }
-      if (result?.result && result.result !== 'success') {
+      if (result.result && result.result !== 'success') {
         console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
       }
     } catch (err) {
@@ -869,7 +849,7 @@ export class ZulipAdapter implements PlatformAdapter {
   ): Promise<ContextInjection | null> {
     const dmIds = parseDmChannelId(channelId);
     if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) return null;
-    const page = await fetchHistory(this.zulipClient, dmIds
+    const page = await fetchHistory(this.api, dmIds
       ? { dmUserIds: dmIds, limit: historySize }
       : { streamName: streamNameOf(channelId), limit: historySize });
     const messages = page.messages.filter((m) => this.allowed(m));
@@ -907,7 +887,7 @@ export class ZulipAdapter implements PlatformAdapter {
     if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) {
       return { messages: [], scannedThrough: null, reachedNewest: true };
     }
-    const page = await fetchHistory(this.zulipClient, {
+    const page = await fetchHistory(this.api, {
       ...(dmIds ? { dmUserIds: dmIds } : { streamName: streamNameOf(channelId) }),
       limit: query.limit,
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
@@ -975,11 +955,10 @@ export class ZulipAdapter implements PlatformAdapter {
   async ensureSubscribed(channelId: string): Promise<void> {
     if (parseDmChannelId(channelId)) return;
     const streamName = streamNameOf(channelId);
-    const result = await this.zulipClient.users.me.subscriptions.add({
-      subscriptions: [{ name: streamName }],
-    });
-    assertApiSuccess(result, `subscribing to #${streamName}`);
-    const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+    const result = await this.api.request<{ unauthorized?: unknown; subscribed?: Record<string, unknown> }>(
+      'POST', '/users/me/subscriptions', `subscribing to #${streamName}`, { subscriptions: [{ name: streamName }] },
+    );
+    const unauthorized: unknown[] = Array.isArray(result.unauthorized) ? result.unauthorized : [];
     if (unauthorized.includes(streamName)) {
       throw new Error(`not authorized to subscribe to #${streamName} (private stream; the bot must be invited)`);
     }
@@ -1036,7 +1015,7 @@ export class ZulipAdapter implements PlatformAdapter {
           });
         }
       : undefined;
-    loop.start(this.zulipClient, async (_streamName, msg, flags) => {
+    loop.start(this.api, async (_streamName, msg, flags) => {
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
