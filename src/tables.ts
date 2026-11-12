@@ -1,7 +1,27 @@
 /*
+ * FENCE and the fence rule in blocks are ported from Zulip 12.4,
+ * zerver/lib/markdown/fenced_code.py (FENCE_RE, generic_handler and the
+ * handlers' handle_line), and HEADING from its HashHeaderProcessor.RE
+ * (zerver/lib/markdown/__init__.py). Its notice:
+ *
+ * Copyright 2012–2015 Dropbox, Inc., 2015–2021 Kandra Labs, Inc., and contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this project except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * isTable, splitRow and split are ported from Python-Markdown 3.10.3,
  * markdown/extensions/tables.py (TableProcessor.test, _split_row, _split),
- * the version Zulip 12.4 pins. Its licence:
+ * the version Zulip 12.4 pins, and RULE from its HRProcessor.RE
+ * (markdown/blockprocessors.py). Its licence:
  *
  * BSD 3-Clause License
  *
