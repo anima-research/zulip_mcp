@@ -22,6 +22,12 @@ export interface Realm {
   reads: Record<string, unknown>[];
   /** One answer for the next `GET /streams`, read before a change it doesn't show. */
   staleList: Record<number, string> | null;
+  /** How many of the next `GET /streams` Zulip refuses. */
+  listRefusals: number;
+  /** How many queue registrations Zulip has answered. */
+  registrations: number;
+  /** Hold every answer to this call until the returned function is called. */
+  hold(call: 'POST /register' | 'GET /streams'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   create(name: string): number;
@@ -103,9 +109,12 @@ export function realm(initial: Record<number, string>): Realm {
     return out;
   };
 
+  const holds = new Map<string, Promise<void>>();
   const { api, calls } = standInApi({
     'GET /users/me': { result: 'success', user_id: SELF },
-    'POST /register': (p) => {
+    'POST /register': async (p) => {
+      await holds.get('POST /register');
+      self.registrations++;
       const types = p.event_types as string[] | undefined;
       dropped = false;
       return {
@@ -122,7 +131,12 @@ export function realm(initial: Record<number, string>): Realm {
       return { result: 'success', events: events.filter((e) => (e.id as number) > after) };
     },
     'DELETE /events': { result: 'success' },
-    'GET /streams': () => {
+    'GET /streams': async () => {
+      await holds.get('GET /streams');
+      if (self.listRefusals > 0) {
+        self.listRefusals--;
+        return { result: 'error', code: 'BAD_REQUEST', msg: 'the stream list is down' };
+      }
       const stale = self.staleList;
       self.staleList = null;
       const answer = stale ? Object.entries(stale).map(([id, name]) => ({ stream_id: Number(id), name, invite_only: false, subscriber_count: 2 })) : list();
@@ -180,6 +194,13 @@ export function realm(initial: Record<number, string>): Realm {
     sends,
     reads,
     staleList: null,
+    listRefusals: 0,
+    registrations: 0,
+    hold(call) {
+      let release!: () => void;
+      holds.set(call, new Promise<void>((resolve) => { release = resolve; }));
+      return () => { holds.delete(call); release(); };
+    },
     rename(streamId, name) {
       streams.set(streamId, name);
       queue({ type: 'stream', op: 'update', stream_id: streamId, name, property: 'name', value: name });

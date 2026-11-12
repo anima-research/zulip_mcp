@@ -348,3 +348,22 @@ test('renderMissedBlock on a DM conversation renders [DM] lines, with no mention
   const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' });
   assert.deepEqual(block.split('\n').slice(1, 3), ['[T id=1] [DM] Bo: hey', '[T id=2] [DM] Bo: you there?']);
 });
+
+test('a state file as main writes it, saved before a stream list fills the directory, keeps its entries for the next start', async () => {
+  const dir = tmp();
+  try {
+    const tally = { anchorId: 4, talliedThrough: 6, messages: 2, characters: 9 };
+    writeFileSync(join(dir, 's.delivery.json'), JSON.stringify({ watermarks: { 'zulip:general': 10 }, missed: { 'zulip:dev': tally }, lastOpen: ['zulip:general'] }));
+    new DeliveryState(dir, 's', new StreamDirectory()).save();
+
+    const directory = new StreamDirectory();
+    const later = new DeliveryState(dir, 's', directory);
+    directory.registration([{ stream_id: 1, name: 'general' }, { stream_id: 2, name: 'dev' }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(later.watermark(GENERAL), 10);
+    assert.equal(later.wasOpen(GENERAL), true);
+    assert.deepEqual(later.tally(DEV), tally);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

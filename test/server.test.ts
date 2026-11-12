@@ -191,6 +191,8 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       return { position: 'beforeUser' as const, content: 'recent history' };
     },
     startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction, onMessageChange?: OnMessageChange) {
+      // As each connection's queue registration answers: the streams the bot can see.
+      directory().registration(streamList(adapter.visible));
       adapter.emit = (message, newChannel) => {
         if (newChannel) learn([newChannel]);
         if ('key' in message) return onMessage(message as unknown as KeyedMessage, newChannel);

@@ -853,3 +853,25 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     } finally { adapter.stopEvents(); }
   });
 }
+
+test('a quote target in a stream the stream list doesn\'t show yet is not remembered as unreachable', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let gets = 0;
+  let listed = false;
+  const adapter = new ZulipAdapter(standInApi({
+    'GET /messages': async () => ({ messages: [raw(300, quote())], found_newest: true }),
+    'GET /messages/:id': async () => {
+      gets++;
+      return { message: raw(QUOTED, 'original', { sender_id: SELF, stream_id: 900, display_recipient: 'late' }) };
+    },
+    'GET /streams': async () => ({ result: 'success', streams: listed ? [...KNOWN, { stream_id: 900, name: 'late' }] : KNOWN }),
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
+  assert.deepEqual(first.unverifiedMessageIds, ['300'], 'unverified, not a definite miss');
+  listed = true;
+  now += 61_000;
+  const second = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
+  assert.equal(second.messages[0].metadata?.replyToSelf, true);
+  assert.equal(gets, 2, 'the retry reads the target again');
+});

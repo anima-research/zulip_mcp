@@ -739,6 +739,30 @@ test('an id that an unanswered change added stays at the host once a new stream 
   assert.deepEqual(sent.at(-1)?.removed, ['zulip:a'], 'stream 101 holds zulip:tmp at the host');
 });
 
+test('a stream renamed while its first announcement waits to be retried: a retry of the backlog doesn\'t offer its old id', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown = new Error('timed out');
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }]);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17)])).local, ['zulip:a']);
+
+  ids.directory.applyEvent({ op: 'update', stream_id: 17, property: 'name', value: 'b' });
+  answer = undefined;
+  await manager.registerAdditional([], { retryBacklog: true });
+  assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'zulip:a is stream 17\'s old id');
+});
+
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
   // The descriptor is recorded before the announcement, so "already in
   // allChannels" cannot mean "the host accepted it" — only a verdict can.
