@@ -60,6 +60,10 @@ const PLACES: [string, string][] = [
   ["past an indented start's backtick", '    code `x\n{T} y`'],
   ['past a rule', 'a `b\n***\n{T} c`'],
   ['after an escaped backtick', 'a \\` then {T} and `x`'],
+  ['a span across a "1)" line', 'a `b\n1) {T} c` d'],
+  ['a span across a "10." line', 'a `b\n10. {T} c` d'],
+  ['after a backslash', 'a \\{T} b'],
+  ['after two backslashes', 'a \\\\{T} b'],
 ];
 
 test('the server puts a link where Zulip itself reads Markdown, and only there', async (t) => {
@@ -87,4 +91,18 @@ test('a message in a private stream links within its own stream, and is refused 
   const id = await post(secret, 'plans', 'private');
   await assert.rejects(send(open, `[[msg:${id}]]`), /is in a private stream, and a link would show that stream's and topic's names to this conversation's readers\. Nothing was sent\./);
   assert.ok(linksTo(await rendered(await send(secret.toUpperCase(), `[[msg:${id}]]`)), id), 'toward its own stream, given by name in another case');
+});
+
+test('a | in a topic reaches Zulip as &#124;, so the link keeps a table row whole and reads | in a paragraph', async () => {
+  const stream = await newStream(env, 'pipes');
+  const id = await post(stream, 'a|b', 'pointed at');
+  const label = (html: string) => (html.match(new RegExp(`<a href="[^"]*/near/${id}"[^>]*>([^<]*)</a>`))?.[1] ?? '').replaceAll('&#124;', '|');
+  const row = await rendered(await send(stream, `| ref | x |\n|---|---|\n| [[msg:${id}]] | kept |`));
+  const cells = row.slice(row.indexOf('<tbody>')).match(/<td[^>]*>[\s\S]*?<\/td>/g) ?? [];
+  assert.equal(cells.length, 2, row);
+  assert.ok(linksTo(cells[0]!, id) && cells[1]!.includes('kept'), row);
+  assert.match(label(row), /a\|b/);
+  const paragraph = await rendered(await send(stream, `see [[msg:${id}]] here`));
+  assert.ok(linksTo(paragraph, id), paragraph);
+  assert.match(label(paragraph), /a\|b/);
 });
