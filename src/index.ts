@@ -63,7 +63,7 @@ const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
 function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
-  const n = parseInt(raw, 10);
+  const n = /^\s*\d+\s*$/.test(raw) ? Number(raw) : NaN;
   if (!Number.isFinite(n) || n < min) {
     console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not ${min === 0 ? 'a non-negative integer' : `an integer of at least ${min}`}); using ${fallback}`);
     return fallback;
