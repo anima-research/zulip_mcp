@@ -1684,7 +1684,7 @@ export class ZulipMcplServer {
     this.toldReadWait = true;
     const channels = [...this.readWaits].map((key) => this.ids.channelIdOf(key) ?? this.label(key));
     this.tellOpen(
-      `Zulip isn't serving reads of the history of ${channels.join(', ')}, and the server keeps trying them. ` +
+      `Zulip isn't serving reads of the history of ${channels.join(', ')}, and they are tried again. ` +
         'A channel whose read waits is silent until Zulip answers it; its messages then arrive in order.',
       { kind: 'history-waiting', channels },
     );
