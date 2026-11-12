@@ -1378,6 +1378,73 @@ test('a close waits only for the job running on its channel, and the messages be
   await h.close();
 });
 
+test('an open\'s page holds no message that waits in its lane, and each waiting message follows the open once, as a message', async () => {
+  const fetches = heldFetches();
+  const gates: (() => void)[] = [];
+  const attachments = {
+    ...fetches.options,
+    source: {
+      async fetch(path: string) {
+        fetches.started.push(path);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+      },
+    },
+  };
+  const h = harness({ attachments, history: [1, 2, 3, 4, 5].map((n) => streamMsg(n)) });
+  await initialize(h, true);
+  await settled(h);
+  const open = async (history: { limit: number; sinceLastSeen?: boolean }) =>
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history }) as Promise<{ history?: { messageId: string }[] }>;
+
+  // The newest rows: the page is the two below the two that wait.
+  h.adapter.emit!(withLog(streamMsg(3)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(4));
+  h.adapter.emit!(streamMsg(5));
+  const newest = open({ limit: 2 });
+  await h.host.sendRequest('ping');
+  gates.shift()!();
+  assert.deepEqual((await newest).history?.map((m) => m.messageId), ['2', '3']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5']);
+
+  // Since last seen: the page ends below the two that wait.
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  h.adapter.history.push(...[6, 7, 8].map((n) => streamMsg(n)));
+  h.adapter.emit!(withLog(streamMsg(6)));
+  await until(() => fetches.started.length === 2, 'the second fetch to start');
+  h.adapter.emit!(streamMsg(7));
+  h.adapter.emit!(streamMsg(8));
+  const since = open({ limit: 10, sinceLastSeen: true });
+  await h.host.sendRequest('ping');
+  gates.shift()!();
+  assert.deepEqual((await since).history?.map((m) => m.messageId), ['6']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5', '7', '8']);
+
+  // A message that comes to wait while the page is read is left out of it.
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  let letRead!: () => void;
+  const gate = new Promise<void>((resolve) => { letRead = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await gate;
+    return read(key, query);
+  };
+  const during = open({ limit: 2 });
+  await until(() => reading, 'the page read to start');
+  h.adapter.history.push(streamMsg(9));
+  h.adapter.emit!(streamMsg(9));
+  letRead();
+  assert.deepEqual((await during).history?.map((m) => m.messageId), ['8']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5', '7', '8', '9']);
+  await h.close();
+});
+
 test('a message waiting for its attachments reaches the host before a later message of its channel', async () => {
   const fetches = heldFetches();
   const h = harness({ attachments: fetches.options });

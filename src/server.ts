@@ -875,12 +875,18 @@ export class ZulipMcplServer {
       const afterMessageId =
         params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined;
       const beforeMessageId = afterMessageId === undefined ? params.history?.beforeMessageId : undefined;
-      const read = await this.adapter.fetchHistory(key, { limit, beforeMessageId, afterMessageId });
+      const firstWaiting = this.firstWaiting(key);
+      const readBefore = afterMessageId === undefined && Number.isFinite(firstWaiting) && !(Number(beforeMessageId) < firstWaiting)
+        ? String(firstWaiting)
+        : beforeMessageId;
+      const read = await this.adapter.fetchHistory(key, { limit, beforeMessageId: readBefore, afterMessageId });
+      const below = Math.min(firstWaiting, this.firstWaiting(key));
+      const messages = read.messages.filter((m) => !(Number(m.messageId) >= below));
       // Not attributed: the host hands this back as the channel_open tool
       // result, JSON that already shows author, threadId and metadata.
-      result.history = this.projectHistoryReactions(read.messages).map((m) => toWire(m, descriptor.id));
+      result.history = this.projectHistoryReactions(messages).map((m) => toWire(m, descriptor.id));
       result.historyTruncated = requested > limit;
-      page = { messages: read.messages, older: beforeMessageId !== undefined };
+      page = { messages, older: beforeMessageId !== undefined };
     }
 
     this.channelManager.markOpen(descriptor.id);
@@ -900,6 +906,10 @@ export class ZulipMcplServer {
     this.delivery.markOpen(key);
     this.delivery.save();
     return result;
+  }
+
+  private firstWaiting(key: ChannelKey): number {
+    return Math.min(Infinity, ...(this.lanes?.lane(key).waitingMessages() ?? []).filter(Number.isFinite));
   }
 
   /**

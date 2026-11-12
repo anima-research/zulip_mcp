@@ -12,3 +12,8 @@
   before it answers that channel's announcement, as agent-framework 0.18.0
   and older did, no longer stalls for 5 s behind a tool call that announced
   the channel.
+- A message still waiting for its attachments when the host opened its
+  channel came both in the open's history and again as a message. The
+  history an open returns now ends below the first message of its channel
+  that the server hasn't handed on yet, and each such message follows the
+  open's answer once, as a message.
