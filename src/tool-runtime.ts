@@ -748,8 +748,8 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        const messageId = numberOrUndefined(args.message_id);
-        if (messageId === undefined || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error("message_id must be a positive integer");
+        const messageId = typeof args.message_id === "string" && /^[0-9]+$/.test(args.message_id) ? Number(args.message_id) : args.message_id;
+        if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error("message_id must be a positive integer");
         if (typeof args.content !== "string") throw new Error("content must be a string");
         const length = [...args.content].length;
         if (length > this.maxMessageLength) {

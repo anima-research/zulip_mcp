@@ -291,11 +291,24 @@ test('edit_message refuses an edit with no content, or a message_id that is not 
   const s = await serverOn(z.url);
   try {
     await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 55 }), /content/);
-    for (const message_id of [0, -3, 1.5, 'abc', undefined]) {
+    for (const message_id of [0, -3, 1.5, 'abc', undefined, '0x37', ' 55 ', '55.0', '1e2', '']) {
       await assert.rejects(s.tools.handleToolCall('edit_message', { message_id, content: 'x' }), /message_id/, `message_id ${String(message_id)}`);
     }
     assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 0, 'Zulip was never asked');
-    await s.tools.handleToolCall('edit_message', { message_id: '55', content: 'a numeric string still names the message' });
+    await s.tools.handleToolCall('edit_message', { message_id: '55', content: 'a string of digits still names the message' });
+    await s.tools.handleToolCall('edit_message', { message_id: '055', content: 'as Zulip reads the path' });
+    assert.deepEqual(z.requests.filter((r) => r.method === 'PATCH').map((r) => r.path), ['/messages/55', '/messages/55']);
+  } finally { s.done(); z.close(); }
+});
+
+test('edit_message refuses content above the configured message length', async () => {
+  const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
+  const s = await serverOn(z.url);
+  try {
+    const tools = new ZulipToolRuntime(s.session, s.dir, { maxMessageLength: 50 });
+    await assert.rejects(tools.handleToolCall('edit_message', { message_id: 55, content: 'é'.repeat(51) }), /51 characters, above the message length of 50/);
+    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 0, 'Zulip was never asked');
+    await tools.handleToolCall('edit_message', { message_id: 55, content: 'é'.repeat(50) });
     assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 1);
   } finally { s.done(); z.close(); }
 });
