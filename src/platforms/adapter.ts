@@ -21,8 +21,14 @@ import type {
   ContentBlock,
   ContextInjection,
 } from '@animalabs/mcpl-core';
-import type { SentRecord } from '../outgoing.js';
 import type { ChannelKey, KeyedMessage } from '../channel-key.js';
+
+/** A message this server sent, as the rollback record keeps it. */
+export interface SentRecord {
+  messageId: string;
+  channelId: string;
+  content: string;
+}
 
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
