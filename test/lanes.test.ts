@@ -217,6 +217,23 @@ test('past the cap, the lane with the most waiting messages is given up: its mes
   assert.ok(log.includes('B 20'));
 });
 
+test('at a give-up, a job about given-up messages alone leaves with them, and one about a message that waits elsewhere, or about none, stays', async () => {
+  const log: string[] = [];
+  const running = gate();
+  const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }, { kind: 'other', turn: true }); }, 2);
+  l.lane(A).enter(async () => { await running.opened; log.push('running'); });
+  l.lane(A).enter(() => { log.push('10'); }, { kind: 'message', id: 10 });
+  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'other', about: [10] });
+  l.lane(A).enter(() => { log.push('11'); }, { kind: 'message', id: 11 });
+  l.lane(A).enter(() => { log.push('about 10 and 5'); }, { kind: 'other', about: [10, 5] });
+  l.lane(A).enter(() => { log.push('about 10 and 11'); }, { kind: 'other', about: [10, 11] });
+  l.lane(A).enter(() => { log.push('about none'); });
+  l.lane(A).enter(() => { log.push('12'); }, { kind: 'message', id: 12 });
+  running.open();
+  await l.quiet();
+  assert.deepEqual(log, ['running', 'read', 'about 10 and 5', 'about none']);
+});
+
 test('the place moves up to what a lane decides, and never down', () => {
   const lane = lanes().lane(A);
   assert.equal(lane.place, undefined);

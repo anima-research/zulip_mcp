@@ -171,6 +171,8 @@ export interface MessageChangeEvent {
  */
 export interface ChangeEntry {
   key: ChannelKey;
+  /** The messages the change is about, as the event names them. */
+  messageIds: number[];
   ready(): Promise<MessageChangeEvent | null>;
 }
 

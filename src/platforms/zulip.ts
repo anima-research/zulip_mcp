@@ -1044,7 +1044,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {
           if (change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId) return;
-          const enter = (key: ChannelKey, located?: SeenMessage) => onMessageChange({ key, ready: () => this.onZulipChange(change, located) });
+          const enter = (key: ChannelKey, located?: SeenMessage) => onMessageChange({ key, messageIds: change.messageIds, ready: () => this.onZulipChange(change, located) });
           const key = this.changeKeyNow(change);
           if (key !== null && (change.streamId !== null || this.placing === 0)) return enter(key);
           this.inOrder(async () => {

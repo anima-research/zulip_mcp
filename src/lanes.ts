@@ -7,6 +7,8 @@ export interface JobInfo {
   id?: number;
   /** The job reads from Zulip, and takes a turn: one such job runs at a time across all lanes. */
   turn?: boolean;
+  /** The messages a change is about: it leaves the queue with them when all of them are given up. */
+  about?: number[];
 }
 
 export interface JobContext<W> {
@@ -100,14 +102,17 @@ export class Lane<W> {
   }
 
   /**
-   * The waiting messages leave the queue, and `job` takes the place of the
-   * first of them. Returns their ids, oldest first.
+   * The waiting messages leave the queue, with each job that is about them
+   * alone, and `job` takes the place of the first of them. Returns their ids,
+   * oldest first.
    */
   replaceMessages(job: Job<W>, info: JobInfo): number[] {
     const first = this.otherQueue.findIndex((e) => e.info.kind === 'message');
     if (first < 0) return [];
     const ids = this.waitingMessages();
-    const kept = this.otherQueue.filter((e, i) => i < first || e.info.kind !== 'message');
+    const given = new Set(ids);
+    const aboutGiven = (e: Entry<W>) => e.info.about !== undefined && e.info.about.length > 0 && e.info.about.every((id) => given.has(id));
+    const kept = this.otherQueue.filter((e, i) => (i < first || e.info.kind !== 'message') && !aboutGiven(e));
     kept.splice(first, 0, { job, info });
     this.otherQueue.length = 0;
     this.otherQueue.push(...kept);

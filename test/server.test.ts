@@ -200,7 +200,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       adapter.change = onMessageChange
         ? ({ channelId, movedToChannelId, ...ev }) => {
             const change = { ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) };
-            onMessageChange({ key: change.key, ready: async () => change });
+            onMessageChange({ key: change.key, messageIds: change.messageIds.map(Number), ready: async () => change });
           }
         : null;
     },
@@ -4501,7 +4501,7 @@ test("a change still being placed when its connection's shutdown grace runs out 
   let answer!: () => void;
   const lookup = new Promise<void>((resolve) => { answer = resolve; });
   let placing = false;
-  first.adapter.enterChange!({ key, ready: async () => {
+  first.adapter.enterChange!({ key, messageIds: [1], ready: async () => {
     placing = true;
     await lookup;
     return {
@@ -4863,6 +4863,51 @@ test('a reaction that waits in its lane is checked again at its turn: its channe
     fetches.release();
     await h.server.quiet();
     assert.deepEqual(handed(), ['1']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('at a give-up, a waiting edit of the first given-up message and a deletion of the second leave with them; an edit of an accepted message and a shown reaction to the first stay, and the reaction follows its row', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-give-up-changes-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const h = harness({ filters: plane, attachments: fetches.options, maxWaitingMessages: 2, visible: [DESCRIPTOR, OTHER] });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    h.adapter.emit!(withLog(streamMsg(2)));
+    await until(() => fetches.started.length === 1, "2's attachment fetch");
+    h.adapter.emit!(streamMsg(3));
+    h.adapter.emit!(streamMsg(4, { mentioned: true, text: '@bot four' }));
+    const change = (over: Partial<MessageChangeEvent>): MessageChangeEvent => ({
+      kind: 'edit', channelId: 'zulip:general', messageId: '3', messageIds: ['3'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'msg 3, edited', previousContent: 'msg 3',
+      mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+      ...over,
+    });
+    h.adapter.change!(change({}));
+    h.adapter.change!(change({ kind: 'delete', messageId: '4', messageIds: ['4'], content: null, previousContent: '@bot four', mentioned: true, previouslyMentioned: true, actorId: null }));
+    h.adapter.change!(change({ messageId: '1', messageIds: ['1'], content: 'msg 1, edited', previousContent: 'msg 1' }));
+    h.adapter.react!({ action: 'add', channelId: 'zulip:general', messageId: '3', emoji: 'thumbs_up', reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_070_000) });
+    h.adapter.history = [streamMsg(1), streamMsg(2), streamMsg(3, { text: 'msg 3, edited' })];
+    h.adapter.emit!(streamMsg(600, { channelId: 'zulip:other' }));
+    fetches.release();
+    await h.server.quiet();
+    const handed = h.incoming.map((m) => m.messageId.startsWith('reaction:') ? m.messageId.split(':').slice(0, 3).join(':') : m.messageId.split(':').slice(0, 2).join(':'));
+    assert.deepEqual(handed, ['1', '2', '3', 'edit:1', 'reaction:add:3']);
+    const three = h.incoming.find((m) => m.messageId === '3')!;
+    assert.match((three.content[0] as TextContent).text, /msg 3, edited$/);
+    assert.equal((three.metadata as { recovered?: boolean }).recovered, true);
+    assert.equal(h.pushed.length, 0, 'no line for the deleted mention goes as a push either');
     plane.stop();
     await h.close();
   } finally {

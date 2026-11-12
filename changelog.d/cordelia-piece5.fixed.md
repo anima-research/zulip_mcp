@@ -94,7 +94,10 @@
   offered again later, after newer ones. Now, past 5,000 messages waiting in
   all channels together, the channel with the most gives them up, and a read
   from history brings them in order, in passes of at most the catch-up limit,
-  before the messages that arrived after them.
+  before the messages that arrived after them. An edit, a move or a deletion
+  that was waiting about given-up messages only isn't sent: the read brings
+  each of those messages as Zulip has it then, or doesn't bring it. A
+  reaction that was waiting stays, and its turn comes after the read.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip

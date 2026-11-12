@@ -2206,7 +2206,7 @@ export class ZulipMcplServer {
         lane?.enter(async () => {
           const change = await entry.ready();
           if (change !== null && !lane.isEnded) return this.onMessageChange(change, lane);
-        });
+        }, { kind: 'other', about: entry.messageIds });
       },
     );
   }
