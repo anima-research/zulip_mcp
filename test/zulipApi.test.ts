@@ -237,6 +237,29 @@ test('a zuliprc is read from its [api] section, quoted values unquoted', async (
   } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a zuliprc with no [api] section fails at start, saying so', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, '[other]\nkey=wrong\n');
+  try {
+    await assert.rejects(initializeZulipClient({ ZULIP_RC_PATH: rc }), /has no \[api\] section/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a zuliprc without email or key takes them from ZULIP_EMAIL and ZULIP_API_KEY for its API calls', async () => {
+  const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, `[api]\nsite=${z.url}\n`);
+  const s = await serverOn('', { ZULIP_RC_PATH: rc, ZULIP_EMAIL: 'env-bot@example.com', ZULIP_API_KEY: 'env-key' });
+  try {
+    await s.tools.handleToolCall('list_streams', {});
+    const call = z.requests.find((r) => r.path === '/streams');
+    assert.ok(call);
+    assert.equal(call.authorization, 'Basic ' + Buffer.from('env-bot@example.com:env-key').toString('base64'));
+  } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a realm that ends with /api is addressed at /api/v1', async () => {
   const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
   const s = await serverOn(`${z.url}/api`);
