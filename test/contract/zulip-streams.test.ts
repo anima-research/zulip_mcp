@@ -92,6 +92,10 @@ test('C2: with "stream" among the event types, the registration answers with str
 test('C3: a send with an integer `to` lands in that stream, also just after a rename', async () => {
   const stream = await newStream(env, 'c3');
   const id = await idOf(stream);
+  const before = await bot.ok('POST', 'messages', { type: 'stream', to: id, topic: 'here', content: 'before the rename' });
+  const readBefore = await user.message(before.id);
+  assert.equal(readBefore.display_recipient, stream);
+  assert.equal(readBefore.content, 'before the rename');
   const renamed = uniqueName('c3-renamed');
   await rename(id, renamed);
   const sent = await bot.ok('POST', 'messages', { type: 'stream', to: id, topic: 'here', content: 'just after the rename' });
@@ -106,11 +110,12 @@ test('C4: a narrow of {operator: "stream", operand: <id>} reads that stream and 
   const id = await idOf(stream);
   const mine = await user.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'here', content: 'in the stream read' });
   await user.ok('POST', 'messages', { type: 'stream', to: other, topic: 'here', content: 'in another stream' });
-  await rename(id, uniqueName('c4-renamed'));
-  const page = await bot.ok('GET', 'messages', {
+  const readById = async () => (await bot.ok('GET', 'messages', {
     anchor: 'newest', num_before: 10, num_after: 0, narrow: [{ operator: 'stream', operand: id }, { operator: 'topic', operand: 'here' }], apply_markdown: false,
-  });
-  assert.deepEqual(page.messages.map((m: { id: number }) => m.id), [mine.id]);
+  })).messages.map((m: { id: number }) => m.id);
+  assert.deepEqual(await readById(), [mine.id], 'before the rename');
+  await rename(id, uniqueName('c4-renamed'));
+  assert.deepEqual(await readById(), [mine.id], 'after the rename');
 });
 
 test('C5: a stream message carries stream_id, as an event and from GET /messages', async () => {
