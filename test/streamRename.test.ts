@@ -892,8 +892,9 @@ scenario('31. a stream open at last sight and renamed while the server was down:
   try {
     await until(() => run.pushed.some((p) => payloadText(p).includes(`id=${ambient}]`)), 'the backlog, with the ambient message');
     const fromLobby = run.pushed.filter((p) => origin(p).mcplChannelId === 'zulip:lobby');
-    assert.match(payloadText(fromLobby[0]), /was renamed #lobby while this server was down/, 'the push that says so comes first');
+    assert.match(payloadText(fromLobby[0]), /was renamed #lobby while no host was connected to this server/, 'the push that says so comes first');
     assert.equal(fromLobby.length, 2);
+    assert.ok(fromLobby[1].tags?.includes('zulip:missed'), 'the backlog comes as a catch-up block, which the README\'s wake policy wakes on');
     await untilAsync(async () => (await missedOn(run, 'zulip:lobby')) === 0, 'zulip:lobby counted as closed, from after its backlog');
   } finally { await run.close(); }
 });
@@ -1090,5 +1091,30 @@ scenario('42. a reactionChannels entry that matches no stream is named in the lo
   try {
     await until(() => run.logs.some((l) => l.includes('reactionChannels') && l.includes('#nowhere')), 'the log line');
     assert.equal(run.logs.filter((l) => l.includes('reactionChannels') && /matches no stream/.test(l)).length, 1);
+  } finally { await run.close(); }
+});
+
+scenario('43. with MCPL, the tools that write the filters refuse a former name with its new name and write nothing; a current name and a name no stream has are written', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const run = await start(r, dir);
+  try {
+    await renameWhileOpen(r, run);
+    await tookRename(run);
+    const before = readJson(dir, 'filters.json');
+    for (const [tool, args] of [
+      ['mute_channel', { channel: 'general' }],
+      ['unmute_channel', { channel: '#general' }],
+      ['filters_update', { addStreams: ['random', 'general'] }],
+      ['filters_update', { removeStreams: ['zulip:general'] }],
+      ['set_reaction_visibility', { channel: 'zulip:general', visible: true }],
+    ] as const) {
+      const answer = await run.tool(tool, args);
+      assert.equal(answer.isError, true, `${tool} ${JSON.stringify(args)}`);
+      assert.match(answer.text, /#general was renamed #lobby/);
+    }
+    assert.deepEqual(readJson(dir, 'filters.json'), before, 'nothing was written');
+    assert.equal((await run.tool('mute_channel', { channel: 'lobby' })).isError, false);
+    assert.equal((await run.tool('mute_channel', { channel: 'nowhere' })).isError, false);
+    assert.deepEqual((readJson(dir, 'filters.json') as { mutedStreams?: string[] }).mutedStreams?.sort(), ['lobby', 'nowhere']);
   } finally { await run.close(); }
 });
