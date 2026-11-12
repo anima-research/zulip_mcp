@@ -147,6 +147,14 @@ test('with an upload, the links come after the prepared text, untouched', async 
   assert.deepEqual(posted(calls, 'POST'), [`${repaired}\n\n[hi.txt](/user_uploads/1/ab/hi.txt)`]);
 });
 
+test('a send at exactly the length goes out as two messages, since the added line counts', async () => {
+  const { api, calls } = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
+  const t = tools(api, [...underText].length);
+  await t.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: underText });
+  t.done();
+  assert.deepEqual(posted(calls, 'POST'), ['Results:', table]);
+});
+
 test('edit_message prepares its text before its length check', async () => {
   const z = standInApi({ 'PATCH /messages/:id': { result: 'success', msg: '' } });
   const t = tools(z.api);
