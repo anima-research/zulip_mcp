@@ -37,6 +37,8 @@ interface Run {
   server: ZulipMcplServer;
   filters: FiltersPlane;
   host: McplConnection;
+  /** The server's side of the connection. */
+  serverSide: McplConnection;
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   changed: { removed?: string[]; added?: ChannelDescriptor[] }[];
@@ -146,7 +148,8 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
       host.sendError(req.id, -32601, `unexpected ${req.method}`);
     }
   });
-  const served = server.serve(McplConnection.fromStreams(toServer, toHost));
+  const serverSide = McplConnection.fromStreams(toServer, toHost);
+  const served = server.serve(serverSide);
   await host.sendRequest(method.INITIALIZE, {
     protocolVersion: '2025-03-26',
     capabilities: mcpl ? { experimental: { mcpl: { version: '0.5', channels: true } } } : {},
@@ -163,7 +166,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     else await grant();
   }
   return {
-    server, filters, host, incoming, pushed, changed, registered, logs, subscribing, directory, grant,
+    server, filters, host, serverSide, incoming, pushed, changed, registered, logs, subscribing, directory, grant,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
     releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
@@ -1481,4 +1484,49 @@ scenario("60. a reaction to a new stream's first message, on a channel set to sh
     assert.ok(message >= 0 && message < reaction(), 'the message reaches the host before its reaction');
     assert.equal(origin(run.pushed[reaction()]).mcplChannelId, 'zulip:north');
   } finally { await run.close(); }
+});
+
+scenario('61. one process: a host that leaves while a request is still served, and while a rename\'s push waits behind its open on the stream\'s lane, leaves the push to the next host', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir, { shutdownGraceMs: 20 });
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on random');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  let answerRegister!: () => void;
+  const registerAnswered = new Promise<void>((resolve) => { answerRegister = resolve; });
+  const second = await start(r, dir, { reuse: first, noWait: true, beforeRegisterAnswer: () => registerAnswered });
+  await until(() => second.registered.length > 0, 'the second host asked to register');
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  let releaseList = () => {};
+  let leaving: Promise<void> = Promise.resolve();
+  try {
+    second.open('zulip:lobby', { limit: 50, sinceLastSeen: true }).catch(() => {});
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 17), 'the open of zulip:lobby reading its page');
+    answerRegister();
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 18), 'the lanes open: random\'s catch-up reading');
+    const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+    const listsBefore = lists();
+    releaseList = r.hold('GET /streams');
+    second.tool('refresh_channels', {}).catch(() => {});
+    await until(() => lists() > listsBefore, 'refresh_channels reading the stream list, on the request chain');
+    const sawClose = new Promise((resolve) => second.serverSide.once('close', resolve));
+    leaving = second.end();
+    await sawClose;
+    await new Promise((resolve) => setImmediate(resolve));
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } finally {
+    release();
+    releaseList();
+  }
+  await leaving;
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
+  } finally { await third.close(); }
 });

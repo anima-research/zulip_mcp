@@ -264,7 +264,7 @@ export class ZulipMcplServer {
     this.channelManager = channels;
     const writer: DeliveryWriter = { delivery, channels };
     const moments: Moments<DeliveryWriter> = {
-      entry: (w, key, id) => w.delivery.hold(key, id, 'queued'),
+      entry: (w, key, id, ended) => w.delivery.hold(key, id, ended ? 'failed' : 'queued'),
       overflow: (w, lane) => this.giveUp(w, lane),
       start: (w) => w.delivery.restartReached(),
       end: (w) => w.delivery.failQueued(),
@@ -397,6 +397,7 @@ export class ZulipMcplServer {
         });
       }
     } finally {
+      this.lanes?.end();
       await this.requestTail;
     }
   }
@@ -486,7 +487,7 @@ export class ZulipMcplServer {
       this.channelManager.destroy();
     };
     let stillRunning = 0;
-    if (this.lanes) stillRunning = await this.lanes.end(this.options.shutdownGraceMs ?? SHUTDOWN_INFLIGHT_GRACE_MS, settle);
+    if (this.lanes) stillRunning = await this.lanes.finish(this.options.shutdownGraceMs ?? SHUTDOWN_INFLIGHT_GRACE_MS, settle);
     else await settle();
     if (stillRunning > 0) {
       console.error(`[zulip-mcp] ${stillRunning} job(s) still running on the lanes at shutdown; left for the next catch-up`);
@@ -515,7 +516,7 @@ export class ZulipMcplServer {
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
-        if (!ctx.ended) this.pushRenamed(key);
+        if (!ctx.ended && !conn.isClosed) this.pushRenamed(key);
       });
     }
     openLanes();
@@ -1044,7 +1045,6 @@ export class ZulipMcplServer {
     if (!this.lanes) return;
     const key = entry.key;
     const lane = this.lanes.lane(key);
-    if (lane.isEnded) return;
     const id = numericId(entry);
     const place = this.placeOf(key);
     if (id !== null && place !== undefined && id <= place) return;

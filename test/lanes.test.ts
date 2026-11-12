@@ -12,6 +12,7 @@ import { Lanes, type Lane } from '../src/lanes.ts';
 
 const A = streamKey(1);
 const B = streamKey(2);
+const C = streamKey(3);
 
 function gate(): { open: () => void; opened: Promise<void> } {
   let open!: () => void;
@@ -21,7 +22,7 @@ function gate(): { open: () => void; opened: Promise<void> } {
 
 function lanes(overflow: (lane: Lane<string>) => void = () => {}, max = 5000, moments: string[] = []): Lanes<string> {
   return new Lanes('writer', {
-    entry: (w, key, id) => moments.push(`${w} entry ${key} ${id}`),
+    entry: (w, key, id, ended) => moments.push(`${w} entry ${key} ${id}${ended ? ' ended' : ''}`),
     overflow: (w, lane) => { moments.push(`${w} overflow ${lane.key}`); overflow(lane); },
     start: (w) => moments.push(`${w} start`),
     end: (w) => moments.push(`${w} end`),
@@ -147,7 +148,7 @@ test('ending the lanes drops what waits, tells a running job, waits for it withi
   l.lane(A).enter(() => { log.push('waiting'); }, { kind: 'message', id: 7 });
   await new Promise((r) => setImmediate(r));
   assert.equal(l.waitingMessages, 1);
-  const ending = l.end(60_000, settled);
+  const ending = l.finish(60_000, settled);
   assert.equal(l.waitingMessages, 0, 'what waited is gone');
   l.lane(A).host(() => { log.push('answer after the end'); });
   l.lane(B).enter(() => { log.push('new lane after the end'); });
@@ -162,7 +163,7 @@ test('ending the lanes gives up waiting for a running job at the grace', async (
   const l = lanes();
   l.lane(A).enter(() => new Promise<void>(() => {}));
   await new Promise((r) => setImmediate(r));
-  assert.equal(await l.end(0, settled), 1, 'one job still running');
+  assert.equal(await l.finish(0, settled), 1, 'one job still running');
 });
 
 test('quiet settles only when no lane runs or waits', async () => {
@@ -196,12 +197,12 @@ test('jobs get the writer and their lane, an answer after the end too', async ()
   l.lane(A).enter((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
   l.lane(B).host((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
   await l.quiet();
-  await l.end(0, settled);
+  await l.finish(0, settled);
   l.lane(A).answer((ctx) => { seen.push(`${ctx.w} ${ctx.lane.key} ${ctx.ended}`); });
   assert.deepEqual(seen, [`writer ${A} false`, `writer ${B} false`, `writer ${A} true`]);
 });
 
-test('the lanes write at four moments, with the writer: their making, a message with an id that waits, the cap, and the end after what settles it', async () => {
+test('the lanes write at four moments, with the writer: their making, a message with an id that enters, the cap, and the end after what settles it', async () => {
   const moments: string[] = [];
   const l = lanes((lane) => { lane.replaceMessages(() => {}, { kind: 'other' }); }, 1, moments);
   assert.deepEqual(moments, ['writer start']);
@@ -215,8 +216,14 @@ test('the lanes write at four moments, with the writer: their making, a message 
   moments.length = 0;
   running.open();
   await l.quiet();
-  await l.end(0, async () => { moments.push('settle'); });
-  assert.deepEqual(moments, ['settle', 'writer end']);
+  l.end();
+  assert.deepEqual(moments, [], 'ending the lanes writes nothing');
+  let ran = false;
+  l.lane(A).enter(() => { ran = true; }, { kind: 'message', id: 30 });
+  l.lane(C).enterFirst(() => { ran = true; }, { kind: 'message', id: 40 });
+  await l.finish(0, async () => { moments.push('settle'); });
+  assert.equal(ran, false, 'nothing runs on an ended lane');
+  assert.deepEqual(moments, [`writer entry ${A} 30 ended`, `writer entry ${C} 40 ended`, 'settle', 'writer end']);
 });
 
 test('past the cap, the lane with the most waiting messages is given up: its messages leave, and one job takes the place of the first', async () => {

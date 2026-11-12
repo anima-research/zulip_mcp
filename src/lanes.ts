@@ -29,8 +29,11 @@ export type Job<W> = (ctx: JobContext<W>) => void | Promise<void>;
  * with the writer they were made with.
  */
 export interface Moments<W> {
-  /** A message with an id waits in a lane, from here until it is decided. */
-  entry(w: W, key: ChannelKey, id: number): void;
+  /**
+   * A message with an id enters a lane. It waits there until it is decided,
+   * or, when its lane has ended, nothing runs it.
+   */
+  entry(w: W, key: ChannelKey, id: number, ended: boolean): void;
   /** More messages wait than the cap allows: the lane with the most gives them up. */
   overflow(w: W, lane: Lane<W>): void;
   /** A connection's lanes are made. */
@@ -104,8 +107,8 @@ export class Lane<W> {
 
   /** Everything else, in the order it enters. */
   enter(job: Job<W>, info: JobInfo = { kind: 'other' }): void {
-    if (this.ended) return;
     if (info.kind === 'message' && info.id !== undefined) this.lanes.entered(this, info.id);
+    if (this.ended) return;
     this.otherQueue.push({ job, info });
     if (info.kind === 'message') this.lanes.messageEntered(this);
     this.lanes.changed(this);
@@ -125,8 +128,8 @@ export class Lane<W> {
 
   /** A job that goes ahead of everything waiting in the other queue, such as a read to try again. */
   enterFirst(job: Job<W>, info: JobInfo = { kind: 'other' }): void {
-    if (this.ended) return;
     if (info.kind === 'message' && info.id !== undefined) this.lanes.entered(this, info.id);
+    if (this.ended) return;
     this.otherQueue.unshift({ job, info });
     if (info.kind === 'message') this.lanes.messageEntered(this);
     this.lanes.changed(this);
@@ -281,15 +284,22 @@ export class Lanes<W> {
     return new Promise((resolve) => this.quietWaiters.push(resolve));
   }
 
-  /**
-   * Ends every lane, and waits for the jobs still running until they have
-   * ended or `graceMs` has passed. Then `settle` runs, and after it the
-   * connection's end. Returns how many jobs were still running at the grace.
-   */
-  async end(graceMs: number, settle: () => Promise<void>): Promise<number> {
+  /** Ends every lane: what waits goes, and nothing more starts. A running job sees the end. */
+  end(): void {
+    if (this.ended) return;
     this.ended = true;
     for (const lane of this.lanes.values()) lane.end();
     this.wakeQuietWaiters();
+  }
+
+  /**
+   * Ends every lane, if they haven't ended, and waits for the jobs still
+   * running until they have ended or `graceMs` has passed. Then `settle`
+   * runs, and after it the connection's end. Returns how many jobs were
+   * still running at the grace.
+   */
+  async finish(graceMs: number, settle: () => Promise<void>): Promise<number> {
+    this.end();
     let running = 0;
     if (this.runningJobs.size > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -326,7 +336,7 @@ export class Lanes<W> {
   }
 
   entered(lane: Lane<W>, id: number): void {
-    this.#moments.entry(this.#w, lane.key, id);
+    this.#moments.entry(this.#w, lane.key, id, lane.isEnded);
   }
 
   messageEntered(_lane: Lane<W>): void {

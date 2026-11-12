@@ -1643,6 +1643,54 @@ test('a first message the host refused, on a channel where it had accepted nothi
   }
 });
 
+test("a message that enters its channel after the host left, while a request is still served, is held and nothing runs it, and the next start offers it once; an event for a message its channel has dealt with makes no hold", async () => {
+  const DEV = { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } };
+  const late = streamMsg(20, { channelId: 'zulip:dev', mentioned: true, text: '@bot after the host left' });
+  const first = harness({ visible: [DESCRIPTOR, DEV], history: [streamMsg(11), streamMsg(12), late] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.policy.rejectIds.add('11');
+  first.adapter.emit!(streamMsg(11));
+  first.adapter.emit!(streamMsg(12));
+  await until(() => first.incoming.some((m) => m.messageId === '12'), 'the host accepting 12');
+  await first.server.quiet();
+  assert.deepEqual(first.delivery.heldIds('zulip:general'), [11], 'the refused 11 keeps the watermark below 12');
+
+  fakeTools.calls.length = 0;
+  let releaseTool!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseTool = resolve; });
+  void first.host.sendRequest('tools/call', { name: 'slow', arguments: {} }).catch(() => {});
+  await until(() => fakeTools.calls.length === 1, 'the slow tool call on the chain');
+  const sawClose = new Promise((resolve) => first.serverSide.once('close', resolve));
+  const closing = first.close();
+  await sawClose;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let ran = false;
+  const enter = (m: IncomingChannelMessage) => {
+    const { channelId, ...rest } = m;
+    const key = first.adapter.keyOf(channelId);
+    first.adapter.enter!({ key, messageId: m.messageId, ready: async () => { ran = true; return { message: { ...rest, key } as KeyedMessage }; } });
+  };
+  enter(late);
+  enter(streamMsg(12));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ran, false, 'nothing runs a message that enters after the host left');
+  releaseTool();
+  await closing;
+  assert.deepEqual(first.delivery.heldIds('zulip:general'), [11], 'the late event for 12 made no hold');
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  const offered = second.pushed.map(firstText).filter((t) => /id=20\]/.test(t));
+  assert.equal(offered.length, 1, 'the next start offers it');
+  assert.equal(offered[0].match(/id=20\]/g)?.length, 1, 'once');
+  await second.close();
+});
+
 test('a message still waiting when the connection ends, on a channel where the host had accepted nothing, is offered after a restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-first-waiting-'));
   try {
