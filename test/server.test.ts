@@ -4920,6 +4920,49 @@ test('at a give-up, a waiting edit of the first given-up message and a deletion 
   }
 });
 
+test('a lane gives its messages up, and the first of them is deleted before the read: the read lets its hold go, so the watermark passes it with no read for held ids', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '3', '4', '5', '6']);
+  assert.deepEqual(h.incoming.filter((m) => (m.metadata as { recovered?: boolean }).recovered === true).map((m) => m.messageId), ['3', '4', '5'], 'the read brought what history still has');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  assert.deepEqual(h.adapter.historyCalls.filter((c) => c.channelId === 'zulip:general').map((c) => c.query.afterMessageId), ['1'], 'one read, the one that fills the hole');
+  await h.close();
+});
+
+test('on a closed channel, a lane gives its messages up and history has nothing after its place: the read lets their hold go, and the next message the host accepts reaches it once and moves the watermark', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 2 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.adapter.history = [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })];
+  h.adapter.emit!(withLog(streamMsg(2, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  for (const id of [3, 4, 5]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.ok(h.adapter.historyCalls.some((c) => c.channelId === 'zulip:general' && c.query.afterMessageId === '2'), 'the read after the give-up ran');
+  h.adapter.history = [...h.adapter.history, streamMsg(6, { mentioned: true })];
+  h.adapter.emit!(streamMsg(6, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 6 || offeredIds(h).length > 3, '6 offered and accepted');
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['1', '2', '6']);
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
 /** The channel's reads from history after a message id fail with `errors`, one each, in order; then they pass. */
 function failReads(h: Harness, channelId: string, errors: unknown[]): void {
   const real = h.adapter.fetchHistory!.bind(h.adapter);

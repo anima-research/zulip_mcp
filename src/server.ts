@@ -1208,25 +1208,29 @@ export class ZulipMcplServer {
     const wanted = new Set(ids);
     const fetched = await this.fetchAfter(key, ids[0] - 1, ids[ids.length - 1]);
     if (lane.isEnded) return;
-    const found = new Set<number>();
     const msgs = fetched.messages.filter((m) => {
       const id = numericId(m);
-      if (id === null || !wanted.has(id)) return false;
-      found.add(id);
-      return true;
+      return id !== null && wanted.has(id);
     });
-    // A held id the scan covered but did not find is gone from history (or
-    // no longer visible to the agent): nothing left to deliver.
-    const scanned = fetched.scannedThrough ?? 0;
-    for (const id of ids) {
-      if (!found.has(id) && (id <= scanned || fetched.complete)) this.delivery.release(key, id);
-    }
+    this.letGoUnfound(key, ids, fetched);
     const rows = this.projectHistoryReactions(msgs);
     for (const m of rows) {
       if (lane.isEnded) return;
       await this.route(recovered(m), undefined, lane, gap);
     }
     if (rows.length > 0) console.error(`[zulip-mcp] ${this.label(key)}: replaying ${rows.length} undelivered message(s) from history`);
+  }
+
+  private letGoUnfound(key: ChannelKey, ids: number[], fetched: { messages: KeyedMessage[]; scannedThrough: number | null; complete: boolean }): void {
+    const found = new Set(fetched.messages.map((m) => numericId(m)));
+    const scanned = fetched.scannedThrough ?? 0;
+    const gone = ids.filter((id) => !found.has(id) && (id <= scanned || fetched.complete));
+    for (const id of gone) this.delivery.release(key, id);
+    if (gone.length > 0) this.delivery.save();
+  }
+
+  private heldBetween(key: ChannelKey, after: number, through: number): number[] {
+    return this.delivery.heldIds(key).filter((id) => id > after && id <= through);
   }
 
   private answerOn(lane: Lane<null> | undefined, job: () => void): void {
@@ -1412,8 +1416,8 @@ export class ZulipMcplServer {
     const passBudget = { remainingMs: retryWindow ? budget.remainingMs : Math.min(budget.remainingMs, 3_000) };
     const startedWith = passBudget.remainingMs;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
+    const bound = retryWindow?.through ?? opts.through?.();
     try {
-      const bound = retryWindow?.through ?? opts.through?.();
       fetched = await this.fetchAfter(key, after, bound !== undefined && Number.isFinite(bound) ? bound : undefined, passBudget);
     } catch (err) {
       if (opts.fill && triesAgain(err)) throw err;
@@ -1425,6 +1429,7 @@ export class ZulipMcplServer {
     }
     if (opts.lane?.isEnded) return false;
     if (fetched.scannedThrough === null) {
+      this.letGoUnfound(key, this.heldBetween(key, after, bound ?? Infinity), fetched);
       onAttempt?.(Infinity);
       return false;
     }
@@ -1713,14 +1718,16 @@ export class ZulipMcplServer {
       return ceiling?.reached ?? false;
     }
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
+    const bound = below();
     try {
-      const bound = below();
       fetched = await this.fetchAfter(key, place, Number.isFinite(bound) ? bound : undefined);
     } catch (err) {
       if (triesAgain(err)) throw err;
       console.error(`[zulip-mcp] reading ${this.label(key)}'s history to fill a hole failed:`, (err as Error).message);
       return false;
     }
+    if (lane.isEnded) return false;
+    this.letGoUnfound(key, this.heldBetween(key, place, bound), fetched);
     for (const m of this.projectHistoryReactions(fetched.messages)) {
       const id = numericId(m);
       if (id === null) continue;
