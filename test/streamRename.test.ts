@@ -1530,3 +1530,19 @@ scenario('61. one process: a host that leaves while a request is still served, a
     await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
   } finally { await third.close(); }
 });
+
+scenario('62. quiet() waits while a rename\'s channels/changed is with the host, and settles once the host answers', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    let settled = false;
+    void run.server.quiet().then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(settled, false, 'quiet() waits for the announcement\'s answer');
+    run.answerChanged();
+    await until(() => settled, 'quiet() once the host answers');
+  } finally { run.releaseChanged(); await run.close(); }
+});

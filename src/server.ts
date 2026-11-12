@@ -190,7 +190,7 @@ export class ZulipMcplServer {
   private starting: Promise<void> | null = null;
   private requestTail: Promise<void> = Promise.resolve();
   private requestsWaiting = 0;
-  private readonly pushesOut = new Set<Promise<unknown>>();
+  private readonly hostRequestsOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private readonly catchupLimit: number;
@@ -415,8 +415,8 @@ export class ZulipMcplServer {
   /**
    * Settles once nothing is under way: no delivery job runs or waits, no
    * request waits to be served, no batch waits for its window or is on the
-   * wire, no push waits for its answer, and no replay runs. For tests and
-   * diagnostics.
+   * wire, no request to the host waits for its answer, and no replay runs.
+   * For tests and diagnostics.
    */
   async quiet(): Promise<void> {
     while (!this.isQuiet()) {
@@ -424,7 +424,7 @@ export class ZulipMcplServer {
         this.starting,
         this.lanes?.quiet(),
         this.requestTail,
-        Promise.allSettled(this.pushesOut),
+        Promise.allSettled(this.hostRequestsOut),
         this.channelManager.idle(),
       ]);
       await new Promise((resolve) => setImmediate(resolve));
@@ -432,7 +432,7 @@ export class ZulipMcplServer {
   }
 
   private isQuiet(): boolean {
-    return this.starting === null && (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.pushesOut.size === 0 && this.channelManager.isIdle();
+    return this.starting === null && (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.hostRequestsOut.size === 0 && this.channelManager.isIdle();
   }
 
   private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {
@@ -1305,11 +1305,7 @@ export class ZulipMcplServer {
       // Local policy exits above are not offers. Once attempted, a refusal
       // or ambiguous transport failure must still consume the replay.
       beforeOffer?.();
-      const answer = conn.sendRequest(method.PUSH_EVENT, params);
-      this.pushesOut.add(answer);
-      const settled = () => this.pushesOut.delete(answer);
-      answer.then(settled, settled);
-      const result = (await answer) as { accepted?: boolean; reason?: string } | undefined;
+      const result = (await this.outToHost(conn.sendRequest(method.PUSH_EVENT, params))) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
         return false;
@@ -2477,18 +2473,25 @@ export class ZulipMcplServer {
   private async registerChannelsWithHost(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    return (await conn.sendRequest(method.CHANNELS_REGISTER, { channels })) as ChannelsRegisterResult | undefined;
+    return (await this.outToHost(conn.sendRequest(method.CHANNELS_REGISTER, { channels }))) as ChannelsRegisterResult | undefined;
   }
 
   private async channelsChangedWithHost(params: ChannelsChangedParams, timeoutMs = this.announceTimeoutMs): Promise<ChannelsRegisterResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    const answer = conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs);
+    const answer = this.outToHost(conn.sendRequest(method.CHANNELS_CHANGED, params, timeoutMs));
     for (const descriptor of params.added ?? []) {
       const key = this.ids.keyOfDescriptor(descriptor);
       if (key !== null) this.lanes?.lane(key).holdOtherUntil(answer);
     }
     return (await answer) as ChannelsRegisterResult | undefined;
+  }
+
+  private outToHost<T>(answer: Promise<T>): Promise<T> {
+    this.hostRequestsOut.add(answer);
+    const settled = () => this.hostRequestsOut.delete(answer);
+    answer.then(settled, settled);
+    return answer;
   }
 
   private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
