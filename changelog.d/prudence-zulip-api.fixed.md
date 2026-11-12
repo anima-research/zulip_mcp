@@ -1,7 +1,9 @@
-- A Zulip call that gets no answer ends with an error after 15 s, or after the
-  caller's own shorter budget. It used to wait without end, until the server
-  restarted. The error says whether the request may have been applied. File
-  uploads and `fetch_attachment`'s download have no bound yet.
+- A Zulip call that gets no answer within 15 s, or within the caller's own
+  shorter budget, ends with an error, also where a slower answer would have
+  come. It used to wait as long as the answer took, and without end when none
+  came, until the server restarted. The error says whether the request may have
+  been applied. File uploads and `fetch_attachment`'s download have no bound
+  yet.
 - An event long poll that gets no answer for 90 s fails. The loop asks again
   with its backoff and counts it toward its `degraded` marker, as for other
   failures. It used to wait without end.
