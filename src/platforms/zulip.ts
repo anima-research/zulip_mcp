@@ -35,7 +35,7 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from '../outgoing.js';
+import { NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from '../outgoing.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -687,8 +687,9 @@ export class ZulipAdapter implements PlatformAdapter {
     // (Zulip's own attachment form). Uploads happen before the send, so a
     // failed upload fails the publish whole; a send that fails after them
     // leaves unreferenced uploads, which Zulip garbage-collects.
-    const uploaded = this.uploader && this.uploadPolicy ? await uploadBlocks(this.uploader, content, this.uploadPolicy) : [];
-    if (!textContent && uploaded.length === 0) return { delivered: false };
+    const uploader = this.uploader;
+    const uploadPolicy = this.uploadPolicy;
+    const upload = uploader && uploadPolicy ? () => uploadBlocks(uploader, content, uploadPolicy) : undefined;
 
     const dmIds = parseDmChannelId(channelId);
     let target: Destination;
@@ -712,12 +713,14 @@ export class ZulipAdapter implements PlatformAdapter {
     try {
       const { chunks } = await sendMessage(this.api, target, textContent, {
         limit: this.maxMessageLength,
-        uploaded,
+        unlinkable: 'as-typed',
+        ...(upload ? { upload } : {}),
         onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
       });
       const messageIds = chunks.map((c) => String(c.id));
       return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
     } catch (err) {
+      if (err instanceof NothingToSend) return { delivered: false };
       if (err instanceof SendRefused) throw refusalError(what, err.answer);
       throw err;
     }
