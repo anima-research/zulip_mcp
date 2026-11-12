@@ -2110,6 +2110,49 @@ test('after an open whose since-last-seen page its limit cut, a break of the eve
   await h.close();
 });
 
+test('a mention that enters a closed channel while its read after a break is at Zulip keeps its hold: refused after a later mention was accepted, it is offered again', async () => {
+  const h = harness({ history: [streamMsg(1)] });
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  // The read's answer is history as Zulip had it when the read was sent: nothing after 1.
+  let letRead!: () => void;
+  const gate = new Promise<void>((resolve) => { letRead = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    const page = await read(key, query);
+    reading = true;
+    await gate;
+    return page;
+  };
+  const offersOf = (id: string) => h.pushed.filter((p) =>
+    (p.origin as { messageId?: unknown }).messageId === id ||
+    p.payload.content.some((c) => new RegExp(`id=${id}\\]`).test((c as { text?: string }).text ?? ''))).length;
+  h.policy.holdPushes = true;
+  h.policy.rejectPushes.add('3');
+  breakQueue(h);
+  await until(() => reading, 'the read at Zulip');
+  h.adapter.history.push(streamMsg(3, { mentioned: true }), streamMsg(4, { mentioned: true }));
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  h.adapter.emit!(streamMsg(4, { mentioned: true }));
+  letRead();
+  await until(() => h.policy.heldPushes.length === 2, 'the pushes of 3 and 4');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), [3, 4], 'both held while their pushes are out');
+  h.policy.heldPushes[1]();
+  await until(() => !h.delivery.heldIds('zulip:general').includes(4), "4's acceptance");
+  h.policy.heldPushes[0]();
+  h.policy.holdPushes = false;
+  h.policy.heldPushes.length = 0;
+  await h.server.quiet();
+  assert.equal(h.delivery.watermark('zulip:general'), 2, 'the refused 3 keeps the watermark below it');
+  h.adapter.history.push(streamMsg(5, { mentioned: true }));
+  h.adapter.emit!(streamMsg(5, { mentioned: true }));
+  await h.server.quiet();
+  assert.equal(offersOf('3'), 2, '3 is offered again once the host accepts 5');
+  await h.close();
+});
+
 test('the gap notice counts a closed channel whose block the host accepted', async () => {
   const both = [DESCRIPTOR, { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } }];
   const h = harness({ history: [streamMsg(60, { channelId: 'zulip:dev', mentioned: true })] });

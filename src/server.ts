@@ -1446,7 +1446,7 @@ export class ZulipMcplServer {
     }
     if (ctx.ended) return false;
     if (fetched.scannedThrough === null) {
-      this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, bound ?? Infinity), fetched);
+      this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, Math.min(bound ?? Infinity, read.through?.() ?? Infinity)), fetched);
       read.onAttempt?.(Infinity);
       return false;
     }
@@ -1734,7 +1734,7 @@ export class ZulipMcplServer {
       return false;
     }
     if (ctx.ended) return false;
-    this.letGoUnfound(ctx.w, key, this.heldBetween(key, place, bound), fetched);
+    this.letGoUnfound(ctx.w, key, this.heldBetween(key, place, Math.min(bound, below())), fetched);
     for (const m of this.projectHistoryReactions(fetched.messages)) {
       const id = numericId(m);
       if (id === null) continue;
