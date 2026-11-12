@@ -102,6 +102,7 @@ const SHUTDOWN_INFLIGHT_GRACE_MS = 5000;
 const ATTACHMENT_DEADLINE_MS = 15_000;
 const READ_RETRY_FIRST_MS = 2_000;
 const READ_RETRY_MAX_MS = 60_000;
+const READ_WAIT_LINE_MS = 90_000;
 
 export interface ZulipMcplServerOptions {
   /** Server name/version reported in `initialize`. */
@@ -136,6 +137,8 @@ export interface ZulipMcplServerOptions {
   maxWaitingMessages?: number;
   /** How a lane waits before it tries a read from history again that got no answer (default: a timer of `ms`). */
   readRetryWait?: (ms: number) => Promise<void>;
+  /** The clock for how long a lane has waited for a read from history (default: Date.now). */
+  now?: () => number;
   directory?: StreamDirectory;
 }
 
@@ -184,6 +187,8 @@ export class ZulipMcplServer {
   private toldAgent = new Map<ChannelKey, string>();
   private reconciling = false;
   private reconcileAgain = false;
+  private readWaits = new Set<ChannelKey>();
+  private toldReadWait = false;
 
   constructor(
     private readonly adapter: PlatformAdapter,
@@ -302,6 +307,8 @@ export class ZulipMcplServer {
     this.grant.reset();
     this.channelManager.reset();
     this.toldAgent.clear();
+    this.readWaits.clear();
+    this.toldReadWait = false;
     this.delivery.restartReached();
     this.lanes = new Lanes(null, {
       maxWaitingMessages: this.options.maxWaitingMessages ?? MAX_WAITING_MESSAGES,
@@ -1642,18 +1649,56 @@ export class ZulipMcplServer {
     lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readGivenUp(key, lane))), { kind: 'other', turn: true });
   }
 
-  private async fillRead(lane: Lane<null>, read: () => Promise<unknown>, tries = 0): Promise<void> {
+  private async fillRead(lane: Lane<null>, read: () => Promise<unknown>, tries = 0, since = this.now()): Promise<void> {
     try {
       await read();
     } catch (err) {
-      if (!triesAgain(err)) throw err;
+      if (!triesAgain(err)) {
+        if (tries > 0) this.readWaitEnded(lane);
+        throw err;
+      }
       if (lane.isEnded) return;
       const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
       const ms = err instanceof ZulipRefused ? Math.max(step, (err.retryAfterSeconds ?? 0) * 1000) : step;
       console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
-      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, read, tries + 1)), { kind: 'other', turn: true });
+      this.readWaits.add(lane.key);
+      const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
+      if (!this.toldReadWait && (ranOut || this.now() - since >= READ_WAIT_LINE_MS)) this.tellReadWait();
+      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, read, tries + 1, since)), { kind: 'other', turn: true });
       lane.holdOtherUntil((this.options.readRetryWait ?? waitMs)(ms));
+      return;
     }
+    if (tries > 0) this.readWaitEnded(lane);
+  }
+
+  private now(): number {
+    return (this.options.now ?? Date.now)();
+  }
+
+  private tellReadWait(): void {
+    this.toldReadWait = true;
+    const channels = [...this.readWaits].map((key) => this.ids.channelIdOf(key) ?? this.label(key));
+    this.tellOpen(
+      `Zulip isn't serving reads of the history of ${channels.join(', ')}, and the server keeps trying them. ` +
+        'A channel whose read waits is silent until Zulip answers it; its messages then arrive in order.',
+      { kind: 'history-waiting', channels },
+    );
+  }
+
+  private readWaitEnded(lane: Lane<null>): void {
+    if (lane.isEnded || !this.readWaits.delete(lane.key)) return;
+    if (!this.toldReadWait || this.readWaits.size > 0) return;
+    this.toldReadWait = false;
+    this.tellOpen('No channel waits for a read of its history from Zulip any more.', { kind: 'history-answered' });
+  }
+
+  private tellOpen(text: string, metadata: Record<string, unknown>): void {
+    const open = this.openKeys();
+    if (open.length === 0) {
+      console.error(`[zulip-mcp] ${text} (no open channel to tell)`);
+      return;
+    }
+    for (const key of open) this.channelManager.notifyChannel(key, text, metadata);
   }
 
   private async readFill(key: ChannelKey, lane: Lane<null>, gap?: GapRead, inPasses = false): Promise<boolean> {
