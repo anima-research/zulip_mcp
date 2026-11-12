@@ -25,7 +25,7 @@ import {
   type PushEventParams,
   type TextContent,
 } from '@animalabs/mcpl-core';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
@@ -1723,6 +1723,155 @@ test('a stream muted while an addressed message of its closed channel waits for 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a catch-up block the host refuses keeps the watermark below it, and is offered again once the host accepts a later message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-refused-block-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'rb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'rb', history: [streamMsg(4, { mentioned: true }), streamMsg(5)] });
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the catch-up block, refused');
+    assert.match(firstText(second.pushed[0]), /id=4\]/);
+
+    second.policy.holdPushes = true;
+    second.adapter.history.push(streamMsg(6, { mentioned: true }));
+    second.adapter.emit!(streamMsg(6, { mentioned: true }));
+    await until(() => second.pushed.length === 2, 'the live mention');
+    second.policy.heldPushes.shift()!();
+    await until(() => second.pushed.length === 3, 'the refused block, offered again');
+    assert.equal(second.delivery.watermark('zulip:general'), 3, 'below the refused block while it is offered again');
+    assert.match(firstText(second.pushed[2]), /id=4\]/);
+    second.policy.holdPushes = false;
+    second.policy.heldPushes.shift()!();
+    await second.server.quiet();
+    assert.equal(second.delivery.watermark('zulip:general'), 6);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+
+function withImage(m: IncomingChannelMessage): IncomingChannelMessage {
+  return {
+    ...m,
+    content: [...m.content, { type: 'text', text: '[attachments: 1]\n- shot.png' }],
+    metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.png`, name: 'shot.png', mimeType: 'image/png', isImage: true }] },
+  };
+}
+
+test('a message offered again from history on an open channel has its image inline', async () => {
+  const h = harness({
+    history: [withImage(streamMsg(1)), streamMsg(2)],
+    attachments: {
+      source: { async fetch() { return { buf: PNG_1X1, mimeType: 'image/png', overflow: false }; } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withImage(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '1'), 'the refused message, offered again');
+  const again = h.incoming.find((m) => m.messageId === '1')!;
+  assert.equal((again.metadata as { recovered?: boolean }).recovered, true);
+  assert.ok(again.content.some((b) => b.type === 'image'), 'the image is inline');
+  await h.close();
+});
+
+test('the filters file changing on disk to mute a stream lets go of what is held for it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-mute-on-disk-'));
+  try {
+    const path = join(dir, 'filters.json');
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.policy.rejectIds.add('1');
+    h.adapter.emit!(streamMsg(1));
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), 1, 'the refused message is held');
+    writeFileSync(path, JSON.stringify({ ...plane.current(), mutedStreams: ['general'] }));
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(path, later, later);
+    plane.tick();
+    assert.deepEqual(plane.current().mutedStreams, ['general']);
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'the hold goes');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a catch-up block refused after its stream was muted leaves nothing held', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-block-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane, history: [streamMsg(5, { mentioned: true })] });
+    await initialize(h, true);
+    await settled(h);
+    h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await h.host.sendRequest('ping');
+    h.adapter.emit!(streamMsg(5, { mentioned: true }));
+    await h.server.quiet();
+    h.policy.holdPushes = true;
+    h.policy.rejectPushes.add('5');
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.pushed.length === 1, 'the catch-up block for the held mention');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
+    h.policy.holdPushes = false;
+    h.policy.heldPushes.shift()!();
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'muted: nothing stays held');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a message refused at its offer and again at its replay is offered a third time only after a break of the event queue', async () => {
+  const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const offers = () => h.hostSaw
+    .filter((r) => r.method === method.CHANNELS_INCOMING)
+    .flatMap((r) => (r.params as unknown as ChannelsIncomingParams).messages)
+    .filter((m) => m.messageId === '2').length;
+  h.policy.rejectIds.add('2');
+  for (const id of [1, 2, 3]) h.adapter.emit!(streamMsg(id));
+  await until(() => offers() === 2, 'refused again at its replay');
+  await h.server.quiet();
+  h.policy.rejectIds.delete('2');
+  h.adapter.emit!(streamMsg(4));
+  await until(() => h.incoming.some((m) => m.messageId === '4'), '4 accepted');
+  await h.server.quiet();
+  assert.equal(offers(), 2, 'no third offer from an accepted message');
+  h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'offered after the break');
+  assert.equal(offers(), 3);
+  await h.close();
 });
 
 test('quiet() settles once what the server was handed has reached the host: delivery jobs, the batch window, a replay, and a request being served', async () => {
@@ -4068,8 +4217,7 @@ for (const failure of ['messaging disable', 'attributed exception'] as const) {
       }
       releaseFetch();
       await until(() => second!.server.isLive, 'settled route leaves the drain');
-      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
-      await second.server.shutdown();
+      await second.server.quiet();
       const persisted = JSON.parse(readFileSync(join(dir, 'r3.delivery.json'), 'utf8'));
       assert.ok(persisted.watermarks['zulip:general'] < 5, 'settled but unaccepted reply must remain below the persisted watermark');
       assert.ok(second.delivery.heldIds('zulip:general', { replayable: failure === 'messaging disable' }).includes(5),
@@ -4157,7 +4305,7 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
       });
       releaseFetch();
       await until(() => second!.server.isLive, 'settled route leaves the drain');
-      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
+      await second.server.quiet();
 
       assert.equal(second.delivery.watermark('zulip:general'), 4);
       assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5));
@@ -4196,14 +4344,13 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
         });
       }
       releaseHeal();
-      const healing = () => (second!.server as unknown as { healing: boolean }).healing;
-      await until(() => !healing(), 'first healing settles');
+      await second.server.quiet();
       if (mode === 'disable-during-heal') {
         assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 0, 'local policy refusal sends nothing');
         assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5),
           'a never-offered reply must remain replayable');
         await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await until(() => !healing(), 'reenabled healing settles');
+        await second.server.quiet();
       }
       const accepted = mode === 'disable-during-heal' || mode === 'no-duplicate';
       assert.equal(second.delivery.watermark('zulip:general'), accepted ? 5 : 4);
@@ -4213,7 +4360,7 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
       for (let i = 0; i < 3; i++) {
         await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
       }
-      await until(() => !healing(), 'repeated grants settle');
+      await second.server.quiet();
       assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1,
         'accepted, refused and ambiguous offers must not loop');
     } finally {
@@ -4221,7 +4368,6 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
       releaseSweep();
       releaseFetch();
       if (second) await until(() => second!.server.isLive, 'released drain completes');
-      if (second) await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'released healing completes');
       await second?.close();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -4232,7 +4378,6 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
   for (const acceptTail of [false, true]) {
     test(`R3-1 ceiling: ${outcome}, tail ${acceptTail ? 'accepted' : 'refused'}`, async (t) => {
       const h = harness({ history: Array.from({ length: 101 }, (_, i) => streamMsg(i + 5)) });
-      const healing = () => (h.server as unknown as { healing: boolean }).healing;
       try {
         await initialize(h, true);
         await settled(h);
@@ -4258,12 +4403,12 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
           });
         }
         await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await until(() => !healing(), 'prefix offer settles');
+        await h.server.quiet();
         assert.deepEqual(h.delivery.heldIds('zulip:general'), [5, 105], 'unaccepted prefix and uncovered tail retain ownership');
         assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [105], 'only uncovered tail stays eligible');
         for (let i = 0; i < 3; i++) {
           await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-          await until(() => !healing(), 'subsequent grant settles');
+          await h.server.quiet();
         }
         const offers = h.pushed.map((push) => (push.origin as { messageId: string }).messageId);
         assert.equal(offers.filter((id) => id === '104').length, 1, 'consumed healing prefix is never re-offered on later grants');

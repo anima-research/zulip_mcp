@@ -322,6 +322,14 @@ export class DeliveryState {
     return this.settle(key);
   }
 
+  /** The host refused a block of (afterId, messageId]: every hold in it is rejected. */
+  refuse(key: ChannelKey, afterId: number, messageId: number): void {
+    const held = this.held.get(key);
+    if (!held) return;
+    for (const [id, h] of held) if (id > afterId && id <= messageId) h.status = 'rejected';
+    if (this.watermarkBelowHolds(key)) this.save();
+  }
+
   /** The connection ended: a hold that was on its way is not any more, so a replay may offer it. */
   failQueued(): void {
     for (const [key, held] of this.held) {

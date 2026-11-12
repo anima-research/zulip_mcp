@@ -40,3 +40,14 @@
   never offered. Such an open now counts as seen only what its channel had
   already dealt with, and the catch-up block moves the watermark when the
   host accepts it.
+- A catch-up block the host refused was lost once the host accepted a later
+  message of its channel: the watermark moved past the block. The block's
+  first message is now held, so the watermark stays below it, and the block
+  is offered again when the host next accepts something.
+- A message offered again from history on an open channel, after the host
+  refused it or its batch was lost, now has its attachments inline, as on
+  live delivery. It had the reference note only.
+- An offer that the host refused, or that was lost, after its stream was
+  muted or left out of the allowlist was held again, so the channel's
+  watermark stayed below it until the host accepted something else there.
+  Such an offer is now let go.
