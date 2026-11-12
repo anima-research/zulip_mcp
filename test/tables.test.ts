@@ -66,6 +66,18 @@ test('the lines that Zulip splits off a block, at a heading, a rule or the end o
   assert.equal(prepareOutgoing(`${table}\n---\nMore:\n| c | d |\n|---|---|`), `${table}\n---\nMore:\n| c | d |\n|---|---|`, 'a block that is a table from its first line keeps its rule and the rows after it');
 });
 
+test('the blank line goes in only where Zulip then shows more tables, and every such place gets one', () => {
+  const absorbs = 'Results:\n| a | b |\n| : | - |\n* * *\n| c | d |\n|---|---|';
+  assert.equal(prepareOutgoing(absorbs), absorbs, 'a table above a rule would take the rule and the table after it as rows');
+  const afterRule = 'x\n---\n| 1 | 2 |\n---|---\n1 | 2\n| 3 |\n| --- |';
+  assert.equal(prepareOutgoing(afterRule), afterRule, 'a table that opens after a rule keeps its rows');
+  assert.equal(
+    prepareOutgoing('plain words here\n| 3 |\n| --- |\n| 1 | 2 |\n:-|-:\n| a | b |'),
+    'plain words here\n\n| 3 |\n| --- |\n\n| 1 | 2 |\n:-|-:\n| a | b |',
+    'a one-column table that a cut below it makes whole',
+  );
+});
+
 test('nothing inside a fence is read, and a fence closes only at a line equal to its opening', () => {
   for (const text of [
     `\`\`\`\n${underText}\n\`\`\``,
