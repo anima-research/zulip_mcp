@@ -42,7 +42,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     const api = parseIni(readFileSync(zuliprc, "utf-8")).api as Record<string, unknown> | undefined;
     if (!api) throw new Error(`The zuliprc file at ${zuliprc} has no [api] section`);
     const text = (v: unknown) => (typeof v === "string" ? v : "");
-    realm = text(api.site);
+    realm = text(api.site) || env.ZULIP_REALM || "";
     email = text(api.email) || env.ZULIP_EMAIL || env.ZULIP_USERNAME || "";
     apiKey = text(api.key) || env.ZULIP_API_KEY || "";
     apiUrl = `${realm}/api/v1`;

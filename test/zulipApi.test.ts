@@ -358,6 +358,33 @@ test('a TLS failure that can come after the request was written leaves a write u
   }
 });
 
+test('a zuliprc without a site takes ZULIP_REALM, for API calls too', async () => {
+  const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, '[api]\nemail=rc-bot@example.com\nkey=rc-key\n');
+  const s = await serverOn(z.url, { ZULIP_RC_PATH: rc });
+  try {
+    await s.tools.handleToolCall('list_streams', {});
+    const call = z.requests.find((r) => r.path === '/streams');
+    assert.ok(call, 'the call reached ZULIP_REALM');
+    assert.equal(call.authorization, 'Basic ' + Buffer.from('rc-bot@example.com:rc-key').toString('base64'));
+    assert.equal(s.session.realm, z.url);
+  } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a zuliprc\'s own site comes before ZULIP_REALM', async () => {
+  const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, `[api]\nemail=rc-bot@example.com\nkey=rc-key\nsite=${z.url}\n`);
+  const s = await serverOn('http://127.0.0.1:1', { ZULIP_RC_PATH: rc });
+  try {
+    await s.tools.handleToolCall('list_streams', {});
+    assert.ok(z.requests.some((r) => r.path === '/streams'), 'the call reached the file\'s site');
+  } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a zuliprc value in a section other than [api] isn\'t used', async () => {
   const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
   const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));

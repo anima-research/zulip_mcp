@@ -39,9 +39,10 @@
   `Zulip refused <what>: <Zulip's message>` where Zulip refuses. They used to
   show "Cannot read properties of undefined".
 - A zuliprc file with no `[api]` section fails at start with a message that says
-  so. A zuliprc file without `email` or `key` takes them from `ZULIP_EMAIL` and
-  `ZULIP_API_KEY` for its API calls too. Those calls used to send "undefined"
-  in place of the missing value. A `site`, `email` or `key` in another section
-  of the file is no longer used. It used to reach attachment fetches and
-  uploads, and an `email` there also named the server's state files when
-  `ZULIP_SESSION_ID` was unset.
+  so. A zuliprc file without `site`, `email` or `key` takes them from
+  `ZULIP_REALM`, `ZULIP_EMAIL` and `ZULIP_API_KEY` for its API calls too. Those
+  calls used to send "undefined" in place of a missing `email` or `key`, and
+  without a `site` they reached no server. A `site`, `email` or `key` in
+  another section of the file is no longer used. It used to reach attachment
+  fetches and uploads, and an `email` there also named the server's state
+  files when `ZULIP_SESSION_ID` was unset.
