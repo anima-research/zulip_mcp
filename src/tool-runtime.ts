@@ -20,7 +20,7 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import type { ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from "./outgoing.js";
+import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from "./outgoing.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -742,11 +742,12 @@ export class ZulipToolRuntime {
         const messageId = typeof args.message_id === "string" && /^[0-9]+$/.test(args.message_id) ? Number(args.message_id) : args.message_id;
         if (typeof messageId !== "number" || !Number.isSafeInteger(messageId) || messageId <= 0) throw new Error("message_id must be a positive integer");
         if (typeof args.content !== "string") throw new Error("content must be a string");
-        const length = [...args.content].length;
+        const content = prepareOutgoing(args.content);
+        const length = [...content].length;
         if (length > this.maxMessageLength) {
           throw new Error(`content is ${length} characters, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
         }
-        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content: args.content });
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content });
       }
 
       case "delete_message": {

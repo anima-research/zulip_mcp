@@ -1,5 +1,6 @@
 import { isRefusal, type ZulipApi, type ZulipRefusal, type ZulipSuccess } from './zulip-api.js';
 import { withAttachmentLinks, type UploadedFile } from './uploads.js';
+import { blankLineAboveTables } from './tables.js';
 
 export interface Destination {
   type: unknown;
@@ -58,7 +59,7 @@ export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LEN
 }
 
 export function prepareOutgoing(content: string): string {
-  return content;
+  return blankLineAboveTables(content);
 }
 
 export async function sendMessage(
