@@ -1,11 +1,3 @@
-/**
- * The tool runtime against a stand-in for Zulip's API — DM conversations in
- * fetch_history, reaction suppression on the legacy raw format, and API
- * errors that surface as errors.
- *
- * Run: node --import tsx --test test/toolRuntime.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -291,7 +283,7 @@ test('listen does not register anything when Zulip refused the subscription (#20
   }
 });
 
-test('delete_message notes the id before the call and un-notes it when the call fails (#22)', async () => {
+test('delete_message notes the id before the call and un-notes it when Zulip refuses the delete (#22)', async () => {
   const noted: string[] = [];
   const failed: string[] = [];
   const { tools } = runtime(standInApi({

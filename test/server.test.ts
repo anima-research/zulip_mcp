@@ -2464,6 +2464,43 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
   }
 });
 
+test('the reconnect catch-up and the missed-tally backfill wait 90 s for each history page, and channels/open\'s page keeps the default', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-recovery-bound-'));
+  let second: Harness | undefined;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'bound' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'the addressed message accepted');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'ambient tally seeded');
+    } finally { await first.close(); }
+    const bounds: (number | undefined)[] = [];
+    const { api } = standInApi({ 'GET /messages': { result: 'success', messages: [], found_newest: true, found_oldest: true } });
+    const history = new ZulipAdapter({
+      ...api,
+      request: ((verb, path, what, params, opts) => {
+        if (path === '/messages') bounds.push(opts?.timeoutMs);
+        return api.request(verb, path, what, params, opts);
+      }) as typeof api.request,
+    }, 100, 'session');
+    second = harness({ stateDir: dir, sessionId: 'bound' });
+    second.adapter.fetchHistory = (channelId, query) => history.fetchHistory(channelId, query);
+    await initialize(second, true);
+    await settled(second);
+    assert.deepEqual(bounds, [90_000, 90_000], 'one catch-up page, then one backfill page');
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5 } });
+    assert.deepEqual(bounds, [90_000, 90_000, undefined], 'the page for channels/open takes the default bound');
+  } finally {
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const refuse of [false, true]) {
   test(`a buffered live reply keeps its verdict when the history quote lookup fails${refuse ? ', including after refusal' : ''}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zulip-live-reply-'));

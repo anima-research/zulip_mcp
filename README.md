@@ -88,7 +88,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   absent/invalid numeric sender ids, non-JSON responses, transport errors and
   timeouts are uncached and eligible for the retry pass. This is not full
   response-schema validation.
-  The wait budget does not cancel the GET or bound history-page HTTP latency.
+  A quote GET ends when the wait budget runs out. The history page's own
+  request has its own bound.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 
@@ -256,7 +257,9 @@ agent is about to answer was rewritten or deleted, a quote reply changed,
 or a DM it is reading changed — the same rule as for messages. A change to a message the host was
 never offered is dropped. Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits and deletions (rollback,
-`delete_message`) are its own doing and never surface either. A moved
+`delete_message`) are its own doing and don't surface either. A deletion's
+mark lasts 10 minutes and holds the bot's latest 500 deletes, so one whose
+event comes later can surface. A moved
 message is reported on the channel it left, naming where it went.
 
 The lines carry `chat:edited` (moves add `zulip:moved`) or `chat:deleted`,
@@ -533,10 +536,13 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
-- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll.
+- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll, for
+  the history reads that recover or count missed messages, and for the start's
+  reads of the bot's profile and the realm's settings.
   A call that reaches it is ended and fails. A send, an edit or a delete that
   may have reached Zulip without an answer fails with an error saying so.
-  File uploads and `fetch_attachment`'s download have no bound yet.
+  `fetch_attachment`'s download ends when it gets no data for 15 s. File
+  uploads have no bound.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 
