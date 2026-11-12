@@ -651,3 +651,101 @@ test('a miss that joined a read already in flight is read for again at its next 
   assert.equal(listCalls, 2);
 });
 
+test('a miss within its hold-off still waits for a read already in flight, which may hold its stream', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) return { result: 'success', streams: [{ name: 'general', stream_id: 7 }] };
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }, { name: 'south', stream_id: 12 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  await adapter.refreshStreams('stream 12');
+  assert.equal(directory.nameOf(12), undefined, 'the first read has no #south, so stream 12 is held off');
+  const other = adapter.refreshStreams('stream 11');
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  let againDone = false;
+  const again = adapter.refreshStreams('stream 12').then(() => { againDone = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(againDone, false, 'the held-off miss waits for the read in flight');
+  release!();
+  await Promise.all([other, again]);
+  assert.equal(directory.nameOf(12), 'south');
+  assert.equal(listCalls, 2);
+});
+
+test('a stream-list answer without a streams array is no list: the directory keeps what it holds', async () => {
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      return { result: 'success' };
+    },
+  }).api;
+  const directory = new StreamDirectory();
+  directory.restart({ streams: { '7': 'general', '11': 'north' } });
+  const removed: number[] = [];
+  directory.onChange((change) => removed.push(...change.removed.map((r) => r.id)));
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await adapter.discoverChannels();
+    await adapter.refreshStreams('stream 12');
+  } finally {
+    console.error = original;
+  }
+  assert.equal(listCalls, 2);
+  assert.deepEqual(removed, []);
+  assert.equal(directory.nameOf(7), 'general');
+  assert.equal(directory.nameOf(11), 'north');
+  assert.equal(directory.isFilled, false, 'no list has been read');
+});
+
+test('a stopped event loop\'s registration that answers late leaves the directory to the loop that runs now', async () => {
+  let registrations = 0;
+  let releaseFirst: (() => void) | undefined;
+  const client = standInApi({
+    'POST /register': async () => {
+      registrations++;
+      if (registrations === 1) {
+        const answer = { queue_id: 'q1', last_event_id: -1, streams: [{ stream_id: 7, name: 'general' }] };
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        return answer;
+      }
+      return { queue_id: `q${registrations}`, last_event_id: -1, streams: [{ stream_id: 7, name: 'lobby' }] };
+    },
+    'GET /events': async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+    'DELETE /events': { result: 'success' },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(() => {});
+    let deadline = Date.now() + 2000;
+    while (!releaseFirst && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+    adapter.startEvents(() => {});
+    deadline = Date.now() + 2000;
+    while (directory.nameOf(7) !== 'lobby' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(directory.nameOf(7), 'lobby', 'the second loop registered');
+    releaseFirst!();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(directory.nameOf(7), 'lobby');
+    assert.equal(directory.formerOf('lobby'), undefined);
+  } finally {
+    adapter.stopEvents();
+    console.error = original;
+  }
+});
+

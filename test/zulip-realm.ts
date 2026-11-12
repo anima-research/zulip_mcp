@@ -16,7 +16,7 @@ export interface Realm {
   staleList: Record<number, string> | null;
   listRefusals: number;
   registrations: number;
-  hold(call: 'POST /register' | 'GET /streams'): () => void;
+  hold(call: 'POST /register' | 'GET /streams' | 'GET /messages'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   /** The bot sees a stream again, under the same id, as Zulip tells a client that regains access to one. */
@@ -129,8 +129,9 @@ export function realm(initial: Record<number, string>): Realm {
       const answer = stale ? Object.entries(stale).map(([id, name]) => ({ stream_id: Number(id), name, invite_only: false, subscriber_count: 2 })) : list();
       return { result: 'success', streams: answer };
     },
-    'GET /messages': (p) => {
+    'GET /messages': async (p) => {
       reads.push(p);
+      await holds.get('GET /messages');
       const where = narrowed((p.narrow as unknown[]) ?? []);
       if (where.refused) return { result: 'error', code: 'BAD_NARROW', msg: where.refused };
       const rows = messages

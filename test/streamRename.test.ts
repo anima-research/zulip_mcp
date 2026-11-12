@@ -45,6 +45,7 @@ interface Run {
   directory: { isFilled: boolean; nameOf(streamId: number): string | undefined } | undefined;
   answerChanged(): void;
   releaseChanged(): void;
+  grant(): Promise<void>;
   open(channelId: string, history?: Record<string, unknown>): Promise<{ channel?: ChannelDescriptor; history?: IncomingChannelMessage[] }>;
   tool(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }>;
   close(): Promise<void>;
@@ -71,6 +72,10 @@ interface StartOptions {
   backscroll?: Record<string, number>;
   reuse?: Run;
   beforePushAnswer?: (push: PushEventParams, host: McplConnection) => Promise<void>;
+  /** Send the host's policy now but don't wait for live delivery. */
+  noWait?: boolean;
+  /** Hold the host's policy until `grant()`. */
+  grantLater?: boolean;
 }
 
 async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Run> {
@@ -137,12 +142,16 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     clientInfo: { name: 'test-host', version: '0' },
   });
   host.sendNotification('notifications/initialized');
-  if (mcpl) {
+  const grant = async () => {
     await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     await until(() => registered.length > 0 && server.isLive, 'registration and live delivery');
+  };
+  if (mcpl && !opts.grantLater) {
+    if (opts.noWait) await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
+    else await grant();
   }
   return {
-    server, filters, host, incoming, pushed, changed, logs, subscribing, directory,
+    server, filters, host, incoming, pushed, changed, logs, subscribing, directory, grant,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
     releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
@@ -1131,4 +1140,53 @@ scenario('45. one process: a host that leaves while a rename waits for its answe
     assert.ok(listed.channels.some((c) => c.id === 'zulip:lobby'));
     assert.ok(!listed.channels.some((c) => c.id === 'zulip:general'));
   } finally { await second.close(); }
+});
+
+scenario('46. one process: a host that leaves while its start reads the stream list leaves the next host\'s start to that host: no live delivery before its policy, then its own catch-up', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+  } finally { await first.end(); }
+  const away = r.post(17, 'written while no host was connected', { mentioned: true });
+  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+  const listsBefore = lists();
+  const release = r.hold('GET /streams');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => lists() > listsBefore, 'the second host\'s start reading the stream list');
+  await second.end();
+  const third = await start(r, dir, { reuse: first, grantLater: true });
+  try {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    await third.grant();
+    await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
+  } finally { await third.close(); }
+});
+
+scenario('47. one process: a host that leaves while its catch-up reads leaves the next host\'s start to that host: no live delivery before its policy, then its own catch-up', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+  } finally { await first.end(); }
+  const away = r.post(17, 'written while no host was connected', { mentioned: true });
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  const second = await start(r, dir, { reuse: first, noWait: true });
+  await until(() => r.reads.length > readsBefore, 'the second host\'s catch-up reading');
+  await second.end();
+  const third = await start(r, dir, { reuse: first, grantLater: true });
+  try {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    await third.grant();
+    await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
+  } finally { await third.close(); }
 });
