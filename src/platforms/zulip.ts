@@ -334,7 +334,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
   /**
    * Descriptors for stream channels. A stream the directory does not hold
-   * costs one read of the stream list; one still unknown after it, or one
+   * can cost one read of the stream list; one still unknown after it, or one
    * outside the allowlist, is never described. A DM is described by its
    * first message.
    */
