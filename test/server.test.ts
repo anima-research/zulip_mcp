@@ -2464,6 +2464,34 @@ test('listen registers what it subscribed the bot to and reports how the host an
   await h.close();
 });
 
+test('an open whose grant loses channels.lifecycle while it reads its page is refused, and no row of the page counts as seen', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await gate;
+    return read(key, query);
+  };
+  const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+  await until(() => reading, 'the page read to start');
+  let updated = false;
+  void h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.lifecycle') }).then(() => { updated = true; });
+  try {
+    await until(() => updated, 'the grant to change while the open reads its page');
+  } finally {
+    release();
+  }
+  await assert.rejects(open, (err: Error) => /Capability denied: channels\.lifecycle/.test(err.message));
+  assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
+  assert.equal(h.delivery.watermark('zulip:general'), undefined, 'no row of the page counts as seen');
+  await h.close();
+});
+
 test('a host that opens a channel before it answers its announcement gets the open served while a tool call waits for that answer', async () => {
   const h = harness({ announceTimeoutMs: 5_000 });
   await initialize(h, true);
