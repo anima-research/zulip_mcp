@@ -67,14 +67,14 @@ async function receive(
 test('own-message quote is tagged as a reply without changing the mention verdict', { timeout: 2000 }, async () => {
   const calls: Record<string, unknown>[] = [];
   // The silent mention's id is deliberately not SELF: the quoted sender decides.
-  const messages = await receive([raw(300, quote(QUOTED, 102))], async (params) => {
-    calls.push(params);
+  const messages = await receive([raw(300, quote(QUOTED, 102))], async (params, { id }) => {
+    calls.push({ id, ...params });
     return { result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }) };
   });
   assert.equal(messages[0].metadata?.mentioned, false);
   assert.equal(messages[0].metadata?.replyToSelf, true);
   assert.ok(messages[0].tags?.includes('chat:reply'));
-  assert.deepEqual(calls, [{ message_id: QUOTED, apply_markdown: false }]);
+  assert.deepEqual(calls, [{ id: QUOTED, apply_markdown: false }]);
 });
 
 test('group DMs stay addressed without any quote lookup', { timeout: 2000 }, async () => {
@@ -114,14 +114,14 @@ for (const [label, content] of [
 ] as const) {
   test(`${label} does not address the connector`, { timeout: 2000 }, async () => {
     const calls: Record<string, unknown>[] = [];
-    const messages = await receive([raw(300, content)], async (params) => {
-      calls.push(params);
-      return { result: 'success', message: raw(Number(params.message_id), 'original') };
+    const messages = await receive([raw(300, content)], async (params, { id }) => {
+      calls.push({ id, ...params });
+      return { result: 'success', message: raw(id, 'original') };
     });
     assert.equal(messages[0].metadata?.mentioned, false);
     assert.ok(messages[0].tags?.includes('chat:ambient'));
     assert.deepEqual(calls, label === 'near link elsewhere before a different quote'
-      ? [{ message_id: 201, apply_markdown: false }] : []);
+      ? [{ id: 201, apply_markdown: false }] : []);
   });
 }
 
@@ -156,8 +156,7 @@ test('multiple quotes resolve only their own headers, once per id, in delivery o
   const calls: number[] = [];
   const messages = await receive([
     raw(300, `${quote(201)}\n${quote(201)}\n${quote()}`), raw(301, 'later'),
-  ], async (params) => {
-    const id = Number(params.message_id);
+  ], async (_params, { id }) => {
     calls.push(id);
     await new Promise((resolve) => setTimeout(resolve, 5));
     if (id === 201) throw new Error('unavailable');
@@ -218,8 +217,7 @@ test('R2-2: a live timeout bounds waiting without poisoning a later lookup', { t
 test('many quote headings look up only the first two distinct ids', { timeout: 2000 }, async () => {
   const calls: number[] = [];
   const content = [201, 201, 202, 203, QUOTED, 204].map((id) => quote(id)).join('\n');
-  const messages = await receive([raw(300, content)], async (params) => {
-    const id = Number(params.message_id);
+  const messages = await receive([raw(300, content)], async (_params, { id }) => {
     calls.push(id);
     return { result: 'success', message: raw(id, 'original', { sender_id: id === QUOTED ? SELF : 101 }) };
   });
@@ -262,7 +260,7 @@ test('history quote lookups share a page cap and still use cached authors after 
   const gets: number[] = [];
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: rows, found_newest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
       gets.push(message_id);
       return { message: raw(message_id, 'another author') };
     },
@@ -281,14 +279,14 @@ test('history verifies an off-page own-message quote with a raw-message GET', as
   const gets: unknown[] = [];
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: [raw(300, quote())], found_newest: true }),
-    'GET /messages/:id': async (params: unknown) => {
-      gets.push(params);
+    'GET /messages/:id': async (params: Record<string, unknown>, { id }: { id: number }) => {
+      gets.push({ id, ...params });
       return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
     },
   }).api, SELF, 'session');
   const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
   assert.equal(page.messages[0].metadata?.replyToSelf, true);
-  assert.deepEqual(gets, [{ message_id: QUOTED, apply_markdown: false }]);
+  assert.deepEqual(gets, [{ id: QUOTED, apply_markdown: false }]);
 });
 
 for (const [label, before, after, wasReply, isReply] of [
@@ -360,8 +358,8 @@ for (const suffix of [' in #**general>topic**:', ' to **User**:']) {
 
 test('an ordinary later quote still counts after an excluded multi-quote heading', { timeout: 2000 }, async () => {
   const calls: number[] = [];
-  const messages = await receive([raw(300, `${quote(201).replace('):', ') in #**general>topic**:')}\n${quote()}`)], async (params) => {
-    calls.push(Number(params.message_id));
+  const messages = await receive([raw(300, `${quote(201).replace('):', ') in #**general>topic**:')}\n${quote()}`)], async (_params, { id }) => {
+    calls.push(id);
     return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
   });
   assert.equal(messages[0].metadata?.replyToSelf, true);
@@ -469,7 +467,7 @@ test('negative-cache hits do not consume the history page GET allowance', async 
   let gets = 0;
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: rows, found_newest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
       gets++;
       return message_id === QUOTED
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
@@ -531,7 +529,7 @@ test('each history page gets a fresh lookup wait budget, even on another channel
   let target = 500;
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: [raw(300, quote(target))], found_newest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
       gets++;
       now += 3_001;
       return { message: raw(message_id, 'original', { sender_id: message_id === 501 ? SELF : 101 }) };
@@ -553,7 +551,7 @@ test('sixteen history channels all verify off-page quote targets', async (t) => 
       now += 300; // one ordinary history page round trip; no quote lookup waited
       return { messages: [raw(300, quote(500 + Number(narrow[0][1])))], found_newest: true };
     },
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => { gets++; return { message: raw(message_id, 'original', { sender_id: SELF }) }; },
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => { gets++; return { message: raw(message_id, 'original', { sender_id: SELF }) }; },
   }).api, SELF, 'session');
   const verdicts: boolean[] = [];
   for (let ch = 0; ch < 16; ch++) {
@@ -590,7 +588,7 @@ for (const resolvedOther of [false, true]) {
   const changed = new Promise<MessageChangeEvent>((resolve) => { finish = resolve; });
   const before = quote();
   const adapter = new ZulipAdapter(standInApi({
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
       if (message_id === 300) return { message: raw(300, before) };
       if (++targetGets > 1) {
         if (!resolvedOther) throw new Error('target unavailable after eviction');
@@ -624,7 +622,7 @@ test('R2-5: quote GETs share one process-wide bucket across pages, adapters and 
   t.mock.method(performance, 'now', () => now);
   let target = 500;
   let gets = 0;
-  const getById = async ({ message_id }: Record<string, unknown>) => {
+  const getById = async (_params: unknown, { id: message_id }: { id: number }) => {
     gets++;
     return { message: raw(Number(message_id), 'original', { sender_id: SELF }) };
   };
@@ -743,7 +741,7 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     let initial = true;
     const adapter = new ZulipAdapter(standInApi({
       'GET /messages': async () => ({ messages: [raw(300, content)], found_newest: true }),
-      'GET /messages/:id': async (params: { message_id: number }) => initial && params.message_id === QUOTED
+      'GET /messages/:id': async (_params: unknown, { id }: { id: number }) => initial && id === QUOTED
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
         : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' },
     }).api, SELF, 'session');

@@ -115,9 +115,9 @@ function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}
       calls.push(params);
       return { result: 'success', messages: rows, ...extra };
     },
-    'GET /messages/:id': (params) => {
-      byId.push(params);
-      const found = rows.find((r) => r.id === params.message_id);
+    'GET /messages/:id': (params, { id }) => {
+      byId.push({ id, ...params });
+      const found = rows.find((r) => r.id === id);
       return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
     },
   });
@@ -163,7 +163,7 @@ test('fetchAround centres a window on the anchor within its own conversation', a
   const client = fakeClient([raw({ id: 41 }), raw({ id: 42 }), raw({ id: 43 })]);
   const page = await fetchAround(client.api, 42, 50);
   assert.deepEqual(page.messages.map((m) => m.id), [41, 42, 43]);
-  assert.deepEqual(client.byId[0], { message_id: 42, apply_markdown: false });
+  assert.deepEqual(client.byId[0], { id: 42, apply_markdown: false });
   assert.deepEqual(client.calls[0], {
     anchor: 42, num_before: 25, num_after: 25, narrow: [['stream', 'general'], ['topic', 'deploys']], apply_markdown: false, include_anchor: true,
   });

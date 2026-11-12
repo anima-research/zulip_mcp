@@ -3,6 +3,7 @@ import { ZulipNoAnswer, zulipApi, type Method, type TransportAnswer, type ZulipA
 export interface StandInCall {
   method: Method;
   path: string;
+  id?: number;
   params: Record<string, unknown>;
 }
 
@@ -30,7 +31,8 @@ export function standInApi(routes: Record<string, Route>): { api: ZulipApi; call
     return { status: refused ? 400 : 200, body: answer };
   };
   const api = zulipApi(async (method, path, params, opts) => {
-    const call: StandInCall = { method, path, params: params ?? {} };
+    const segment = path.match(/\/(\d+)(?=\/|$)/)?.[1];
+    const call: StandInCall = { method, path, params: params ?? {}, ...(segment === undefined ? {} : { id: Number(segment) }) };
     calls.push(call);
     const answering = answerFor(call);
     const bound = opts?.timeoutMs;

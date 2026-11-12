@@ -2437,7 +2437,7 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
         })).filter((m) => m.id > q.anchor);
         return { messages: rows.slice(0, 3), found_newest: rows.length <= 3 };
       },
-      'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         return { message: {
           id: message_id, sender_id: 102, sender_full_name: 'Other', sender_email: 'other@example.invalid',
@@ -2715,7 +2715,7 @@ test('a budget-starved quote row is retried before catch-up advances past it', a
     }));
     const history = new ZulipAdapter(standInApi({
       'GET /messages': async ({ anchor }: { anchor: number }) => ({ messages: rows.filter((m) => m.id > anchor), found_newest: true }),
-      'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         return { message: { ...rows[0], id: message_id, sender_id: message_id === 508 ? 100 : 102 } };
       },
@@ -2984,7 +2984,7 @@ test('R2-2: catch-up shares a total quote wait budget across history pages', asy
         const tail = rows.filter((m) => m.id > anchor);
         return { messages: tail.slice(0, 1), found_newest: tail.length <= 1 };
       },
-      'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         now += 1500;
         return { message: { ...rows[0], id: message_id, sender_id: 102 } };

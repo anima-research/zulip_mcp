@@ -287,7 +287,7 @@ export class ZulipToolRuntime {
     const id = numberOrUndefined(args.reply_to);
     if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
     if (args.to !== undefined || args.topic !== undefined) throw new Error("reply_to sets the destination; omit to/topic");
-    const result = await this.api.requestAnswer<{ message?: any }>("GET", `/messages/${id}`, { message_id: id });
+    const result = await this.api.requestAnswer<{ message?: any }>("GET", `/messages/${id}`);
     if (result.result === "error") {
       // Keep the API code as well as its wording: missing/deleted/inaccessible
       // messages must never fall back to a caller-supplied destination.
@@ -755,10 +755,7 @@ export class ZulipToolRuntime {
         if (length > this.maxMessageLength) {
           throw new Error(`content is ${length} characters, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
         }
-        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, {
-          message_id: args.message_id,
-          content: args.content,
-        });
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content: args.content });
       }
 
       case "delete_message": {
@@ -766,9 +763,7 @@ export class ZulipToolRuntime {
         // response does. Un-noted on failure: nothing will echo.
         this.onDeleted?.(String(args.message_id));
         try {
-          return await api.request("DELETE", `/messages/${args.message_id}`, `deleting message ${args.message_id}`, {
-            message_id: args.message_id,
-          });
+          return await api.request("DELETE", `/messages/${args.message_id}`, `deleting message ${args.message_id}`);
         } catch (err) {
           this.onDeleteFailed?.(String(args.message_id));
           throw err;

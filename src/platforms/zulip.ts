@@ -411,7 +411,7 @@ export class ZulipAdapter implements PlatformAdapter {
     if (cached) return cached;
     try {
       const result = await this.api.requestAnswer<{ message?: ZulipRawMessage }>(
-        'GET', `/messages/${messageId}`, { message_id: messageId, apply_markdown: false }, { timeoutMs },
+        'GET', `/messages/${messageId}`, { apply_markdown: false }, { timeoutMs },
       );
       // This endpoint uses BAD_REQUEST for both missing and inaccessible ids.
       // Older (pre-5.0) servers omit code; only then use the legacy text.
@@ -731,7 +731,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const id = Number(messageId);
     this.noteSelfDeleted(id);
     try {
-      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`, { message_id: id });
+      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`);
     } catch (err) {
       this.selfDeleted.delete(id);
       throw err;

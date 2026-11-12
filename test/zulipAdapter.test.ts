@@ -247,7 +247,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   const client = standInApi({
     'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 1 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => {
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
       getById.push(message_id);
       // A slow GET must not let later changes overtake this one.
       if (message_id === 6) await new Promise((r) => setTimeout(r, 40));
@@ -313,8 +313,8 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
   const client = standInApi({
     'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id) }),
-    'DELETE /messages/:id': async ({ message_id }: { message_id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => ({ result: 'success', message: raw(message_id) }),
+    'DELETE /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       polls++;
@@ -377,7 +377,7 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
   const client = standInApi({
     'GET /streams': async () => { listCalls++; return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'secret', stream_id: 8 }] }; },
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
-    'GET /messages/:id': async ({ message_id }: { message_id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'secret', stream_id: 8 }) }),
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => ({ result: 'success', message: raw(message_id, { display_recipient: 'secret', stream_id: 8 }) }),
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       polls++;

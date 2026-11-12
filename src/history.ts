@@ -297,7 +297,7 @@ export async function fetchHistory(api: ZulipApi, q: HistoryQuery): Promise<Hist
  */
 export async function fetchAround(api: ZulipApi, messageId: number, limit: number): Promise<HistoryPage> {
   const half = Math.max(0, Math.floor(Math.min(ZULIP_MAX_PAGE, limit) / 2));
-  const single = await api.request<{ message?: ZulipRawMessage }>('GET', `/messages/${messageId}`, `message ${messageId}`, { message_id: messageId, apply_markdown: false });
+  const single = await api.request<{ message?: ZulipRawMessage }>('GET', `/messages/${messageId}`, `message ${messageId}`, { apply_markdown: false });
   const anchorMsg = single?.message ? normalizeMessage(single.message as ZulipRawMessage) : null;
   if (!anchorMsg) throw new Error(`message ${messageId} is not readable by this bot`);
   const narrow = anchorMsg.isDm

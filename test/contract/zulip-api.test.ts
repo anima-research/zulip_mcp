@@ -87,7 +87,7 @@ test('a reaction is added, then removed with its parameters in a DELETE body', a
   const sent = await api.request<{ id: number }>('POST', '/messages', 'a stream message', { type: 'stream', to: stream, topic: 'here', content: 'react to me' });
   await api.request('POST', `/messages/${sent.id}/reactions`, 'a reaction', { emoji_name: 'eyes', reaction_type: 'unicode_emoji' });
   await api.request('DELETE', `/messages/${sent.id}/reactions`, 'removing a reaction', { emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji' });
-  const read = await api.request<{ message: { reactions: unknown[] } }>('GET', `/messages/${sent.id}`, 'the message', { message_id: sent.id });
+  const read = await api.request<{ message: { reactions: unknown[] } }>('GET', `/messages/${sent.id}`, 'the message');
   assert.deepEqual(read.message.reactions, []);
 });
 
@@ -123,6 +123,13 @@ test('Zulip itself cuts an edit above its limit to its length and marks the cut,
   t.diagnostic(`stored ${[...stored].length} code points, ending ${JSON.stringify(stored.slice(-24))}`);
   assert.equal([...stored].length, 10_000);
   assert.match(stored, /\[message truncated\]$/);
+});
+
+test('delete_message deletes the message', async () => {
+  const stream = await newStream(env, 'delete');
+  const sent = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, topic: 'deletes', content: 'delete me' })) as { id: number };
+  await tools.handleToolCall('delete_message', { message_id: sent.id });
+  await assert.rejects(user.message(sent.id));
 });
 
 test('send_message to a person with no topic sends none, and Zulip takes it', async () => {

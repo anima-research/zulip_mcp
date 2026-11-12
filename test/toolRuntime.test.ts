@@ -295,7 +295,7 @@ test('delete_message notes the id before the call and un-notes it when the call 
   const noted: string[] = [];
   const failed: string[] = [];
   const { tools } = runtime(standInApi({
-    'DELETE /messages/:id': async ({ message_id }: { message_id: number }) =>
+    'DELETE /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) =>
       message_id === 7 ? { result: 'error', msg: 'You don\'t have permission to delete this message' } : { result: 'success' },
   }).api);
   tools.onDeleted = (id) => noted.push(id);
@@ -322,7 +322,7 @@ function replyRuntime(message: Record<string, unknown>, error?: Record<string, u
   const { uploader, uploaded } = fakeUploader();
   const result = { result: 'success', id: 501 };
   const client = standInApi({
-    'GET /messages/:id': async (params: unknown) => { gets.push(params); return error ?? { result: 'success', message }; },
+    'GET /messages/:id': async (params: Record<string, unknown>, { id }: { id: number }) => { gets.push({ id, ...params }); return error ?? { result: 'success', message }; },
     'POST /messages': async (params: unknown) => { sends.push(params); return result; },
     'GET /users': async (params: unknown) => { userLookups.push(params); return { result: 'success', members: [] }; },
   }).api;
@@ -335,7 +335,7 @@ test('send_message reply_to derives the current stream and topic', async () => {
   tools.onSent = (s) => sent.push(s);
   try {
     assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), result);
-    assert.deepEqual(gets, [{ message_id: 123 }]);
+    assert.deepEqual(gets, [{ id: 123 }]);
     assert.deepEqual(sends, [{ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }]);
     assert.deepEqual(sent[0], { messageId: '501', channelId: 'zulip:General', content: 'reply' });
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -391,7 +391,7 @@ for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
         type: 'stream', reply_to: 999, content: 'reply',
         attachments: [{ data: 'aGk=', name: 'hi.txt' }],
       }), (err: Error) => err.message.includes(code) && err.message.includes('Invalid message(s)'));
-      assert.deepEqual(gets, [{ message_id: 999 }]);
+      assert.deepEqual(gets, [{ id: 999 }]);
       assert.deepEqual(sends, []);
       assert.deepEqual(uploaded, []);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -406,7 +406,7 @@ test('send_message reply_to accepts integer-valued strings without mutating argu
       await tools.handleToolCall('send_message', args);
       assert.deepEqual(args, { reply_to, content: 'reply' });
     }
-    assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+    assert.deepEqual(gets, Array(4).fill({ id: 123 }));
     assert.deepEqual(sends, Array(4).fill({ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }));
     assert.deepEqual(userLookups, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -430,7 +430,7 @@ for (const [alias, message] of [
         type: alias === 'channel' ? 'direct' : 'channel', reply_to: 123, content: 'reply',
         attachments: [{ data: 'aGk=', name: 'hi.txt' }],
       }), /type disagrees/);
-      assert.deepEqual(gets, [{ message_id: 123 }, { message_id: 123 }]);
+      assert.deepEqual(gets, [{ id: 123 }, { id: 123 }]);
       assert.equal(sends.length, 1, 'a conflicting alias sends nothing');
       assert.deepEqual(uploaded, [], 'a conflicting alias uploads nothing');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -523,7 +523,7 @@ test('send_message reply_to over HTTP takes numeric strings and aliases before P
     dir = state.dir;
     await state.tools.handleToolCall('send_message', { type: 'channel', reply_to: '123', content: 'reply' });
     assert.deepEqual(requests.map(({ method, url }) => ({ method, url })), [
-      { method: 'GET', url: '/api/v1/messages/123?message_id=123' },
+      { method: 'GET', url: '/api/v1/messages/123' },
       { method: 'POST', url: '/api/v1/messages' },
     ]);
     const posted = new URLSearchParams(requests[1].body);
@@ -629,7 +629,7 @@ for (const message of [replyStream, { type: 'private', display_recipient: replyP
         await tools.handleToolCall('send_message', args);
         assert.deepEqual(args, original, 'normalization does not mutate the caller');
       }
-      assert.deepEqual(gets, Array(4).fill({ message_id: 123 }));
+      assert.deepEqual(gets, Array(4).fill({ id: 123 }));
       assert.deepEqual(sends, Array(4).fill({
         type: message.type, to: message.type === 'stream' ? 12 : [790, 42, 7],
         topic: message.type === 'stream' ? replyStream.subject : undefined, content: 'reply',
