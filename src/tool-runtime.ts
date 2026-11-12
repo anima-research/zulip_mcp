@@ -20,7 +20,8 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import type { ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from "./outgoing.js";
+import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import type { SentRecord } from "./platforms/adapter.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {

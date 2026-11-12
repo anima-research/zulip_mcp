@@ -32,10 +32,11 @@ import type {
   PlatformAdapter,
   PublishResult,
   RoutingHints,
+  SentRecord,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from '../outgoing.js';
+import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
