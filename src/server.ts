@@ -159,6 +159,16 @@ interface DeliveryWriter {
 
 type Ctx = JobContext<DeliveryWriter>;
 
+interface CatchUpRead {
+  keepAll: boolean;
+  after?: number;
+  through?: () => number;
+  answers?: Promise<boolean>[];
+  ceiling?: { reached: boolean };
+  fill?: boolean;
+  onAttempt?: (through: number) => void;
+}
+
 export class ZulipMcplServer {
   private conn: McplConnection | null = null;
   private mcplActive = false;
@@ -1205,9 +1215,10 @@ export class ZulipMcplServer {
       } else {
         const watermark = this.delivery.watermark(key);
         const after = (this.delivery.floor(key) ?? ids[0]) < ids[0] ? ids[0] - 1 : watermark ?? ids[0] - 1;
-        await this.catchUpClosedChannel(ctx, key, this.delivery.wasOpen(key), after, undefined,
-          (through) => ctx.w.delivery.markReplayed(key, ids.filter((id) => id <= through)),
-          { through: () => place, answers: gap?.answers });
+        await this.catchUpClosedChannel(ctx, key, {
+          keepAll: this.delivery.wasOpen(key), after, through: () => place, answers: gap?.answers,
+          onAttempt: (through) => ctx.w.delivery.markReplayed(key, ids.filter((id) => id <= through)),
+        });
       }
     } catch (err) {
       console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
@@ -1323,8 +1334,9 @@ export class ZulipMcplServer {
         this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
       const place = this.placeOf(key);
       if (place !== undefined) {
-        await this.catchUpClosedChannel(ctx, key, this.delivery.wasOpen(key), place, undefined, undefined,
-          { through: () => this.firstWaiting(key) - 1, answers, fill: true });
+        await this.catchUpClosedChannel(ctx, key, {
+          keepAll: this.delivery.wasOpen(key), after: place, through: () => this.firstWaiting(key) - 1, answers, fill: true,
+        });
       }
       if (!ctx.ended && this.delivery.tally(key)) await this.backfillTally(ctx, key);
     }
@@ -1405,18 +1417,15 @@ export class ZulipMcplServer {
   private async catchUpClosedChannel(
     ctx: Ctx,
     key: ChannelKey,
-    keepAllHint: boolean,
-    afterId?: number,
+    read: CatchUpRead,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
-    onAttempt?: (through: number) => void,
-    opts: { through?: () => number; answers?: Promise<boolean>[]; ceiling?: { reached: boolean }; fill?: boolean } = {},
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (this.ids.heldIdOf(key) === undefined) return false;
     const channelId = this.ids.channelIdOf(key)!;
     if (this.isMuted(key) || !this.isAllowed(key)) return false;
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return false;
-    const after = afterId ?? this.delivery.watermark(key);
+    const after = read.after ?? this.delivery.watermark(key);
     if (after === undefined) return false;
     // At most two quote-wait allowances for the entire call, not per row or
     // page. Reserve the second allowance for one pass over ALL deferred rows.
@@ -1424,13 +1433,13 @@ export class ZulipMcplServer {
     const passBudget = { remainingMs: retryWindow ? budget.remainingMs : Math.min(budget.remainingMs, 3_000) };
     const startedWith = passBudget.remainingMs;
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
-    const bound = retryWindow?.through ?? opts.through?.();
+    const bound = retryWindow?.through ?? read.through?.();
     try {
       fetched = await this.fetchAfter(key, after, bound !== undefined && Number.isFinite(bound) ? bound : undefined, passBudget);
     } catch (err) {
-      if (opts.fill && triesAgain(err)) throw err;
+      if (read.fill && triesAgain(err)) throw err;
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`, (err as Error).message);
-      onAttempt?.(Infinity); // A history failure counts as the held read's attempt, unlike a local policy abort.
+      read.onAttempt?.(Infinity); // A history failure counts as the held read's attempt, unlike a local policy abort.
       return false;
     } finally {
       budget.remainingMs -= startedWith - passBudget.remainingMs;
@@ -1438,23 +1447,23 @@ export class ZulipMcplServer {
     if (ctx.ended) return false;
     if (fetched.scannedThrough === null) {
       this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, bound ?? Infinity), fetched);
-      onAttempt?.(Infinity);
+      read.onAttempt?.(Infinity);
       return false;
     }
-    if (opts.ceiling && !retryWindow) opts.ceiling.reached = fetched.truncated;
+    if (read.ceiling && !retryWindow) read.ceiling.reached = fetched.truncated;
     // The one retry stays inside the first walk's ceiling. Any quote still
     // unverified on that pass fails closed rather than starting another walk.
     const window = retryWindow ?? {
-      through: Math.min(fetched.scannedThrough, opts.through?.() ?? Infinity),
+      through: Math.min(fetched.scannedThrough, read.through?.() ?? Infinity),
       truncated: fetched.truncated,
       budget,
     };
     fetched.truncated ||= window.truncated;
-    let newestId = Math.min(fetched.scannedThrough, window.through, opts.through?.() ?? Infinity);
+    let newestId = Math.min(fetched.scannedThrough, window.through, read.through?.() ?? Infinity);
     if (newestId <= after) return false;
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = retryWindow ? undefined : fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
-    const retry = (cursor: number) => this.catchUpClosedChannel(ctx, key, keepAllHint, cursor, window, onAttempt, opts);
+    const retry = (cursor: number) => this.catchUpClosedChannel(ctx, key, { ...read, after: cursor }, window);
     if (blocked !== undefined) {
       newestId = Math.min(newestId, blocked - 1);
       msgs = msgs.filter((message) => Number(message.messageId) < blocked);
@@ -1462,10 +1471,10 @@ export class ZulipMcplServer {
     }
     ctx.decide(newestId);
     const views = msgs.map(viewOf);
-    const keepAll = keepAllHint || isDmKey(key);
+    const keepAll = read.keepAll || isDmKey(key);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
-      onAttempt?.(Infinity);
+      read.onAttempt?.(Infinity);
       ctx.w.delivery.advanceThrough(key, newestId, after);
       return blocked !== undefined ? retry(newestId) : false;
     }
@@ -1483,7 +1492,7 @@ export class ZulipMcplServer {
       count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
-      moreBeyond: (fetched.truncated && !opts.ceiling) || blocked !== undefined,
+      moreBeyond: (fetched.truncated && !read.ceiling) || blocked !== undefined,
       newestScannedId: newestId,
     });
     const synthetic: KeyedMessage = {
@@ -1509,10 +1518,10 @@ export class ZulipMcplServer {
       missed: true,
       reason,
       messages: kept.length,
-      ...((fetched.truncated && !opts.ceiling) || blocked !== undefined ? { truncated: true } : {}),
+      ...((fetched.truncated && !read.ceiling) || blocked !== undefined ? { truncated: true } : {}),
     }, () => {
       offered = true;
-      onAttempt?.(newestId);
+      read.onAttempt?.(newestId);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
@@ -1542,7 +1551,7 @@ export class ZulipMcplServer {
       answered(c.w, ok);
       resolve(ok);
     })));
-    opts.answers?.push(answer);
+    read.answers?.push(answer);
     if (blocked !== undefined) await retry(newestId);
     return true;
   }
@@ -1712,7 +1721,7 @@ export class ZulipMcplServer {
     if (place === undefined || below() <= place) return false;
     if (!this.channelManager.isKeyOpen(key)) {
       const ceiling = inPasses ? { reached: false } : undefined;
-      await this.catchUpClosedChannel(ctx, key, false, place, undefined, undefined, { through: below, answers: gap?.answers, ceiling, fill: true });
+      await this.catchUpClosedChannel(ctx, key, { keepAll: false, after: place, through: below, answers: gap?.answers, ceiling, fill: true });
       return ceiling?.reached ?? false;
     }
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
