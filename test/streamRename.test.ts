@@ -40,6 +40,7 @@ interface Run {
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   changed: { removed?: string[]; added?: ChannelDescriptor[] }[];
+  registered: ChannelDescriptor[];
   logs: string[];
   subscribing: Promise<void>;
   directory: { isFilled: boolean; nameOf(streamId: number): string | undefined } | undefined;
@@ -151,7 +152,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     else await grant();
   }
   return {
-    server, filters, host, incoming, pushed, changed, logs, subscribing, directory, grant,
+    server, filters, host, incoming, pushed, changed, registered, logs, subscribing, directory, grant,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
     releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
@@ -884,7 +885,7 @@ scenario('31. a stream open at last sight and renamed while the server was down:
   try {
     await until(() => run.pushed.some((p) => payloadText(p).includes(`id=${ambient}]`)), 'the backlog, with the ambient message');
     const fromLobby = run.pushed.filter((p) => origin(p).mcplChannelId === 'zulip:lobby');
-    assert.match(payloadText(fromLobby[0]), /was renamed #lobby while no host was connected to this server/, 'the push that says so comes first');
+    assert.match(payloadText(fromLobby[0]), /was renamed #lobby since its channel was last open\. Its channel is now zulip:lobby/, 'the push that says so comes first');
     assert.equal(fromLobby.length, 2);
     assert.ok(fromLobby[1].tags?.includes('zulip:missed'), 'the backlog comes as a catch-up block, which the README\'s wake policy wakes on');
     await untilAsync(async () => (await missedOn(run, 'zulip:lobby')) === 0, 'zulip:lobby counted as closed, from after its backlog');
@@ -1189,4 +1190,42 @@ scenario('47. one process: a host that leaves while its catch-up reads leaves th
     await third.grant();
     await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
   } finally { await third.close(); }
+});
+
+scenario('48. a stream renamed and renamed back while the connected host holds no channel for it gets no push', async (dir) => {
+  const r = realm({ 17: 'general' });
+  await savedAsGeneral(r, dir);
+  const registrations = r.registrations;
+  const run = await start(r, dir, { grantLater: true });
+  try {
+    await until(() => r.registrations > registrations && run.directory?.isFilled === true, 'the queue registered, before the host\'s policy');
+    r.rename(17, 'lobby');
+    r.rename(17, 'general');
+    await until(() => run.logs.some((l) => l.includes('#lobby -> #general')), 'the rename back seen');
+    await run.grant();
+    await deliveriesSettled(run);
+    assert.deepEqual(run.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), []);
+  } finally { await run.close(); }
+});
+
+scenario('49. a stream outside the allowlist gets no push after a rename, nor at a later start where the allowlist holds it', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'other' });
+  await savedAsGeneral(r, dir);
+  writeFilters(dir, { streams: ['other'] });
+  r.rename(17, 'lobby');
+  const first = await start(r, dir);
+  try {
+    await until(() => first.logs.some((l) => l.includes('#general -> #lobby')), 'the rename found');
+    await deliveriesSettled(first);
+    assert.deepEqual(first.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'no push for a stream outside the allowlist');
+  } finally { await first.end(); }
+  writeFilters(dir, {});
+  first.filters.tick();
+  assert.equal(first.filters.streamAllowed('lobby'), true, 'the allowlist widened');
+  const second = await start(r, dir, { reuse: first });
+  try {
+    await until(() => second.registered.some((c) => c.id === 'zulip:lobby'), 'the stream registered at the start where the allowlist holds it');
+    await deliveriesSettled(second);
+    assert.deepEqual(second.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'no push at a later start either');
+  } finally { await second.close(); }
 });

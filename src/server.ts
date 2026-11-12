@@ -1525,8 +1525,9 @@ export class ZulipMcplServer {
       const key = streamKey(id);
       console.error(`[zulip-mcp] Zulip stream ${id} was renamed #${from} -> #${to} (zulip:${from} -> zulip:${to})`);
       if (this.ids.heldIdOf(key) === undefined && this.delivery.wasOpen(key)) {
-        const earlier = this.renamedUnannounced.get(key);
-        this.renamedUnannounced.set(key, { from: earlier?.from ?? from, to });
+        const first = this.renamedUnannounced.get(key)?.from ?? from;
+        if (first === to) this.renamedUnannounced.delete(key);
+        else this.renamedUnannounced.set(key, { from: first, to });
       }
     }
     if (change.renamed.length > 0 || change.removed.length > 0) {
@@ -1662,10 +1663,10 @@ export class ZulipMcplServer {
     const pushedFor: ChannelKey[] = [];
     for (const [key, { from, to }] of this.renamedUnannounced) {
       this.renamedUnannounced.delete(key);
-      if (!this.delivery.wasOpen(key)) continue;
+      if (!this.delivery.wasOpen(key) || !this.isAllowed(key)) continue;
       const fresh = this.ids.channelIdOf(key);
       if (fresh === null) continue;
-      const text = `Zulip stream #${from} was renamed #${to} while no host was connected to this server. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
+      const text = `Zulip stream #${from} was renamed #${to} since its channel was last open. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
         `Open ${fresh} to keep hearing it. What you had read stays read.`;
       const pushed = await this.pushEvent({
         key,

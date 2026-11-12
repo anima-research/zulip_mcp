@@ -6,10 +6,10 @@
   filters file can't be read or written at the rename, the old name stays in
   it, and the log says so. A stream that was open at last sight and was
   renamed while the server was down, or while no host was connected, gets
-  one push from its new channel when a host next connects, and then its
-  backlog, as any stream open at last sight does. A rename used to go
-  unnoticed: the channel went quiet, and its place and its filters entries
-  were lost.
+  one push from its new channel when a host next connects, if the allowlist
+  holds the stream then, and then its backlog, as any stream open at last
+  sight does. A rename used to go unnoticed: the channel went quiet, and its
+  place and its filters entries were lost.
 - A channel id under a stream's former name is refused by `channels/open`,
   `channels/publish`, `channels/typing`, `channels/acknowledge`,
   `channel_missed` and, with MCPL, `fetch_history`, and the refusal names

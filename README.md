@@ -323,10 +323,10 @@ stream has taken the old name, as in a swap. With MCPL, `send_message`,
 `listen` and `unlisten` given the old name are refused the same way, and
 send nothing to Zulip. A stream that was open at last sight and was renamed
 while the server was down, or while no host was connected, gets one push
-from its new channel when a host next connects, and then its backlog, as
-any stream open at last sight does. An archived stream, or one the
-bot lost access to, is removed at the host the same way, with nothing
-added.
+from its new channel when a host next connects, if the allowlist holds the
+stream then, and then its backlog, as any stream open at last sight does.
+An archived stream, or one the bot lost access to, is removed at the host
+the same way, with nothing added.
 
 A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit
