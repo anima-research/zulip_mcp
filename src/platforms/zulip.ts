@@ -746,6 +746,7 @@ export class ZulipAdapter implements PlatformAdapter {
     for (const [id, at] of this.selfDeleted) {
       if (now - at > SELF_DELETE_TTL_MS) this.selfDeleted.delete(id);
     }
+    this.selfDeleted.delete(messageId);
     if (this.selfDeleted.size >= SELF_DELETE_CAP) {
       const oldest = this.selfDeleted.keys().next().value;
       if (oldest !== undefined) this.selfDeleted.delete(oldest);

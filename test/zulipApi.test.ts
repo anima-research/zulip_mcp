@@ -23,7 +23,8 @@ interface Recorded {
 type Answer =
   | { json: unknown; status?: number; delayMs?: number }
   | { html: string; status: number }
-  | 'hang';
+  | 'hang'
+  | 'stall-body';
 
 async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>) {
   const requests: Recorded[] = [];
@@ -51,6 +52,10 @@ async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ result: 'error', msg: `no stand-in for ${recorded.method} ${path}` }));
       } else if (answer === 'hang') {
+      } else if (answer === 'stall-body') {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.write('{"result":"success","streams":[');
       } else if ('html' in answer) {
         res.statusCode = answer.status;
         res.setHeader('content-type', 'text/html');
@@ -209,6 +214,7 @@ test('delete_message keeps its note of the delete while the delete may have been
   s.tools.onDeleteFailed = (id) => failed.push(id);
   try {
     for (const message_id of [55, 56, 57]) await assert.rejects(s.tools.handleToolCall('delete_message', { message_id }));
+    assert.deepEqual(z.requests.filter((r) => r.method === 'DELETE').map((r) => r.path), ['/messages/55', '/messages/56', '/messages/57'], 'each delete reached Zulip');
   } finally { s.done(); z.close(); }
   const gone = await realm({});
   gone.close();
@@ -297,6 +303,32 @@ test('a password exchange that gets no JSON answer fails the start, and its erro
   } finally { z.close(); }
 });
 
+test('a call\'s own bound ends a real HTTP call at it, below the default', { timeout: 10_000 }, async () => {
+  const z = await realm({ 'GET /streams': 'hang' });
+  try {
+    const api = zulipApi(httpTransport({ apiUrl: `${z.url}/api/v1`, authHeader: '', timeoutMs: 15_000 }));
+    const started = Date.now();
+    await assert.rejects(api.request('GET', '/streams', 'listing streams', {}, { timeoutMs: 300 }), (err: Error & { kind?: string }) => {
+      assert.equal(err.kind, 'timeout');
+      assert.match(err.message, /within 300 ms\./);
+      return true;
+    });
+    assert.ok(Date.now() - started < 5_000, 'it ended at its own bound');
+  } finally { z.close(); }
+});
+
+test('a bound also ends a call whose answer stalls after its headers', { timeout: 10_000 }, async () => {
+  const z = await realm({ 'GET /streams': 'stall-body' });
+  try {
+    const api = zulipApi(httpTransport({ apiUrl: `${z.url}/api/v1`, authHeader: '', timeoutMs: 300 }));
+    await assert.rejects(api.request('GET', '/streams', 'listing streams'), (err: Error & { kind?: string }) => {
+      assert.equal(err.kind, 'timeout');
+      assert.match(err.message, /within 300 ms\./);
+      return true;
+    });
+  } finally { z.close(); }
+});
+
 test('a call with no bound of its own ends at 15 s', async () => {
   const z = await realm({ 'GET /streams': 'hang' });
   const s = await serverOn(z.url);
@@ -316,8 +348,13 @@ test('the start reads the bot\'s profile and the realm\'s settings past the defa
     'GET /users/me': { json: { result: 'success', user_id: 790, email: 'bot@example.com' }, delayMs: 400 },
     'GET /server_settings': { json: { result: 'success', max_file_upload_size_mib: 25 }, delayMs: 400 },
   });
-  const s = await serverOn(z.url, {}, { timeoutMs: 100 });
+  const delays: number[] = [];
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => { if (typeof ms === 'number') delays.push(ms); return original(fn, ms, ...rest); }) as typeof setTimeout;
+  let s: Awaited<ReturnType<typeof serverOn>>;
+  try { s = await serverOn(z.url, {}, { timeoutMs: 100 }); } finally { globalThis.setTimeout = original; }
   try {
+    assert.equal(delays.filter((ms) => ms === 90_000).length, 2, 'the profile read and the settings read each have a 90 s bound');
     assert.equal(s.session.selfUserId, 790);
     assert.equal(s.session.maxUploadBytes, 25 * 1024 * 1024);
   } finally { s.done(); z.close(); }
@@ -479,11 +516,12 @@ test('edit_message refuses an edit with no content, or a message_id that is not 
   const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
   const s = await serverOn(z.url);
   try {
+    const before = z.requests.length;
     await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 55 }), /content/);
     for (const message_id of [0, -3, 1.5, 'abc', undefined, '0x37', ' 55 ', '55.0', '1e2', '']) {
       await assert.rejects(s.tools.handleToolCall('edit_message', { message_id, content: 'x' }), /message_id/, `message_id ${String(message_id)}`);
     }
-    assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 0, 'Zulip was never asked');
+    assert.equal(z.requests.length, before, 'Zulip was never asked');
     await s.tools.handleToolCall('edit_message', { message_id: '55', content: 'a string of digits still names the message' });
     await s.tools.handleToolCall('edit_message', { message_id: '055', content: 'as Zulip reads the path' });
     assert.deepEqual(z.requests.filter((r) => r.method === 'PATCH').map((r) => r.path), ['/messages/55', '/messages/55']);

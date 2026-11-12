@@ -352,6 +352,48 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
   assert.deepEqual(changes.map((c) => [c.kind, c.messageId]), [['delete', '7'], ['delete', '9']], 'only the deletions the bot did not make surface');
 });
 
+test('a delete noted again becomes the newest mark, and noting it again removes no other mark', async () => {
+  let released: (() => void) | null = null;
+  let polls = 0;
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => ({ result: 'success', message: raw(message_id) }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) {
+        await new Promise<void>((r) => { released = r; });
+        return { events: [1000, 1001, 1002, 9].map((id, i) => ({ id: i + 1, type: 'delete_message', message_ids: [id], message_type: 'stream', stream_id: 7, topic: 'deploys' })) };
+      }
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
+    const deadline = Date.now() + 2000;
+    while (!released && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.noteSelfDeleted(1000);
+    adapter.noteSelfDeleted(1001);
+    for (let id = 1002; id < 1500; id++) adapter.noteSelfDeleted(id);
+    adapter.noteSelfDeleted(1001);
+    adapter.noteSelfDeleted(2000);
+    adapter.noteSelfDeleted(2001);
+    released!();
+    while (!changes.some((c) => c.messageId === '9') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(changes.map((c) => c.messageId), ['1000', '1002', '9'], 'the two oldest marks went to the two new ids, and the mark noted again stayed');
+});
+
 test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22 round 2)', async () => {
   const events = [
     { id: 1, type: 'message', flags: [], message: raw(20) },

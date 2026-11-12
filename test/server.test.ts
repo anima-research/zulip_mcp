@@ -2464,7 +2464,7 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
   }
 });
 
-test('the reconnect catch-up and the missed-tally backfill wait 90 s for each history page', async () => {
+test('the reconnect catch-up and the missed-tally backfill wait 90 s for each history page, and channels/open\'s page keeps the default', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-recovery-bound-'));
   let second: Harness | undefined;
   try {
@@ -2493,6 +2493,8 @@ test('the reconnect catch-up and the missed-tally backfill wait 90 s for each hi
     await initialize(second, true);
     await settled(second);
     assert.deepEqual(bounds, [90_000, 90_000], 'one catch-up page, then one backfill page');
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5 } });
+    assert.deepEqual(bounds, [90_000, 90_000, undefined], 'the page for channels/open takes the default bound');
   } finally {
     await second?.close();
     rmSync(dir, { recursive: true, force: true });

@@ -99,6 +99,23 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
   assert.doesNotMatch(degraded[0].text, /\.\)/, 'no period inside the parentheses');
 });
 
+test('a long poll waits up to 90 s by default', async () => {
+  const bounds: (number | undefined)[] = [];
+  const loop = new ZulipEventLoop({ sleep: async () => {} });
+  const { api } = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => { loop.stop(); return { result: 'success', events: [] }; },
+  });
+  await loop.start({
+    ...api,
+    requestAnswer: ((verb, path, params, opts) => {
+      if (path === '/events') bounds.push(opts?.timeoutMs);
+      return api.requestAnswer(verb, path, params, opts);
+    }) as typeof api.requestAnswer,
+  }, () => {});
+  assert.deepEqual(bounds, [90_000]);
+});
+
 test('backoff caps at maxBackoffMs', async () => {
   let loop: ZulipEventLoop;
   const { delays, sleep } = makeSleepRecorder(() => loop, 5);
