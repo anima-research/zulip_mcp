@@ -1379,6 +1379,28 @@ function withLog(m: IncomingChannelMessage): IncomingChannelMessage {
   return { ...m, metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.log`, name: 'run.log', mimeType: 'text/plain', isImage: false }] } };
 }
 
+test("an ambient message with an attachment on a closed channel fetches nothing, and is counted as missed", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted on the open channel');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  h.adapter.emit!(withLog(streamMsg(2, { text: 'see the log' })));
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => fetches.started.length > 0 || h.pushed.length > 0, "the ambient message's fetch, or the mention's push");
+  const started = [...fetches.started];
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(started, [], 'nothing fetched for the ambient message');
+  assert.deepEqual(h.pushed.map((p) => (p.origin as { messageId?: unknown }).messageId), ['3']);
+  assert.equal(h.delivery.tally('zulip:general')?.messages, 1, 'the ambient message counted as missed');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  await h.close();
+});
+
 test('a close waits only for the job running on its channel, and the messages behind that job are handled as on a closed channel', async () => {
   const fetches = heldFetches();
   const h = harness({ attachments: fetches.options });
@@ -1424,7 +1446,7 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
     h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history }) as Promise<{ history?: { messageId: string }[] }>;
 
   // The newest rows: the page is the two below the two that wait.
-  h.adapter.emit!(withLog(streamMsg(3)));
+  h.adapter.emit!(withLog(streamMsg(3, { mentioned: true })));
   await until(() => fetches.started.length === 1, 'the fetch to start');
   h.adapter.emit!(streamMsg(4));
   h.adapter.emit!(streamMsg(5));
@@ -1438,7 +1460,7 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
   // Since last seen: the page ends below the two that wait.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.history.push(...[6, 7, 8].map((n) => streamMsg(n)));
-  h.adapter.emit!(withLog(streamMsg(6)));
+  h.adapter.emit!(withLog(streamMsg(6, { mentioned: true })));
   await until(() => fetches.started.length === 2, 'the second fetch to start');
   h.adapter.emit!(streamMsg(7));
   h.adapter.emit!(streamMsg(8));
@@ -1576,10 +1598,10 @@ test('a reaction and an edit to a message waiting for its attachments reach the 
 
 test('a message still waiting in its channel when the connection ends is offered by the next connection', async () => {
   const fetches = heldFetches();
-  const first = harness({ attachments: fetches.options, history: [withLog(streamMsg(1)), streamMsg(2, { mentioned: true })] });
+  const first = harness({ attachments: fetches.options, history: [withLog(streamMsg(1, { mentioned: true })), streamMsg(2, { mentioned: true })] });
   await initialize(first, true);
   await settled(first);
-  first.adapter.emit!(withLog(streamMsg(1)));
+  first.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
   await until(() => fetches.started.length === 1, 'the fetch to start');
   first.adapter.emit!(streamMsg(2, { mentioned: true }));
   first.serverSide.once('close', () => setTimeout(fetches.release, 50));
@@ -1698,13 +1720,13 @@ test('a message still waiting when the connection ends, on a channel where the h
     const first = harness({ stateDir: dir, sessionId: 'fw', attachments: fetches.options });
     await initialize(first, true);
     await settled(first);
-    first.adapter.emit!(withLog(streamMsg(5)));
+    first.adapter.emit!(withLog(streamMsg(5, { mentioned: true })));
     await until(() => fetches.started.length === 1, 'the fetch to start');
     first.adapter.emit!(streamMsg(6, { mentioned: true }));
     first.serverSide.once('close', () => setTimeout(fetches.release, 50));
     await first.close();
 
-    const second = harness({ stateDir: dir, sessionId: 'fw', history: [withLog(streamMsg(5)), streamMsg(6, { mentioned: true })] });
+    const second = harness({ stateDir: dir, sessionId: 'fw', history: [withLog(streamMsg(5, { mentioned: true })), streamMsg(6, { mentioned: true })] });
     await initialize(second, true);
     await settled(second);
     await second.server.quiet();
