@@ -162,7 +162,7 @@ are likely to touch:
 |---|---|---|
 | `ZULIP_SESSION_ID` | bot email (from env or zuliprc) | Keys the persistent state files (monitoring, delivery, filters); set it when two sessions of one bot share a state dir |
 | `ZULIP_STATE_DIR` | `~/.zulip_mcp_state` | Where those files live |
-| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read |
+| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read, or, for a client without MCPL, once its read of the list got no answer |
 | `ZULIP_FILTERS_FILE` | `<state dir>/<session>.filters.json` | The filters plane file (hot-reloaded) |
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
