@@ -60,15 +60,19 @@ export { formatMessages } from './tool-runtime.js';
 
 const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
 
-function intEnv(name: string, fallback: number): number {
+function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) {
-    console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not a non-negative integer); using ${fallback}`);
+  if (!Number.isFinite(n) || n < min) {
+    console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not ${min === 0 ? 'a non-negative integer' : `an integer of at least ${min}`}); using ${fallback}`);
     return fallback;
   }
   return n;
+}
+
+export function maxMessageLengthFromEnv(): number | undefined {
+  return process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000, 1) : undefined;
 }
 
 /** "general:50,dev:200" → Map { general → 50, dev → 200 }. Bad entries are reported and skipped. */
@@ -112,7 +116,7 @@ async function main(): Promise<void> {
   }
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
-  const maxMessageLength = process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined;
+  const maxMessageLength = maxMessageLengthFromEnv();
   const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
     formatTime,
     uploader,

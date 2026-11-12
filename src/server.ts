@@ -230,8 +230,9 @@ export class ZulipMcplServer {
     this.contextProvider = new ContextProvider(this.channelManager, this.grant, options.contextHistorySize, {
       excludeChannel: (channelId) => this.isMuted(channelId) || !this.isAllowed(channelId),
     });
-    // Sends made through the tool surface are part of the rollback record.
+    // Sends made through the tool surface and through publish are part of the rollback record.
     this.tools.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
+    this.adapter.onSent = (sent) => this.stateTracker.recordSent(sent.messageId, sent.channelId, sent.content);
     // A stream `listen` just subscribed the bot to is registered at once, so
     // the host can open it without waiting for a message or a refresh (#20).
     // Only those streams: a realm enumeration here would cost a full stream
@@ -600,19 +601,10 @@ export class ZulipMcplServer {
         case method.CHANNELS_PUBLISH: {
           this.requireMcpl();
           const publish = params as unknown as ChannelsPublishParams;
+          // No checkpoint is minted here: the publish result has no field to
+          // carry one (§14.6), so a host can only learn checkpoints from tool
+          // results — see callTool.
           const result = await this.channelManager.publish(publish);
-          if (result.delivered) {
-            // Part of the rollback record. No checkpoint is minted here: the
-            // publish result has no field to carry one (§14.6), so a host can
-            // only learn checkpoints from tool results — see callTool.
-            const text = publish.content
-              .filter((b): b is TextContent => b.type === 'text')
-              .map((b) => b.text)
-              .join('\n');
-            for (const id of (result as { messageIds?: string[] }).messageIds ?? (result.messageId ? [result.messageId] : [])) {
-              this.stateTracker.recordSent(id, publish.channelId, text);
-            }
-          }
           conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) });
           break;
         }
