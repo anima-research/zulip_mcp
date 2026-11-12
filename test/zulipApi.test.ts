@@ -104,7 +104,7 @@ test('a long edit_message sends its text in the body, and nothing in the URL', a
   } finally { s.done(); z.close(); }
 });
 
-test('delete_message, remove_reaction and unlisten send their parameters in the body', async () => {
+test('delete_message sends no parameter, and remove_reaction and unlisten send theirs in the body', async () => {
   const z = await realm({
     'DELETE /messages/55': { json: { result: 'success' } },
     'DELETE /messages/55/reactions': { json: { result: 'success' } },
@@ -118,6 +118,7 @@ test('delete_message, remove_reaction and unlisten send their parameters in the 
     const deletes = z.requests.filter((r) => r.method === 'DELETE');
     assert.equal(deletes.length, 3);
     for (const d of deletes) assert.equal([...d.query.keys()].length, 0, `no parameter in the URL of ${d.path}`);
+    assert.equal(deletes[0].body, '', 'delete_message sends no body');
     assert.equal(new URLSearchParams(deletes[1].body).get('emoji_name'), 'thumbs_up');
     assert.equal(new URLSearchParams(deletes[2].body).get('subscriptions'), JSON.stringify(['general']));
   } finally { s.done(); z.close(); }
@@ -128,9 +129,10 @@ test('a call that gets no answer ends with an error at its bound, and its connec
   const s = await serverOn(z.url, {}, { timeoutMs: 300 });
   try {
     const started = Date.now();
-    await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error) => {
+    await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
       assert.match(err.message, /no answer/i);
       assert.match(err.message, /300 ?ms|0\.3 ?s/);
+      assert.equal(err.kind, 'timeout');
       return true;
     });
     assert.ok(Date.now() - started < 5_000, 'it ended at its bound, not later');
@@ -146,10 +148,11 @@ test('an answer that is not JSON names its status, and for a send says it may ha
   try {
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
-      (err: Error & { mayHaveBeenApplied?: boolean }) => {
+      (err: Error & { mayHaveBeenApplied?: boolean; kind?: string }) => {
         assert.match(err.message, /502/);
         assert.match(err.message, /may have been (applied|sent)/i);
         assert.equal(err.mayHaveBeenApplied, true);
+        assert.equal(err.kind, 'not-json');
         return true;
       },
     );
@@ -160,19 +163,65 @@ test('a JSON refusal with a server status says once, on a write, that it may hav
   const z = await realm({
     'POST /messages': { json: { result: 'error', msg: 'Internal server error.' }, status: 500 },
     'PATCH /messages/55': { json: { result: 'error', msg: 'Busy' }, status: 503 },
+    'PATCH /messages/56': { json: { result: 'error', msg: '' }, status: 500 },
     'GET /streams': { json: { result: 'error', msg: 'Internal server error.' }, status: 500 },
   });
   const s = await serverOn(z.url);
+  const sentence = 'Zulip answered with a server error, so the request may have been applied: check before sending it again.';
+  const once = (message: string) => message.split(sentence).length - 1;
   try {
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
-      /Internal server error\. Zulip answered with a server error, so the request may have been applied: check before sending it again\./,
+      (err: Error) => {
+        assert.ok(err.message.endsWith(`Internal server error. ${sentence}`), err.message);
+        assert.equal(once(err.message), 1);
+        return true;
+      },
     );
-    await assert.rejects(
-      s.tools.handleToolCall('edit_message', { message_id: 55, content: 'x' }),
-      /Busy\. Zulip answered with a server error, so the request may have been applied/,
-    );
+    await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 55, content: 'x' }), (err: Error) => {
+      assert.ok(err.message.endsWith(`Busy. ${sentence}`), err.message);
+      assert.equal(once(err.message), 1);
+      return true;
+    });
+    await assert.rejects(s.tools.handleToolCall('edit_message', { message_id: 56, content: 'x' }), (err: Error) => {
+      assert.ok(err.message.endsWith(`: unknown error. ${sentence}`), err.message);
+      return true;
+    });
     assert.deepEqual(await s.session.api.requestAnswer('GET', '/streams'), { result: 'error', msg: 'Internal server error.' });
+  } finally { s.done(); z.close(); }
+});
+
+test('delete_message keeps its note of the delete while the delete may have been applied, and drops it once the delete surely failed', { timeout: 10_000 }, async () => {
+  const failed: string[] = [];
+  const z = await realm({
+    'DELETE /messages/55': 'hang',
+    'DELETE /messages/56': { json: { result: 'error', msg: 'Internal server error' }, status: 500 },
+    'DELETE /messages/57': { json: { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }, status: 400 },
+  });
+  const s = await serverOn(z.url, {}, { timeoutMs: 300 });
+  s.tools.onDeleteFailed = (id) => failed.push(id);
+  try {
+    for (const message_id of [55, 56, 57]) await assert.rejects(s.tools.handleToolCall('delete_message', { message_id }));
+  } finally { s.done(); z.close(); }
+  const gone = await realm({});
+  gone.close();
+  const refused = await serverOn(gone.url);
+  refused.tools.onDeleteFailed = (id) => failed.push(id);
+  try {
+    await assert.rejects(refused.tools.handleToolCall('delete_message', { message_id: 58 }));
+  } finally { refused.done(); }
+  assert.deepEqual(failed, ['57', '58'], 'no answer and a server error keep the note; a refusal and a refused connection drop it');
+});
+
+test('send_message to a person with no topic sends no topic parameter', async () => {
+  const z = await realm({ 'POST /messages': { json: { result: 'success', id: 501 } } });
+  const s = await serverOn(z.url);
+  try {
+    await s.tools.handleToolCall('send_message', { type: 'private', to: 'ann@example.com', content: 'hi' });
+    await s.tools.handleToolCall('send_message', { type: 'direct', to: [42], content: 'hi' });
+    const sends = z.requests.filter((r) => r.method === 'POST' && r.path === '/messages');
+    assert.equal(sends.length, 2);
+    for (const send of sends) assert.equal(new URLSearchParams(send.body).has('topic'), false, send.body);
   } finally { s.done(); z.close(); }
 });
 
@@ -221,6 +270,22 @@ test('a password login makes one exchange for a key at start, and no error shows
     const after = z.requests.filter((r) => r.path === '/streams');
     assert.equal(after[0].authorization, 'Basic ' + Buffer.from('bot@example.com:exchanged-key').toString('base64'));
   } finally { s.done(); z.close(); }
+});
+
+test('a password exchange that gets no JSON answer fails the start, and its error shows no password', async () => {
+  const password = 'pw-that-must-not-show';
+  const z = await realm({ 'POST /fetch_api_key': { html: '<html><body>502 Bad Gateway</body></html>', status: 502 } });
+  try {
+    await assert.rejects(
+      initializeZulipClient({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: password }),
+      (err: Error) => {
+        assert.match(err.message, /fetch_api_key/);
+        assert.doesNotMatch(err.message + JSON.stringify(err) + String(err.stack), new RegExp(password));
+        return true;
+      },
+    );
+    assert.equal(z.requests.filter((r) => r.path === '/fetch_api_key').length, 1);
+  } finally { z.close(); }
 });
 
 test('a zuliprc is read from its [api] section, quoted values unquoted', async () => {

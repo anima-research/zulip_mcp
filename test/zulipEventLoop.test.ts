@@ -1,14 +1,3 @@
-/**
- * Tests for ZulipEventLoop failure handling.
- *
- *   - Queue expiry (BAD_EVENT_QUEUE_ID) is Zulip's JSON refusal, which the
- *     poll reads as an answer: `{ result:'error', code:'BAD_EVENT_QUEUE_ID' }`.
- *   - No JSON answer (a dropped connection, an HTML/proxy 502 body, a poll
- *     past its bound) throws ZulipNoAnswer, as the HTTP transport does.
- *
- * Run: node --import tsx --test test/zulipEventLoop.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipEventLoop, type ZulipMessageChange } from '../src/platforms/zulip-events.ts';
@@ -16,12 +5,10 @@ import type { PlatformSystemEvent } from '../src/platforms/adapter.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
 
-/** What the HTTP transport throws for an HTML/proxy 502 answer to a poll. */
 function html502Error(): Error {
   return new ZulipNoAnswer('not-json', 'GET', '/events', false, "Zulip's answer to GET /events wasn't JSON (HTTP 502).", 502);
 }
 
-/** What the HTTP transport throws for a poll whose connection dropped. */
 function econnresetError(): Error {
   return new ZulipNoAnswer('network', 'GET', '/events', false, 'The connection to Zulip failed during GET /events (ECONNRESET).');
 }
@@ -110,6 +97,7 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
   assert.match(degraded[0].text, /no answer/i);
+  assert.doesNotMatch(degraded[0].text, /\.\)/, 'no period inside the parentheses');
 });
 
 test('backoff caps at maxBackoffMs', async () => {
@@ -164,7 +152,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
         };
       }
       if (retrieveCalls === 2) {
-        // Queue died server-side: Zulip refuses the poll with this code.
         return { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'Bad event queue ID: q1' };
       }
       // First poll on the fresh queue — end the test.

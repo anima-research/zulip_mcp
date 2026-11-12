@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import type { ZulipApi } from "./zulip-api.js";
+import { mayHaveBeenApplied, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from "./content.js";
 import { messageLineHead } from "./message-line.js";
@@ -234,7 +234,7 @@ export class ZulipToolRuntime {
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
-  /** Called when that delete_message failed: the message still exists, and
+  /** Called when that delete_message surely failed: the message still exists, and
    *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
@@ -760,12 +760,12 @@ export class ZulipToolRuntime {
 
       case "delete_message": {
         // Noted before the call: the delete event can arrive before the
-        // response does. Un-noted on failure: nothing will echo.
+        // response does. Un-noted once the delete surely failed: nothing will echo.
         this.onDeleted?.(String(args.message_id));
         try {
           return await api.request("DELETE", `/messages/${args.message_id}`, `deleting message ${args.message_id}`);
         } catch (err) {
-          this.onDeleteFailed?.(String(args.message_id));
+          if (!mayHaveBeenApplied(err)) this.onDeleteFailed?.(String(args.message_id));
           throw err;
         }
       }

@@ -18,8 +18,8 @@ export type ZulipSuccess<T extends object> = T & { result: 'success' };
 
 export interface ZulipApi {
   /**
-   * Zulip's answer. Throws `Zulip refused <what>: <msg>` when its `result` is
-   * "error", and ZulipNoAnswer when Zulip gave no JSON answer.
+   * Zulip's answer. Throws ZulipRefused, `Zulip refused <what>: <msg>`, when
+   * its `result` is "error", and ZulipNoAnswer when Zulip gave no JSON answer.
    */
   request<T extends object = Record<string, unknown>>(
     method: Method, path: string, what: string, params?: Record<string, unknown>, opts?: RequestOptions,
@@ -69,29 +69,33 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
 }
 
-/** The error a checking site throws for a refusal: `Zulip refused <what>: <msg>`. */
-export function refusalError(what: string, answer: ZulipRefusal): Error {
-  return new Error(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
+export class ZulipRefused extends Error {
+  constructor(what: string, answer: ZulipRefusal, readonly mayHaveBeenApplied = false) {
+    super(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
+  }
 }
 
-/** Builds the two entry points on a transport. */
+export function mayHaveBeenApplied(err: unknown): boolean {
+  return (err instanceof ZulipNoAnswer || err instanceof ZulipRefused) && err.mayHaveBeenApplied;
+}
+
 export function zulipApi(transport: Transport): ZulipApi {
-  const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions): Promise<unknown> => {
+  const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) => {
     const { status, body } = await transport(method, path, params, opts);
     if (method !== 'GET' && status >= 500 && isRefusal(body)) {
-      const text = body.msg ?? body.code ?? 'unknown error';
-      return { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` };
+      const text = body.msg || body.code || 'unknown error';
+      return { body: { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` }, serverError: true };
     }
-    return body;
+    return { body, serverError: false };
   };
   return {
     async request<T extends object>(method: Method, path: string, what: string, params?: Record<string, unknown>, opts?: RequestOptions) {
-      const body = await answer(method, path, params, opts);
-      if (isRefusal(body)) throw refusalError(what, body);
+      const { body, serverError } = await answer(method, path, params, opts);
+      if (isRefusal(body)) throw new ZulipRefused(what, body, serverError);
       return body as ZulipSuccess<T>;
     },
     async requestAnswer<T extends object>(method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) {
-      return (await answer(method, path, params, opts)) as ZulipSuccess<T> | ZulipRefusal;
+      return (await answer(method, path, params, opts)).body as ZulipSuccess<T> | ZulipRefusal;
     },
   };
 }
@@ -133,7 +137,6 @@ function duration(ms: number): string {
   return ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
 }
 
-/** Sends each request over HTTP, ended at its bound. */
 export function httpTransport(config: HttpTransportConfig): Transport {
   return async (method, path, params, opts) => {
     const timeoutMs = opts?.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;

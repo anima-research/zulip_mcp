@@ -4,6 +4,9 @@
   came, until the server restarted. The error says whether the request may have
   been applied. File uploads and `fetch_attachment`'s download have no bound
   yet.
+- A history page that the server reads to recover messages it missed, or to
+  count them, waits up to 90 s. Past that it fails, where it used to wait
+  without end.
 - An event long poll that gets no answer for 90 s fails. The loop asks again
   with its backoff and counts it toward its `degraded` marker, as for other
   failures. It used to wait without end.
@@ -14,12 +17,16 @@
   (10000 by default), counted in code points. Zulip itself would cut such an
   edit to its limit without a word. It also refuses an edit with no `content`,
   which used to send the text "undefined" as the content, and one whose
-  `message_id` isn't a positive integer (#36).
+  `message_id` isn't a positive integer (#50).
 - Where Zulip gives no JSON answer, the error says what happened: no answer
   within the bound, a failed connection, or an answer that isn't JSON, with its
   HTTP status. It says whether the request may have been applied. It used to
   show the HTTP library's own text. A JSON refusal with a 5xx status on any
   request other than a GET gains the same sentence.
+- A delete that the bot asked for, and that may have been applied, still
+  counts as the bot's own for 10 minutes: Zulip gave no JSON answer once it was
+  sent, or refused it with a 5xx status. If Zulip applied it, its deletion
+  doesn't reach the agent as a change. It used to.
 - `get_channel_history`, the per-channel errors of `start_monitoring` and
   `get_unread_messages`, and a channel's resource text show
   `Zulip refused <what>: <Zulip's message>` where Zulip refuses. They used to

@@ -139,6 +139,18 @@ test('send_message to a person with no topic sends none, and Zulip takes it', as
   assert.equal(read.content, 'no topic for a direct message');
 });
 
+test('send_message with reply_to, and fetch_around, find the message they name', async () => {
+  const stream = await newStream(env, 'around');
+  const first = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, topic: 'here', content: 'first' })) as { id: number };
+  const reply = (await tools.handleToolCall('send_message', { reply_to: first.id, content: 'a reply' })) as { id: number };
+  const read = await user.message(reply.id);
+  assert.equal(read.display_recipient, stream);
+  assert.equal(read.subject, 'here');
+  const around = (await tools.handleToolCall('fetch_around', { message_id: first.id, limit: 10 })) as { topic: string; count: number };
+  assert.equal(around.topic, 'here');
+  assert.equal(around.count, 2);
+});
+
 test('no call in this file came back saying Zulip ignored a parameter', () => {
   assert.ok(answers.length > 10, `answers recorded: ${answers.length}`);
   const ignored = answers

@@ -1,11 +1,3 @@
-/**
- * ZulipAdapter against a stand-in for Zulip's API — what the allowlists do to
- * history reads, what a history page reports about what it scanned, and
- * that opening a channel asks Zulip about the subscription every time.
- *
- * Run: node --import tsx --test test/zulipAdapter.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
@@ -13,6 +5,7 @@ import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import { standInApi } from './zulip-stand-in.ts';
+import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 const SELF = 790;
 
@@ -302,7 +295,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   assert.equal(changes[0].authorEmail, 'ann@example.com', 'the sender travels with the change for the DM allowlist');
 });
 
-test('the bot\'s own deletions (rollback, the delete tool) do not echo back as changes', async () => {
+test('the bot\'s own deletions (rollback, the delete tool) do not echo back as changes, a delete that got no answer included', async () => {
   const events = [
     { id: 1, type: 'message', flags: [], message: raw(5) },
     { id: 2, type: 'message', flags: [], message: raw(6) },
@@ -314,7 +307,10 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
     'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
     'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => ({ result: 'success', message: raw(message_id) }),
-    'DELETE /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => (message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' }),
+    'DELETE /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
+      if (message_id === 8) throw new ZulipNoAnswer('timeout', 'DELETE', '/messages/8', true, 'Zulip gave no answer to DELETE /messages/8 within 15 s.');
+      return message_id === 7 ? { result: 'error', msg: 'nope' } : { result: 'success' };
+    },
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       polls++;
@@ -326,6 +322,7 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
           { id: 4, type: 'delete_message', message_ids: [5], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // rollback
           { id: 5, type: 'delete_message', message_ids: [6], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // delete tool
           { id: 6, type: 'delete_message', message_ids: [7], message_type: 'stream', stream_id: 7, topic: 'deploys' },   // someone else: the bot's delete failed
+          { id: 7, type: 'delete_message', message_ids: [8], message_type: 'stream', stream_id: 7, topic: 'deploys' },
         ] };
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -344,6 +341,7 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
     await adapter.deleteMessage('zulip:general', '5');
     adapter.noteSelfDeleted(6);
     await assert.rejects(adapter.deleteMessage('zulip:general', '7'));
+    await assert.rejects(adapter.deleteMessage('zulip:general', '8'));
     released!();
     while (changes.length < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     await new Promise((r) => setTimeout(r, 30));

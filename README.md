@@ -88,7 +88,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   absent/invalid numeric sender ids, non-JSON responses, transport errors and
   timeouts are uncached and eligible for the retry pass. This is not full
   response-schema validation.
-  The wait budget does not cancel the GET or bound history-page HTTP latency.
+  A quote GET ends when the wait budget runs out. The history page's own
+  request has its own bound.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 
@@ -533,7 +534,8 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
-- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll.
+- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll and
+  for the history reads that recover or count missed messages.
   A call that reaches it is ended and fails. A send, an edit or a delete that
   may have reached Zulip without an answer fails with an error saying so.
   File uploads and `fetch_attachment`'s download have no bound yet.

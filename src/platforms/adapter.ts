@@ -158,6 +158,7 @@ export interface ChannelHistoryQuery {
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
   afterMessageId?: string;
+  timeoutMs?: number;
 }
 
 /**

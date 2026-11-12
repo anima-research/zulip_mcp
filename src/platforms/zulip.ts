@@ -38,7 +38,7 @@ import { chunkMessage, cleanMarkdown } from '../content.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
-import { isRefusal, refusalError, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, mayHaveBeenApplied, ZulipRefused, type ZulipApi } from '../zulip-api.js';
 import {
   channelIdOf,
   dmCounterparts,
@@ -119,7 +119,6 @@ function quotedMessageIds(content: string): Set<number> {
 type QuoteLookup = { authorId: number } | null | 'budget-skipped';
 type QuoteVerdict = 'reply' | 'not-reply' | 'ineligible' | 'unverified' | 'budget-skipped';
 
-/** A recently seen message, as the cache places reactions and changes. */
 interface ZulipStream {
   stream_id?: number;
   name: string;
@@ -127,6 +126,7 @@ interface ZulipStream {
   invite_only?: boolean;
 }
 
+/** A recently seen message, as the cache places reactions and changes. */
 interface SeenMessage {
   channelId: string;
   authorId: number;
@@ -417,7 +417,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // Older (pre-5.0) servers omit code; only then use the legacy text.
       if (quoteLookup && result.result === 'error' &&
           (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
-      if (isRefusal(result)) throw refusalError(`message ${messageId}`, result);
+      if (isRefusal(result)) throw new ZulipRefused(`message ${messageId}`, result);
       const raw = result.message;
       if (!raw) throw new Error('response contained no message');
       if (raw.id !== messageId) throw new Error('response contained a different message id');
@@ -733,7 +733,7 @@ export class ZulipAdapter implements PlatformAdapter {
     try {
       await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`);
     } catch (err) {
-      this.selfDeleted.delete(id);
+      if (!mayHaveBeenApplied(err)) this.selfDeleted.delete(id);
       throw err;
     }
   }
@@ -892,6 +892,7 @@ export class ZulipAdapter implements PlatformAdapter {
       limit: query.limit,
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
+      timeoutMs: query.timeoutMs,
     });
     // Page authors take precedence over older cached rows, including targets
     // later in the page and pages larger than the seen cache. Uncached targets
