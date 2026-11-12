@@ -15,24 +15,17 @@ import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/cha
 import type { PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import type { ChannelDescriptor, ContentBlock } from '@animalabs/mcpl-core';
 
-/** Stream ids for the fixtures' stream names, numbered as Zulip numbers streams. */
 const streamIds = new Map<string, number>();
 function streamIdFor(name: string): number {
   if (!streamIds.has(name)) streamIds.set(name, streamIds.size + 1);
   return streamIds.get(name)!;
 }
 
-/** The key the server keeps for a fixture's channel id. */
 function fixtureKey(channelId: string): ChannelKey {
   const dm = parseDmChannelId(channelId);
   return dm ? dmKey(dm) : streamKey(streamIdFor(channelId.slice('zulip:'.length)));
 }
 
-/**
- * An adapter that describes `descriptors`, each stream with its stream id as
- * the Zulip adapter describes it, and records publishes by the channel id the
- * host holds. The stream directory knows each stream's name.
- */
 function fakeAdapter(type: string, descriptors: ChannelDescriptor[]) {
   const directory = new StreamDirectory();
   const streams = descriptors.filter((d) => !parseDmChannelId(d.id));
@@ -56,7 +49,6 @@ function fakeAdapter(type: string, descriptors: ChannelDescriptor[]) {
   return { adapter, calls, ids };
 }
 
-/** A message as the adapter hands it over: on its channel's key, with no channel id. */
 function deliver(manager: ChannelManager, channelId: string, message: Omit<KeyedMessage, 'key'> & { channelId?: string; key?: ChannelKey }): void {
   const { channelId: _wire, key: _key, ...rest } = message;
   const key = fixtureKey(channelId);
@@ -733,7 +725,6 @@ test('an id that an unanswered change added stays at the host once a new stream 
   answer = new Error('timed out');
   assert.equal(await manager.announceChanges(['zulip:a'], [on('zulip:tmp', 17)]), 'unanswered');
 
-  // A new stream takes #tmp, and the host is told of it under zulip:tmp.
   answer = undefined;
   assert.deepEqual((await manager.registerAdditional([on('zulip:tmp', 101)])).announced, ['zulip:tmp']);
 
@@ -755,14 +746,16 @@ test('a stream renamed while its first announcement waits to be retried: a retry
   } as never;
   const { adapter, ids } = fakeAdapter('zulip', []);
   const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
-  ids.directory.registration([{ stream_id: 17, name: 'a' }]);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }, { stream_id: 18, name: 'c' }]);
   const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
-  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17)])).local, ['zulip:a']);
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17), on('zulip:c', 18)])).local, ['zulip:a', 'zulip:c']);
 
   ids.directory.applyEvent({ op: 'update', stream_id: 17, property: 'name', value: 'b' });
   answer = undefined;
   await manager.registerAdditional([], { retryBacklog: true });
-  assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'zulip:a is stream 17\'s old id');
+  const retried = sent.slice(1).flatMap((c) => (c.added ?? []).map((d) => d.id));
+  assert.ok(retried.includes('zulip:c'), 'stream 18\'s descriptor, unchanged, is retried');
+  assert.equal(retried.includes('zulip:a'), false, 'zulip:a is stream 17\'s old id');
 });
 
 test('a stream archived while its first announcement waits to be retried: a retry of the backlog doesn\'t offer it', async () => {

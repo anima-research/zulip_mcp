@@ -170,7 +170,6 @@ test('fetchAround centres a window on the anchor within its own conversation', a
     anchor: 42, num_before: 25, num_after: 25, narrow: [{ operator: 'stream', operand: 17 }, { operator: 'topic', operand: 'deploys' }], apply_markdown: false, include_anchor: true,
   });
 
-  // An anchor that carries no stream id is narrowed by the name it came with.
   const noId = fakeClient([raw({ id: 42, stream_id: undefined })]);
   await fetchAround(noId.api, 42, 10);
   assert.deepEqual(noId.calls[0].narrow, [['stream', 'general'], ['topic', 'deploys']]);

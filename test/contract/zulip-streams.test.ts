@@ -67,8 +67,7 @@ test('C1: a rename gives a stream event with op "update", property "name", the s
   try {
     const renamed = uniqueName('c1-renamed');
     await rename(id, renamed);
-    const event = await queue.next(`the rename of stream ${id}`, (e) => e.type === 'stream' && e.op === 'update' && e.stream_id === id);
-    assert.equal(event.property, 'name');
+    const event = await queue.next(`the rename of stream ${id}`, (e) => e.type === 'stream' && e.op === 'update' && e.stream_id === id && e.property === 'name');
     assert.equal(event.value, renamed);
   } finally {
     await queue.close();
@@ -118,18 +117,24 @@ test('C4: a narrow of {operator: "stream", operand: <id>} reads that stream and 
   assert.deepEqual(await readById(), [mine.id], 'after the rename');
 });
 
-test('C5: a stream message carries stream_id, as an event and from GET /messages', async () => {
+test('C5: a stream message carries stream_id, as an event and from GET /messages, also after a rename', async () => {
   const stream = await newStream(env, 'c5');
   const id = await idOf(stream);
   const queue = await Queue.register(bot);
-  try {
-    const sent = await user.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'here', content: 'carry my stream id' });
+  const carries = async (content: string, name: string) => {
+    const sent = await user.ok('POST', 'messages', { type: 'stream', to: name, topic: 'here', content });
     const event = await queue.next(`message ${sent.id} as an event`, (e) => e.type === 'message' && e.message?.id === sent.id);
-    assert.equal(event.message.stream_id, id);
+    assert.equal(event.message.stream_id, id, `${content}: the event`);
     const page = await bot.ok('GET', 'messages', {
-      anchor: sent.id, num_before: 0, num_after: 0, narrow: [['stream', stream]], apply_markdown: false, include_anchor: true,
+      anchor: sent.id, num_before: 0, num_after: 0, narrow: [['stream', name]], apply_markdown: false, include_anchor: true,
     });
-    assert.deepEqual(page.messages.map((m: { id: number; stream_id: unknown }) => [m.id, m.stream_id]), [[sent.id, id]]);
+    assert.deepEqual(page.messages.map((m: { id: number; stream_id: unknown }) => [m.id, m.stream_id]), [[sent.id, id]], `${content}: GET /messages`);
+  };
+  try {
+    await carries('before the rename', stream);
+    const renamed = uniqueName('c5-renamed');
+    await rename(id, renamed);
+    await carries('after the rename', renamed);
   } finally {
     await queue.close();
   }
