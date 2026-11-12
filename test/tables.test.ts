@@ -63,6 +63,11 @@ test('the lines that Zulip splits off a block, at a heading, a rule or the end o
   assert.equal(prepareOutgoing(`Results:\n| a |\n| --- |\n---`), `Results:\n\n| a |\n| --- |\n---`, 'a one-column table that a rule ends');
   assert.equal(prepareOutgoing(`Results:\n| a |\n| --- |\n# Next`), `Results:\n\n| a |\n| --- |\n# Next`, 'a one-column table that a heading ends');
   assert.equal(prepareOutgoing(`    code\nResults:\n${table}`), `    code\nResults:\n\n${table}`, 'after an indented start');
+  assert.equal(
+    prepareOutgoing('Results:\n    | a | b |\n|---|---|\n| : | - |'),
+    'Results:\n    | a | b |\n\n|---|---|\n| : | - |',
+    'not above a line indented four, which would then be code, but above the table that follows',
+  );
   assert.equal(prepareOutgoing(`${table}\n---\nMore:\n| c | d |\n|---|---|`), `${table}\n---\nMore:\n| c | d |\n|---|---|`, 'a block that is a table from its first line keeps its rule and the rows after it');
 });
 
