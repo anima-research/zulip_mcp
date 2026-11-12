@@ -29,6 +29,7 @@
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
 import { isRefusal, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import type { StreamDirectory, ZulipStreamEvent } from '../stream-directory.js';
 
 export interface ZulipEventMessage {
   id: number;
@@ -152,6 +153,8 @@ export interface ZulipEventLoopOptions {
   sleep?: (ms: number) => Promise<void>;
   /** The bound on one long poll. Default 90000ms. */
   pollTimeoutMs?: number;
+  /** Takes each registration's stream list and each `stream` event, in queue order. */
+  directory?: StreamDirectory;
 }
 
 const DEFAULT_BASE_BACKOFF_MS = 2000;
@@ -189,8 +192,10 @@ export class ZulipEventLoop {
   private readonly degradedThreshold: number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly pollTimeoutMs: number;
+  private readonly directory: StreamDirectory | null;
 
   constructor(options: ZulipEventLoopOptions = {}) {
+    this.directory = options.directory ?? null;
     this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
@@ -250,8 +255,11 @@ export class ZulipEventLoop {
     // default (false): Zulip 12 validates client_capabilities as a whole
     // model and rejects the registration with "client_capabilities
     // [\"notification_settings_null\"] field is missing" when it is absent.
-    const registration = await api.requestAnswer<{ queue_id?: unknown; last_event_id: number }>('POST', '/register', {
-      event_types: ['message', 'reaction', 'update_message', 'delete_message'],
+    // `stream` events, and the stream list the registration answers with
+    // for them, keep the stream directory: the list's place among the events
+    // is this queue's first event id.
+    const registration = await api.requestAnswer<{ queue_id?: unknown; last_event_id: number; streams?: unknown }>('POST', '/register', {
+      event_types: ['message', 'reaction', 'update_message', 'delete_message', 'stream'],
       all_public_streams: true,
       apply_markdown: false,
       client_capabilities: { notification_settings_null: false, bulk_message_deletion: true },
@@ -272,6 +280,8 @@ export class ZulipEventLoop {
 
     this.queueId = registration.queue_id;
     let lastEventId = registration.last_event_id;
+    if (Array.isArray(registration.streams)) this.directory?.registration(registration.streams);
+    else if (this.directory) console.error('[zulip-mcp] the event queue registration carried no stream list; the stream directory learns streams from stream list reads only');
 
     console.error(`Zulip event queue registered: ${this.queueId}`);
 
@@ -342,6 +352,11 @@ export class ZulipEventLoop {
         for (const event of response.events) {
           if (this.stopped) return;
           lastEventId = event.id;
+
+          if (event.type === 'stream') {
+            this.directory?.applyEvent(event as ZulipStreamEvent);
+            continue;
+          }
 
           if (event.type === 'reaction' && onReaction && typeof event.message_id === 'number') {
             try {

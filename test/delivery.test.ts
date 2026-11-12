@@ -12,6 +12,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
+import { dmKey, streamKey, type KeyedMessage } from '../src/channel-key.ts';
+
+/** A stream directory that knows these streams, as a queue registration would fill it. */
+function directoryOf(streams: Record<number, string> = {}): StreamDirectory {
+  const directory = new StreamDirectory();
+  directory.registration(Object.entries(streams).map(([id, name]) => ({ stream_id: Number(id), name })));
+  return directory;
+}
+
+const GENERAL = streamKey(1);
+const DEV = streamKey(2);
+const NEVER = streamKey(3);
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'zulip-delivery-'));
@@ -20,130 +33,133 @@ function tmp(): string {
 test('watermarks only advance, and survive a restart', () => {
   const dir = tmp();
   try {
-    const a = new DeliveryState(dir, 's1');
-    assert.equal(a.watermark('zulip:general'), undefined);
-    assert.equal(a.advance('zulip:general', 10), true);
-    assert.equal(a.advance('zulip:general', 7), false, 'never retreats');
-    assert.equal(a.advance('zulip:general', 12), true);
+    const a = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    assert.equal(a.watermark(GENERAL), undefined);
+    assert.equal(a.advance(GENERAL, 10), true);
+    assert.equal(a.advance(GENERAL, 7), false, 'never retreats');
+    assert.equal(a.advance(GENERAL, 12), true);
     a.save();
 
-    const b = new DeliveryState(dir, 's1');
-    assert.equal(b.watermark('zulip:general'), 12);
-    assert.deepEqual(b.watermarkedChannels(), ['zulip:general']);
+    const b = new DeliveryState(dir, 's1', new StreamDirectory());
+    assert.equal(b.watermark(GENERAL), 12);
+    assert.deepEqual(b.watermarkedChannels(), [GENERAL]);
 
     // Sessions are isolated.
-    const other = new DeliveryState(dir, 's2');
-    assert.equal(other.watermark('zulip:general'), undefined);
+    const other = new DeliveryState(dir, 's2', new StreamDirectory());
+    assert.equal(other.watermark(GENERAL), undefined);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('the undelivered floor: the watermark never passes an offered-but-unaccepted id, and lifts when it is delivered', () => {
-  const state = new DeliveryState(null, 'mem');
+  const state = new DeliveryState(null, 'mem', directoryOf());
   // 1, 2, 3 offered; 1 and 3 accepted, 2 rejected.
-  for (const id of [1, 2, 3]) state.hold('zulip:general', id);
-  assert.equal(state.floor('zulip:general'), 1);
-  state.release('zulip:general', 1);
-  state.release('zulip:general', 3);
-  state.hold('zulip:general', 2, 'rejected');
-  assert.equal(state.advance('zulip:general', 3), true);
-  assert.equal(state.watermark('zulip:general'), 1, 'stops below the rejected id');
+  for (const id of [1, 2, 3]) state.hold(GENERAL, id);
+  assert.equal(state.floor(GENERAL), 1);
+  state.release(GENERAL, 1);
+  state.release(GENERAL, 3);
+  state.hold(GENERAL, 2, 'rejected');
+  assert.equal(state.advance(GENERAL, 3), true);
+  assert.equal(state.watermark(GENERAL), 1, 'stops below the rejected id');
 
   // A later batch is accepted in full: still capped by the floor.
-  state.hold('zulip:general', 4);
-  state.release('zulip:general', 4);
-  assert.equal(state.advance('zulip:general', 4), false);
-  assert.equal(state.watermark('zulip:general'), 1);
-  assert.deepEqual(state.heldIds('zulip:general'), [2]);
-  assert.deepEqual(state.heldIds('zulip:general', { replayable: true }), [2], 'rejected → a live replay may try once');
-  state.markReplayed('zulip:general', [2]);
-  assert.deepEqual(state.heldIds('zulip:general', { replayable: true }), [], 'and only once');
+  state.hold(GENERAL, 4);
+  state.release(GENERAL, 4);
+  assert.equal(state.advance(GENERAL, 4), false);
+  assert.equal(state.watermark(GENERAL), 1);
+  assert.deepEqual(state.heldIds(GENERAL), [2]);
+  assert.deepEqual(state.heldIds(GENERAL, { replayable: true }), [2], 'rejected → a live replay may try once');
+  state.markReplayed(GENERAL, [2]);
+  assert.deepEqual(state.heldIds(GENERAL, { replayable: true }), [], 'and only once');
 
   // The replay is accepted: the floor lifts and the watermark catches up to everything accepted.
-  assert.equal(state.release('zulip:general', 2), true);
-  assert.equal(state.watermark('zulip:general'), 4);
-  assert.equal(state.floor('zulip:general'), undefined);
+  assert.equal(state.release(GENERAL, 2), true);
+  assert.equal(state.watermark(GENERAL), 4);
+  assert.equal(state.floor(GENERAL), undefined);
 
   // A batch given up on holds too; a catch-up block that scanned past it releases it.
-  state.hold('zulip:general', 5, 'failed');
-  state.hold('zulip:general', 6);
-  state.release('zulip:general', 6);
-  state.advance('zulip:general', 6);
-  assert.equal(state.watermark('zulip:general'), 4);
-  assert.equal(state.advanceThrough('zulip:general', 6), true);
-  assert.equal(state.watermark('zulip:general'), 6);
+  state.hold(GENERAL, 5, 'failed');
+  state.hold(GENERAL, 6);
+  state.release(GENERAL, 6);
+  state.advance(GENERAL, 6);
+  assert.equal(state.watermark(GENERAL), 4);
+  assert.equal(state.advanceThrough(GENERAL, 6), true);
+  assert.equal(state.watermark(GENERAL), 6);
   assert.deepEqual(state.heldChannels(), []);
 
   // Already forwarded ids are never held; releasing everything drops a channel's floor.
-  state.hold('zulip:general', 3);
-  assert.equal(state.floor('zulip:general'), undefined);
-  state.hold('zulip:general', 9, 'failed');
-  state.advance('zulip:general', 10);
-  assert.equal(state.watermark('zulip:general'), 8);
-  assert.equal(state.releaseAll('zulip:general'), true);
-  assert.equal(state.watermark('zulip:general'), 10);
+  state.hold(GENERAL, 3);
+  assert.equal(state.floor(GENERAL), undefined);
+  state.hold(GENERAL, 9, 'failed');
+  state.advance(GENERAL, 10);
+  assert.equal(state.watermark(GENERAL), 8);
+  assert.equal(state.releaseAll(GENERAL), true);
+  assert.equal(state.watermark(GENERAL), 10);
 });
 
 test('closing a channel starts a tally anchored at the watermark; reopening clears it', () => {
-  const state = new DeliveryState(null, 'mem');
-  state.advance('zulip:dev', 100);
-  state.markOpen('zulip:dev');
-  assert.equal(state.tally('zulip:dev'), undefined);
-  assert.equal(state.countMissed('zulip:dev', { id: 101, text: 'x' }), false, 'open channels are not tallied');
+  const state = new DeliveryState(null, 'mem', directoryOf());
+  state.advance(DEV, 100);
+  state.markOpen(DEV);
+  assert.equal(state.tally(DEV), undefined);
+  assert.equal(state.countMissed(DEV, { id: 101, text: 'x' }), false, 'open channels are not tallied');
 
-  state.markClosed('zulip:dev');
-  assert.deepEqual(state.tally('zulip:dev'), { anchorId: 100, talliedThrough: 100, messages: 0, characters: 0 });
-  assert.equal(state.countMissed('zulip:dev', { id: 101, text: 'hello' }), true);
-  assert.equal(state.countMissed('zulip:dev', { id: 103, text: 'world!' }), true);
-  assert.deepEqual(state.tally('zulip:dev'), { anchorId: 100, talliedThrough: 103, messages: 2, characters: 11 });
+  state.markClosed(DEV);
+  assert.deepEqual(state.tally(DEV), { anchorId: 100, talliedThrough: 100, messages: 0, characters: 0 });
+  assert.equal(state.countMissed(DEV, { id: 101, text: 'hello' }), true);
+  assert.equal(state.countMissed(DEV, { id: 103, text: 'world!' }), true);
+  assert.deepEqual(state.tally(DEV), { anchorId: 100, talliedThrough: 103, messages: 2, characters: 11 });
 
   // Closing a channel that was never open changes nothing.
-  state.markClosed('zulip:never');
-  assert.equal(state.tally('zulip:never'), undefined);
+  state.markClosed(NEVER);
+  assert.equal(state.tally(NEVER), undefined);
 
-  state.markOpen('zulip:dev');
-  assert.equal(state.tally('zulip:dev'), undefined);
-  assert.equal(state.wasOpen('zulip:dev'), true);
+  state.markOpen(DEV);
+  assert.equal(state.tally(DEV), undefined);
+  assert.equal(state.wasOpen(DEV), true);
 });
 
 test('backfill folds fetched ambient into the tally and moves the cursor', () => {
-  const state = new DeliveryState(null, 'mem');
-  state.markOpen('zulip:dev');
-  state.markClosed('zulip:dev');
-  state.backfillMissed('zulip:dev', [{ id: 5, text: 'ab' }, { id: 6, text: 'cde' }], 9);
-  assert.deepEqual(state.tally('zulip:dev'), { anchorId: 0, talliedThrough: 9, messages: 2, characters: 5 });
+  const state = new DeliveryState(null, 'mem', directoryOf());
+  state.markOpen(DEV);
+  state.markClosed(DEV);
+  state.backfillMissed(DEV, [{ id: 5, text: 'ab' }, { id: 6, text: 'cde' }], 9);
+  assert.deepEqual(state.tally(DEV), { anchorId: 0, talliedThrough: 9, messages: 2, characters: 5 });
 });
 
 test('the state file is round-tripped, sorted, and tolerant of garbage', () => {
   const dir = tmp();
   try {
-    const a = new DeliveryState(dir, 's');
-    a.advance('zulip:b', 2);
-    a.advance('zulip:a', 1);
-    a.markOpen('zulip:b');
-    a.markOpen('zulip:a');
-    a.markClosed('zulip:a');
-    a.countMissed('zulip:a', { id: 3, text: 'xyz' });
+    const A = streamKey(1);
+    const B = streamKey(2);
+    const a = new DeliveryState(dir, 's', directoryOf({ 1: 'a', 2: 'b' }));
+    a.advance(B, 2);
+    a.advance(A, 1);
+    a.markOpen(B);
+    a.markOpen(A);
+    a.markClosed(A);
+    a.countMissed(A, { id: 3, text: 'xyz' });
     a.save();
 
     const raw = JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf-8'));
     assert.deepEqual(Object.keys(raw.watermarks), ['zulip:a', 'zulip:b']);
     assert.deepEqual(raw.lastOpen, ['zulip:b']);
     assert.deepEqual(raw.missed['zulip:a'], { anchorId: 1, talliedThrough: 3, messages: 1, characters: 3 });
+    assert.deepEqual(raw.streams, { 1: 'a', 2: 'b' });
 
-    const b = new DeliveryState(dir, 's');
-    assert.equal(b.watermark('zulip:b'), 2);
-    assert.equal(b.wasOpen('zulip:b'), true);
-    assert.equal(b.wasOpen('zulip:a'), false);
-    assert.deepEqual(b.tally('zulip:a'), { anchorId: 1, talliedThrough: 3, messages: 1, characters: 3 });
+    const b = new DeliveryState(dir, 's', new StreamDirectory());
+    assert.equal(b.watermark(B), 2);
+    assert.equal(b.wasOpen(B), true);
+    assert.equal(b.wasOpen(A), false);
+    assert.deepEqual(b.tally(A), { anchorId: 1, talliedThrough: 3, messages: 1, characters: 3 });
 
     // A corrupt file is reported and ignored, not fatal.
     const dirty = tmp();
     try {
       const path = join(dirty, 'x.delivery.json');
       writeFileSync(path, '{not json');
-      const c = new DeliveryState(dirty, 'x');
+      const c = new DeliveryState(dirty, 'x', new StreamDirectory());
       assert.deepEqual(c.watermarkedChannels(), []);
     } finally {
       rmSync(dirty, { recursive: true, force: true });
@@ -265,9 +281,9 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
 
 // ── attributeMessage ──
 
-function incoming(over: Partial<IncomingChannelMessage> = {}): IncomingChannelMessage {
+function incoming(over: Partial<KeyedMessage> = {}): KeyedMessage {
   return {
-    channelId: 'zulip:qa',
+    key: streamKey(5),
     messageId: '17206924',
     threadId: 'router',
     author: { id: '760', name: 'Mykhailo Buialo' },
@@ -280,7 +296,7 @@ function incoming(over: Partial<IncomingChannelMessage> = {}): IncomingChannelMe
 }
 
 test('attributeMessage renders who/where/when into the body in the fetch_history line shape, and keeps the fields', () => {
-  const out = attributeMessage(incoming(), () => '2026-09-14T08:42:52Z');
+  const out = attributeMessage(incoming(), 'qa', () => '2026-09-14T08:42:52Z');
   assert.equal((out.content[0] as { text: string }).text, '[2026-09-14T08:42:52Z id=17206924] [#qa > router] Mykhailo Buialo (mention): @Knowledge Resident do you have the same issue');
   assert.deepEqual(out.author, { id: '760', name: 'Mykhailo Buialo' });
   assert.equal(out.threadId, 'router');
@@ -290,31 +306,31 @@ test('attributeMessage renders who/where/when into the body in the fetch_history
   assert.equal((out.content[0] as { text: string }).text.startsWith((out.metadata as { attributionHeader: string }).attributionHeader), true);
 
   // Ambient (no mention) has no marker; a DM says so instead of stream > topic.
-  assert.equal((attributeMessage(incoming({ metadata: { topic: 'router', mentioned: false } }), () => 'T').content[0] as { text: string }).text.startsWith('[T id=17206924] [#qa > router] Mykhailo Buialo: @'), true);
-  const dm = attributeMessage(incoming({ channelId: 'zulip:dm:760', threadId: undefined, metadata: { isDM: true, mentioned: false }, content: [{ type: 'text', text: 'hi' }] }), () => 'T');
+  assert.equal((attributeMessage(incoming({ metadata: { topic: 'router', mentioned: false } }), 'qa', () => 'T').content[0] as { text: string }).text.startsWith('[T id=17206924] [#qa > router] Mykhailo Buialo: @'), true);
+  const dm = attributeMessage(incoming({ key: dmKey([760]), threadId: undefined, metadata: { isDM: true, mentioned: false }, content: [{ type: 'text', text: 'hi' }] }), null, () => 'T');
   assert.equal((dm.content[0] as { text: string }).text, '[T id=17206924] [DM] Mykhailo Buialo: hi');
 });
 
 test('attributeMessage: no timestamp style, attachments after the body, image-only content, and idempotence', () => {
-  const none = attributeMessage(incoming(), () => '');
+  const none = attributeMessage(incoming(), 'qa', () => '');
   assert.equal((none.content[0] as { text: string }).text.startsWith('[id=17206924] [#qa > router]'), true, 'AGENT_TIMESTAMP_STYLE=none drops the time, not the id');
 
-  const withNote = attributeMessage(incoming({ content: [{ type: 'text', text: 'see file' }, { type: 'text', text: '[attachments: 1]\n- a.pdf' }] }), () => 'T');
+  const withNote = attributeMessage(incoming({ content: [{ type: 'text', text: 'see file' }, { type: 'text', text: '[attachments: 1]\n- a.pdf' }] }), 'qa', () => 'T');
   assert.equal((withNote.content[0] as { text: string }).text, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention): see file');
   assert.equal((withNote.content[1] as { text: string }).text, '[attachments: 1]\n- a.pdf', 'the note is untouched');
 
-  const imageOnly = attributeMessage(incoming({ content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] }), () => 'T');
+  const imageOnly = attributeMessage(incoming({ content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] }), 'qa', () => 'T');
   assert.equal((imageOnly.content[0] as { text: string }).text, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention):');
   assert.equal((imageOnly.metadata as { attributionHeader: string }).attributionHeader, '[T id=17206924] [#qa > router] Mykhailo Buialo (mention):', 'the recorded prefix is what was inserted');
   assert.equal(imageOnly.content[1].type, 'image');
 
   const original = incoming();
-  const once = attributeMessage(original, () => 'T');
-  assert.deepEqual(attributeMessage(once, () => 'T'), once, 'a replay does not double the header');
+  const once = attributeMessage(original, 'qa', () => 'T');
+  assert.deepEqual(attributeMessage(once, 'qa', () => 'T'), once, 'a replay does not double the header');
   assert.equal(viewOf(original).text, '@Knowledge Resident do you have the same issue', 'the input is not mutated');
   assert.equal((original.metadata as { attributed?: boolean }).attributed, undefined);
 
-  const bad = attributeMessage(incoming({ timestamp: 'not-a-date' }), () => { throw new Error('must not format an invalid date'); });
+  const bad = attributeMessage(incoming({ timestamp: 'not-a-date' }), 'qa', () => { throw new Error('must not format an invalid date'); });
   assert.equal((bad.content[0] as { text: string }).text.startsWith('[id=17206924] '), true, 'an unparseable timestamp drops the time, not the message');
 });
 

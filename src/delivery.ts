@@ -19,14 +19,22 @@
  *                reopen them); every other watermarked channel gets only its
  *                addressed messages, with vicinity.
  *
+ * In memory each table is keyed by channel key. In the file each key is a
+ * channel id (`zulip:<current name>`, `zulip:dm:<ids>`), and the file also
+ * carries the stream directory's copy (`streams`, `formerNames`). At a load,
+ * a key is resolved by the file's own `streams`; a file without them is
+ * resolved by name when the directory is first filled.
+ *
  * File: `<stateDir>/<session>.delivery.json`, alongside the tool layer's
  * monitoring state. Best-effort: a failed save is logged, never fatal.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
-import { isDmChannelId } from './history.js';
+import type { TextContent } from '@animalabs/mcpl-core';
+import { dmKey, isDmKey, parseKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
+import { dmChannelIdFor, parseDmChannelId } from './history.js';
+import type { StreamDirectory } from './stream-directory.js';
 import { messageLineHead } from './message-line.js';
 
 export interface MissedTally {
@@ -42,6 +50,15 @@ interface DeliveryFile {
   watermarks?: Record<string, number>;
   missed?: Record<string, Partial<MissedTally>>;
   lastOpen?: string[];
+  streams?: Record<string, string>;
+  formerNames?: Record<string, number>;
+}
+
+/** Entries of a file without `streams`, held by stream name until the directory is first filled. */
+interface Unresolved {
+  watermark?: number;
+  missed?: MissedTally;
+  lastOpen?: boolean;
 }
 
 /** Why an offered message is not (yet) accepted. `queued` is on its way;
@@ -60,9 +77,12 @@ interface Held {
 const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
-  private watermarks = new Map<string, number>();
-  private missed = new Map<string, MissedTally>();
-  private lastOpen = new Set<string>();
+  /** Whether `save` writes the file. */
+  writes = true;
+  private watermarks = new Map<ChannelKey, number>();
+  private missed = new Map<ChannelKey, MissedTally>();
+  private lastOpen = new Set<ChannelKey>();
+  private unresolved = new Map<string, Unresolved>();
   /**
    * The undelivered floor (in-memory). Every message id offered to the host
    * on a channel — queued for `channels/incoming`, or sent as `push/event` —
@@ -74,16 +94,18 @@ export class DeliveryState {
    * persisted watermark is already below every held id, which is all a
    * restart needs.
    */
-  private held = new Map<string, Map<number, Held>>();
+  private held = new Map<ChannelKey, Map<number, Held>>();
   /** The highest id acceptance has reached per channel; the watermark is
    *  this, capped by the floor. Recomputed when a hold is released. */
-  private reached = new Map<string, number>();
+  private reached = new Map<ChannelKey, number>();
 
   constructor(
     private readonly stateDir: string | null,
     private readonly sessionId: string,
+    private readonly directory: StreamDirectory,
   ) {
     this.load();
+    if (this.unresolved.size > 0) void this.directory.whenFilled().then(() => this.resolveByName());
   }
 
   private file(): string | null {
@@ -95,32 +117,100 @@ export class DeliveryState {
     if (!path || !existsSync(path)) return;
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8')) as DeliveryFile;
+      const saved = parsed.streams && typeof parsed.streams === 'object' ? parsed.streams : null;
+      if (saved) this.directory.load({ streams: saved, formerNames: parsed.formerNames ?? {} });
+      const idBySavedName = new Map<string, number>();
+      for (const [id, name] of Object.entries(saved ?? {})) if (typeof name === 'string') idBySavedName.set(name, Number(id));
+      const keyOf = (chan: string): ChannelKey | null => {
+        const dm = parseDmChannelId(chan);
+        if (dm) return dmKey(dm);
+        if (!chan.startsWith('zulip:')) return null;
+        const id = idBySavedName.get(chan.slice('zulip:'.length));
+        return id !== undefined && Number.isSafeInteger(id) && id > 0 ? streamKey(id) : null;
+      };
+      const place = (chan: string, apply: (key: ChannelKey) => void, hold: (u: Unresolved) => void): void => {
+        const key = keyOf(chan);
+        if (key !== null) return apply(key);
+        if (saved || !chan.startsWith('zulip:')) {
+          console.error(`[zulip-mcp] delivery state: dropping ${chan}, whose stream the file's own stream list does not hold`);
+          return;
+        }
+        const name = chan.slice('zulip:'.length);
+        const u = this.unresolved.get(name) ?? {};
+        hold(u);
+        this.unresolved.set(name, u);
+      };
       for (const [chan, id] of Object.entries(parsed.watermarks ?? {})) {
-        if (typeof id === 'number' && Number.isFinite(id) && id > 0) this.watermarks.set(chan, id);
+        if (typeof id !== 'number' || !Number.isFinite(id) || id <= 0) continue;
+        place(chan, (key) => this.watermarks.set(key, id), (u) => { u.watermark = id; });
       }
       for (const [chan, t] of Object.entries(parsed.missed ?? {})) {
-        this.missed.set(chan, {
+        const tally: MissedTally = {
           anchorId: num(t.anchorId),
           talliedThrough: num(t.talliedThrough ?? t.anchorId),
           messages: num(t.messages),
           characters: num(t.characters),
-        });
+        };
+        place(chan, (key) => this.missed.set(key, tally), (u) => { u.missed = tally; });
       }
-      for (const id of parsed.lastOpen ?? []) if (typeof id === 'string') this.lastOpen.add(id);
+      for (const chan of parsed.lastOpen ?? []) {
+        if (typeof chan !== 'string') continue;
+        place(chan, (key) => this.lastOpen.add(key), (u) => { u.lastOpen = true; });
+      }
     } catch (err) {
       console.error('[zulip-mcp] Failed to load delivery state:', (err as Error).message);
     }
   }
 
+  /** A file from before stream ids: its entries carry by name, once the directory knows the names. */
+  private resolveByName(): void {
+    for (const [name, u] of this.unresolved) {
+      const id = this.directory.idOf(name);
+      if (id === undefined) {
+        console.error(`[zulip-mcp] delivery state: dropping zulip:${name}: no Zulip stream has that name`);
+        continue;
+      }
+      const key = streamKey(id);
+      if (u.watermark !== undefined && !this.watermarks.has(key)) this.watermarks.set(key, u.watermark);
+      if (u.missed && !this.missed.has(key)) this.missed.set(key, u.missed);
+      if (u.lastOpen) this.lastOpen.add(key);
+    }
+    this.unresolved.clear();
+    this.save();
+  }
+
+  /** The channel id a key is written under: the stream's current name, or the DM's user ids. */
+  private fileKey(key: ChannelKey): string | null {
+    const parsed = parseKey(key);
+    if (parsed.kind === 'dm') return dmChannelIdFor(parsed.userIds);
+    const name = this.directory.nameOf(parsed.streamId);
+    return name === undefined ? null : `zulip:${name}`;
+  }
+
   save(): void {
     const path = this.file();
-    if (!path) return;
+    if (!path || !this.writes) return;
     try {
       mkdirSync(this.stateDir!, { recursive: true });
+      const entries = <T>(map: Map<ChannelKey, T>): [string, T][] => {
+        const out: [string, T][] = [];
+        for (const [key, value] of map) {
+          const chan = this.fileKey(key);
+          if (chan !== null) out.push([chan, value]);
+        }
+        for (const [name, u] of this.unresolved) {
+          const value = map === (this.watermarks as Map<ChannelKey, unknown>) ? u.watermark : map === (this.missed as Map<ChannelKey, unknown>) ? u.missed : undefined;
+          if (value !== undefined) out.push([`zulip:${name}`, value as T]);
+        }
+        return out.sort((a, b) => a[0].localeCompare(b[0]));
+      };
+      const lastOpen = [...this.lastOpen].map((key) => this.fileKey(key)).filter((c): c is string => c !== null);
+      for (const [name, u] of this.unresolved) if (u.lastOpen) lastOpen.push(`zulip:${name}`);
       const out: DeliveryFile = {
-        watermarks: Object.fromEntries([...this.watermarks].sort((a, b) => a[0].localeCompare(b[0]))),
-        missed: Object.fromEntries([...this.missed].sort((a, b) => a[0].localeCompare(b[0]))),
-        lastOpen: [...this.lastOpen].sort(),
+        watermarks: Object.fromEntries(entries(this.watermarks)),
+        missed: Object.fromEntries(entries(this.missed)),
+        lastOpen: lastOpen.sort(),
+        ...this.directory.snapshot(),
       };
       // tmp + rename: a crash mid-write must not leave a truncated file that
       // the next start reads as "no watermarks" and sweeps from nowhere.
@@ -134,18 +224,18 @@ export class DeliveryState {
 
   // ── watermarks ──
 
-  watermark(channelId: string): number | undefined {
-    return this.watermarks.get(channelId);
+  watermark(key: ChannelKey): number | undefined {
+    return this.watermarks.get(key);
   }
 
   /**
    * Advance (never retreat) the forwarded watermark towards `messageId`,
    * stopping below the undelivered floor. Returns true if it moved.
    */
-  advance(channelId: string, messageId: number): boolean {
-    const reached = Math.max(this.reached.get(channelId) ?? 0, this.watermarks.get(channelId) ?? 0, messageId);
-    this.reached.set(channelId, reached);
-    return this.settle(channelId);
+  advance(key: ChannelKey, messageId: number): boolean {
+    const reached = Math.max(this.reached.get(key) ?? 0, this.watermarks.get(key) ?? 0, messageId);
+    this.reached.set(key, reached);
+    return this.settle(key);
   }
 
   /**
@@ -153,28 +243,28 @@ export class DeliveryState {
    * scanned and pushed that range): release only the holds in it and
    * advance. Returns true if the watermark moved.
    */
-  advanceThrough(channelId: string, messageId: number, afterId = 0): boolean {
-    const held = this.held.get(channelId);
+  advanceThrough(key: ChannelKey, messageId: number, afterId = 0): boolean {
+    const held = this.held.get(key);
     if (held) {
       for (const id of held.keys()) if (id > afterId && id <= messageId) held.delete(id);
-      if (held.size === 0) this.held.delete(channelId);
+      if (held.size === 0) this.held.delete(key);
     }
-    return this.advance(channelId, messageId);
+    return this.advance(key, messageId);
   }
 
   /** Apply the floor: watermark = highest reached, capped below the lowest held id. */
-  private settle(channelId: string): boolean {
-    const reached = this.reached.get(channelId);
+  private settle(key: ChannelKey): boolean {
+    const reached = this.reached.get(key);
     if (reached === undefined) return false;
-    const floor = this.floor(channelId);
+    const floor = this.floor(key);
     const target = floor === undefined ? reached : Math.min(reached, floor - 1);
-    const current = this.watermarks.get(channelId) ?? 0;
+    const current = this.watermarks.get(key) ?? 0;
     if (target <= current) return false;
-    this.watermarks.set(channelId, target);
+    this.watermarks.set(key, target);
     return true;
   }
 
-  watermarkedChannels(): string[] {
+  watermarkedChannels(): ChannelKey[] {
     return [...this.watermarks.keys()];
   }
 
@@ -182,13 +272,13 @@ export class DeliveryState {
 
   /** The message was offered to the host and is not accepted yet. An id at
    *  or below the watermark is already forwarded and is not held. */
-  hold(channelId: string, messageId: number, status: HeldStatus = 'queued'): void {
+  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
-    if (messageId <= (this.watermarks.get(channelId) ?? 0)) return;
-    let held = this.held.get(channelId);
+    if (messageId <= (this.watermarks.get(key) ?? 0)) return;
+    let held = this.held.get(key);
     if (!held) {
       held = new Map();
-      this.held.set(channelId, held);
+      this.held.set(key, held);
     }
     const existing = held.get(messageId);
     if (existing) {
@@ -199,7 +289,7 @@ export class DeliveryState {
       // Keep the lowest ids: the floor protects everything above it anyway.
       const highest = Math.max(...held.keys());
       if (messageId >= highest) {
-        console.error(`[zulip-mcp] ${channelId}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
+        console.error(`[zulip-mcp] ${key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
         return;
       }
       held.delete(highest);
@@ -208,33 +298,33 @@ export class DeliveryState {
   }
 
   /** The host accepted the message. Returns true if the watermark moved. */
-  release(channelId: string, messageId: number): boolean {
-    const held = this.held.get(channelId);
+  release(key: ChannelKey, messageId: number): boolean {
+    const held = this.held.get(key);
     if (!held?.delete(messageId)) return false;
-    if (held.size === 0) this.held.delete(channelId);
-    return this.settle(channelId);
+    if (held.size === 0) this.held.delete(key);
+    return this.settle(key);
   }
 
   /** Drop every hold on a channel (nothing from it may reach the agent any more). */
-  releaseAll(channelId: string): boolean {
-    if (!this.held.delete(channelId)) return false;
-    return this.settle(channelId);
+  releaseAll(key: ChannelKey): boolean {
+    if (!this.held.delete(key)) return false;
+    return this.settle(key);
   }
 
   /** The lowest id offered but not accepted, if any. */
-  floor(channelId: string): number | undefined {
-    const held = this.held.get(channelId);
+  floor(key: ChannelKey): number | undefined {
+    const held = this.held.get(key);
     if (!held || held.size === 0) return undefined;
     return Math.min(...held.keys());
   }
 
-  heldChannels(): string[] {
+  heldChannels(): ChannelKey[] {
     return [...this.held.keys()];
   }
 
   /** Held ids on a channel, ascending; optionally only those a live replay may still try. */
-  heldIds(channelId: string, opts: { replayable?: boolean } = {}): number[] {
-    const held = this.held.get(channelId);
+  heldIds(key: ChannelKey, opts: { replayable?: boolean } = {}): number[] {
+    const held = this.held.get(key);
     if (!held) return [];
     return [...held.entries()]
       .filter(([, h]) => !opts.replayable || (h.status !== 'queued' && !h.replayed))
@@ -243,8 +333,8 @@ export class DeliveryState {
   }
 
   /** A live replay of these ids has been attempted; only a sweep or gap recovery re-offers them after this. */
-  markReplayed(channelId: string, ids: number[]): void {
-    const held = this.held.get(channelId);
+  markReplayed(key: ChannelKey, ids: number[]): void {
+    const held = this.held.get(key);
     if (!held) return;
     for (const id of ids) {
       const h = held.get(id);
@@ -254,40 +344,40 @@ export class DeliveryState {
 
   // ── open mirror ──
 
-  wasOpen(channelId: string): boolean {
-    return this.lastOpen.has(channelId);
+  wasOpen(key: ChannelKey): boolean {
+    return this.lastOpen.has(key);
   }
 
-  lastOpenChannels(): string[] {
+  lastOpenChannels(): ChannelKey[] {
     return [...this.lastOpen];
   }
 
   /** Host opened the channel: it receives everything, so no tally applies. */
-  markOpen(channelId: string): void {
-    this.lastOpen.add(channelId);
-    this.missed.delete(channelId);
+  markOpen(key: ChannelKey): void {
+    this.lastOpen.add(key);
+    this.missed.delete(key);
   }
 
   /** Host closed the channel: start counting what it no longer sees. */
-  markClosed(channelId: string): void {
-    if (!this.lastOpen.delete(channelId)) return;
-    const anchor = this.watermarks.get(channelId) ?? 0;
-    this.missed.set(channelId, { anchorId: anchor, talliedThrough: anchor, messages: 0, characters: 0 });
+  markClosed(key: ChannelKey): void {
+    if (!this.lastOpen.delete(key)) return;
+    const anchor = this.watermarks.get(key) ?? 0;
+    this.missed.set(key, { anchorId: anchor, talliedThrough: anchor, messages: 0, characters: 0 });
   }
 
   // ── missed tallies ──
 
-  tally(channelId: string): MissedTally | undefined {
-    return this.missed.get(channelId);
+  tally(key: ChannelKey): MissedTally | undefined {
+    return this.missed.get(key);
   }
 
-  talliedChannels(): string[] {
+  talliedChannels(): ChannelKey[] {
     return [...this.missed.keys()];
   }
 
   /** Count one dropped ambient message. No-op unless the channel is tracked. */
-  countMissed(channelId: string, m: { id: number; text: string }): boolean {
-    const t = this.missed.get(channelId);
+  countMissed(key: ChannelKey, m: { id: number; text: string }): boolean {
+    const t = this.missed.get(key);
     if (!t) return false;
     t.messages += 1;
     t.characters += m.text.length;
@@ -296,8 +386,8 @@ export class DeliveryState {
   }
 
   /** Fold a batch of fetched messages into the tally (reconnect backfill). */
-  backfillMissed(channelId: string, ambient: { id: number; text: string }[], scannedThrough: number): void {
-    const t = this.missed.get(channelId);
+  backfillMissed(key: ChannelKey, ambient: { id: number; text: string }[], scannedThrough: number): void {
+    const t = this.missed.get(key);
     if (!t) return;
     t.messages += ambient.length;
     t.characters += ambient.reduce((n, m) => n + m.text.length, 0);
@@ -324,7 +414,7 @@ export interface MissedView {
   attachmentNames: string[];
 }
 
-export function viewOf(m: IncomingChannelMessage): MissedView {
+export function viewOf(m: KeyedMessage): MissedView {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
   const attachments = Array.isArray(meta.attachments) ? (meta.attachments as { name?: string }[]) : [];
   const text = m.content
@@ -358,15 +448,15 @@ export function viewOf(m: IncomingChannelMessage): MissedView {
  * header can skip it, and one that scans message text can strip the prefix
  * first. Idempotent on the flag, so a replay cannot double the header.
  */
-export function attributeMessage(m: IncomingChannelMessage, formatTime: (d: Date) => string): IncomingChannelMessage {
+export function attributeMessage(m: KeyedMessage, stream: string | null, formatTime: (d: Date) => string): KeyedMessage {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
   if (meta.attributed === true) return m;
-  const isDM = meta.isDM === true || isDmChannelId(m.channelId);
+  const isDM = meta.isDM === true || isDmKey(m.key);
   const at = new Date(m.timestamp);
   const header = messageLineHead({
     id: m.messageId,
     time: Number.isNaN(at.getTime()) ? '' : formatTime(at),
-    stream: isDM ? null : (m.channelId.startsWith('zulip:') ? m.channelId.slice('zulip:'.length) : m.channelId),
+    stream: isDM ? null : (stream ?? ''),
     topic: typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? ''),
     author: m.author.name,
     mentioned: meta.mentioned === true,
@@ -434,7 +524,7 @@ function historyPointer(channelId: string, cursor: 'before' | 'after', id: numbe
  * newest line is itself over budget it is cut and says so.
  */
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
-  const dm = isDmChannelId(opts.channelId);
+  const dm = parseDmChannelId(opts.channelId) !== null;
   const render = (m: MissedView): string => {
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
     const head = messageLineHead({

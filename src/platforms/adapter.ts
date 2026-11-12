@@ -10,8 +10,9 @@
  *   - fetching recent history for context/beforeInference injections
  *   - streaming real-time incoming messages (self-filtered)
  *
- * Channel IDs are prefixed with the adapter's `type` ('zulip:...'); the MCPL
- * layer routes purely on that prefix and never inspects the remainder.
+ * Everything that crosses this seam names a channel by its key (see
+ * channel-key.ts); channel ids are made only where something leaves for the
+ * host, and descriptors carry the id the host is told.
  */
 
 import type {
@@ -19,9 +20,9 @@ import type {
   ChannelsPublishResult,
   ContentBlock,
   ContextInjection,
-  IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
 import type { SentRecord } from '../outgoing.js';
+import type { ChannelKey, KeyedMessage } from '../channel-key.js';
 
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
@@ -46,7 +47,7 @@ export interface RoutingHints {
  * channel the adapter has not described before (a DM from a new
  * conversation) — the server registers it with the host before routing.
  */
-export type OnIncomingMessage = (message: IncomingChannelMessage, newChannel?: ChannelDescriptor) => void;
+export type OnIncomingMessage = (message: KeyedMessage, newChannel?: ChannelDescriptor) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -73,7 +74,7 @@ export type OnSystemEvent = (event: PlatformSystemEvent) => void;
 /** A reaction added to or removed from a message, resolved to its channel. */
 export interface ReactionEvent {
   action: 'add' | 'remove';
-  channelId: string;
+  key: ChannelKey;
   messageId: string;
   /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
   emoji: string;
@@ -102,7 +103,7 @@ export type OnReaction = (event: ReactionEvent) => void;
  */
 export interface MessageChangeEvent {
   kind: 'edit' | 'move' | 'delete';
-  channelId: string;
+  key: ChannelKey;
   /** The changed message; a move or bulk delete names the one acted on and
    *  lists every affected id in `messageIds`. */
   messageId: string;
@@ -120,7 +121,7 @@ export interface MessageChangeEvent {
   /** The topic before a move; null when the topic did not change. */
   previousTopic: string | null;
   /** The channel the message moved to, when it left this one. */
-  movedToChannelId: string | null;
+  movedToKey: ChannelKey | null;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -149,7 +150,7 @@ export interface MessageChangeEvent {
 
 export type OnMessageChange = (event: MessageChangeEvent) => void;
 
-/** History request against one channel, in the platform's own id space. */
+/** History request against one channel. */
 export interface ChannelHistoryQuery {
   limit: number;
   /** Mutable allowance shared across a catch-up walk. Adapters subtract only
@@ -170,7 +171,7 @@ export interface ChannelHistoryQuery {
  */
 export interface ChannelHistoryPage {
   /** Oldest first. */
-  messages: IncomingChannelMessage[];
+  messages: KeyedMessage[];
   /** Newest id scanned (filtered rows included); null when the page was empty. */
   scannedThrough: number | null;
   /** The platform reports nothing newer than this page. */
@@ -192,28 +193,28 @@ export interface PlatformAdapter {
 
   /**
    * Deliver content to a channel. `descriptor` is the registered descriptor
-   * when known; adapters fall back to parsing the channelId.
+   * when known. A stream name the directory does not hold is sent to as given.
    */
   publish(
-    channelId: string,
+    target: ChannelKey | { streamName: string },
     descriptor: ChannelDescriptor | undefined,
     content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult>;
 
   /**
-   * Describe channels by id without enumerating the platform — for a channel
-   * the bot just joined, whose descriptor the server wants to register
-   * without a full discovery pass. Unknown ids are omitted. Optional.
+   * Describe channels without enumerating the platform — for a channel the
+   * bot just joined, whose descriptor the server wants to register without
+   * a full discovery pass. Unknown keys are omitted. Optional.
    */
-  describeChannels?(channelIds: string[]): Promise<ChannelDescriptor[]>;
+  describeChannels?(keys: ChannelKey[]): Promise<ChannelDescriptor[]>;
 
   /**
    * Best-effort typing indicator. Optional — platforms without a usable
    * typing API simply omit it.
    */
   sendTyping?(
-    channelId: string,
+    key: ChannelKey,
     descriptor: ChannelDescriptor | undefined,
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
@@ -224,26 +225,26 @@ export interface PlatformAdapter {
    * context/beforeInference. Returns null when there's nothing to inject.
    */
   fetchContext(
-    channelId: string,
+    key: ChannelKey,
     descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<ContextInjection | null>;
+  ): Promise<Omit<ContextInjection, 'namespace'> | null>;
 
   /**
    * Channel history as incoming-shaped messages, oldest first. Optional —
    * without it channels/open cannot return backscroll and the reconnect
    * sweep has nothing to scan.
    */
-  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
+  fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
    * Make sure the platform delivers events for this channel — Zulip only
    * sends stream events to subscribers. Optional; idempotent; best-effort.
    */
-  ensureSubscribed?(channelId: string): Promise<void>;
+  ensureSubscribed?(key: ChannelKey): Promise<void>;
 
   /** channels/acknowledge — mark a message as seen on the surface (a reaction). Returns the representation used. */
-  acknowledge?(channelId: string, messageId: string, value?: string): Promise<string>;
+  acknowledge?(key: ChannelKey | null, messageId: string, value?: string): Promise<string>;
 
   /** Delete one of the bot's own messages (rollback). */
   deleteMessage?(channelId: string, messageId: string): Promise<void>;
@@ -273,4 +274,7 @@ export interface PlatformAdapter {
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;
+
+  /** Read the platform's channel list once, adding to the stream directory only what it does not hold. Optional. */
+  refreshStreams?(why?: string, force?: boolean): Promise<void>;
 }

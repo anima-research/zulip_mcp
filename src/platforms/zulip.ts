@@ -1,14 +1,12 @@
 /**
  * ZulipAdapter — Zulip implementation of PlatformAdapter.
  *
- * Channel ids:
- *   zulip:{stream_name}      a stream; threads map to topics (incoming carries
- *                            the topic as threadId; publishes route to the
- *                            topic of the newest message
- *                            ChannelManager.noteConversation took there,
- *                            else 'mcpl')
- *   zulip:dm:{ids}           a direct-message conversation, keyed by the
- *                            other parties' sorted user ids (see history.ts)
+ * Channels are keyed by stream id or by a DM's user ids (channel-key.ts);
+ * a stream's name comes from the stream directory at the moment it is
+ * needed. Threads map to topics: incoming carries the topic as threadId,
+ * and publishes route to the topic of the newest message
+ * ChannelManager.noteConversation took there, else 'mcpl'. The descriptor
+ * this adapter builds for a stream carries the id `zulip:{stream_name}`.
  *
  * DM conversations are discovered from recent DM history at startup and
  * described on the fly when a message from a new conversation arrives.
@@ -18,9 +16,10 @@ import type {
   ChannelDescriptor,
   ContentBlock,
   ContextInjection,
-  IncomingChannelMessage,
   TextContent,
 } from '@animalabs/mcpl-core';
+import { dmKey, parseKey, streamIdOfKey, streamKey, type ChannelKey } from '../channel-key.js';
+import { StreamDirectory } from '../stream-directory.js';
 import type {
   ChannelHistoryPage,
   ChannelHistoryQuery,
@@ -41,14 +40,14 @@ import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
 import { isRefusal, refusalError, type ZulipApi } from '../zulip-api.js';
 import {
-  channelIdOf,
+  dmChannelIdFor,
   dmCounterparts,
   dmDescriptor,
   editedTrailer,
   fetchHistory,
+  keyOfMessage,
   normalizeMessage,
   looksLikeBotEmail,
-  parseDmChannelId,
   toIncoming,
   type ZulipIdentity,
   type ZulipMessage,
@@ -58,18 +57,11 @@ import {
 /** The address every stream descriptor carries. */
 export interface ZulipChannelAddress {
   stream_name: string;
-  /** Absent only when a stream was described from an event that carried no
-   *  id; the name addresses every send, and typing degrades to a no-op. */
-  stream_id?: number;
+  stream_id: number;
 }
 
 export function zulipChannelId(streamName: string): string {
   return `zulip:${streamName}`;
-}
-
-/** The stream behind a `zulip:{stream_name}` channel id. */
-export function streamNameOf(channelId: string): string {
-  return channelId.slice('zulip:'.length);
 }
 
 const SNIPPET_MAX = 80;
@@ -81,14 +73,6 @@ export function snippetOf(text: string): string | null {
   return one.length > SNIPPET_MAX ? `${one.slice(0, SNIPPET_MAX - 1)}…` : one;
 }
 
-function isDmChannelIdLocal(channelId: string): boolean {
-  return parseDmChannelId(channelId) !== null;
-}
-
-function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChannelAddress> {
-  const address = descriptor?.address;
-  return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
-}
 
 /** Only a link immediately heading a quote fence is a reply target.
  *  Ignore fenced examples; keep only the first two distinct targets. */
@@ -129,7 +113,7 @@ interface ZulipStream {
 }
 
 interface SeenMessage {
-  channelId: string;
+  key: ChannelKey;
   authorId: number;
   authorName: string;
   authorEmail: string;
@@ -181,6 +165,8 @@ export interface ZulipAdapterOptions {
   filters?: FilterView;
   /** How many recent DMs to scan for conversations at startup. */
   dmDiscoveryLimit?: number;
+  /** Stream ids and names. Default: an empty directory of the adapter's own. */
+  directory?: StreamDirectory;
   /** The realm's max message length; longer publishes are split. */
   maxMessageLength?: number;
   /** Uploads for the media blocks of a publish (image/audio with inline data). Unset: such blocks are dropped. */
@@ -208,6 +194,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
   private readonly formatTime: (d: Date) => string;
+  readonly directory: StreamDirectory;
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
   /** Recently seen messages, so a reaction or an edit can be placed without
@@ -229,16 +216,12 @@ export class ZulipAdapter implements PlatformAdapter {
 
   /** Failed quote-target GETs only; id → retry-after timestamp. Bounded like seen. */
   private failedQuoteLookups = new Map<number, number>();
-  /** Stream names by id, from discovery (refreshed on a miss): how a
-   *  deletion or a cross-stream move names a stream the cache does not know. */
-  private streamNamesById = new Map<number, string>();
   /** Messages this adapter deleted itself (rollback, the delete tool), by
    *  id → when: Zulip's delete event names no actor, so the echo of the
    *  bot's own deletion is recognised here and dropped. Bounded and expiring
    *  — a failed delete never echoes. */
   private selfDeleted = new Map<number, number>();
-  /** When the stream list was last refreshed for an unknown id: a stream
-   *  the bot cannot see never resolves, and must not cost a refresh per event. */
+  /** When the stream list was last read for a stream the directory did not hold. */
   private streamsRefreshedAt = 0;
   /** Messages just moved to a stream the bot cannot see, by id → when: the
    *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
@@ -259,12 +242,27 @@ export class ZulipAdapter implements PlatformAdapter {
     this.uploader = options.uploader ?? null;
     this.uploadPolicy = options.uploadPolicy ?? null;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
+    this.directory = options.directory ?? new StreamDirectory();
+    if (this.backscrollLimits.size > 0) void this.directory.whenFilled().then(() => this.logFormerBackscrollNames());
     if (this.uploader && !this.uploadPolicy) throw new Error('ZulipAdapter: uploader needs an uploadPolicy');
   }
 
-  /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
+  private logFormerBackscrollNames(): void {
+    for (const name of this.backscrollLimits.keys()) {
+      const former = this.directory.formerOf(name);
+      if (former) console.error(`[zulip-mcp] ZULIP_BACKSCROLL_CHANNELS names #${name}, which Zulip stream ${former.id} had before it was renamed #${former.current}; the default cap applies to it`);
+    }
+  }
+
+  /** The history cap for a stream (descriptor `capabilities.history.maxMessages`), by its current name. */
   backscrollLimitFor(streamName: string): number {
     return this.backscrollLimits.get(streamName) ?? this.backscrollDefault;
+  }
+
+  /** The allowlist, by the stream's current name; a stream the directory does not hold is not allowed. */
+  private streamAllowed(streamId: number): boolean {
+    const name = this.directory.nameOf(streamId);
+    return name !== undefined && this.filters.streamAllowed(name);
   }
 
   get selfUserId(): number | null {
@@ -279,15 +277,14 @@ export class ZulipAdapter implements PlatformAdapter {
         include_subscribed: true,
       });
       const streams = result.streams || [];
+      this.directory.list(streams);
       for (const stream of streams) {
-        if (typeof stream.stream_id === 'number' && typeof stream.name === 'string') {
-          this.streamNamesById.set(stream.stream_id, stream.name);
-        }
-        if (!this.filters.streamAllowed(stream.name)) continue;
-        channels.push(this.streamDescriptor(stream.name, stream.stream_id, {
+        if (typeof stream.stream_id !== 'number' || !this.streamAllowed(stream.stream_id)) continue;
+        const descriptor = this.streamDescriptor(stream.stream_id, {
           subscriber_count: stream.subscriber_count,
           is_public: !stream.invite_only,
-        }));
+        });
+        if (descriptor) channels.push(descriptor);
       }
     } catch (error) {
       console.error('Failed to discover Zulip streams:', error);
@@ -297,11 +294,14 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * The descriptor for a stream. Built from discovery and, for a stream the
-   * bot joined after startup, from the first message that arrives on it —
-   * both must describe the same channel, so they share this (#20).
+   * The descriptor for a stream, under its current name. Built from
+   * discovery and, for a stream the bot joined after startup, from the first
+   * message that arrives on it — both must describe the same channel, so
+   * they share this (#20). null for a stream the directory does not hold.
    */
-  private streamDescriptor(name: string, streamId: number | undefined, metadata: Record<string, unknown> = {}): ChannelDescriptor {
+  streamDescriptor(streamId: number, metadata: Record<string, unknown> = {}): ChannelDescriptor | null {
+    const name = this.directory.nameOf(streamId);
+    if (name === undefined) return null;
     const address: ZulipChannelAddress = { stream_name: name, stream_id: streamId };
     const descriptor: ChannelDescriptor = {
       id: zulipChannelId(name),
@@ -322,25 +322,17 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Descriptors for the named stream channels, without enumerating the realm.
-   * The stream id comes from `get_stream_id` so the descriptor is the same
-   * shape discovery builds; a name Zulip does not resolve is omitted, and one
-   * outside the allowlist is never described.
+   * Descriptors for stream channels, without enumerating the realm: a
+   * stream the directory does not hold, or one outside the allowlist, is
+   * never described. A DM is described by its first message.
    */
-  async describeChannels(channelIds: string[]): Promise<ChannelDescriptor[]> {
+  async describeChannels(keys: ChannelKey[]): Promise<ChannelDescriptor[]> {
     const out: ChannelDescriptor[] = [];
-    for (const channelId of channelIds) {
-      if (isDmChannelIdLocal(channelId)) continue;
-      const name = streamNameOf(channelId);
-      if (!name || !this.filters.streamAllowed(name)) continue;
-      let streamId: number | undefined;
-      try {
-        const result = await this.api.requestAnswer<{ stream_id?: unknown }>('GET', '/get_stream_id', { stream: name });
-        if (result.result === 'success' && typeof result.stream_id === 'number') streamId = result.stream_id;
-      } catch (error) {
-        console.error(`[zulip-mcp] could not resolve the stream id for #${name}:`, (error as Error).message);
-      }
-      out.push(this.streamDescriptor(name, streamId));
+    for (const key of keys) {
+      const streamId = streamIdOfKey(key);
+      if (streamId === null || !(await this.knownStream(streamId)) || !this.streamAllowed(streamId)) continue;
+      const descriptor = this.streamDescriptor(streamId);
+      if (descriptor) out.push(descriptor);
     }
     return out;
   }
@@ -372,14 +364,14 @@ export class ZulipAdapter implements PlatformAdapter {
     return [...this.knownDms.values()];
   }
 
-  private remember(channelId: string, m: ZulipMessage): void {
+  private remember(key: ChannelKey, m: ZulipMessage): void {
     this.failedQuoteLookups.delete(m.id);
     if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
     }
     this.seen.set(m.id, {
-      channelId,
+      key,
       authorId: m.authorId,
       authorName: m.authorName,
       authorEmail: m.authorEmail,
@@ -425,8 +417,9 @@ export class ZulipAdapter implements PlatformAdapter {
       if (raw.id !== messageId) throw new Error('response contained a different message id');
       if (!Number.isSafeInteger(raw.sender_id) || raw.sender_id <= 0) throw new Error('response contained no valid sender_id');
       const m = normalizeMessage(raw);
-      const channelId = channelIdOf(m, this.identity.selfUserId);
-      this.remember(channelId, m);
+      const key = await this.keyFor(m, raw);
+      if (key === null) return null;
+      this.remember(key, m);
       return this.seen.get(messageId) ?? null;
     } catch (err) {
       console.error(`[zulip-mcp] could not resolve message ${messageId} for ${purpose}:`, (err as Error).message);
@@ -489,15 +482,40 @@ export class ZulipAdapter implements PlatformAdapter {
    * judge and is left to the server's per-conversation check.
    */
   private changeAllowed(where: SeenMessage): boolean {
-    if (where.isDm) {
+    const parsed = parseKey(where.key);
+    if (parsed.kind === 'dm') {
       if (this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId) {
         // The bot's own DM message: judged by whom it was sent to.
-        const counterparts = parseDmChannelId(where.channelId) ?? [];
-        return counterparts.some((id) => this.filters.dmAllowed({ id, email: '' }));
+        return parsed.userIds.some((id) => this.filters.dmAllowed({ id, email: '' }));
       }
       return this.filters.dmAllowed({ id: where.authorId, email: where.authorEmail });
     }
-    return this.filters.streamAllowed(streamNameOf(where.channelId));
+    return this.streamAllowed(parsed.streamId);
+  }
+
+  /**
+   * The key of a message's channel. A stream message is keyed by its stream
+   * id, read from the stream list once when the directory does not hold it;
+   * one that carries no id is keyed by its exact name, the same way.
+   * null, with an error line, for a stream no list resolves.
+   */
+  private async keyFor(m: ZulipMessage, raw: Pick<ZulipRawMessage, 'display_recipient'>): Promise<ChannelKey | null> {
+    if (m.isDm) return keyOfMessage(m, this.identity.selfUserId);
+    let streamId = m.streamId;
+    if (streamId === null) {
+      const name = typeof raw.display_recipient === 'string' ? raw.display_recipient : null;
+      if (name !== null && this.directory.idOf(name) === undefined) await this.refreshStreams(`#${name}`);
+      streamId = name !== null ? this.directory.idOf(name) ?? null : null;
+      if (streamId === null) {
+        console.error(`[zulip-mcp] dropping message ${m.id}: it carries no stream id, and no stream is named ${name === null ? '(none)' : `#${name}`}`);
+        return null;
+      }
+    }
+    if (!(await this.knownStream(streamId))) {
+      console.error(`[zulip-mcp] dropping message ${m.id}: stream ${streamId} is not in the stream list`);
+      return null;
+    }
+    return streamKey(streamId);
   }
 
   /**
@@ -519,21 +537,19 @@ export class ZulipAdapter implements PlatformAdapter {
       const where = cached ?? await this.locate(change.messageId, 'an edit');
       if (!where) return;
       const crossStream = change.newStreamId !== null && !where.isDm;
-      const fromStream = crossStream && change.streamId !== null ? await this.streamNameById(change.streamId) : null;
-      // A cross-stream move of an uncached message whose origin cannot be
-      // named has nowhere honest to go: the GET only knows the destination.
-      if (crossStream && !cached && fromStream === null) {
-        console.error(`[zulip-mcp] dropping a move of message ${change.messageId}: origin stream ${change.streamId} unknown`);
+      // A cross-stream move of an uncached message whose origin the event
+      // doesn't name has nowhere honest to go: the GET only knows the destination.
+      if (crossStream && !cached && change.streamId === null) {
+        console.error(`[zulip-mcp] dropping a move of message ${change.messageId}: the event names no origin stream`);
         return;
       }
-      const fromChannelId = fromStream !== null ? zulipChannelId(fromStream) : where.channelId;
-      const placed: SeenMessage = { ...where, channelId: fromChannelId };
+      const fromKey = crossStream && change.streamId !== null ? streamKey(change.streamId) : where.key;
+      const placed: SeenMessage = { ...where, key: fromKey };
       if (!this.changeAllowed(placed)) return;
       const content = change.content !== null ? cleanMarkdown(change.content) : null;
       const previousContent = change.origContent !== null ? cleanMarkdown(change.origContent) : null;
       const topic = change.topic ?? where.topic;
-      const movedToStream = crossStream ? await this.streamNameById(Number(change.newStreamId)) : null;
-      const movedToChannelId = movedToStream !== null ? zulipChannelId(movedToStream) : null;
+      const movedToKey = crossStream && (await this.knownStream(Number(change.newStreamId))) ? streamKey(Number(change.newStreamId)) : null;
       // Zulip's verdict on the new content replaces the cached one only when
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
@@ -553,23 +569,23 @@ export class ZulipAdapter implements PlatformAdapter {
         replyToSelf,
         quoteTargets,
         ...(content !== null ? { snippet: snippetOf(content) } : {}),
-        ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}),
+        ...(movedToKey !== null ? { key: movedToKey } : {}),
       });
-      if (change.topic !== null || movedToChannelId !== null) {
+      if (change.topic !== null || movedToKey !== null) {
         for (const id of change.messageIds) {
           if (id === change.messageId) continue;
           const co = this.seen.get(id);
-          if (co) this.seen.set(id, { ...co, topic, ...(movedToChannelId !== null ? { channelId: movedToChannelId } : {}) });
+          if (co) this.seen.set(id, { ...co, topic, ...(movedToKey !== null ? { key: movedToKey } : {}) });
         }
       }
-      if (crossStream && movedToStream === null) {
+      if (crossStream && movedToKey === null) {
         const now = Date.now();
         for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
         for (const id of change.messageIds) this.movedAway.set(id, now);
       }
       emit({
         kind: content !== null ? 'edit' : 'move',
-        channelId: fromChannelId,
+        key: fromKey,
         messageId: String(change.messageId),
         messageIds: change.messageIds.map(String),
         authorId: String(where.authorId),
@@ -578,7 +594,7 @@ export class ZulipAdapter implements PlatformAdapter {
         actorId: change.actorId !== null ? String(change.actorId) : null,
         topic,
         previousTopic: change.topic !== null ? change.origTopic : null,
-        movedToChannelId,
+        movedToKey,
         content,
         previousContent,
         mentioned,
@@ -614,7 +630,7 @@ export class ZulipAdapter implements PlatformAdapter {
       if (!this.changeAllowed(cached)) return;
       event = {
         kind: 'delete',
-        channelId: cached.channelId,
+        key: cached.key,
         messageId: String(placedId),
         messageIds: ids.map(String),
         authorId: String(cached.authorId),
@@ -623,7 +639,7 @@ export class ZulipAdapter implements PlatformAdapter {
         actorId: null,
         topic: change.topic ?? cached.topic,
         previousTopic: null,
-        movedToChannelId: null,
+        movedToKey: null,
         content: null,
         previousContent: cached.snippet,
         // A deleted mention is the one the agent was about to answer.
@@ -637,11 +653,10 @@ export class ZulipAdapter implements PlatformAdapter {
         timestamp: new Date(),
       };
     } else if (change.messageType === 'stream' && change.streamId !== null) {
-      const streamName = await this.streamNameById(change.streamId);
-      if (streamName === null || !this.filters.streamAllowed(streamName)) return;
+      if (!(await this.knownStream(change.streamId)) || !this.streamAllowed(change.streamId)) return;
       event = {
         kind: 'delete',
-        channelId: zulipChannelId(streamName),
+        key: streamKey(change.streamId),
         messageId: String(placedId),
         messageIds: ids.map(String),
         authorId: null,
@@ -650,7 +665,7 @@ export class ZulipAdapter implements PlatformAdapter {
         actorId: null,
         topic: change.topic ?? '',
         previousTopic: null,
-        movedToChannelId: null,
+        movedToKey: null,
         content: null,
         previousContent: null,
         mentioned: false,
@@ -674,7 +689,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   async publish(
-    channelId: string,
+    target: ChannelKey | { streamName: string },
     _descriptor: ChannelDescriptor | undefined,
     content: ContentBlock[],
     hints?: RoutingHints,
@@ -690,14 +705,15 @@ export class ZulipAdapter implements PlatformAdapter {
     const uploaded = this.uploader && this.uploadPolicy ? await uploadBlocks(this.uploader, content, this.uploadPolicy) : [];
     if (!textContent && uploaded.length === 0) return { delivered: false };
 
-    const dmIds = parseDmChannelId(channelId);
-    let target: Destination;
+    const parsed = typeof target === 'string' ? parseKey(target) : null;
+    let destination: Destination;
+    let channelId: string;
     let what: string;
-    if (dmIds) {
-      target = { type: 'private', to: dmIds };
+    if (parsed?.kind === 'dm') {
+      destination = { type: 'private', to: parsed.userIds };
+      channelId = dmChannelIdFor(parsed.userIds);
       what = `direct message to ${channelId}`;
     } else {
-      const streamName = streamNameOf(channelId);
       // Route to the topic of the newest message noteConversation took on
       // this channel (in-thread answers); fall back to the 'mcpl' topic when
       // the agent initiates the conversation.
@@ -705,12 +721,14 @@ export class ZulipAdapter implements PlatformAdapter {
         (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
         hints?.threadId ??
         'mcpl';
-      target = { type: 'stream', to: streamName, topic };
+      const streamName = parsed?.kind === 'stream' ? this.directory.nameOf(parsed.streamId) ?? String(parsed.streamId) : (target as { streamName: string }).streamName;
+      destination = { type: 'stream', to: parsed?.kind === 'stream' ? parsed.streamId : streamName, topic };
+      channelId = zulipChannelId(streamName);
       what = `message to #${streamName}`;
     }
 
     try {
-      const { chunks } = await sendMessage(this.api, target, textContent, {
+      const { chunks } = await sendMessage(this.api, destination, textContent, {
         limit: this.maxMessageLength,
         uploaded,
         onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
@@ -724,7 +742,7 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */
-  async acknowledge(_channelId: string, messageId: string, value?: string): Promise<string> {
+  async acknowledge(_key: ChannelKey | null, messageId: string, value?: string): Promise<string> {
     const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
     await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${messageId}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
     return `:${name}:`;
@@ -767,26 +785,28 @@ export class ZulipAdapter implements PlatformAdapter {
     return Date.now() - at <= SELF_DELETE_TTL_MS;
   }
 
-  /** A stream's name by id — from discovery, else one refresh of the list
-   *  (a stream created after startup). */
-  private async streamNameById(streamId: number): Promise<string | null> {
-    const known = this.streamNamesById.get(streamId);
-    if (known !== undefined) return known;
-    if (Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return null;
+  /** Whether the directory holds a stream, after one read of the stream list on a miss. */
+  private async knownStream(streamId: number): Promise<boolean> {
+    if (this.directory.nameOf(streamId) !== undefined) return true;
+    await this.refreshStreams(`stream ${streamId}`);
+    return this.directory.nameOf(streamId) !== undefined;
+  }
+
+  /**
+   * One read of the stream list, which only adds to the directory: at most
+   * one a minute, unless `force`.
+   */
+  async refreshStreams(why = 'a name the directory does not hold', force = false): Promise<void> {
+    if (!force && Date.now() - this.streamsRefreshedAt < STREAM_REFRESH_HOLDOFF_MS) return;
     this.streamsRefreshedAt = Date.now();
     try {
-      const result = await this.api.request<{ streams?: { stream_id?: unknown; name?: unknown }[] }>(
+      const result = await this.api.request<{ streams?: unknown[] }>(
         'GET', '/streams', 'refreshing the stream list', { include_public: true, include_subscribed: true }, { timeoutMs: LOCATE_TIMEOUT_MS },
       );
-      for (const stream of result.streams ?? []) {
-        if (typeof stream.stream_id === 'number' && typeof stream.name === 'string') {
-          this.streamNamesById.set(stream.stream_id, stream.name);
-        }
-      }
+      this.directory.list(result.streams ?? []);
     } catch (err) {
-      console.error(`[zulip-mcp] could not refresh the stream list for stream ${streamId}:`, (err as Error).message);
+      console.error(`[zulip-mcp] could not refresh the stream list for ${why}:`, (err as Error).message);
     }
-    return this.streamNamesById.get(streamId) ?? null;
   }
 
   /**
@@ -802,25 +822,20 @@ export class ZulipAdapter implements PlatformAdapter {
    * is never stopped on its own, so a missed stop lingers but does not stick.
    */
   async sendTyping(
-    channelId: string,
-    descriptor: ChannelDescriptor | undefined,
+    key: ChannelKey,
+    _descriptor: ChannelDescriptor | undefined,
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
   ): Promise<void> {
     const send = (params: Record<string, unknown>) => this.api.requestAnswer('POST', '/typing', params);
-    const dmIds = parseDmChannelId(channelId);
+    const parsed = parseKey(key);
     try {
       let result: Awaited<ReturnType<typeof send>>;
-      if (dmIds) {
-        result = await send({ type: 'direct', to: dmIds, op });
+      if (parsed.kind === 'dm') {
+        result = await send({ type: 'direct', to: parsed.userIds, op });
       } else {
-        const streamId = addressOf(descriptor).stream_id;
-        if (!streamId) {
-          console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
-          return;
-        }
         const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
-        result = await send({ type: 'stream', stream_id: streamId, topic, op });
+        result = await send({ type: 'stream', stream_id: parsed.streamId, topic, op });
       }
       if (result.result && result.result !== 'success') {
         console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
@@ -842,19 +857,20 @@ export class ZulipAdapter implements PlatformAdapter {
   private allowed(m: ZulipMessage): boolean {
     if (this.identity.selfUserId !== null && m.authorId === this.identity.selfUserId) return true;
     if (m.isDm) return this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail });
-    return m.streamName === null || this.filters.streamAllowed(m.streamName);
+    return m.streamId === null || this.streamAllowed(m.streamId);
   }
 
   async fetchContext(
-    channelId: string,
+    key: ChannelKey,
     _descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<ContextInjection | null> {
-    const dmIds = parseDmChannelId(channelId);
-    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) return null;
-    const page = await fetchHistory(this.api, dmIds
-      ? { dmUserIds: dmIds, limit: historySize }
-      : { streamName: streamNameOf(channelId), limit: historySize });
+  ): Promise<Omit<ContextInjection, 'namespace'> | null> {
+    const parsed = parseKey(key);
+    if (parsed.kind === 'stream' && !this.streamAllowed(parsed.streamId)) return null;
+    const streamName = parsed.kind === 'stream' ? this.directory.nameOf(parsed.streamId) ?? '' : null;
+    const page = await fetchHistory(this.api, parsed.kind === 'dm'
+      ? { dmUserIds: parsed.userIds, limit: historySize }
+      : { streamId: parsed.streamId, limit: historySize });
     const messages = page.messages.filter((m) => this.allowed(m));
     if (messages.length === 0) return null;
 
@@ -863,15 +879,14 @@ export class ZulipAdapter implements PlatformAdapter {
     const formatted = messages.map((m) => messageLineHead({
       id: m.id,
       time: Number.isNaN(m.timestamp.getTime()) ? '' : this.formatTime(m.timestamp),
-      stream: dmIds ? null : (m.streamName ?? streamNameOf(channelId)),
+      stream: parsed.kind === 'dm' ? null : m.streamNameShown ?? streamName,
       topic: m.topic,
       author: m.authorName,
       mentioned: m.mentioned,
     }) + m.cleanContent + editedTrailer(m)).join('\n');
 
-    const label = dmIds ? `the direct-message conversation ${channelId}` : `Zulip #${streamNameOf(channelId)}`;
+    const label = parsed.kind === 'dm' ? `the direct-message conversation ${dmChannelIdFor(parsed.userIds)}` : `Zulip #${streamName}`;
     return {
-      namespace: channelId,
       position: 'beforeUser',
       content: `Recent messages from ${label}:\n${formatted}`,
     };
@@ -885,13 +900,13 @@ export class ZulipAdapter implements PlatformAdapter {
    * `scannedThrough` covers the excluded rows too, so a pager never mistakes
    * a page of nothing but the bot's own messages for the end of history.
    */
-  async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
-    const dmIds = parseDmChannelId(channelId);
-    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) {
+  async fetchHistory(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
+    const parsed = parseKey(key);
+    if (parsed.kind === 'stream' && !this.streamAllowed(parsed.streamId)) {
       return { messages: [], scannedThrough: null, reachedNewest: true };
     }
     const page = await fetchHistory(this.api, {
-      ...(dmIds ? { dmUserIds: dmIds } : { streamName: streamNameOf(channelId) }),
+      ...(parsed.kind === 'dm' ? { dmUserIds: parsed.userIds } : { streamId: parsed.streamId }),
       limit: query.limit,
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
@@ -926,11 +941,11 @@ export class ZulipAdapter implements PlatformAdapter {
       m.replyToSelf = this.replyToSelfForVerdict(verdict, quotedMessageIds(m.rawContent), this.seen.get(m.id));
       if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }
-    for (const m of page.messages) this.remember(channelId, m);
+    for (const m of page.messages) this.remember(key, m);
     const messages = page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
       .filter((m) => this.allowed(m))
-      .map((m) => toIncoming(channelId, m, this.identity, { backscroll: true }));
+      .map((m) => toIncoming(key, m, this.identity, { backscroll: true }));
     return {
       messages,
       scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
@@ -955,9 +970,12 @@ export class ZulipAdapter implements PlatformAdapter {
    * result that lists the stream under `unauthorized`. The caller (the open
    * lifecycle) turns that into a failed open rather than a silent one.
    */
-  async ensureSubscribed(channelId: string): Promise<void> {
-    if (parseDmChannelId(channelId)) return;
-    const streamName = streamNameOf(channelId);
+  async ensureSubscribed(key: ChannelKey): Promise<void> {
+    const streamId = streamIdOfKey(key);
+    if (streamId === null) return;
+    // Zulip's subscribe call takes names only: the name is read at the call.
+    const streamName = this.directory.nameOf(streamId);
+    if (streamName === undefined) throw new Error(`stream ${streamId} is not in the stream list`);
     const result = await this.api.request<{ unauthorized?: unknown; subscribed?: Record<string, unknown> }>(
       'POST', '/users/me/subscriptions', `subscribing to #${streamName}`, { subscriptions: [{ name: streamName }] },
     );
@@ -966,7 +984,7 @@ export class ZulipAdapter implements PlatformAdapter {
       throw new Error(`not authorized to subscribe to #${streamName} (private stream; the bot must be invited)`);
     }
     const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
-    if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
+    if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} (stream ${streamId})`);
   }
 
   startEvents(
@@ -975,7 +993,7 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
-    const loop = this.eventLoop = new ZulipEventLoop();
+    const loop = this.eventLoop = new ZulipEventLoop({ directory: this.directory });
     // Changes are placed asynchronously (a cache miss costs one GET) but must
     // reach the server in queue order: an edit followed by a deletion of the
     // same message reads backwards otherwise. Every await in the chain is
@@ -1001,10 +1019,11 @@ export class ZulipAdapter implements PlatformAdapter {
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
           void this.locate(ev.message_id).then((where) => {
             if (!where || this.eventLoop !== loop) return;
-            if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
+            const streamId = streamIdOfKey(where.key);
+            if (streamId !== null && !this.streamAllowed(streamId)) return;
             onReaction({
               action: ev.op,
-              channelId: where.channelId,
+              key: where.key,
               messageId: String(ev.message_id),
               emoji: ev.emoji_name,
               emojiCode: ev.emoji_code || undefined,
@@ -1019,10 +1038,13 @@ export class ZulipAdapter implements PlatformAdapter {
         }
       : undefined;
     loop.start(this.api, async (_streamName, msg, flags) => {
-      const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
+      const raw = { ...(msg as ZulipRawMessage), flags };
+      const m = normalizeMessage(raw);
+      const key = await this.keyFor(m, raw);
+      if (key === null || this.eventLoop !== loop) return;
       // Remember our own messages too: reactions to them are the ones that
       // matter most ("someone reacted to your message").
-      this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
+      this.remember(key, m);
       if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       if (m.isDm) {
         if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail })) {
@@ -1030,10 +1052,11 @@ export class ZulipAdapter implements PlatformAdapter {
           return;
         }
         const { descriptor, isNew } = this.describeDm(m);
-        onMessage(toIncoming(descriptor.id, m, this.identity), isNew ? descriptor : undefined);
+        onMessage(toIncoming(key, m, this.identity), isNew ? descriptor : undefined);
         return;
       }
-      if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
+      const streamId = streamIdOfKey(key)!;
+      if (!this.streamAllowed(streamId)) return;
       m.replyToSelf = await this.classifyQuoteReply(m) === 'reply';
       if (this.eventLoop !== loop) return;
       const cached = this.seen.get(m.id);
@@ -1045,12 +1068,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // it is cleared on reconnect, and a descriptor the host refused or
       // never confirmed must be offered again rather than held back by
       // adapter-side memory.
-      const channelId = channelIdOf(m, this.identity.selfUserId);
-      const streamId = typeof msg.stream_id === 'number' ? msg.stream_id : undefined;
-      // Remembered so a later reaction or edit on this stream can be placed.
-      if (m.streamName !== null && streamId !== undefined) this.streamNamesById.set(streamId, m.streamName);
-      const descriptor = m.streamName !== null ? this.streamDescriptor(m.streamName, streamId) : undefined;
-      onMessage(toIncoming(channelId, m, this.identity), descriptor);
+      onMessage(toIncoming(key, m, this.identity), this.streamDescriptor(streamId) ?? undefined);
     }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });

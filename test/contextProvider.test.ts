@@ -10,6 +10,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelManager } from '../src/channels.ts';
+import { ChannelIds } from '../src/channel-ids.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
 import { ContextProvider } from '../src/context.ts';
 import { CapabilityGrant } from '../src/grant.ts';
 import type { PlatformAdapter } from '../src/platforms/adapter.ts';
@@ -24,7 +26,14 @@ const DESCRIPTOR: ChannelDescriptor = {
   type: 'zulip',
   label: '#general',
   direction: 'bidirectional',
+  address: { stream_id: 1 },
 };
+
+function ids(): ChannelIds {
+  const directory = new StreamDirectory();
+  directory.registration([{ stream_id: 1, name: 'general' }]);
+  return new ChannelIds(directory);
+}
 
 const client = {
   registerChannels: async () => ({ results: [{ id: 'zulip:general', accepted: true }] }),
@@ -53,6 +62,7 @@ async function setup(effectiveCapabilities: string[], position: ContextInjection
     client,
     new Map([['zulip', adapterInjecting(position)]]),
     grant,
+    ids(),
     10,
   );
   await manager.registerChannels();
@@ -93,7 +103,7 @@ test('an injection at a position the grant does not cover is dropped (§5.4, §1
 
 test('nothing is contributed before the initial policy exchange (§5.3)', async () => {
   const grant = new CapabilityGrant();
-  const manager = new ChannelManager(client, new Map([['zulip', adapterInjecting('beforeUser')]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapterInjecting('beforeUser')]]), grant, ids(), 10);
   const provider = new ContextProvider(manager, grant, 5);
   const result = await provider.handleBeforeInference(PARAMS);
   assert.deepEqual(result.contextInjections, []);
@@ -105,7 +115,7 @@ test('a host-disabled feature set contributes nothing (§6.7 reductions are imme
     'zulip.context': { description: 'x', uses: ['contextHooks.beforeInference.inject.beforeUser'] },
   });
   grant.apply({ effectiveCapabilities: GRANTED, disabled: ['zulip.context'] });
-  const manager = new ChannelManager(client, new Map([['zulip', adapterInjecting('beforeUser')]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapterInjecting('beforeUser')]]), grant, ids(), 10);
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
   const provider = new ContextProvider(manager, grant, 5);

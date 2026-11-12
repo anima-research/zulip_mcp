@@ -19,8 +19,10 @@ import {
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
 import type { ZulipApi } from "./zulip-api.js";
-import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
+import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination, type SentRecord } from "./outgoing.js";
+import { parseKey, streamKey } from './channel-key.js';
+import type { ChannelIds } from './channel-ids.js';
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -191,7 +193,7 @@ export function formatHistoryLines(
     const head = messageLineHead({
       id: m.id,
       time: Number.isNaN(m.timestamp.getTime()) ? "" : formatTime(m.timestamp),
-      stream: m.isDm ? null : (m.streamName ?? ""),
+      stream: m.isDm ? null : (m.streamNameShown ?? ""),
       topic: m.topic,
       author: m.authorName,
       mentioned: m.mentioned,
@@ -236,6 +238,9 @@ export class ZulipToolRuntime {
    *  Awaited, and its result is reported by `listen`: an announcement the
    *  host did not confirm is the agent's business, not a stderr line. */
   onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
+
+  /** Set by the server while its client speaks MCPL; while it is null, a stream name goes to Zulip as given. */
+  channelIds: ChannelIds | null = null;
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
@@ -318,6 +323,30 @@ export class ZulipToolRuntime {
     }
     const ids = recipients.map((r) => r.id);
     return { type: message.type, to: ids, topic: undefined, channelId: dmChannelIdFor(dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id)) };
+  }
+
+  /**
+   * Where `fetch_history` reads. A DM conversation goes by its channel id
+   * (`zulip:dm:<ids>`).
+   * With MCPL, a stream the directory holds goes by its id, and a former name
+   * is refused with the new channel id. Any other name goes to Zulip as given.
+   */
+  private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string; isDm: boolean }> {
+    const asId = channel.startsWith("zulip:") ? channel : `zulip:${channel}`;
+    const dmIds = parseDmChannelId(asId);
+    if (dmIds) return { query: { dmUserIds: dmIds }, channel: dmChannelIdFor(dmIds), channelId: dmChannelIdFor(dmIds), isDm: true };
+    const ids = this.channelIds;
+    const answer = ids ? await ids.keyOf(asId, { byName: !channel.startsWith("zulip:") }) : null;
+    if (answer && "refusal" in answer) throw new Error(answer.refusal);
+    if (ids && answer && "key" in answer) {
+      const parsed = parseKey(answer.key);
+      if (parsed.kind === "stream") {
+        const name = ids.directory.nameOf(parsed.streamId) ?? "";
+        return { query: { streamId: parsed.streamId }, channel: name, channelId: ids.channelIdOf(answer.key) ?? `zulip:${name}`, isDm: false };
+      }
+    }
+    const name = asId.slice("zulip:".length);
+    return { query: { streamName: name }, channel: name, channelId: asId, isDm: false };
   }
 
   // ── Persistent monitoring state ──
@@ -891,22 +920,19 @@ export class ZulipToolRuntime {
       case "fetch_history": {
         const channel = String(args.channel ?? "").trim().replace(/^#/, "");
         if (!channel) throw new Error("channel is required");
-        // A DM conversation reads by its channel id (`zulip:dm:<ids>`, the
-        // form every catch-up note and history line quotes); anything else
-        // is a stream name or stream channel id.
-        const dmIds = parseDmChannelId(channel.startsWith("zulip:") ? channel : `zulip:${channel}`);
-        const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
+        const target = await this.historyTarget(channel);
         const limit = clampInt(args.limit, 50, 1, 1000);
         const page = await fetchHistory(api, {
-          ...(dmIds ? { dmUserIds: dmIds } : { streamName, topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
+          ...target.query,
+          ...(target.isDm ? {} : { topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
           limit,
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
         return {
-          channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
-          channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
-          topic: dmIds ? undefined : args.topic,
+          channel: target.channel,
+          channelId: target.channelId,
+          topic: target.isDm ? undefined : args.topic,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
@@ -922,10 +948,12 @@ export class ZulipToolRuntime {
         const limit = clampInt(args.limit, 50, 1, 200);
         const page = await fetchAround(api, messageId, limit);
         const anchor = page.messages.find((m) => m.id === messageId);
+        const shown = anchor?.streamNameShown ?? null;
+        const held = this.channelIds && anchor?.streamId != null ? this.channelIds.channelIdOf(streamKey(anchor.streamId)) : null;
         return {
           message_id: messageId,
-          channel: anchor?.streamName ?? null,
-          channelId: anchor?.streamName ? `zulip:${anchor.streamName}` : null,
+          channel: shown,
+          channelId: held ?? (shown ? `zulip:${shown}` : null),
           topic: anchor?.topic ?? null,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,

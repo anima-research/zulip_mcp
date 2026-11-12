@@ -11,7 +11,7 @@
  *   ZULIP_REALM / ZULIP_EMAIL / ZULIP_API_KEY   - bot credentials
  *   ZULIP_RC_PATH                               - alternative: a zuliprc file
  *   ZULIP_SESSION_ID                            - persistent monitoring state id
- *   ZULIP_SUBSCRIBE                             - comma-separated streams to join on startup
+ *   ZULIP_SUBSCRIBE                             - comma-separated streams to join once the stream list is first read
  *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
  *                                                 (default ~/.zulip_mcp_state)
  *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
@@ -48,12 +48,13 @@ import { fetchCapped, resolveInlineOptions } from './attachments.js';
 import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
+import { StreamDirectory } from './stream-directory.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
 import { agentLineTimeFormatter } from './timezone.js';
-import { initializeZulipClient } from './zulip-client.js';
+import { initializeZulipClient, subscribeConfigured } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
@@ -117,7 +118,10 @@ async function main(): Promise<void> {
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
   const maxMessageLength = maxMessageLengthFromEnv();
+  const directory = new StreamDirectory();
+  void subscribeConfigured(session.api, directory, process.env.ZULIP_SUBSCRIBE);
   const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
+    directory,
     formatTime,
     uploader,
     uploadPolicy,
@@ -142,6 +146,7 @@ async function main(): Promise<void> {
     attributeDelivery: process.env.ZULIP_ATTRIBUTE_DELIVERY !== 'false',
     formatTime,
     filters,
+    directory,
     attachments: {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm
       // host may ever see the bot's credentials.
