@@ -366,6 +366,41 @@ test('edit_message refuses an edit with no content, or a message_id that is not 
   } finally { s.done(); z.close(); }
 });
 
+test('delete_message, add_reaction, remove_reaction and get_stream_topics refuse an id that is not a positive integer, before asking Zulip', async () => {
+  const z = await realm({
+    'GET /realm/emoji': { json: { result: 'success', emoji: {} } },
+    'DELETE /messages/55': { json: { result: 'success' } },
+    'POST /messages/55/reactions': { json: { result: 'success' } },
+    'DELETE /messages/55/reactions': { json: { result: 'success' } },
+    'GET /users/me/12/topics': { json: { result: 'success', topics: [] } },
+  });
+  const s = await serverOn(z.url);
+  const started = z.requests.length;
+  const noted: string[] = [];
+  s.tools.onDeleted = (id) => noted.push(id);
+  try {
+    for (const message_id of [0, -3, 1.5, 'abc', undefined, '../users/me', '5/reactions', ' 55 ', '0x37', '']) {
+      await assert.rejects(s.tools.handleToolCall('delete_message', { message_id }), /message_id/, `delete_message ${String(message_id)}`);
+      await assert.rejects(s.tools.handleToolCall('add_reaction', { message_id, emoji_name: 'eyes' }), /message_id/, `add_reaction ${String(message_id)}`);
+      await assert.rejects(s.tools.handleToolCall('remove_reaction', { message_id, emoji_name: 'eyes' }), /message_id/, `remove_reaction ${String(message_id)}`);
+      await assert.rejects(s.tools.handleToolCall('get_stream_topics', { stream_id: message_id }), /stream_id/, `get_stream_topics ${String(message_id)}`);
+    }
+    assert.deepEqual(z.requests.slice(started).map((r) => `${r.method} ${r.path}`), [], 'Zulip was never asked');
+    assert.deepEqual(noted, [], 'no delete was noted');
+    for (const message_id of [55, '55']) {
+      await s.tools.handleToolCall('add_reaction', { message_id, emoji_name: 'eyes' });
+      await s.tools.handleToolCall('remove_reaction', { message_id, emoji_name: 'eyes' });
+      await s.tools.handleToolCall('delete_message', { message_id });
+    }
+    for (const stream_id of [12, '12']) await s.tools.handleToolCall('get_stream_topics', { stream_id });
+    assert.deepEqual(z.requests.filter((r) => r.path.endsWith('/topics')).map((r) => r.path), ['/users/me/12/topics', '/users/me/12/topics']);
+    assert.deepEqual(z.requests.filter((r) => r.path.startsWith('/messages')).map((r) => `${r.method} ${r.path}`), [
+      'POST /messages/55/reactions', 'DELETE /messages/55/reactions', 'DELETE /messages/55',
+      'POST /messages/55/reactions', 'DELETE /messages/55/reactions', 'DELETE /messages/55',
+    ]);
+  } finally { s.done(); z.close(); }
+});
+
 test('edit_message refuses content above the configured message length', async () => {
   const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
   const s = await serverOn(z.url);
