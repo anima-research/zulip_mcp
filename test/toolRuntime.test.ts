@@ -408,13 +408,27 @@ test('send_message reply_to with a topic on a direct message is refused before u
   }
 });
 
-test('send_message to a stream with neither a topic nor reply_to is refused before uploads or sends, and says to name one', async () => {
+test('send_message reply_to a direct message names the bot in to_user_ids where its id is unknown, or the conversation is its own', async () => {
+  for (const [participants, selfUserId, expected] of [
+    [replyParticipants.slice(0, 2), null, [42, 790]],
+    [replyParticipants.slice(0, 1), 790, [790]],
+  ] as const) {
+    const { tools, dir } = replyRuntime({ type: 'private', display_recipient: participants, subject: '' }, undefined, selfUserId);
+    try {
+      assert.deepEqual(await tools.handleToolCall('send_message', { reply_to: 123, content: 'reply' }),
+        { result: 'success', id: 501, channelId: `zulip:dm:${expected.join('+')}`, to_user_ids: [...expected] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message to a stream with neither a topic nor reply_to is refused before any read, upload or send, and says to name one', async () => {
   for (const args of [{ type: 'stream' }, { type: 'channel' }, { type: 'stream', topic: null }]) {
-    const { tools, dir, sends, uploaded } = replyRuntime(replyStream);
+    const { tools, dir, gets, sends, uploaded } = replyRuntime(replyStream);
     try {
       await assert.rejects(tools.handleToolCall('send_message', {
         ...args, to: 'general', content: 'hello', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
-      }), (err: Error) => /topic/.test(err.message) && /reply_to/.test(err.message));
+      }), { message: 'topic is required for a stream message: name one, or use reply_to to answer a message where it is' });
+      assert.deepEqual(gets, []);
       assert.deepEqual(sends, []);
       assert.deepEqual(uploaded, []);
     } finally { rmSync(dir, { recursive: true, force: true }); }

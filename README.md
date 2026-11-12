@@ -398,7 +398,7 @@ Replies use the message's current stream/topic or complete DM recipient list, wi
 For a stream message, a `topic` beside `reply_to` sends to that message's stream in the given topic: `{"reply_to":12345,"topic":"follow-up","content":"Thanks!"}`.
 Omit `to`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
 A supplied `to`, a `topic` for a direct message, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
-After a send with `reply_to`, the result says where the message went: `channelId` and `channel`, the stream's name, for a stream message, and `topic` when you gave none; `channelId` and `to_user_ids`, the other participants, for a direct message.
+After a send with `reply_to`, the result says where the message went: `channelId` and `channel`, the stream's name, for a stream message, and `topic` when you gave none; `channelId` and `to_user_ids` for a direct message, where `to_user_ids` is the participants other than the bot, or the bot too where its own id isn't known or the conversation is its own.
 Without `reply_to`, provide `type` and `to`, plus `topic` for a stream message: a stream message with neither `topic` nor `reply_to` is refused before uploads or sends. No additional permissions are needed.
 
 Both send tools take an optional `attachments` array; each entry is a local
