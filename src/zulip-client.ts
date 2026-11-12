@@ -112,8 +112,10 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   }
 
   // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
-  // Needed because Zulip's event queue only delivers message events for streams
-  // the bot is subscribed to, even with all_public_streams: true on the queue.
+  // Needed because, even with all_public_streams: true on the queue, a bot
+  // that isn't subscribed gets a public stream's edits and reactions only for
+  // messages that mention it, and from a private stream at most the messages
+  // that mention it.
   if (env.ZULIP_SUBSCRIBE) {
     const streams = env.ZULIP_SUBSCRIBE.split(",").map(s => s.trim()).filter(Boolean);
     if (streams.length > 0) {
