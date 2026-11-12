@@ -24,3 +24,13 @@
   announcement, before it answers. A host that doesn't answer delays the
   stream's messages by the announcement's 5 s bound, after which they go
   under the old id.
+- A read from history that fills a hole and gets no answer from Zulip, or
+  that Zulip refuses by its rate limit, is now tried again: after 2 s, then
+  at waits that double up to 60 s, or after Zulip's `retry-after` where that
+  is longer. These are the catch-up at a connection's start, the recovery
+  after Zulip's event queue broke, and the read after a channel gave up its
+  waiting messages. Meanwhile the channel's later messages wait behind the
+  read, so the messages of the hole reach the host first, in order. Such a
+  read used to be logged and skipped, and the messages of that stretch were
+  never offered once the host accepted a later one. A read that Zulip
+  refuses for another reason still ends the hole, as before.

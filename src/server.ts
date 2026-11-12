@@ -62,7 +62,7 @@ import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewO
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId, parseDmChannelId } from './history.js';
-import { LONG_TIMEOUT_MS } from './zulip-api.js';
+import { LONG_TIMEOUT_MS, ZulipNoAnswer, ZulipRefused } from './zulip-api.js';
 import type { FiltersPlane } from './filters.js';
 import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
 import type { AttachmentRef } from './content.js';
@@ -100,6 +100,8 @@ const MAX_WAITING_MESSAGES = 5000;
  *  (attachment fetches) before flushing what has been queued. */
 const SHUTDOWN_INFLIGHT_GRACE_MS = 5000;
 const ATTACHMENT_DEADLINE_MS = 15_000;
+const READ_RETRY_FIRST_MS = 2_000;
+const READ_RETRY_MAX_MS = 60_000;
 
 export interface ZulipMcplServerOptions {
   /** Server name/version reported in `initialize`. */
@@ -132,6 +134,8 @@ export interface ZulipMcplServerOptions {
   shutdownGraceMs?: number;
   /** At most this many messages wait in all channels' lanes together; past it, the channel with the most gives them up to a read from history (default 5,000). */
   maxWaitingMessages?: number;
+  /** How a lane waits before it tries a read from history again that got no answer (default: a timer of `ms`). */
+  readRetryWait?: (ms: number) => Promise<void>;
   directory?: StreamDirectory;
 }
 
@@ -482,7 +486,8 @@ export class ZulipMcplServer {
     const keys = new Set([...this.delivery.watermarkedChannels(), ...this.delivery.talliedChannels(), ...this.delivery.lastOpenChannels()]);
     for (const key of keys) {
       const lane = lanes.lane(key);
-      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.readStart(key, lane, renamed.has(key))), { kind: 'other', turn: true });
+      const answers: Promise<boolean>[] = [];
+      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readStart(key, lane, renamed.has(key), answers))), { kind: 'other', turn: true });
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
@@ -1295,14 +1300,13 @@ export class ZulipMcplServer {
    * verification can split a channel into multiple `<missed>` pushes. On a
    * closed channel the tally's backfill follows.
    */
-  private async readStart(key: ChannelKey, lane: Lane<null>, renamed: boolean): Promise<void> {
-    const answers: Promise<boolean>[] = [];
+  private async readStart(key: ChannelKey, lane: Lane<null>, renamed: boolean, answers: Promise<boolean>[]): Promise<void> {
     if (this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
         this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
       const place = this.placeOf(key);
       if (place !== undefined) {
         await this.catchUpClosedChannel(key, this.delivery.wasOpen(key), place, undefined, undefined,
-          { through: () => this.firstWaiting(key) - 1, lane, answers });
+          { through: () => this.firstWaiting(key) - 1, lane, answers, fill: true });
       }
       if (!lane.isEnded && this.delivery.tally(key)) await this.backfillTally(key, lane);
     }
@@ -1386,7 +1390,7 @@ export class ZulipMcplServer {
     afterId?: number,
     retryWindow?: { through: number; truncated: boolean; budget: { remainingMs: number } },
     onAttempt?: (through: number) => void,
-    opts: { through?: () => number; lane?: Lane<null>; answers?: Promise<boolean>[]; ceiling?: { reached: boolean } } = {},
+    opts: { through?: () => number; lane?: Lane<null>; answers?: Promise<boolean>[]; ceiling?: { reached: boolean }; fill?: boolean } = {},
   ): Promise<boolean> {
     if (!this.adapter.fetchHistory || this.catchupLimit === 0) return false;
     if (this.ids.heldIdOf(key) === undefined) return false;
@@ -1405,6 +1409,7 @@ export class ZulipMcplServer {
       const bound = retryWindow?.through ?? opts.through?.();
       fetched = await this.fetchAfter(key, after, bound !== undefined && Number.isFinite(bound) ? bound : undefined, passBudget);
     } catch (err) {
+      if (opts.fill && triesAgain(err)) throw err;
       console.error(`[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`, (err as Error).message);
       onAttempt?.(Infinity); // A history failure counts as the held read's attempt, unlike a local policy abort.
       return false;
@@ -1613,12 +1618,12 @@ export class ZulipMcplServer {
   private async readGap(key: ChannelKey, lane: Lane<null>, gap: GapRead): Promise<void> {
     this.delivery.clearReplayed(key);
     await this.readHeld(key, lane, gap);
-    await this.readFill(key, lane, gap);
+    await this.fillRead(lane, () => this.readFill(key, lane, gap));
   }
 
   private giveUp(lane: Lane<null>): void {
     const key = lane.key;
-    const ids = lane.replaceMessages((ctx) => (ctx.ended ? undefined : this.readGivenUp(key, lane)), { kind: 'other', turn: true });
+    const ids = lane.replaceMessages((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readGivenUp(key, lane))), { kind: 'other', turn: true });
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
       const first = Math.min(...held);
@@ -1634,7 +1639,21 @@ export class ZulipMcplServer {
     const atCeiling = await this.readFill(key, lane, undefined, true);
     const after = this.placeOf(key);
     if (lane.isEnded || !atCeiling || after === undefined || after === before || after >= this.firstWaiting(key) - 1) return;
-    lane.enterFirst((ctx) => (ctx.ended ? undefined : this.readGivenUp(key, lane)), { kind: 'other', turn: true });
+    lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, () => this.readGivenUp(key, lane))), { kind: 'other', turn: true });
+  }
+
+  private async fillRead(lane: Lane<null>, read: () => Promise<unknown>, tries = 0): Promise<void> {
+    try {
+      await read();
+    } catch (err) {
+      if (!triesAgain(err)) throw err;
+      if (lane.isEnded) return;
+      const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
+      const ms = err instanceof ZulipRefused ? Math.max(step, (err.retryAfterSeconds ?? 0) * 1000) : step;
+      console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
+      lane.enterFirst((ctx) => (ctx.ended ? undefined : this.fillRead(lane, read, tries + 1)), { kind: 'other', turn: true });
+      lane.holdOtherUntil((this.options.readRetryWait ?? waitMs)(ms));
+    }
   }
 
   private async readFill(key: ChannelKey, lane: Lane<null>, gap?: GapRead, inPasses = false): Promise<boolean> {
@@ -1645,7 +1664,7 @@ export class ZulipMcplServer {
     if (place === undefined || below() <= place) return false;
     if (!this.channelManager.isKeyOpen(key)) {
       const ceiling = inPasses ? { reached: false } : undefined;
-      await this.catchUpClosedChannel(key, false, place, undefined, undefined, { through: below, lane, answers: gap?.answers, ceiling });
+      await this.catchUpClosedChannel(key, false, place, undefined, undefined, { through: below, lane, answers: gap?.answers, ceiling, fill: true });
       return ceiling?.reached ?? false;
     }
     let fetched: Awaited<ReturnType<ZulipMcplServer['fetchAfter']>>;
@@ -1653,6 +1672,7 @@ export class ZulipMcplServer {
       const bound = below();
       fetched = await this.fetchAfter(key, place, Number.isFinite(bound) ? bound : undefined);
     } catch (err) {
+      if (triesAgain(err)) throw err;
       console.error(`[zulip-mcp] reading ${this.label(key)}'s history to fill a hole failed:`, (err as Error).message);
       return false;
     }
@@ -2436,6 +2456,17 @@ function gapNotice(event: PlatformSystemEvent, tally: GapTally): PlatformSystemE
     text: notes.length > 0 ? `${event.text} ${notes.join(' ')}` : event.text,
     metadata: { ...event.metadata, recoveredMessages: tally.recovered, closedChannelsCaughtUp: tally.caughtUp.size },
   };
+}
+
+function triesAgain(err: unknown): err is ZulipNoAnswer | ZulipRefused {
+  return err instanceof ZulipNoAnswer || (err instanceof ZulipRefused && err.code === 'RATE_LIMIT_HIT');
+}
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
 }
 
 function recovered(m: KeyedMessage): KeyedMessage {

@@ -37,6 +37,7 @@ import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
@@ -297,6 +298,7 @@ interface HarnessOptions {
   announceTimeoutMs?: number;
   shutdownGraceMs?: number;
   maxWaitingMessages?: number;
+  readRetryWait?: (ms: number) => Promise<void>;
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
   visible?: ChannelDescriptor[];
@@ -323,6 +325,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     announceTimeoutMs: opts.announceTimeoutMs ?? 100,
     shutdownGraceMs: opts.shutdownGraceMs,
     maxWaitingMessages: opts.maxWaitingMessages,
+    readRetryWait: opts.readRetryWait,
     filters: opts.filters,
     attachments: opts.attachments,
     attributeDelivery: opts.attributeDelivery,
@@ -4913,4 +4916,182 @@ test('at a give-up, a waiting edit of the first given-up message and a deletion 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/** The channel's reads from history after a message id fail with `errors`, one each, in order; then they pass. */
+function failReads(h: Harness, channelId: string, errors: unknown[]): void {
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === channelId && query.afterMessageId !== undefined && errors.length > 0) throw errors.shift();
+    return real(key, query);
+  };
+}
+const noAnswer = () => new ZulipNoAnswer('network', 'GET', '/messages', false, 'The connection to Zulip failed during GET /messages.');
+const refusal = (code: string, retryAfter?: number) => new ZulipRefused('history of stream 7', {
+  result: 'error', msg: code === 'RATE_LIMIT_HIT' ? 'API usage exceeded rate limit' : 'Invalid narrow', code, ...(retryAfter !== undefined ? { 'retry-after': retryAfter } : {}),
+});
+function heldWaits() {
+  const asked: number[] = [];
+  const pending: (() => void)[] = [];
+  return {
+    asked,
+    release: () => { for (const resolve of pending.splice(0)) resolve(); },
+    wait: (ms: number) => { asked.push(ms); return new Promise<void>((resolve) => pending.push(resolve)); },
+  };
+}
+
+test("after a break of the event queue, a read that gets no answer is tried again after a wait, and a message behind it isn't handed over: the hole's rows reach the host first, then the message", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3));
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await h.host.sendRequest('ping');
+  assert.deepEqual(seenIds(h), ['1'], 'nothing is handed over while the read waits');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  assert.equal((h.incoming[1].metadata as { recovered?: boolean }).recovered, true, '2 is recovered');
+  await h.close();
+});
+
+for (const rateLimited of [false, true]) {
+  test(`after a break of the event queue, a read that Zulip refuses ${rateLimited
+    ? 'by its rate limit is tried again, as one that gets no answer'
+    : 'for another reason ends the hole, as on main: the message behind it is handed over'}`, async () => {
+    const waits = heldWaits();
+    const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    failReads(h, 'zulip:general', [refusal(rateLimited ? 'RATE_LIMIT_HIT' : 'BAD_REQUEST')]);
+    breakQueue(h);
+    h.adapter.emit!(streamMsg(3));
+    if (rateLimited) {
+      await until(() => waits.asked.length === 1, 'the wait before the second try');
+      waits.release();
+    }
+    await until(() => gapNoticeIn(h), 'the gap notice');
+    await h.server.quiet();
+    assert.deepEqual(seenIds(h), rateLimited ? ['1', '2', '3', 'notice'] : ['1', '3', 'notice']);
+    assert.deepEqual(waits.asked, rateLimited ? [2000] : []);
+    await h.close();
+  });
+}
+
+test('after a break of the event queue, an open lane whose read gets no answer holds back only itself: the other open lanes get the gap notice, and it gets its recovered rows and then the notice once its read answers', async () => {
+  const waits = heldWaits();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({
+    visible: [DESCRIPTOR, OTHER],
+    readRetryWait: waits.wait,
+    history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  const on = (channelId: string) => h.incoming.filter((m) => m.channelId === channelId).map((m) => (m.messageId.startsWith('system:') ? 'notice' : m.messageId));
+  breakQueue(h);
+  await until(() => waits.asked.length === 1 && on('zulip:other').includes('notice'), "general's wait and other's notice");
+  assert.deepEqual(on('zulip:other'), ['500', '501', 'notice']);
+  assert.deepEqual(on('zulip:general'), ['1']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(on('zulip:general'), ['1', '2', 'notice']);
+  await h.close();
+});
+
+test("a connection that ends while a lane waits to try its read again makes no try, and the next connection's catch-up covers the hole", async () => {
+  const waits = heldWaits();
+  const first = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(1));
+  await until(() => first.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(first, 'zulip:general', [noAnswer()]);
+  breakQueue(first);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await first.close();
+  const reads = first.adapter.historyCalls.length;
+  waits.release();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.equal(first.adapter.historyCalls.length - reads, 1, "the next connection's catch-up is the one read");
+  assert.equal(second.pushed.length, 1, 'the catch-up block');
+  assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=2\]/);
+  await second.close();
+});
+
+test("a read that gets no answer is tried again after 2 s, doubling to at most 60 s, and after a refusal by the rate limit after the longer of that step and Zulip's retry-after", async () => {
+  const asked: number[] = [];
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: async (ms) => { asked.push(ms); } });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(h, 'zulip:general', [...Array.from({ length: 7 }, noAnswer), refusal('RATE_LIMIT_HIT', 90), refusal('RATE_LIMIT_HIT', 0.5)]);
+  breakQueue(h);
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(asked, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 90000, 60000]);
+  assert.deepEqual(seenIds(h), ['1', '2', 'notice']);
+  await h.close();
+});
+
+test("a connection's catch-up read that gets no answer is tried again, and a mention that arrives meanwhile follows the catch-up's block", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait });
+  h.delivery.advance('zulip:general', 1);
+  failReads(h, 'zulip:general', [noAnswer()]);
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await awaitRegistered(h, false);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await h.host.sendRequest('ping');
+  assert.equal(h.pushed.length, 0, 'the mention waits behind the read');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['2', '3']);
+  await h.close();
+});
+
+test('a read after a give-up that gets no answer is tried again, and the given-up messages still come by it, in order, before a later message', async () => {
+  const waits = heldWaits();
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3, readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  failReads(h, 'zulip:general', [noAnswer()]);
+  fetches.release();
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2', '3', '4', '5', '6']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  await h.close();
 });
