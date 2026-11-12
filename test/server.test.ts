@@ -1253,6 +1253,41 @@ test('attachments on live delivery are inlined from the configured source', asyn
   await h.close();
 });
 
+test("a message whose attachment fetches never answer goes at its one deadline, with a note for each", { timeout: 5000 }, async () => {
+  const fetched: string[] = [];
+  const deadline = new AbortController();
+  const h = harness({
+    attachments: {
+      source: { fetch(path) { fetched.push(path); return new Promise(() => {}); } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+      deadline: () => deadline.signal,
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  h.adapter.emit!({
+    ...streamMsg(1, { text: 'see attached' }),
+    metadata: {
+      topic: 'deploys', mentioned: false, isDM: false,
+      attachments: [
+        { path: '/user_uploads/1/a/shot.png', name: 'shot.png', mimeType: 'image/png', isImage: true },
+        { path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false },
+      ],
+    },
+  });
+  await until(() => fetched.length === 1, 'the first fetch to start');
+  deadline.abort();
+  await until(() => h.incoming.length === 1, 'delivery at the deadline');
+  const notes = h.incoming[0].content.slice(1).map((b) => (b as { text: string }).text);
+  assert.deepEqual(notes, [
+    "[attachment: shot.png — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/shot.png]",
+    "[attachment: run.log — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/run.log]",
+  ]);
+  await h.close();
+});
+
 test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-wire-'));
   const original = console.error;

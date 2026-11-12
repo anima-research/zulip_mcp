@@ -152,10 +152,10 @@ async function main(): Promise<void> {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm
       // host may ever see the bot's credentials.
       source: {
-        fetch: (path, maxBytes) => {
+        fetch: (path, maxBytes, signal) => {
           const url = parseZulipAttachmentUrl(path, session.realm);
           const headers: Record<string, string> = session.authHeader ? { Authorization: session.authHeader } : {};
-          return fetchCapped(url.toString(), headers, maxBytes);
+          return fetchCapped(url.toString(), headers, maxBytes, signal);
         },
       },
       inline: resolveInlineOptions(),

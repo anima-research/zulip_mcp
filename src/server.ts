@@ -105,6 +105,7 @@ const PRE_LIVE_BUFFER_CAP = 5000;
 /** How long shutdown waits for deliveries still building their content
  *  (attachment fetches) before flushing what has been queued. */
 const SHUTDOWN_INFLIGHT_GRACE_MS = 5000;
+const ATTACHMENT_DEADLINE_MS = 15_000;
 
 export interface ZulipMcplServerOptions {
   /** Server name/version reported in `initialize`. */
@@ -125,8 +126,8 @@ export interface ZulipMcplServerOptions {
   formatTime?: (d: Date) => string;
   /** The filters plane (stream/DM allowlists, mutes, reaction policy). Optional: without it nothing is filtered. */
   filters?: FiltersPlane;
-  /** Where attachment bytes come from, and how much of them to inline on live delivery. */
-  attachments?: { source: AttachmentSource; inline: InlineOptions };
+  /** Where attachment bytes come from, and how much of them to inline on live delivery. `deadline` gives one bound for all of a message's fetches together; 15 s from the first when left out. */
+  attachments?: { source: AttachmentSource; inline: InlineOptions; deadline?: () => AbortSignal };
   /** Size cap (characters) on one `<missed>` catch-up block; the oldest lines are elided. */
   missedBlockMaxChars?: number;
   /** How long an announcement waits for the host (default 5s). */
@@ -1041,7 +1042,8 @@ export class ZulipMcplServer {
     // inlined can still be fetched.
     const refs = Array.isArray(meta.attachments) ? (meta.attachments as AttachmentRef[]) : [];
     if (refs.length > 0 && this.options.attachments) {
-      const blocks = await buildAttachmentBlocks(refs, this.options.attachments.source, this.options.attachments.inline);
+      const { source, inline, deadline = () => AbortSignal.timeout(ATTACHMENT_DEADLINE_MS) } = this.options.attachments;
+      const blocks = await buildAttachmentBlocks(refs, source, inline, deadline());
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 

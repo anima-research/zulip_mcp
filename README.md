@@ -568,6 +568,9 @@ environment). Under connectome-host, point it into the data volume, e.g.
   may have reached Zulip without an answer fails with an error saying so.
   `fetch_attachment`'s download ends when it gets no data for 15 s. File
   uploads have no bound.
+- **A message's attachments share one bound on live delivery:** 15 s for
+  all its fetches together. An attachment not fetched by then gets a note
+  with its path for `fetch_attachment`.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

@@ -102,22 +102,23 @@ test('fetchCapped sends the credentials, honours the ceiling, and reports overfl
   });
   try {
     const headers = { Authorization: 'Basic dGVzdA==' };
-    const small = await fetchCapped(`${origin}/user_uploads/1/a/small.txt`, headers, 100);
+    const open = new AbortController().signal;
+    const small = await fetchCapped(`${origin}/user_uploads/1/a/small.txt`, headers, 100, open);
     assert.equal(small.overflow, false);
     assert.equal(small.buf.toString(), 'hello');
     assert.equal(small.mimeType, 'text/plain');
 
-    const over = await fetchCapped(`${origin}/user_uploads/1/a/big.txt`, headers, 1000);
+    const over = await fetchCapped(`${origin}/user_uploads/1/a/big.txt`, headers, 1000, open);
     assert.equal(over.overflow, true);
     assert.equal(over.buf.length, 0);
 
     // No Content-Length: the streamed read stops at the cap.
-    const nolength = await fetchCapped(`${origin}/user_uploads/1/a/nolength.txt`, headers, 1000);
+    const nolength = await fetchCapped(`${origin}/user_uploads/1/a/nolength.txt`, headers, 1000, open);
     assert.equal(nolength.overflow, true);
     assert.equal(nolength.buf.length, 0);
 
-    await assert.rejects(fetchCapped(`${origin}/user_uploads/1/a/small.txt`, {}, 100), /HTTP 401/);
-    await assert.rejects(fetchCapped(`${origin}/nope`, headers, 100), /HTTP 404/);
+    await assert.rejects(fetchCapped(`${origin}/user_uploads/1/a/small.txt`, {}, 100, open), /HTTP 401/);
+    await assert.rejects(fetchCapped(`${origin}/nope`, headers, 100, open), /HTTP 404/);
     assert.ok(hits.every((h) => h.startsWith('Basic dGVzdA== ') || h.startsWith('- ')));
   } finally {
     server.close();
@@ -128,6 +129,54 @@ function ref(path: string, mimeType: string, isImage: boolean): AttachmentRef {
   return { path, name: path.split('/').pop()!, mimeType, isImage };
 }
 
+test('fetchCapped ends when its signal aborts', { timeout: 5000 }, async () => {
+  let arrived!: () => void;
+  const request = new Promise<void>((resolve) => { arrived = resolve; });
+  const server = createServer(() => arrived());
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const deadline = new AbortController();
+    const silent = fetchCapped(`${origin}/user_uploads/1/a/silent.txt`, {}, 100, deadline.signal);
+    await request;
+    deadline.abort();
+    await assert.rejects(silent);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("a message's attachments share one deadline: the fetch it cuts, and every one not yet started, become notes", { timeout: 5000 }, async () => {
+  const calls: { path: string; signal: AbortSignal }[] = [];
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+  const source: AttachmentSource = {
+    // Never answers, and doesn't listen to its signal.
+    fetch(path, _maxBytes, signal) {
+      calls.push({ path, signal });
+      started();
+      return new Promise(() => {});
+    },
+  };
+  const deadline = new AbortController();
+  const refs = [
+    ref('/user_uploads/1/a/shot.png', 'image/png', true),
+    ref('/user_uploads/1/a/run.log', 'text/plain', false),
+  ];
+  const built = buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 }, deadline.signal);
+  await firstStarted;
+  deadline.abort();
+  const blocks = await built;
+  assert.deepEqual(blocks.map((b) => (b as { text: string }).text), [
+    "[attachment: shot.png — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/shot.png]",
+    "[attachment: run.log — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/run.log]",
+  ]);
+  assert.deepEqual(calls.map((c) => c.path), ['/user_uploads/1/a/shot.png'], 'nothing is fetched once the deadline has passed');
+  assert.equal(calls[0].signal.aborted, true, 'the fetch the deadline cut is told to stop');
+});
+
 test('buildAttachmentBlocks inlines images and small text, and degrades everything else to notes', async () => {
   const image = await png(3000, 1500);
   const { server, origin } = await uploadHost({
@@ -137,7 +186,7 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     '/user_uploads/1/a/second.png': { body: image, type: 'image/png' },
   });
   const source: AttachmentSource = {
-    fetch: (path, maxBytes) => fetchCapped(`${origin}${path}`, { Authorization: 'Basic dGVzdA==' }, maxBytes),
+    fetch: (path, maxBytes, signal) => fetchCapped(`${origin}${path}`, { Authorization: 'Basic dGVzdA==' }, maxBytes, signal),
   };
   try {
     const refs = [
@@ -148,7 +197,8 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
       ref('/user_uploads/1/a/deck.pdf', 'application/pdf', false),
       ref('/user_uploads/1/a/second.png', 'image/png', true),
     ];
-    const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 });
+    const open = new AbortController().signal;
+    const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 }, open);
     // A failed fetch does not spend the image budget.
     assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(HTTP 404\)/);
     assert.equal(blocks[1].type, 'image');
@@ -160,7 +210,7 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     assert.match((blocks[5] as { text: string }).text, /second\.png" not inlined \(per-message image limit reached\)/);
     assert.equal(blocks.length, 6);
 
-    const off = await buildAttachmentBlocks(refs.slice(0, 1), source, { inlineImages: false, inlineTextMaxBytes: 0, maxImages: 4 });
+    const off = await buildAttachmentBlocks(refs.slice(0, 1), source, { inlineImages: false, inlineTextMaxBytes: 0, maxImages: 4 }, open);
     assert.match((off[0] as { text: string }).text, /image inlining is off/);
   } finally {
     server.close();
