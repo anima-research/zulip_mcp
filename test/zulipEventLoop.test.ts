@@ -49,7 +49,6 @@ test('an HTML/proxy 502 backs off exponentially', async () => {
   assert.equal(degraded.length, 1);
   assert.match(degraded[0].text, /non-JSON/);
 
-  // And it must NOT have been misread as queue expiry.
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
 });
 
