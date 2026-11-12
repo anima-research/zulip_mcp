@@ -30,6 +30,8 @@ export interface Realm {
   hold(call: 'POST /register' | 'GET /streams'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
+  /** The bot sees a stream again, under the same id, as Zulip tells a client that regains access to one. */
+  regain(streamId: number, name: string): void;
   create(name: string): number;
   /**
    * The bot's event queue is lost while `during` changes the realm: nothing
@@ -208,6 +210,10 @@ export function realm(initial: Record<number, string>): Realm {
     archive(streamId) {
       streams.delete(streamId);
       queue({ type: 'stream', op: 'delete', stream_ids: [streamId], streams: [{ stream_id: streamId }] });
+    },
+    regain(streamId, name) {
+      streams.set(streamId, name);
+      queue({ type: 'stream', op: 'create', streams: [{ stream_id: streamId, name }] });
     },
     create(name) {
       const id = nextStreamId++;

@@ -1050,3 +1050,33 @@ scenario('39. one process, two clients without MCPL, and a rename between them: 
     assert.equal(await missedOn(second, 'zulip:lobby'), 0);
   } finally { await second.close(); }
 });
+
+scenario('40. a removal the host doesn\'t answer, offered again at a refresh: the agent gets its line once', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const run = await start(r, dir, { holdChanged: true });
+  try {
+    await run.open('zulip:general');
+    const before = run.changed.length;
+    r.archive(17);
+    await until(() => run.logs.some((l) => l.includes('got no answer')), 'the removal left unanswered');
+    await run.tool('refresh_channels', {});
+    await until(() => run.changed.slice(before).filter((c) => (c.removed ?? []).includes('zulip:general')).length >= 2, 'the removal offered again');
+    assert.equal(run.incoming.filter((m) => m.channelId === 'zulip:general' && /archived/.test(textOf(m))).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
+scenario('41. a stream removed, seen again, and removed again: the agent gets a line each time', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const run = await start(r, dir);
+  const lines = () => run.incoming.filter((m) => m.channelId === 'zulip:general' && /archived/.test(textOf(m))).length;
+  try {
+    await run.open('zulip:general');
+    r.archive(17);
+    await until(() => lines() === 1, 'the first line');
+    r.regain(17, 'general');
+    await run.tool('refresh_channels', {});
+    await run.open('zulip:general');
+    r.archive(17);
+    await until(() => lines() === 2, 'the second line');
+  } finally { await run.close(); }
+});
