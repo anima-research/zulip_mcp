@@ -17,3 +17,8 @@
   history an open returns now ends below the first message of its channel
   that the server hasn't handed on yet, and each such message follows the
   open's answer once, as a message.
+- After a restart, a message the host hadn't accepted wasn't offered again
+  when the host had accepted nothing on its channel before it, such as one
+  the host refused, or one that was waiting or on its way when the
+  connection ended. Such a channel had no watermark on disk. It now gets one
+  just below that message, so the next start offers it.

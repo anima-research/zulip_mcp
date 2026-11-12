@@ -3,7 +3,10 @@
  * missing, and which channels it had open. Persisted so a restart can catch
  * up instead of starting from "now".
  *
- *   watermarks   channelId → highest message id forwarded to the host. The
+ *   watermarks   channelId → highest message id forwarded to the host. A
+ *                channel the host has accepted nothing on gets one just
+ *                below its lowest held message once a hold there is no
+ *                longer on its way (`hold`, `failQueued`). The
  *                "since when" anchor for the reconnect sweep, for gap
  *                recovery after a Zulip event-queue expiry, and for
  *                `sinceLastSeen` history on channels/open. It never passes
@@ -86,9 +89,10 @@ export class DeliveryState {
    * past the lowest held id, whatever is accepted after it: a message the
    * host refused or a batch lost to a transport failure stays below the
    * watermark, so the next sweep, a gap recovery, or a live replay can offer
-   * it again instead of a later acceptance burying it. Not persisted: the
-   * persisted watermark is already below every held id, which is all a
-   * restart needs.
+   * it again instead of a later acceptance burying it. Not persisted: a
+   * hold that is not on its way has a watermark below it, and a connection's
+   * end ends every hold's way, so the persisted watermark is below every held
+   * id, which is all a restart needs.
    */
   private held = new Map<ChannelKey, Map<number, Held>>();
   /** The highest id acceptance has reached per channel; the watermark is
@@ -291,18 +295,23 @@ export class DeliveryState {
     const existing = held.get(messageId);
     if (existing) {
       existing.status = status;
-      return;
-    }
-    if (held.size >= HELD_CAP_PER_CHANNEL) {
+    } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
       // Keep the lowest ids: the floor protects everything above it anyway.
-      const highest = Math.max(...held.keys());
-      if (messageId >= highest) {
-        console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
-        return;
-      }
-      held.delete(highest);
+      console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
+      return;
+    } else {
+      if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
+      held.set(messageId, { status, replayed: false });
     }
-    held.set(messageId, { status, replayed: false });
+    if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
+  }
+
+  private watermarkBelowHolds(key: ChannelKey): boolean {
+    if (this.watermarks.has(key)) return false;
+    const floor = this.floor(key);
+    if (floor === undefined) return false;
+    this.watermarks.set(key, floor - 1);
+    return true;
   }
 
   /** The host accepted the message. Returns true if the watermark moved. */
@@ -315,8 +324,14 @@ export class DeliveryState {
 
   /** The connection ended: a hold that was on its way is not any more, so a replay may offer it. */
   failQueued(): void {
-    for (const held of this.held.values()) {
-      for (const h of held.values()) if (h.status === 'queued') h.status = 'failed';
+    for (const [key, held] of this.held) {
+      let failed = false;
+      for (const h of held.values()) {
+        if (h.status !== 'queued') continue;
+        h.status = 'failed';
+        failed = true;
+      }
+      if (failed) this.watermarkBelowHolds(key);
     }
   }
 

@@ -1527,6 +1527,125 @@ test('a message still waiting in its channel when the connection ends is offered
   await second.close();
 });
 
+const BO_DM: ChannelDescriptor = {
+  id: 'zulip:dm:42',
+  type: 'zulip',
+  label: 'DM: Bo',
+  direction: 'bidirectional',
+  address: { dm: true, user_ids: [42], emails: ['bo@example.com'] },
+  metadata: { channelType: 'dm', recipientName: 'Bo', recipientId: '42' },
+};
+
+function boDm(id: number, text = `dm ${id}`): IncomingChannelMessage {
+  return {
+    channelId: 'zulip:dm:42',
+    messageId: String(id),
+    author: { id: '42', name: 'Bo' },
+    timestamp: new Date(1_700_000_000_000 + id * 1000).toISOString(),
+    content: [{ type: 'text', text }],
+    tags: ['chat:dm', 'chat:private', 'chat:from-human'],
+    metadata: { isDM: true, mentioned: false },
+  };
+}
+
+const firstText = (p: PushEventParams) => (p.payload.content[0] as { text: string }).text;
+
+test('a first message the host refused, on a channel where it had accepted nothing, is offered again after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-first-refused-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'fr' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.policy.rejectIds.add('5');
+    first.adapter.emit!(streamMsg(5));
+    await first.server.quiet();
+    assert.equal(first.incoming.length, 0, 'the host refused it');
+    const onDisk = JSON.parse(readFileSync(join(dir, 'fr.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
+    assert.equal(onDisk.watermarks['zulip:general'], 4, 'on disk before the connection ends');
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'fr', history: [streamMsg(5)] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next start offers it');
+    assert.match(firstText(second.pushed[0]), /id=5\]/);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a message still waiting when the connection ends, on a channel where the host had accepted nothing, is offered after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-first-waiting-'));
+  try {
+    const fetches = heldFetches();
+    const first = harness({ stateDir: dir, sessionId: 'fw', attachments: fetches.options });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(withLog(streamMsg(5)));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    first.adapter.emit!(streamMsg(6, { mentioned: true }));
+    first.serverSide.once('close', () => setTimeout(fetches.release, 50));
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'fw', history: [withLog(streamMsg(5)), streamMsg(6, { mentioned: true })] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next start offers it');
+    assert.match(firstText(second.pushed[0]), /id=6\]/);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a first message the host refused, on a channel where it had accepted nothing, is offered once by the next connection', async () => {
+  const first = harness({ history: [streamMsg(5)] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.policy.rejectIds.add('5');
+  first.adapter.emit!(streamMsg(5));
+  await first.server.quiet();
+  assert.equal(first.incoming.length, 0, 'the host refused it');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.deepEqual(second.pushed.map((p) => /id=5\]/.test(firstText(p))), [true], 'offered once');
+  await second.close();
+});
+
+test('two DMs that arrive close together in a new conversation both carry the first-message note', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(boDm(500), BO_DM);
+  h.adapter.emit!(boDm(501), BO_DM);
+  await until(() => h.pushed.length === 2, 'both pushes');
+  for (const p of h.pushed) assert.match(firstText(p), /^<system>Direct message from Bo/);
+  await h.close();
+});
+
+test('after the host refuses a DM conversation\'s first message, the next DM carries no first-message note', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.policy.rejectPushes.add('500');
+  h.adapter.emit!(boDm(500), BO_DM);
+  await until(() => h.pushed.length === 1, 'the first push');
+  await h.server.quiet();
+  h.adapter.emit!(boDm(501));
+  await until(() => h.pushed.length === 2, 'the second push');
+  assert.equal(firstText(h.pushed[1]), '[T id=501] [DM] Bo: dm 501');
+  await h.close();
+});
+
 test('quiet() settles once what the server was handed has reached the host: delivery jobs, the batch window, a replay, and a request being served', async () => {
   const h = harness({ attachments: heldFetches(30).options, batchWindowMs: 30, history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);
@@ -2199,7 +2318,7 @@ test('a feature set disabled while a message waits in the batch window withholds
     await h.host.sendRequest('ping');
     await h.server.quiet();
     assert.equal(h.incoming.length, 0, 'withheld at send time, not only at enqueue');
-    assert.equal(h.delivery.watermark('zulip:general'), undefined);
+    assert.equal(h.delivery.watermark('zulip:general'), 0, 'just below the withheld message');
     assert.equal(h.delivery.floor('zulip:general'), 1, 'held, not forgotten: not heard is not the same as heard');
 
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });

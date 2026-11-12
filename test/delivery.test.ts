@@ -59,7 +59,8 @@ test('the undelivered floor: the watermark never passes an offered-but-unaccepte
   state.release(GENERAL, 1);
   state.release(GENERAL, 3);
   state.hold(GENERAL, 2, 'rejected');
-  assert.equal(state.advance(GENERAL, 3), true);
+  assert.equal(state.watermark(GENERAL), 1, 'a channel with no watermark gets one just below a hold that is no longer on its way');
+  assert.equal(state.advance(GENERAL, 3), false);
   assert.equal(state.watermark(GENERAL), 1, 'stops below the rejected id');
 
   // A later batch is accepted in full: still capped by the floor.
