@@ -23,6 +23,7 @@ import {
   type IncomingChannelMessage,
   type JsonRpcRequest,
   type PushEventParams,
+  type TextContent,
 } from '@animalabs/mcpl-core';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -118,6 +119,8 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     async publish(channelId, _descriptor, content, hints) {
       adapter.published.push({ channelId, content, hints });
       const n = adapter.published.length;
+      const text = content.filter((b): b is TextContent => b.type === 'text').map((b) => b.text).join('\n');
+      adapter.onSent?.({ messageId: String(40 + n), channelId, content: text });
       return { delivered: true, messageId: String(40 + n), messageIds: [String(40 + n)] };
     },
     async fetchContext(channelId): Promise<ContextInjection> {
@@ -1218,6 +1221,26 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
     console.error = original;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a publish refused partway leaves its posted chunks on record, so a rollback deletes them', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const sent = (await h.host.sendRequest('tools/call', { name: 'send_message', arguments: { content: 'via tool' } })) as { state?: { checkpoint: string } };
+  const checkpoint = sent.state!.checkpoint;
+
+  h.adapter.publish = async (channelId) => {
+    h.adapter.onSent?.({ messageId: '61', channelId, content: 'first chunk' });
+    throw new Error('Zulip refused message to #general: nope');
+  };
+  await assert.rejects(h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'long' }] }), /nope/);
+
+  const rolled = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint })) as { success: boolean };
+  assert.equal(rolled.success, true);
+  assert.deepEqual(h.adapter.deleted, ['61']);
+  await h.close();
 });
 
 test('messaging tools mint checkpoints the host can roll back to; publishes and tool sends after it are deleted; acknowledge reacts; streaming terminators are inert', async () => {
