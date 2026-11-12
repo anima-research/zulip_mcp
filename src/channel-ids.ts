@@ -11,6 +11,10 @@ const PREFIX = 'zulip:';
 export class ChannelIds {
   private heldByKey = new Map<ChannelKey, string>();
   private keyByHeld = new Map<string, ChannelKey>();
+  /** Keys that a change the host didn't answer named. */
+  private unsettled = new Set<ChannelKey>();
+  /** Ids that a change the host didn't answer added, which no key holds. */
+  private doubtful = new Set<string>();
 
   /**
    * @param refreshStreams reads the stream list once, adding only what the
@@ -46,14 +50,31 @@ export class ChannelIds {
     return this.heldByKey.get(key);
   }
 
-  /** Keys whose id at the host differs from the id they would be told now. */
+  /** Keys whose id at the host differs from the id they would be told now, or that a change the host didn't answer named. */
   stale(): { key: ChannelKey; held: string; fresh: string | null }[] {
     const out: { key: ChannelKey; held: string; fresh: string | null }[] = [];
     for (const [key, held] of this.heldByKey) {
       const fresh = this.freshIdOf(key);
-      if (fresh !== held) out.push({ key, held, fresh });
+      if (fresh !== held || this.unsettled.has(key)) out.push({ key, held, fresh });
     }
     return out;
+  }
+
+  /** Ids that a change the host didn't answer added and that no key holds now. The host may hold each or not. */
+  inDoubt(): string[] {
+    return [...this.doubtful];
+  }
+
+  /** The host didn't answer a change that named these keys and added these ids. */
+  unanswered(keys: ChannelKey[], added: string[]): void {
+    for (const key of keys) this.unsettled.add(key);
+    for (const id of added) if (!this.keyByHeld.has(id)) this.doubtful.add(id);
+  }
+
+  /** The host answered a change that named these keys and removed these ids. */
+  answered(keys: ChannelKey[], removed: string[]): void {
+    for (const key of keys) this.unsettled.delete(key);
+    for (const id of removed) this.doubtful.delete(id);
   }
 
   /** The host was told this id for this key. The first id told stands until `move`. */
@@ -61,6 +82,7 @@ export class ChannelIds {
     if (this.heldByKey.has(key) || this.keyByHeld.has(channelId)) return;
     this.heldByKey.set(key, channelId);
     this.keyByHeld.set(channelId, key);
+    this.doubtful.delete(channelId);
   }
 
   /** The host now holds `channelId` for this key in place of the old one. */
@@ -71,6 +93,7 @@ export class ChannelIds {
     if (other !== undefined && other !== key) this.heldByKey.delete(other);
     this.heldByKey.set(key, channelId);
     this.keyByHeld.set(channelId, key);
+    this.doubtful.delete(channelId);
   }
 
   /** The host no longer holds this id. */
@@ -84,6 +107,8 @@ export class ChannelIds {
   reset(): void {
     this.heldByKey.clear();
     this.keyByHeld.clear();
+    this.unsettled.clear();
+    this.doubtful.clear();
   }
 
   /** The key a descriptor this server built stands for. */

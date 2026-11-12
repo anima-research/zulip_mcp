@@ -305,13 +305,19 @@ once before it fails. Only a channel none of these can find answers
 current name, so a rename changes it. When Zulip renames a stream, the host
 gets one `channels/changed` that removes `zulip:<old name>` and adds
 `zulip:<new name>`, and an agent that has the channel open gets one line
-naming both. Until the host answers, the old id is still the stream's id.
-The watermark, the missed tally and the filters entries carry to the new
-name. After that, a request for the old id is refused, and the refusal
-names the new id. A stream that was open at last sight and was renamed
-while the server was down gets one push from its new channel when a host
-next connects. An archived stream, or one the bot lost access to, is
-removed at the host the same way, with nothing added.
+naming both. Renames and removals waiting together go in one
+`channels/changed`, so two streams can swap names. Until the host answers,
+the old id is still the stream's id. A rename the host doesn't answer is
+offered again, and the server can't tell whether the host applied it, so
+the next `channels/changed` also removes each id the unanswered one added,
+unless a stream holds that id now. The watermark, the missed tally and
+the filters entries carry to the new name. Once the host answers, a request
+for the old id is refused, and the refusal names the new id, unless another
+stream has taken the old name, as in a swap. A stream that was open
+at last sight and was renamed while the server was down gets one push from
+its new channel when a host next connects. An archived stream, or one the
+bot lost access to, is removed at the host the same way, with nothing
+added.
 
 A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit

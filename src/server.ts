@@ -1511,10 +1511,10 @@ export class ZulipMcplServer {
    */
   private onDirectoryChange(change: DirectoryChange): void {
     if (!this.mcplActive) return;
+    this.rewriteFilters(change.renamed);
     for (const { id, from, to } of change.renamed) {
       const key = streamKey(id);
       console.error(`[zulip-mcp] Zulip stream ${id} was renamed #${from} -> #${to} (zulip:${from} -> zulip:${to})`);
-      this.rewriteFilters(from, to);
       if (this.ids.heldIdOf(key) === undefined && this.delivery.wasOpen(key)) {
         const earlier = this.renamedUnannounced.get(key);
         this.renamedUnannounced.set(key, { from: earlier?.from ?? from, to });
@@ -1539,21 +1539,27 @@ export class ZulipMcplServer {
     }
   }
 
-  /** Each filters entry that held the old name, or the old channel id, holds the new one. */
-  private rewriteFilters(from: string, to: string): void {
-    if (!this.filters) return;
-    const swap = (list: string[] | undefined, a: string, b: string) => (list?.includes(a) ? list.map((x) => (x === a ? b : x)) : list);
+  /** Each filters entry that held a renamed stream's old name, or its old channel id, holds the new one: all of one change at once. */
+  private rewriteFilters(renamed: { from: string; to: string }[]): void {
+    if (!this.filters || renamed.length === 0) return;
+    const names = new Map(renamed.map(({ from, to }) => [from, to]));
+    const ids = new Map(renamed.map(({ from, to }) => [`zulip:${from}`, `zulip:${to}`]));
+    const mapped = (list: string[] | undefined, map: Map<string, string>) => list?.map((x) => map.get(x) ?? x);
+    this.filters.tick();
     const f = this.filters.current();
-    const touched = f.streams?.includes(from) || f.mutedStreams?.includes(from) || f.reactionChannels?.includes(`zulip:${from}`);
-    if (!touched) return;
+    const held = new Set([...(f.streams ?? []), ...(f.mutedStreams ?? []), ...(f.reactionChannels ?? [])]);
+    const touched = renamed.filter(({ from }) => held.has(from) || held.has(`zulip:${from}`));
+    if (touched.length === 0) return;
     const result = this.filters.update((cur) => ({
       ...cur,
-      ...(cur.streams ? { streams: swap(cur.streams, from, to) } : {}),
-      ...(cur.mutedStreams ? { mutedStreams: swap(cur.mutedStreams, from, to) } : {}),
-      ...(cur.reactionChannels ? { reactionChannels: swap(cur.reactionChannels, `zulip:${from}`, `zulip:${to}`) } : {}),
+      ...(cur.streams ? { streams: mapped(cur.streams, names) } : {}),
+      ...(cur.mutedStreams ? { mutedStreams: mapped(cur.mutedStreams, names) } : {}),
+      ...(cur.reactionChannels ? { reactionChannels: mapped(cur.reactionChannels, ids) } : {}),
     }));
-    if (result.ok) console.error(`[zulip-mcp] filters: #${from} is now #${to}`);
-    else console.error(`[zulip-mcp] filters: could not rewrite #${from} as #${to} (${result.reason}); the old name now matches no stream`);
+    for (const { from, to } of touched) {
+      if (result.ok) console.error(`[zulip-mcp] filters: #${from} is now #${to}`);
+      else console.error(`[zulip-mcp] filters: could not rewrite #${from} as #${to} (${result.reason}); the old name now matches no stream`);
+    }
   }
 
   /**
@@ -1570,10 +1576,7 @@ export class ZulipMcplServer {
     try {
       do {
         this.reconcileAgain = false;
-        for (const { key, held, fresh } of this.ids.stale()) {
-          if (fresh !== null) await this.renameAtHost(key, held, fresh);
-          else if (streamIdOfKey(key) !== null) await this.removeAtHost(key, held);
-        }
+        await this.changeAtHost();
       } while (this.reconcileAgain);
     } catch (err) {
       console.error('[zulip-mcp] bringing the host\'s channel ids to the stream names failed:', (err as Error).message);
@@ -1583,46 +1586,72 @@ export class ZulipMcplServer {
   }
 
   /**
-   * One rename at the host. Until the host's answer lands, the old id is the
-   * stream's id: everything that leaves for the host about the stream bears
-   * it, and a request that names it is served.
+   * One pass at the host for every key whose id there is stale: a line to
+   * each open channel, then one `channels/changed` that removes every held id
+   * and adds every new descriptor. Until the host's answer lands, each old id
+   * is still its stream's id, and a request that names it is served.
    */
-  private async renameAtHost(key: ChannelKey, held: string, fresh: string): Promise<void> {
-    const streamId = streamIdOfKey(key);
-    if (streamId === null) return;
-    const [descriptor] = (await this.adapter.describeChannels?.([key])) ?? [];
-    if (!descriptor || descriptor.id !== fresh) return;
-    const from = held.slice('zulip:'.length);
-    const to = fresh.slice('zulip:'.length);
-    if (this.channelManager.isOpen(held)) {
+  private async changeAtHost(): Promise<void> {
+    const renames: { key: ChannelKey; held: string; fresh: string; descriptor: ChannelDescriptor }[] = [];
+    const removals: { key: ChannelKey; held: string }[] = [];
+    for (const { key, held, fresh } of this.ids.stale()) {
+      if (streamIdOfKey(key) === null) continue;
+      if (fresh === null) {
+        removals.push({ key, held });
+        continue;
+      }
+      const [descriptor] = (await this.adapter.describeChannels?.([key])) ?? [];
+      if (descriptor && descriptor.id === fresh) renames.push({ key, held, fresh, descriptor });
+    }
+    if (renames.length === 0 && removals.length === 0 && this.ids.inDoubt().length === 0) return;
+    let told = false;
+    for (const { key, held, fresh } of renames) {
+      if (held === fresh || !this.channelManager.isOpen(held)) continue;
+      const from = held.slice('zulip:'.length);
       this.channelManager.notifyChannel(key,
-        `Zulip stream #${from} was renamed #${to}. Its channel is now ${fresh}, and ${held} is gone. ` +
+        `Zulip stream #${from} was renamed #${fresh.slice('zulip:'.length)}. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
           `Open ${fresh} to keep hearing it, unless it is already open. What you had read stays read.`,
         { kind: 'stream-renamed', from: held, to: fresh });
-      await this.channelManager.flush();
+      told = true;
     }
-    const answer = await this.channelManager.announceReplacement(held, descriptor, this.announceTimeoutMs);
+    for (const { key, held } of removals) {
+      if (!this.channelManager.isOpen(held)) continue;
+      this.channelManager.notifyChannel(key,
+        `Zulip stream #${held.slice('zulip:'.length)} was archived, or this bot lost access to it. This channel is gone.`,
+        { kind: 'stream-removed', channelId: held });
+      told = true;
+    }
+    if (told) await this.channelManager.flush();
+    const removed = [...renames, ...removals].map(({ held }) => held);
+    const openBefore = new Set(removed.filter((id) => this.channelManager.isOpen(id)));
+    const answer = await this.channelManager.announceChanges(removed, renames.map(({ descriptor }) => descriptor), this.announceTimeoutMs);
     if (answer === 'unanswered') return;
-    const wasOpen = this.channelManager.retireId(held);
-    if (answer === 'answered') this.ids.move(key, fresh);
-    if (wasOpen && !this.channelManager.isKeyOpen(key)) this.delivery.markClosed(key);
+    const added = new Set(renames.map(({ fresh }) => fresh));
+    const wasOpen = new Map<ChannelKey, boolean>();
+    for (const { key, held } of [...renames, ...removals]) {
+      if (added.has(held)) {
+        wasOpen.set(key, openBefore.has(held));
+        this.ids.forget(held);
+      } else {
+        wasOpen.set(key, this.channelManager.retireId(held));
+      }
+    }
+    for (const { key, held, fresh } of renames) {
+      const verdict = answer.get(fresh);
+      if (verdict === 'accepted') this.ids.move(key, fresh);
+      if (wasOpen.get(key) && !this.channelManager.isKeyOpen(key)) this.delivery.markClosed(key);
+      console.error(`[zulip-mcp] stream ${streamIdOfKey(key)}: the host ${verdict === 'accepted' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
+    }
+    for (const { key, held } of removals) console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
     this.delivery.save();
-    console.error(`[zulip-mcp] stream ${streamId}: the host ${answer === 'answered' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
   }
 
-  /** A stream that is gone (archived, or the bot lost access): the same steps as a rename, with nothing added. */
-  private async removeAtHost(key: ChannelKey, held: string): Promise<void> {
-    const name = held.slice('zulip:'.length);
-    if (this.channelManager.isOpen(held)) {
-      this.channelManager.notifyChannel(key,
-        `Zulip stream #${name} was archived, or this bot lost access to it. This channel is gone.`,
-        { kind: 'stream-removed', channelId: held });
-      await this.channelManager.flush();
-    }
-    if (await this.channelManager.announceRemoval(held, this.announceTimeoutMs) === 'unanswered') return;
-    this.channelManager.retireId(held);
-    this.delivery.save();
-    console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+  /** What a renamed stream's old channel id is now: gone, or another stream's, which took the old name. */
+  private oldIdNow(key: ChannelKey, oldName: string): string {
+    const holder = this.directory.idOf(oldName);
+    return holder !== undefined && holder !== streamIdOfKey(key)
+      ? `zulip:${oldName} now belongs to another stream, which took the name #${oldName}`
+      : `zulip:${oldName} is gone`;
   }
 
   /**
@@ -1636,7 +1665,7 @@ export class ZulipMcplServer {
       if (!this.delivery.wasOpen(key)) continue;
       const fresh = this.ids.channelIdOf(key);
       if (fresh === null) continue;
-      const text = `Zulip stream #${from} was renamed #${to} while this server was down. Its channel is now ${fresh}, and zulip:${from} is gone. ` +
+      const text = `Zulip stream #${from} was renamed #${to} while this server was down. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
         `Open ${fresh} to keep hearing it. What you had read stays read.`;
       const pushed = await this.pushEvent({
         key,

@@ -307,49 +307,55 @@ export class ChannelManager {
   }
 
   /**
-   * Tell the host that a channel id is replaced by another: one
-   * `channels/changed` with the old id under `removed` and the new
-   * descriptor under `added`. The new descriptor is recorded here before it
-   * goes out; the key keeps the old id until the caller applies the answer.
-   * Resolves 'answered' or 'refused' once the host has answered, and
-   * 'unanswered' when it hasn't.
+   * One `channels/changed` with `removed` and `added` together. It also
+   * removes each id that an unanswered change added and no key holds now,
+   * unless it adds that id again. Each added descriptor is recorded here
+   * before it goes out, and an added id that is also removed is closed
+   * first, so the host's state for it is the new stream's. Each key keeps
+   * its old id until the caller applies the answer. Resolves each added id's
+   * verdict once the host has answered, and 'unanswered' when it hasn't,
+   * with what was recorded put back.
    */
-  async announceReplacement(oldId: string, descriptor: ChannelDescriptor, timeoutMs?: number): Promise<'answered' | 'refused' | 'unanswered'> {
+  async announceChanges(removed: string[], added: ChannelDescriptor[], timeoutMs?: number): Promise<Map<string, 'accepted' | 'refused'> | 'unanswered'> {
     if (!this.grant.has('channels.register')) return 'unanswered';
-    if (this.announcing.has(descriptor.id)) return 'unanswered';
-    this.allChannels.set(descriptor.id, descriptor);
-    this.announcing.add(descriptor.id);
+    if (added.some((d) => this.announcing.has(d.id))) return 'unanswered';
+    const addedIds = added.map((d) => d.id);
+    const doubtful = this.ids.inDoubt().filter((id) => !addedIds.includes(id));
+    const keys = removed.map((id) => this.ids.holderOf(id)).filter((key): key is ChannelKey => key !== undefined);
+    const before = added.map((d) => ({ id: d.id, descriptor: this.allChannels.get(d.id), open: this.openChannels.has(d.id) }));
+    for (const d of added) {
+      this.allChannels.set(d.id, d);
+      if (removed.includes(d.id)) this.openChannels.delete(d.id);
+      this.announcing.add(d.id);
+    }
     try {
-      const result = await this.host.channelsChanged({ removed: [oldId], added: [descriptor] }, timeoutMs);
-      if (this.readVerdicts(result, [descriptor]).get(descriptor.id) === 'refused') {
-        this.refused.add(descriptor.id);
-        this.allChannels.delete(descriptor.id);
-        this.openChannels.delete(descriptor.id);
-        return 'refused';
+      const result = await this.host.channelsChanged({ removed: [...removed, ...doubtful], added }, timeoutMs);
+      this.ids.answered(keys, doubtful);
+      const verdicts = this.readVerdicts(result, added);
+      const out = new Map<string, 'accepted' | 'refused'>();
+      for (const d of added) {
+        if (verdicts.get(d.id) === 'refused') {
+          this.refused.add(d.id);
+          this.allChannels.delete(d.id);
+          this.openChannels.delete(d.id);
+          out.set(d.id, 'refused');
+        } else {
+          this.refused.delete(d.id);
+          out.set(d.id, 'accepted');
+        }
       }
-      this.refused.delete(descriptor.id);
-      return 'answered';
+      return out;
     } catch (error) {
-      console.error(`[channels] replacing ${oldId} with ${descriptor.id} got no answer (${(error as Error).message}); offered again at the next pass`);
+      console.error(`[channels] changing ${removed.join(', ') || 'nothing'} for ${added.map((d) => d.id).join(', ') || 'nothing'} got no answer (${(error as Error).message}); offered again at the next pass`);
+      for (const { id, descriptor, open } of before) {
+        if (descriptor) this.allChannels.set(id, descriptor);
+        else this.allChannels.delete(id);
+        if (open) this.openChannels.add(id);
+      }
+      this.ids.unanswered(keys, addedIds);
       return 'unanswered';
     } finally {
-      this.announcing.delete(descriptor.id);
-    }
-  }
-
-  /**
-   * One `channels/changed` with this id under `removed` and nothing added:
-   * the stream behind it is gone. Resolves 'answered' once the host has
-   * answered, and 'unanswered' when it hasn't.
-   */
-  async announceRemoval(oldId: string, timeoutMs?: number): Promise<'answered' | 'unanswered'> {
-    if (!this.grant.has('channels.register')) return 'unanswered';
-    try {
-      await this.host.channelsChanged({ removed: [oldId], added: [] }, timeoutMs);
-      return 'answered';
-    } catch (error) {
-      console.error(`[channels] removing ${oldId} got no answer (${(error as Error).message}); offered again at the next pass`);
-      return 'unanswered';
+      for (const d of added) this.announcing.delete(d.id);
     }
   }
 

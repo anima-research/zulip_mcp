@@ -77,7 +77,7 @@ export class StreamDirectory {
     return [...this.byId.keys()];
   }
 
-  /** True once a queue registration's list has filled it. */
+  /** True once a stream list has filled it: a queue registration's, or a list read before any registration. */
   get isFilled(): boolean {
     return this.filled;
   }
@@ -126,7 +126,16 @@ export class StreamDirectory {
     for (const entry of entries(list)) if (this.admissible(entry.name)) wanted.set(entry.stream_id, entry.name);
     const change = emptyChange();
     for (const id of [...this.byId.keys()]) if (!wanted.has(id)) this.remove(id, change);
-    for (const [id, name] of wanted) this.setName(id, name, change);
+    for (const [id, name] of wanted) {
+      const previous = this.byId.get(id);
+      if (previous === undefined) change.added.push({ id, name });
+      else if (previous !== name) {
+        change.renamed.push({ id, from: previous, to: name });
+        this.former.set(previous, id);
+      }
+    }
+    this.byId = wanted;
+    this.byName = new Map([...wanted].map(([id, name]) => [name, id]));
     this.dropShadowedFormerNames();
     const wasFilled = this.filled;
     this.filled = true;
