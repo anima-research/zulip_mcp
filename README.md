@@ -533,9 +533,10 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
-- **Every Zulip call has a bound:** 15 s, and 90 s for the event long poll.
+- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll.
   A call that reaches it is ended and fails. A send, an edit or a delete that
   may have reached Zulip without an answer fails with an error saying so.
+  File uploads and `fetch_attachment`'s download have no bound yet.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

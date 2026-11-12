@@ -79,7 +79,8 @@ export function zulipApi(transport: Transport): ZulipApi {
   const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions): Promise<unknown> => {
     const { status, body } = await transport(method, path, params, opts);
     if (method !== 'GET' && status >= 500 && isRefusal(body)) {
-      return { ...body, msg: `${body.msg ?? body.code ?? 'unknown error'}. ${WRITE_MAY_HAVE_BEEN_APPLIED}` };
+      const text = body.msg ?? body.code ?? 'unknown error';
+      return { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` };
     }
     return body;
   };

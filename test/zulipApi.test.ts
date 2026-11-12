@@ -1,11 +1,3 @@
-/**
- * The server's Zulip calls over HTTP, against a local server that records
- * each request: what goes in the URL and in the body, the bound on a call,
- * and what an error says when Zulip gives no JSON answer.
- *
- * Run: node --import tsx --test test/zulipApi.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -31,7 +23,6 @@ type Answer =
   | { html: string; status: number }
   | 'hang';
 
-/** A local stand-in for a realm: answers by "METHOD /path" below /api/v1, and records every request. */
 async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>) {
   const requests: Recorded[] = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -57,7 +48,6 @@ async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ result: 'error', msg: `no stand-in for ${recorded.method} ${path}` }));
       } else if (answer === 'hang') {
-        // Never answers: the client's bound has to end it.
       } else if ('html' in answer) {
         res.statusCode = answer.status;
         res.setHeader('content-type', 'text/html');
@@ -84,7 +74,6 @@ const defaults: Record<string, Answer> = {
   'GET /server_settings': { json: { result: 'success', max_file_upload_size_mib: 25 } },
 };
 
-/** The session as the server builds it, from the environment, and the tool runtime on it. */
 async function serverOn(realmUrl: string, env: Record<string, string> = {}, options: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
   const original = console.error;
@@ -164,6 +153,26 @@ test('an answer that is not JSON names its status, and for a send says it may ha
         return true;
       },
     );
+  } finally { s.done(); z.close(); }
+});
+
+test('a JSON refusal with a server status says once, on a write, that it may have been applied, and reaches a read as Zulip gave it', async () => {
+  const z = await realm({
+    'POST /messages': { json: { result: 'error', msg: 'Internal server error.' }, status: 500 },
+    'PATCH /messages/55': { json: { result: 'error', msg: 'Busy' }, status: 503 },
+    'GET /streams': { json: { result: 'error', msg: 'Internal server error.' }, status: 500 },
+  });
+  const s = await serverOn(z.url);
+  try {
+    await assert.rejects(
+      s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
+      /Internal server error\. Zulip answered with a server error, so the request may have been applied: check before sending it again\./,
+    );
+    await assert.rejects(
+      s.tools.handleToolCall('edit_message', { message_id: 55, content: 'x' }),
+      /Busy\. Zulip answered with a server error, so the request may have been applied/,
+    );
+    assert.deepEqual(await s.session.api.requestAnswer('GET', '/streams'), { result: 'error', msg: 'Internal server error.' });
   } finally { s.done(); z.close(); }
 });
 
