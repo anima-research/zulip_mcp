@@ -7,6 +7,7 @@ import type { ZulipRawMessage } from '../src/history.ts';
 import { standInApi } from './zulip-stand-in.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type ChannelKey } from '../src/channel-key.ts';
+import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
 // individual cases (including the multi-adapter saturation regression).
@@ -691,7 +692,7 @@ for (const failure of ['rejecting promise', 'RATE_LIMIT_HIT', 'non-JSON response
       'GET /messages/:id': async () => {
         if (++gets === 1) {
           if (failure === 'rejecting promise') throw new Error('ECONNRESET');
-          if (failure === 'non-JSON response') throw new SyntaxError('Unexpected token <');
+          if (failure === 'non-JSON response') throw new ZulipNoAnswer('not-json', 'GET', `/messages/${QUOTED}`, false, `Zulip's answer to GET /messages/${QUOTED} wasn't JSON (HTTP 502).`, 502);
           return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'Too many requests' };
         }
         return { message: raw(QUOTED, 'original', { sender_id: SELF }) };

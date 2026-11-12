@@ -1,11 +1,3 @@
-/**
- * History — the one message shape every reader shares, the RFC-001 tags it
- * carries, and the cursor semantics of the fetch helpers against a stand-in
- * for Zulip's API.
- *
- * Run: node --import tsx --test test/history.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -113,7 +105,6 @@ test('toIncoming renders the incoming shape, with the attachment note as a secon
   assert.equal((anon.metadata as Record<string, unknown>).botUserId, 'sess');
 });
 
-/** A stand-in for Zulip's API that records the query and answers with a fixed page. */
 function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}) {
   const calls: Record<string, unknown>[] = [];
   const byId: Record<string, unknown>[] = [];
