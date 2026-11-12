@@ -15,7 +15,6 @@ import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewO
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type KeyedMessage } from '../src/channel-key.ts';
 
-/** A stream directory that knows these streams, as a queue registration would fill it. */
 function directoryOf(streams: Record<number, string> = {}): StreamDirectory {
   const directory = new StreamDirectory();
   directory.registration(Object.entries(streams).map(([id, name]) => ({ stream_id: Number(id), name })));

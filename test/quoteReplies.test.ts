@@ -20,7 +20,6 @@ beforeEach(() => {
 const SELF = 100;
 const STREAMS = [{ stream_id: 1, name: 'general' }];
 
-/** The streams the history tests read, numbered as Zulip numbers them. */
 const KNOWN = [
   ...STREAMS,
   { stream_id: 2, name: 'other' },
@@ -34,7 +33,6 @@ function knownStreams(): StreamDirectory {
   return directory;
 }
 
-/** The key the server keeps for a channel id these tests name. */
 function key(channelId: string): ChannelKey {
   const name = channelId.slice('zulip:'.length);
   if (name.startsWith('dm:')) return dmKey(name.slice(3).split('+').map(Number));

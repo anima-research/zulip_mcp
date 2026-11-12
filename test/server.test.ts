@@ -57,7 +57,6 @@ const DESCRIPTOR: ChannelDescriptor = {
   address: { stream_name: 'general', stream_id: 7 },
 };
 
-/** The streams a real ZulipAdapter reads as history here, under the ids the harness's descriptors give them. */
 const HISTORY_STREAMS = [{ stream_id: 7, name: 'general' }, { stream_id: 8, name: 'other' }];
 
 function historyStreams(): StreamDirectory {
@@ -66,19 +65,11 @@ function historyStreams(): StreamDirectory {
   return directory;
 }
 
-/** The stream name a history read narrows to (by id, in the object form). */
 function narrowedStream(narrow: unknown[]): string {
   const operand = (narrow[0] as { operand?: unknown }).operand;
   return HISTORY_STREAMS.find((st) => st.stream_id === operand)?.name ?? String(operand);
 }
 
-/**
- * The fake speaks the wire's vocabulary to the tests (channel ids, wire
- * messages) and the server's at the seam (keys): each callback converts. A
- * channel id becomes a key the way the server's own boundary does (an id
- * the host holds, else a DM's ids, else a stream name through the
- * directory), and a stream name no descriptor gave yet gets an id of its own.
- */
 interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   published: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[];
   typing: { channelId: string; op: string; metadata?: Record<string, unknown> }[];
@@ -99,7 +90,6 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   /** What discoverChannels answers now — a stream the bot joins later is pushed here. */
   visible: ChannelDescriptor[];
   startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction, onMessageChange?: OnMessageChange): void;
-  /** Set by the harness: the server whose boundary and directory the fake converts by. */
   bind(server: ZulipMcplServer): void;
   keyOf(channelId: string): ChannelKey;
   wireOf(key: ChannelKey): string;
@@ -135,7 +125,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     subscribeError: new Map(),
     pageCap: Infinity,
     visible: [DESCRIPTOR],
-    // As Zulip's queue registration answers: the streams the bot can see. Each list read after it only adds.
     bind(s: ZulipMcplServer) { server = s; s.directory.registration(streamList(adapter.visible)); },
     keyOf(channelId: string): ChannelKey {
       const dm = parseDmChannelId(channelId);
@@ -154,7 +143,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     wireOf(key: ChannelKey): string {
       return server!.ids.channelIdOf(key) ?? String(key);
     },
-    // The stream list read: what the bot can see now, which only adds once a queue has registered.
     async refreshStreams() { learn(adapter.visible); },
     async fetchHistory(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
       adapter.historyCalls.push({ channelId: adapter.wireOf(key), query });
@@ -191,7 +179,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       return { position: 'beforeUser' as const, content: 'recent history' };
     },
     startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction, onMessageChange?: OnMessageChange) {
-      // As each connection's queue registration answers: the streams the bot can see.
       directory().registration(streamList(adapter.visible));
       adapter.emit = (message, newChannel) => {
         if (newChannel) learn([newChannel]);
@@ -207,7 +194,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     },
     stopEvents() { adapter.emit = null; },
   } as unknown as FakeAdapter;
-  // A test may put its own discovery in place; what it answers is learned all the same.
   Object.defineProperty(adapter, 'discoverChannels', {
     get: () => async () => learn(await discover()),
     set: (fn: () => Promise<ChannelDescriptor[]>) => { discover = fn; },
@@ -222,7 +208,6 @@ function fakeAdapter(withTyping = true): FakeAdapter {
   return adapter;
 }
 
-/** Methods of the delivery state that answer with keys: the tests read channel ids. */
 const KEY_LISTS = new Set(['watermarkedChannels', 'heldChannels', 'lastOpenChannels', 'talliedChannels']);
 
 function byChannelId(delivery: ZulipMcplServer['delivery'], adapter: FakeAdapter): ZulipMcplServer['delivery'] {
@@ -267,7 +252,6 @@ const fakeTools = {
 
 interface Harness {
   server: ZulipMcplServer;
-  /** The server's delivery state, addressed by channel id as the tests write it: each id becomes the key the server keeps. */
   delivery: ZulipMcplServer['delivery'];
   adapter: FakeAdapter;
   host: McplConnection;
@@ -295,7 +279,6 @@ interface HarnessOptions {
   announceTimeoutMs?: number;
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
-  /** The streams the bot can see from the start: what Zulip's queue registration answers with. */
   visible?: ChannelDescriptor[];
 }
 

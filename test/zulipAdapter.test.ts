@@ -12,7 +12,6 @@ import { ZulipNoAnswer } from '../src/zulip-api.ts';
 const SELF = 790;
 const GENERAL = streamKey(7);
 
-/** A stream directory that knows these streams, as a queue registration fills it. */
 function directoryOf(streams: Record<number, string> = { 7: 'general' }): StreamDirectory {
   const directory = new StreamDirectory();
   directory.registration(Object.entries(streams).map(([id, name]) => ({ stream_id: Number(id), name })));
@@ -157,7 +156,6 @@ test('publish uploads image blocks and links them after the text; without an upl
   assert.equal(sends[2].content, 'chart attached');
   assert.equal((await plain.publish(GENERAL, undefined, [blocks[1]])).delivered, false);
 
-  // A name the directory does not hold goes to Zulip by the name, as given.
   await plain.publish({ streamName: 'elsewhere' }, undefined, [blocks[0]]);
   assert.deepEqual(sends[3], { type: 'stream', to: 'elsewhere', topic: 'mcpl', content: 'chart attached' });
 });
@@ -511,12 +509,10 @@ test('a message from a stream created after startup carries its descriptor, with
     { id: 4, type: 'message', flags: [], message: raw(12, { display_recipient: 'late-stream', stream_id: 9 }) },
     // Outside the allowlist: filtered before any descriptor is made.
     { id: 5, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
-    // After it, so its arrival shows #secret's message was handled.
     { id: 6, type: 'message', flags: [], message: raw(14) },
   ];
   let polls = 0;
   const client = standInApi({
-    // #secret is in the list, so only the allowlist keeps its message out.
     'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 2 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),

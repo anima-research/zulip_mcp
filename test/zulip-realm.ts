@@ -2,46 +2,29 @@ import type { ZulipApi } from '../src/zulip-api.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
 
 /**
- * A stand-in for one Zulip realm with state: streams that can be renamed,
- * archived and created, the messages in them, and an event queue that
- * hears each change in order, as Zulip 12.4's API describes them. Messages
- * carry their stream's current name, as Zulip's `display_recipient` does,
- * and a stream list comes sorted by name, as Zulip 12.4's does.
+ * Messages carry their stream's current name, as Zulip's `display_recipient`
+ * does, and a stream list comes sorted by name, as Zulip 12.4's does.
  */
 export interface Realm {
   api: ZulipApi;
   calls: StandInCall[];
   streams: Map<number, string>;
-  /** Names the subscribe call created, in order. */
   created: string[];
-  /** Names the subscribe call was given, in order. */
   subscribed: string[];
-  /** What `POST /messages` was asked to send, in order, refused or not. */
   sends: Record<string, unknown>[];
-  /** What `GET /messages` was asked for, in order. */
   reads: Record<string, unknown>[];
-  /** One answer for the next `GET /streams`, read before a change it doesn't show. */
   staleList: Record<number, string> | null;
-  /** How many of the next `GET /streams` Zulip refuses. */
   listRefusals: number;
-  /** How many queue registrations Zulip has answered. */
   registrations: number;
-  /** Hold every answer to this call until the returned function is called. */
   hold(call: 'POST /register' | 'GET /streams'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   /** The bot sees a stream again, under the same id, as Zulip tells a client that regains access to one. */
   regain(streamId: number, name: string): void;
   create(name: string): number;
-  /**
-   * The bot's event queue is lost while `during` changes the realm: nothing
-   * `during` does reaches a queue, and the next poll is refused with
-   * BAD_EVENT_QUEUE_ID, as Zulip refuses a poll of a queue it has dropped.
-   */
+  /** The next poll is refused with BAD_EVENT_QUEUE_ID, as Zulip refuses a poll of a queue it has dropped. */
   gap(during: () => void): void;
-  /** A message from someone else; returns its id. */
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean }): number;
-  /** Someone else adds a reaction to a message. */
   react(messageId: number, emoji: string): void;
 }
 
