@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -33,7 +33,6 @@ const GRANT = [
 ];
 
 test('end to end: a second user\'s message reaches the host, and the host\'s plain answer lands in its topic', async () => {
-  assert.ok(existsSync(BIN), `${BIN} is missing; npm run build makes it`);
   const stream = await newStream(env, 'e2e');
   const topic = 'the question';
   const botId = await bot.myId();
@@ -99,7 +98,10 @@ test('end to end: a second user\'s message reaches the host, and the host\'s pla
   } finally {
     child.stdin.end();
     const code = await Promise.race([exited, new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 10_000))]);
-    if (code === 'timeout') child.kill();
+    if (code === 'timeout') {
+      child.kill('SIGKILL');
+      await exited;
+    }
     host.close();
     rmSync(stateDir, { recursive: true, force: true });
   }

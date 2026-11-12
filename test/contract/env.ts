@@ -13,6 +13,9 @@ export function contractEnv(env: NodeJS.ProcessEnv = process.env): ContractEnv {
       `the contract suite needs a Zulip realm and two accounts; set ${missing.join(', ')} (scripts/contract-zulip.sh prints them)`,
     );
   }
+  for (const name of Object.keys(env)) {
+    if (/^(ZULIP_|MCPL_|AGENT_)/.test(name) && !(REQUIRED as readonly string[]).includes(name)) delete env[name];
+  }
   return {
     realm: env.ZULIP_REALM!.replace(/\/+$/, ''),
     bot: { email: env.ZULIP_EMAIL!, apiKey: env.ZULIP_API_KEY! },

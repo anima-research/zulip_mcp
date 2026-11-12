@@ -114,8 +114,8 @@ test('Zulip itself: a stream message with no topic parameter is refused, and one
 
 test('with empty topics disabled: the server\'s send path still lands in "undefined", and Zulip refuses both no topic and an empty one', async (t) => {
   const before = await topicsPolicy();
-  await user.ok('PATCH', 'realm', { topics_policy: 'disable_empty_topic' });
   try {
+    await user.ok('PATCH', 'realm', { topics_policy: 'disable_empty_topic' });
     t.diagnostic(`realm_topics_policy: ${await topicsPolicy()}`);
     const stream = await newStream(env, 'notopic-required');
     const sent = (await tools.handleToolCall('send_message', { type: 'stream', to: stream, content: 'no topic given' })) as { id: number };
