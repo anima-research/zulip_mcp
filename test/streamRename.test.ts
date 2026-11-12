@@ -1118,3 +1118,34 @@ scenario('43. with MCPL, the tools that write the filters refuse a former name w
     assert.deepEqual((readJson(dir, 'filters.json') as { mutedStreams?: string[] }).mutedStreams?.sort(), ['lobby', 'nowhere']);
   } finally { await run.close(); }
 });
+
+scenario('44. without MCPL, mute_channel by a former name that the state file knows is written as given, as on main', async (dir) => {
+  const r = realm({ 17: 'general' });
+  await savedAsGeneral(r, dir);
+  r.rename(17, 'lobby');
+  const run = await start(r, dir, { mcpl: false });
+  try {
+    await until(() => run.directory?.isFilled === true, 'the start\'s read of the stream list');
+    const answer = await run.tool('mute_channel', { channel: 'general' });
+    assert.equal(answer.isError, false, answer.text);
+    assert.deepEqual((readJson(dir, 'filters.json') as { mutedStreams?: string[] }).mutedStreams, ['general']);
+  } finally { await run.close(); }
+});
+
+scenario('45. one process: a host that leaves while a rename waits for its answer ends that pass as it goes, and the next host is offered the new id', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const first = await start(r, dir, { holdChanged: true });
+  try {
+    await first.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => first.changed.some((c) => c.removed?.includes('zulip:general')), 'the rename offered to the first host');
+  } finally { await first.end(); }
+  assert.ok(first.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer')), 'the pass ended before the connection was done');
+  assert.equal((first.server as unknown as { reconciling: boolean }).reconciling, false);
+  const second = await start(r, dir, { reuse: first });
+  try {
+    const listed = (await second.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
+    assert.ok(listed.channels.some((c) => c.id === 'zulip:lobby'));
+    assert.ok(!listed.channels.some((c) => c.id === 'zulip:general'));
+  } finally { await second.close(); }
+});

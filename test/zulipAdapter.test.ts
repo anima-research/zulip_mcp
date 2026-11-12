@@ -610,3 +610,29 @@ test('a stream the directory does not hold costs one list read for that stream, 
   // within the minute: no read.
   assert.equal(listCalls, 4);
 });
+
+test('a miss while a read of the stream list is in flight waits for that read', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const first = adapter.refreshStreams('stream 11');
+  let secondDone = false;
+  const second = adapter.refreshStreams('#north').then(() => { secondDone = true; });
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(secondDone, false, 'the second miss waits for the read in flight');
+  release!();
+  await Promise.all([first, second]);
+  assert.equal(directory.nameOf(11), 'north');
+  assert.equal(listCalls, 1);
+});
+
