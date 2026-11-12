@@ -149,6 +149,12 @@ function blocks(lines: string[]): number[][] {
   return out;
 }
 
+/** Zulip 12.4's HashHeaderProcessor.RE (zerver/lib/markdown/__init__.py), for one line. */
+const HEADING = /^#{1,6}\s/;
+/** Python-Markdown 3.10.3's HRProcessor.RE (markdown/blockprocessors.py). */
+const RULE = /^[ ]{0,3}(?=((?:-+[ ]{0,2}){3,}|(?:_+[ ]{0,2}){3,}|(?:\*+[ ]{0,2}){3,}))\1[ ]*$/;
+const CODE = /^ {4}/;
+
 /**
  * Puts one blank line above the header row of each table that sits directly
  * under a line of text, where Zulip's parser shows no table, and changes
@@ -158,18 +164,39 @@ export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
   const above = new Set<number>();
-  for (const block of blocks(lines)) {
+  // In the order Zulip's block processors take a block: an indented start
+  // (code), a heading, a table, a rule; what none of them takes is a
+  // paragraph, a list or a quote.
+  const walk = (block: number[]): void => {
+    if (block.length === 0) return;
     const rows = block.map((i) => lines[i]!);
-    if (!/^ {4}/.test(rows[0]!) && isTable(rows)) continue;
+    if (CODE.test(rows[0]!)) {
+      const rest = rows.findIndex((row) => !CODE.test(row));
+      if (rest !== -1) walk(block.slice(rest));
+      return;
+    }
+    const heading = rows.findIndex((row) => HEADING.test(row));
+    if (heading !== -1) {
+      walk(block.slice(0, heading));
+      walk(block.slice(heading + 1));
+      return;
+    }
+    if (isTable(rows)) return;
+    const rule = rows.findIndex((row) => RULE.test(row));
+    if (rule !== -1) {
+      walk(block.slice(0, rule));
+      walk(block.slice(rule + 1));
+      return;
+    }
     for (let at = 1; at < rows.length; at += 1) {
-      if (LIST_OR_QUOTE.test(rows[at - 1]!)) break;
-      if (/^ {4}/.test(rows[at]!)) continue;
-      if (isTable(rows.slice(at))) {
+      if (LIST_OR_QUOTE.test(rows[at - 1]!)) return;
+      if (!CODE.test(rows[at]!) && isTable(rows.slice(at))) {
         above.add(block[at]!);
-        break;
+        return;
       }
     }
-  }
+  };
+  for (const block of blocks(lines)) walk(block);
   if (above.size === 0) return text;
   return raw.flatMap((line, i) => (above.has(i) ? ['', line] : [line])).join('\n');
 }
