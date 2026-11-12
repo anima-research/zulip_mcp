@@ -11,6 +11,7 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:contract": "node --import tsx test/contract/preflight.ts && node --import tsx --test --test-concurrency=1 --test-force-exit test/contract/*.test.ts",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepare": "npm run build"
   },
