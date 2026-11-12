@@ -67,6 +67,7 @@ interface Held {
   status: HeldStatus;
   /** A live replay from history has been attempted once already. */
   replayed: boolean;
+  replyVerified: boolean;
 }
 
 /** Ids held per channel before the newest ones stop being tracked. Far
@@ -285,7 +286,7 @@ export class DeliveryState {
 
   /** The message is on its way to the host, or was offered and is not accepted
    *  yet. An id at or below the watermark is already forwarded and is not held. */
-  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
+  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued', opts: { reply?: boolean } = {}): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
     let held = this.held.get(key);
@@ -296,13 +297,14 @@ export class DeliveryState {
     const existing = held.get(messageId);
     if (existing) {
       existing.status = status;
+      if (opts.reply) existing.replyVerified = true;
     } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
       // Keep the lowest ids: the floor protects everything above it anyway.
       console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
       return;
     } else {
       if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
-      held.set(messageId, { status, replayed: false });
+      held.set(messageId, { status, replayed: false, replyVerified: opts.reply === true });
     }
     if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
   }
@@ -379,6 +381,17 @@ export class DeliveryState {
       const h = held.get(id);
       if (h) h.replayed = true;
     }
+  }
+
+  /** The event path verified this held message as a reply to the bot, for a read from history that can't verify it. The verdict goes with the hold. */
+  verifiedReply(key: ChannelKey, messageId: number): boolean {
+    return this.held.get(key)?.get(messageId)?.replyVerified === true;
+  }
+
+  /** An edit took the quote out: the message is no longer a verified reply. */
+  forgetReply(key: ChannelKey, messageId: number): void {
+    const h = this.held.get(key)?.get(messageId);
+    if (h) h.replyVerified = false;
   }
 
   clearReplayed(key: ChannelKey): void {

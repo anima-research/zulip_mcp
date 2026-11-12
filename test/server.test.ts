@@ -3727,8 +3727,8 @@ test('a reply the event path verified, refused by the host, comes again as a rep
   try {
     await initialize(h, true);
     await settled(h);
-    h.adapter.emit!(streamMsg(1, { mentioned: true }));
-    await until(() => h.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    h.adapter.emit!(streamMsg(3, { mentioned: true }));
+    await until(() => h.delivery.watermark('zulip:general') === 3, 'acceptance above the quoted message, so a read from here leaves it off the page');
     const reply = (await quoteHistory().fetchHistory(streamKey(7), { limit: 100 })).messages[0];
     const unreadable = quoteHistory(false);
     h.adapter.fetchHistory = unreadable.fetchHistory.bind(unreadable);
@@ -3747,6 +3747,34 @@ test('a reply the event path verified, refused by the host, comes again as a rep
     assert.equal((again.origin as { isReplyToBot: boolean }).isReplyToBot, true);
     assert.match((again.payload.content[0] as { text: string }).text, /id=5\]/);
   } finally { await h.close(); }
+});
+
+test('a reply the event path verified, refused by the host, comes again as a reply after a reconnect when the lookup in its history fails', async () => {
+  const first = harness();
+  let second: Harness | undefined;
+  try {
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(3, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'acceptance above the quoted message, so a read from here leaves it off the page');
+    const reply = (await quoteHistory().fetchHistory(streamKey(7), { limit: 100 })).messages[0];
+    first.policy.rejectPushes.add('5');
+    first.adapter.emit!(reply);
+    await until(() => first.delivery.heldIds('zulip:general').includes(5), 'refused reply held');
+    await first.server.quiet();
+    await first.close();
+
+    const unreadable = quoteHistory(false);
+    first.adapter.fetchHistory = unreadable.fetchHistory.bind(unreadable);
+    second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(second.pushed.length, 1, 'offered again');
+    assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+    assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
+    assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=5\]/);
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
+  } finally { await (second ?? first).close(); }
 });
 
 for (const reconnect of [false, true]) {
@@ -3881,11 +3909,12 @@ for (const verified of [false, true]) {
   });
 }
 
-test('releasing a muted channel clears pending reply overlays before it is unmuted', async () => {
+test("a reply verdict goes with its hold when a mute lets the hold go: after the unmute, a reconnect's catch-up reads the message as history has it", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-pending-release-'));
   const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
   plane.start();
   const h = harness({ filters: plane });
+  let second: Harness | undefined;
   try {
     await initialize(h, true);
     await settled(h);
@@ -3896,10 +3925,19 @@ test('releasing a muted channel clears pending reply overlays before it is unmut
     await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply held');
     assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
     await until(() => h.delivery.heldIds('zulip:general').length === 0, 'muted channel released');
-    const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5) ?? false, false, 'the released verdict is gone before the unmute');
-  } finally {
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: [] })).ok, true);
+    await h.server.quiet();
     await h.close();
+
+    h.adapter.history = [streamMsg(5)];
+    second = harness({ reuse: { server: h.server, adapter: h.adapter } });
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(second.pushed.length, 0, 'history reads 5 as ambient, and nothing makes it a reply');
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
+  } finally {
+    await (second ?? h).close();
     plane.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -3920,8 +3958,7 @@ test('a reply missing from replay history releases both its hold and pending ver
     h.adapter.emit!(streamMsg(6));
     await until(() => h.delivery.watermark('zulip:general') === 6, 'missing reply released');
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
-    const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5) ?? false, false);
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
   } finally { await h.close(); }
 });
 
@@ -4134,13 +4171,12 @@ test('R2-7: closed-channel catch-up forgets a held reply missing from history', 
     }));
     await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply held');
     await h.server.quiet();
-    const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5), true);
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), true);
     h.adapter.history = [streamMsg(6)];
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 6, 'catch-up releases missing reply hold');
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5) ?? false, false);
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
   } finally { await h.close(); }
 });
 
@@ -4369,9 +4405,8 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
         assert.deepEqual(h.delivery.heldIds('zulip:general'), acceptTail ? [5] : [5, 105]);
         assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), []);
         assert.ok(h.delivery.watermark('zulip:general')! < 5, 'accepting the tail must not erase the refused prefix floor');
-        const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-        assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5), true, 'unaccepted prefix verdict remains owned');
-        assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(105) ?? false, !acceptTail);
+        assert.equal(h.delivery.verifiedReply('zulip:general', 5), true, 'unaccepted prefix verdict remains owned');
+        assert.equal(h.delivery.verifiedReply('zulip:general', 105), !acceptTail);
       } finally { await h.close(); }
     });
   }

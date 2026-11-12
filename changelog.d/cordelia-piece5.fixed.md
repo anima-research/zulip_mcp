@@ -83,3 +83,8 @@
   grace ran out could reach the next connection's host twice: in that
   connection's catch-up, and again when the fetch ended. It now reaches it
   once, in the catch-up.
+- A reply that the server had verified as it arrived, and that the host
+  hadn't accepted, lost that verdict at a reconnect. If history could then
+  not verify the quote, the catch-up offered it without its reply tag, or on
+  a closed channel didn't offer it. The verdict now lasts as long as the
+  message is held, within one process.

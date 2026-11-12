@@ -85,8 +85,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   without another gap or reconnect. An unknown bot identity fails closed;
   unreadable targets fail closed except for the unchanged-target cached
   verdict described above. An unaccepted live-verified
-  reply keeps its verdict through sweep deduplication and retries even when
-  history cannot verify it again. Only API errors with
+  reply keeps its verdict while it is held, across a reconnect within one
+  process too, and its retries use it even when history cannot verify it
+  again. Only API errors with
   `result: "error"` and `code: "BAD_REQUEST"` (missing or inaccessible targets)
   are cached for three minutes. On pre-5.0 servers without a code, the legacy
   `msg: "Invalid message(s)"` is used instead. Other API errors, missing message objects, mismatched message ids,

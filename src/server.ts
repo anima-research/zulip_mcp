@@ -95,7 +95,6 @@ const MISSED_VICINITY = 7;
 const CATCHUP_HARD_CAP = 10_000;
 export const DEFAULT_CATCHUP_LIMIT = 3000;
 const HISTORY_ON_OPEN_CAP = 500;
-const PRE_LIVE_BUFFER_CAP = 5000;
 /** How long shutdown waits for deliveries still building their content
  *  (attachment fetches) before flushing what has been queued. */
 const SHUTDOWN_INFLIGHT_GRACE_MS = 5000;
@@ -159,10 +158,6 @@ export class ZulipMcplServer {
 
   private detachManifest: (() => void) | null = null;
   private eventsStarted = false;
-  /** Live-verified replies not yet accepted: history can fail closed under a
-   *  tighter/shared lookup budget without erasing the verdict held for retry.
-   *  Oldest-first eviction, capped per channel. */
-  private pendingReplies = new Map<ChannelKey, Set<number>>();
   private lanes: Lanes<null> | null = null;
   private starting: Promise<void> | null = null;
   private requestTail: Promise<void> = Promise.resolve();
@@ -299,7 +294,6 @@ export class ZulipMcplServer {
     this.directory.restart(this.delivery.directoryCopy());
     this.grant.reset();
     this.channelManager.reset();
-    this.pendingReplies.clear();
     this.toldAgent.clear();
     this.delivery.restartReached();
     this.lanes = new Lanes(null, { maxWaitingMessages: Infinity, onOverflow: () => {} });
@@ -932,16 +926,9 @@ export class ZulipMcplServer {
     return !this.isMuted(message.key) && this.isAllowed(message.key, message);
   }
 
-  private forgetPendingReply(key: ChannelKey, id: number): void {
-    const pending = this.pendingReplies.get(key);
-    pending?.delete(id);
-    if (pending?.size === 0) this.pendingReplies.delete(key);
-  }
-
   /** The host accepted (or was handed) a message: its hold is released and the watermark may advance. */
   private accepted(key: ChannelKey, id: number): boolean {
     if (!Number.isFinite(id) || id <= 0) return false;
-    this.forgetPendingReply(key, id);
     const released = this.delivery.release(key, id);
     return this.delivery.advance(key, id) || released;
   }
@@ -959,7 +946,6 @@ export class ZulipMcplServer {
     for (const m of accepted) {
       const id = numericId(m);
       if (id === null) continue;
-      this.forgetPendingReply(key, id);
       moved = this.delivery.release(key, id) || moved;
       high = Math.max(high, id);
     }
@@ -982,7 +968,6 @@ export class ZulipMcplServer {
 
   private notAccepted(key: ChannelKey, id: number, status: 'failed' | 'rejected', message?: KeyedMessage): void {
     if (this.isMuted(key) || !this.isAllowed(key, message)) {
-      this.forgetPendingReply(key, id);
       this.letGo(key, id);
     } else {
       this.delivery.hold(key, id, status);
@@ -1000,7 +985,6 @@ export class ZulipMcplServer {
       const id = numericId(m);
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
-        this.forgetPendingReply(key, id);
         moved = this.delivery.release(key, id) || moved;
       } else this.delivery.hold(key, id, 'failed');
     }
@@ -1018,17 +1002,6 @@ export class ZulipMcplServer {
 
   /** One message from the adapter: it enters its channel's lane, held until it is decided. */
   private onIncoming(message: KeyedMessage, newChannel?: ChannelDescriptor): void {
-    const id = numericId(message);
-    if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null &&
-        !this.isMuted(message.key) && this.isAllowed(message.key, message)) {
-      let pending = this.pendingReplies.get(message.key);
-      if (!pending) this.pendingReplies.set(message.key, pending = new Set());
-      if (!pending.has(id) && pending.size >= PRE_LIVE_BUFFER_CAP) {
-        const oldest = pending.values().next().value;
-        if (oldest !== undefined) pending.delete(oldest);
-      }
-      pending.add(id);
-    }
     if (this.lanes) this.enterMessage(this.lanes, message, newChannel);
   }
 
@@ -1038,7 +1011,9 @@ export class ZulipMcplServer {
     const id = numericId(message);
     const place = this.placeOf(message.key);
     if (id !== null && place !== undefined && id <= place) return;
-    if (id !== null) this.delivery.hold(message.key, id, 'queued');
+    const reply = (message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true &&
+      !this.isMuted(message.key) && this.isAllowed(message.key, message);
+    if (id !== null) this.delivery.hold(message.key, id, 'queued', { reply });
     lane.enter(() => this.route(message, newChannel, lane), { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
@@ -1177,7 +1152,6 @@ export class ZulipMcplServer {
 
   private async readHeld(key: ChannelKey, lane: Lane<null>, gap?: GapRead): Promise<void> {
     if (this.isMuted(key) || !this.isAllowed(key)) {
-      for (const id of this.pendingReplies.get(key) ?? []) this.forgetPendingReply(key, id);
       this.delivery.releaseAll(key);
       this.delivery.save();
       return;
@@ -1220,10 +1194,7 @@ export class ZulipMcplServer {
     // no longer visible to the agent): nothing left to deliver.
     const scanned = fetched.scannedThrough ?? 0;
     for (const id of ids) {
-      if (!found.has(id) && (id <= scanned || fetched.complete)) {
-        this.forgetPendingReply(key, id);
-        this.delivery.release(key, id);
-      }
+      if (!found.has(id) && (id <= scanned || fetched.complete)) this.delivery.release(key, id);
     }
     const rows = this.projectHistoryReactions(msgs);
     for (const m of rows) {
@@ -1368,10 +1339,10 @@ export class ZulipMcplServer {
       }
       for (const id of page.unverifiedMessageIds ?? []) {
         const numeric = Number(id);
-        if (Number.isFinite(numeric) && !this.pendingReplies.get(key)?.has(numeric)) unverified.add(numeric);
+        if (Number.isFinite(numeric) && !this.delivery.verifiedReply(key, numeric)) unverified.add(numeric);
       }
       out.push(...page.messages.map((message) => {
-        if (!this.pendingReplies.get(key)?.has(Number(message.messageId))) return message;
+        if (!this.delivery.verifiedReply(key, Number(message.messageId))) return message;
         return {
           ...message,
           tags: [...new Set([...(message.tags ?? []).filter((tag) => tag !== CHAT_TAGS.ambient), CHAT_TAGS.reply])],
@@ -1387,15 +1358,6 @@ export class ZulipMcplServer {
     }
     // Not complete: the ceiling (or a bound) stopped the walk with more beyond the newest id scanned.
     return { messages: out, truncated: !complete, complete, scannedThrough: cursor > afterId ? cursor : null, unverifiedMessageIds: [...unverified].sort((a, b) => a - b) };
-  }
-
-  private advanceCatchUp(key: ChannelKey, through: number, after: number): void {
-    // An accepted/empty catch-up scan releases every hold in its range,
-    // including ids deleted from history. Their pending verdicts go too.
-    for (const id of this.delivery.heldIds(key)) {
-      if (id > after && id <= through) this.forgetPendingReply(key, id);
-    }
-    this.delivery.advanceThrough(key, through, after);
   }
 
   /**
@@ -1465,8 +1427,7 @@ export class ZulipMcplServer {
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
       onAttempt?.(Infinity);
-      // Nothing to deliver. Commit this scan after pre-live verdicts are reconciled.
-      this.advanceCatchUp(key, newestId, after);
+      this.delivery.advanceThrough(key, newestId, after);
       return blocked !== undefined ? retry(newestId) : false;
     }
     const addressedCount = views.filter(isAddressed).length;
@@ -1517,11 +1478,10 @@ export class ZulipMcplServer {
     });
     const answered = (ok: boolean) => {
       if (ok) {
-        for (const view of kept) this.forgetPendingReply(key, view.id);
         // Advance past everything scanned, not just what was delivered, so a
         // mention-only channel does not re-surface its non-mention tail; the
         // block covered every held id in the range, so their holds go too.
-        this.advanceCatchUp(key, newestId, after);
+        this.delivery.advanceThrough(key, newestId, after);
         // The agent answers the block through channels/publish too, so the
         // conversation is where its newest message that addresses the agent
         // is (in a backscroll, its newest message), as live pushes or an open
@@ -1531,7 +1491,6 @@ export class ZulipMcplServer {
           if (this.channelManager.noteConversation(key, msgs[i])) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
-        for (const id of this.pendingReplies.get(key) ?? []) this.forgetPendingReply(key, id);
         this.delivery.releaseAll(key);
       } else if (offered) {
         this.delivery.hold(key, firstId, 'rejected');
@@ -2232,7 +2191,7 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ev: MessageChangeEvent, lane: Lane<null>, announce = true): Promise<void> {
-    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.forgetPendingReply(ev.key, Number(ev.messageId));
+    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) this.delivery.forgetReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
