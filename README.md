@@ -34,6 +34,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
   (`channel_missed`). Message events are handled in order, and a quote lookup
   delays later events in the same batch by up to three seconds per message.
+  On live delivery, each channel's messages, reactions and changes are offered
+  to the host in the order the server received them, and a message waiting for
+  its attachments holds back only its own channel.
   Stopping delivery mid-batch drops the rest of that batch, and the next sweep
   recovers what it can.
 

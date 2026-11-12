@@ -1322,6 +1322,113 @@ test("a message whose attachment fetches never answer goes at its one deadline, 
   await h.close();
 });
 
+/** An attachment source whose fetches wait until the test lets them go, or for `ms` when given. */
+function heldFetches(ms?: number) {
+  const started: string[] = [];
+  let release!: () => void;
+  const gate = ms === undefined ? new Promise<void>((resolve) => { release = resolve; }) : null;
+  return {
+    started,
+    release: () => release(),
+    options: {
+      source: {
+        async fetch(path: string) {
+          started.push(path);
+          await (gate ?? new Promise((resolve) => setTimeout(resolve, ms)));
+          return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+        },
+      },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  };
+}
+
+function withLog(m: IncomingChannelMessage): IncomingChannelMessage {
+  return { ...m, metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.log`, name: 'run.log', mimeType: 'text/plain', isImage: false }] } };
+}
+
+test('a message waiting for its attachments reaches the host before a later message of its channel', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(2));
+  fetches.release();
+  await until(() => h.incoming.length === 2, 'both messages');
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2']);
+  await h.close();
+});
+
+test('the host refuses a message that waited for its attachments and accepts the next: the refused one is offered again', async () => {
+  const h = harness({ attachments: heldFetches(50).options, history: [withLog(streamMsg(1)), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withLog(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '1'), 'the refused message, offered again');
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['2', '1']);
+  assert.equal((h.incoming[1].metadata as { recovered?: boolean }).recovered, true);
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the watermark past both');
+  await h.close();
+});
+
+test('a reaction and an edit to a message waiting for its attachments reach the host after it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-lane-order-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+
+    h.adapter.emit!(withLog(streamMsg(1)));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '1', emoji: 'eyes',
+      reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: 'msg 1', timestamp: new Date(1_700_000_002_000),
+    });
+    h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:general', messageId: '1', messageIds: ['1'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'msg 1, fixed', previousContent: 'msg 1',
+      mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_003_000),
+    });
+    fetches.release();
+    await until(() => h.incoming.length === 3, 'the message, the reaction and the edit');
+    assert.deepEqual(h.incoming.map((m) => m.messageId.split(':')[0]), ['1', 'reaction', 'edit']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a message still waiting in its channel when the connection ends is offered by the next connection', async () => {
+  const fetches = heldFetches();
+  const first = harness({ attachments: fetches.options, history: [withLog(streamMsg(1)), streamMsg(2, { mentioned: true })] });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  first.adapter.emit!(streamMsg(2, { mentioned: true }));
+  first.serverSide.once('close', () => setTimeout(fetches.release, 50));
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  const offered = () => [...first.pushed, ...second.pushed].map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
+  await until(() => /id=2\]/.test(offered()), 'the waiting mention, offered');
+  await second.close();
+});
+
 test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-wire-'));
   const original = console.error;
@@ -1506,7 +1613,7 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     // Shutdown on a live connection pushes the last window out instead of
     // cancelling it.
     h.adapter.emit!(streamMsg(7));
-    assert.equal(h.server.channelManager.pendingCount(), 1);
+    await until(() => h.server.channelManager.pendingCount() === 1, '7 in the batch window');
     await h.server.shutdown();
     assert.equal(h.incoming[h.incoming.length - 1].messageId, '7');
     assert.equal(h.delivery.watermark('zulip:general'), 7);

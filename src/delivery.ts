@@ -78,9 +78,11 @@ export class DeliveryState {
   private lastOpen = new Set<ChannelKey>();
   private unresolved = new Map<string, Unresolved>();
   /**
-   * The undelivered floor (in-memory). Every message id offered to the host
+   * The undelivered floor (in-memory). Every live message id is held here
+   * from when it enters its channel's lane, and every id offered to the host
    * on a channel — queued for `channels/incoming`, or sent as `push/event` —
-   * is held here until the host accepts it. The watermark never advances
+   * until the host accepts it or the server decides it is not for the host.
+   * The watermark never advances
    * past the lowest held id, whatever is accepted after it: a message the
    * host refused or a batch lost to a transport failure stays below the
    * watermark, so the next sweep, a gap recovery, or a live replay can offer
@@ -276,8 +278,8 @@ export class DeliveryState {
 
   // ── undelivered floor ──
 
-  /** The message was offered to the host and is not accepted yet. An id at
-   *  or below the watermark is already forwarded and is not held. */
+  /** The message is on its way to the host, or was offered and is not accepted
+   *  yet. An id at or below the watermark is already forwarded and is not held. */
   hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
@@ -309,6 +311,13 @@ export class DeliveryState {
     if (!held?.delete(messageId)) return false;
     if (held.size === 0) this.held.delete(key);
     return this.settle(key);
+  }
+
+  /** The connection ended: a hold that was on its way is not any more, so a replay may offer it. */
+  failQueued(): void {
+    for (const held of this.held.values()) {
+      for (const h of held.values()) if (h.status === 'queued') h.status = 'failed';
+    }
   }
 
   /** Drop every hold on a channel (nothing from it may reach the agent any more). */

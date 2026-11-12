@@ -14,8 +14,9 @@
  *   - channel closed, ambient   → dropped and tallied (`channel_missed`)
  *
  * Every forward the host accepts advances a persisted per-channel
- * watermark; what the host was offered but has not accepted holds the
- * watermark below it (the undelivered floor) and is offered again — by a
+ * watermark; what is on its way to the host, or was offered and not
+ * accepted, holds the watermark below it (the undelivered floor). What the
+ * host has not accepted is offered again — by a
  * live replay from history once the host answers, by the catch-up sweep on
  * the next connection, or by the gap recovery a Zulip event-queue expiry
  * triggers. Nothing is lost to a later acceptance.
@@ -56,6 +57,7 @@ import { ChannelIds } from './channel-ids.js';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { StreamDirectory, type DirectoryChange } from './stream-directory.js';
 import { ContextProvider } from './context.js';
+import { Lanes } from './lanes.js';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
@@ -168,8 +170,7 @@ export class ZulipMcplServer {
    *  catches up from, whatever moves them meanwhile (a channel_open with
    *  backscroll in the first seconds must not hide the offline gap). */
   private sweepAnchors = new Map<ChannelKey, number>();
-  /** Deliveries still building their content, so shutdown can wait for them. */
-  private inFlight = new Set<Promise<void>>();
+  private lanes: Lanes<null> | null = null;
   private healing = false;
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
@@ -318,6 +319,7 @@ export class ZulipMcplServer {
     this.pendingReplies.clear();
     this.preLiveScanned.clear();
     this.toldAgent.clear();
+    this.lanes = new Lanes(null, { maxWaitingMessages: Infinity, onOverflow: () => {} });
     this.sweepAnchors = new Map(this.delivery.watermarkedChannels().map((id) => [id, this.delivery.watermark(id)!]));
   }
 
@@ -402,17 +404,9 @@ export class ZulipMcplServer {
       this.adapter.stopEvents();
       this.eventsStarted = false;
     }
-    if (this.inFlight.size > 0) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const grace = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, SHUTDOWN_INFLIGHT_GRACE_MS);
-        (timer as { unref?: () => void }).unref?.();
-      });
-      await Promise.race([Promise.allSettled([...this.inFlight]), grace]);
-      clearTimeout(timer);
-      if (this.inFlight.size > 0) {
-        console.error(`[zulip-mcp] ${this.inFlight.size} delivery(ies) still in flight at shutdown; left for the next catch-up sweep`);
-      }
+    const stillRunning = (await this.lanes?.end(SHUTDOWN_INFLIGHT_GRACE_MS)) ?? 0;
+    if (stillRunning > 0) {
+      console.error(`[zulip-mcp] ${stillRunning} delivery(ies) still in flight at shutdown; left for the next catch-up sweep`);
     }
     try {
       await this.channelManager.flush();
@@ -420,6 +414,7 @@ export class ZulipMcplServer {
       console.error('[zulip-mcp] final flush failed:', (error as Error).message ?? error);
     }
     this.channelManager.destroy();
+    this.delivery.failQueued();
     this.commitScannedCatchUp();
     this.delivery.save();
   }
@@ -455,6 +450,7 @@ export class ZulipMcplServer {
         }
       }
       try {
+        this.delivery.hold(message.key, id, 'queued');
         await this.route(message, newChannel);
       } catch (err) {
         console.error('[zulip-mcp] delivery of a held message failed:', (err as Error).message);
@@ -986,9 +982,10 @@ export class ZulipMcplServer {
    * One message from the adapter. Before live delivery opens (registration
    * and the sweep pending) it is held, in order, bounded — the oldest beyond
    * the cap leave the buffer but stay held below the watermark, and the
-   * replay after go-live fetches them back. Live, it is routed at once.
+   * replay after go-live fetches them back. Live, it enters its channel's
+   * lane, held until it is decided.
    */
-  private async onIncoming(message: KeyedMessage, newChannel?: ChannelDescriptor): Promise<void> {
+  private onIncoming(message: KeyedMessage, newChannel?: ChannelDescriptor): void {
     const id = numericId(message);
     if ((message.metadata as Record<string, unknown> | undefined)?.replyToSelf === true && id !== null &&
         !this.isMuted(message.key) && this.isAllowed(message.key, message)) {
@@ -1010,7 +1007,19 @@ export class ZulipMcplServer {
       this.preLive.push({ message, newChannel });
       return;
     }
-    await this.route(message, newChannel);
+    if (this.lanes) this.enterMessage(this.lanes, message, newChannel);
+  }
+
+  private enterMessage(lanes: Lanes<null>, message: KeyedMessage, newChannel: ChannelDescriptor | undefined): void {
+    const lane = lanes.lane(message.key);
+    if (lane.isEnded) return;
+    const id = numericId(message);
+    if (id !== null) this.delivery.hold(message.key, id, 'queued');
+    lane.enter(() => this.route(message, newChannel), { kind: 'message', ...(id !== null ? { id } : {}) });
+  }
+
+  private letGo(key: ChannelKey, id: number): void {
+    if (this.delivery.release(key, id)) this.delivery.save();
   }
 
   /**
@@ -1028,12 +1037,12 @@ export class ZulipMcplServer {
     // Muted stream, or outside the allowlist: nothing reaches the agent —
     // ambient AND mentions — and nothing is tallied, before any other
     // routing. Rechecked here (not only at the event) for what was held.
-    if (this.isMuted(key) || !this.isAllowed(key, message)) return;
+    if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
 
     // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
     // and push alike. Not watermarked: the host asked not to hear it now,
     // which is not the same as having heard it.
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return this.letGo(key, id);
 
     // A channel the host has never seen — a DM from someone new, or a stream
     // the bot was added to after startup (#20): make it a registered channel
@@ -1075,7 +1084,6 @@ export class ZulipMcplServer {
     if (this.deliverToOpen(key, message)) return;
 
     if (addressed) {
-      this.delivery.hold(key, id, 'queued');
       const delivered = await this.pushEvent(message, `zulip_msg_${message.messageId}`);
       if (delivered) {
         // The agent's answer goes back through channels/publish, so it goes
@@ -1089,6 +1097,7 @@ export class ZulipMcplServer {
       return;
     }
 
+    this.letGo(key, id);
     if (this.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
   }
 
@@ -2040,28 +2049,14 @@ export class ZulipMcplServer {
     if (this.eventsStarted) return;
     this.eventsStarted = true;
     this.adapter.startEvents(
-      (message, newChannel) => {
-        const delivery = this.onIncoming(message, newChannel).catch((err) => {
-          console.error('[zulip-mcp] inbound delivery failed:', (err as Error).message);
-        });
-        this.inFlight.add(delivery);
-        void delivery.finally(() => this.inFlight.delete(delivery));
-      },
+      (message, newChannel) => this.onIncoming(message, newChannel),
       (event) => {
         void this.onSystemEvent(event).catch((err) => {
           console.error('[zulip-mcp] system event handling failed:', (err as Error).message);
         });
       },
-      (reaction) => {
-        void this.onReaction(reaction).catch((err) => {
-          console.error('[zulip-mcp] reaction handling failed:', (err as Error).message);
-        });
-      },
-      (change) => {
-        void this.onMessageChange(change).catch((err) => {
-          console.error('[zulip-mcp] message change handling failed:', (err as Error).message);
-        });
-      },
+      (reaction) => this.lanes?.lane(reaction.key).enter(() => this.onReaction(reaction)),
+      (change) => this.lanes?.lane(change.key).enter(() => this.onMessageChange(change)),
     );
   }
 

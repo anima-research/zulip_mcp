@@ -271,7 +271,7 @@ const origin = (p: PushEventParams) => p.origin as { messageId: string; mcplChan
 const payloadText = (p: PushEventParams) => ((p.payload as { content?: { text?: string }[] }).content ?? []).map((c) => c.text ?? '').join('\n');
 const named = (run: Run, id: number) => [...run.incoming.map((m) => m.messageId), ...run.pushed.map((p) => origin(p).messageId)].includes(String(id))
   || run.pushed.some((p) => payloadText(p).includes(`id=${id}]`));
-const deliveriesSettled = (run: Run) => until(() => (run.server as unknown as { inFlight: Set<unknown> }).inFlight.size === 0, 'no delivery in flight');
+const deliveriesSettled = (run: Run) => (run.server as unknown as { lanes: { quiet(): Promise<void> } }).lanes.quiet();
 
 async function tookRename(run: Run, newId = 'zulip:lobby'): Promise<void> {
   await untilAsync(async () => (await missedOn(run, newId)) !== null, `the host's answer taken for ${newId}`);
