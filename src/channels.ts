@@ -607,18 +607,22 @@ export class ChannelManager {
     const timestamp = new Date().toISOString();
     for (const channelId of targets) {
       const key = this.keyOfHeld(channelId);
-      if (key === null) continue;
-      this.enqueue(key, {
-        key,
-        messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
-        author: { id: 'system', name: `${platformType} connection` },
-        timestamp,
-        content: [{ type: 'text', text: event.text }],
-        // Spread adapter metadata FIRST so it can never clobber the
-        // discriminators consumers filter on (system / kind).
-        metadata: { ...event.metadata, system: true, kind: event.kind },
-      });
+      if (key !== null) this.systemEventTo(key, platformType, event, timestamp);
     }
+  }
+
+  systemEventTo(key: ChannelKey, platformType: string, event: PlatformSystemEvent, timestamp = new Date().toISOString()): void {
+    if (!this.isKeyOpen(key)) return;
+    this.enqueue(key, {
+      key,
+      messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
+      author: { id: 'system', name: `${platformType} connection` },
+      timestamp,
+      content: [{ type: 'text', text: event.text }],
+      // Spread adapter metadata FIRST so it can never clobber the
+      // discriminators consumers filter on (system / kind).
+      metadata: { ...event.metadata, system: true, kind: event.kind },
+    });
   }
 
   notifyChannel(key: ChannelKey, text: string, metadata: Record<string, unknown>): void {

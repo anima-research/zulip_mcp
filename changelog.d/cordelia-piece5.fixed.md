@@ -45,9 +45,22 @@
   first message is now held, so the watermark stays below it, and the block
   is offered again when the host next accepts something.
 - A message offered again from history on an open channel, after the host
-  refused it or its batch was lost, now has its attachments inline, as on
-  live delivery. It had the reference note only.
+  refused it, its batch was lost or Zulip's event queue broke, now has its
+  attachments inline, as on live delivery. It had the reference note only.
 - An offer that the host refused, or that was lost, after its stream was
   muted or left out of the allowlist was held again, so the channel's
   watermark stayed below it until the host accepted something else there.
   Such an offer is now let go.
+- After Zulip's event queue broke, a message could reach the host twice
+  when both its event and the recovery's read of its channel's history
+  brought it: once recovered, and once as a message. The recovery now reads
+  only up to the first message that waits on its channel, and an event for a
+  message that the recovery already handed on is dropped.
+- After Zulip's event queue broke, the recovery read from the watermark, so
+  it offered again the messages the host had accepted above one that it
+  refused. It now offers again only what the host hasn't accepted.
+- After an open whose `sinceLastSeen` history its limit cut, a break of
+  Zulip's event queue handed the channel, as recovered, the messages above
+  that history, if the host had accepted nothing there since. Those messages
+  had been counted as missed while the channel was closed. The recovery now
+  starts above the newest message its channel has dealt with.

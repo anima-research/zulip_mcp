@@ -370,7 +370,7 @@ export class DeliveryState {
       .sort((a, b) => a - b);
   }
 
-  /** A live replay of these ids has been attempted; only a sweep or gap recovery re-offers them after this. */
+  /** A held read has offered these ids again: no later held read asks for them until `clearReplayed`. */
   markReplayed(key: ChannelKey, ids: number[]): void {
     const held = this.held.get(key);
     if (!held) return;
@@ -378,6 +378,10 @@ export class DeliveryState {
       const h = held.get(id);
       if (h) h.replayed = true;
     }
+  }
+
+  clearReplayed(key: ChannelKey): void {
+    for (const h of this.held.get(key)?.values() ?? []) h.replayed = false;
   }
 
   // ── open mirror ──
