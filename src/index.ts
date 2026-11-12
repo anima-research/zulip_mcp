@@ -11,7 +11,8 @@
  *   ZULIP_REALM / ZULIP_EMAIL / ZULIP_API_KEY   - bot credentials
  *   ZULIP_RC_PATH                               - alternative: a zuliprc file
  *   ZULIP_SESSION_ID                            - persistent monitoring state id
- *   ZULIP_SUBSCRIBE                             - comma-separated streams to join once the stream list is first read
+ *   ZULIP_SUBSCRIBE                             - comma-separated streams to join once the stream list is first read,
+ *                                                 or a read without MCPL got no answer
  *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
  *                                                 (default ~/.zulip_mcp_state)
  *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
