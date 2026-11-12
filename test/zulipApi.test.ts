@@ -373,6 +373,18 @@ test('a zuliprc without a site takes ZULIP_REALM, for API calls too', async () =
   } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('ZULIP_REALM that ends with /api gets /v1 with a zuliprc too', async () => {
+  const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
+  const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
+  const rc = join(dir, 'zuliprc');
+  writeFileSync(rc, '[api]\nemail=rc-bot@example.com\nkey=rc-key\n');
+  const s = await serverOn(`${z.url}/api`, { ZULIP_RC_PATH: rc });
+  try {
+    await s.tools.handleToolCall('list_streams', {});
+    assert.deepEqual(z.requests.filter((r) => r.path === '/streams').map((r) => r.rawPath), ['/api/v1/streams']);
+  } finally { s.done(); z.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a zuliprc\'s own site comes before ZULIP_REALM', async () => {
   const z = await realm({ 'GET /streams': { json: { result: 'success', streams: [] } } });
   const dir = mkdtempSync(join(tmpdir(), 'zuliprc-'));
