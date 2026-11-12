@@ -64,7 +64,8 @@ import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
 const TOKEN = /\[\[msg:([0-9]+)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
-const LIST_ITEM = /^[ ]*(?:[-*+]|\d+[.)])(?:[ ]|$)/;
+/** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
+const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;
 
 interface MessageToken {
   start: number;
@@ -123,7 +124,8 @@ function inlineRuns(
 /**
  * Each `[[msg:ID]]` that Zulip would read as Markdown: outside every code and
  * math fence (a quote, quoted or spoiler fence's inside counts as Markdown)
- * and outside inline code.
+ * and outside inline code. Zulip has no backslash escape for a bracket, so a
+ * backslash before a token changes nothing.
  */
 function messageTokens(text: string): MessageToken[] {
   if (!text.includes('[[msg:')) return [];
@@ -137,10 +139,10 @@ function messageTokens(text: string): MessageToken[] {
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
   const table = tableTest(lines);
   const next = { heading: nextMatching(lines, HEADING), rule: nextMatching(lines, RULE) };
-  const markdownLineStarts = new Set<number>();
+  const markdownLine = new Array<boolean>(lines.length).fill(false);
   const code: [number, number][] = [];
   for (const block of markdownBlocks(lines)) {
-    for (const i of block) markdownLineStarts.add(starts[i]!);
+    for (const i of block) markdownLine[i] = true;
     for (const [first, end] of inlineRuns(block[0]!, block.at(-1)! + 1, lines, next, table)) {
       const from = starts[first]!;
       const last = end - 1;
@@ -150,13 +152,19 @@ function messageTokens(text: string): MessageToken[] {
       }
     }
   }
+  // Tokens come in order, and code spans don't overlap, so one pointer into
+  // each finds a token's line and the first span that doesn't end before it.
+  code.sort((x, y) => x[0] - y[0]);
   const tokens: MessageToken[] = [];
+  let line = 0;
+  let span = 0;
   for (const m of text.matchAll(TOKEN)) {
     const start = m.index;
     const end = start + m[0].length;
-    const lineStart = text.lastIndexOf('\n', start - 1) + 1;
-    if (!markdownLineStarts.has(lineStart)) continue;
-    if (code.some(([from, to]) => start < to && from < end)) continue;
+    while (line + 1 < starts.length && starts[line + 1]! <= start) line += 1;
+    while (span < code.length && code[span]![1] <= start) span += 1;
+    if (!markdownLine[line]) continue;
+    if (span < code.length && code[span]![0] < end) continue;
     tokens.push({ start, end, digits: m[1]! });
   }
   return tokens;
@@ -185,7 +193,7 @@ function streamSlug(streamId: number, name: string): string {
   return encoded;
 }
 
-const MARKDOWN_SYNTAX = /[`>*&[\]]|(\$\$)/g;
+const MARKDOWN_SYNTAX = /[`>*&[\]|]|(\$\$)/g;
 const MARKDOWN_ESCAPES = new Map([
   ['`', '&#96;'],
   ['>', '&gt;'],
@@ -194,6 +202,8 @@ const MARKDOWN_ESCAPES = new Map([
   ['$$', '&#36;&#36;'],
   ['[', '&#91;'],
   [']', '&#93;'],
+  // Not in Zulip's client: a | would split a table row that the link sits in.
+  ['|', '&#124;'],
 ]);
 
 function escapeMarkdownSyntax(text: string): string {
@@ -274,13 +284,14 @@ export async function linkMessages(
 
   let destination: Promise<Audience> | undefined;
   const destinationOnce = () => (destination ??= audience());
-  let destinationId: Promise<number | undefined> | undefined;
+  let destinationId: Promise<{ id?: number } | { refused: string }> | undefined;
   const destinationIdOnce = () =>
     (destinationId ??= destinationOnce().then(async (to) => {
-      if (to.kind !== 'stream') return undefined;
-      if (to.id !== undefined || to.name === undefined) return to.id;
+      if (to.kind !== 'stream') return {};
+      if (to.id !== undefined || to.name === undefined) return { id: to.id };
       const answer = await api.requestAnswer<{ stream_id?: unknown }>('GET', '/get_stream_id', { stream: to.name });
-      return !isRefusal(answer) && typeof answer.stream_id === 'number' ? answer.stream_id : undefined;
+      if (isRefusal(answer)) return { refused: `Zulip refused the lookup of the destination stream ${to.name} (${answer.msg ?? answer.code ?? 'unknown error'})` };
+      return typeof answer.stream_id === 'number' ? { id: answer.stream_id } : {};
     }));
   const privacy = new Map<number, Promise<{ inviteOnly: boolean } | { refused: string }>>();
   const privacyOnce = (streamId: number) => {
@@ -301,7 +312,7 @@ export async function linkMessages(
       apply_markdown: false,
       allow_empty_topic_name: true,
     });
-    if (isRefusal(answer)) return { reason: `Zulip doesn't show message ${id} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
+    if (isRefusal(answer)) return { reason: `Zulip refused to show message ${id} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
     const m = answer.message ?? {};
     if (m.type !== 'stream') return { reason: `message ${id} is a direct message, and only a stream message can be linked` };
     const { stream_id: streamId, display_recipient: stream, subject: topic } = m;
@@ -314,20 +325,32 @@ export async function linkMessages(
     const read = await privacyOnce(streamId);
     if ('refused' in read) return { reason: `Zulip didn't say whether message ${id}'s stream is private (${read.refused})` };
     if (!read.inviteOnly) return link;
-    if ((await destinationIdOnce()) === streamId) return link;
+    const destinationId = await destinationIdOnce();
+    if ('refused' in destinationId) return { reason: destinationId.refused };
+    if (destinationId.id === streamId) return link;
     return { reason: `message ${id} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
   };
 
   const keyOf = (digits: string) => (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits);
   const outcomes = new Map<number | string, { digits: string; outcome: Outcome | null }>();
+  let answered = true;
   for (const token of tokens) {
     const key = keyOf(token.digits);
     if (outcomes.has(key)) continue;
+    if (!answered) {
+      outcomes.set(key, { digits: token.digits, outcome: null });
+      continue;
+    }
     try {
       outcomes.set(key, { digits: token.digits, outcome: await decide(token.digits) });
     } catch (err) {
-      if (unlinkable === 'refuse' || !(err instanceof ZulipNoAnswer)) throw err;
+      // A tool call says what failed, and its caller adds that nothing was
+      // sent: the preparation only reads. A plain answer reads no further
+      // once Zulip doesn't answer, and posts the rest of its tokens as typed.
+      if (unlinkable === 'refuse') throw new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? err.message : err).replace(/\.$/, '')}.`]);
+      if (!(err instanceof ZulipNoAnswer)) throw err;
       outcomes.set(key, { digits: token.digits, outcome: null });
+      answered = false;
     }
   }
 

@@ -9,6 +9,7 @@ import { toolDefinitions } from '../src/tools.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
 import type { UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
+import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 // What Zulip 12.4's own web client functions write for each case: on-gh run
 // 20261112T122955Z-9f66f64b, zulip/zulip at da085bbb5c90, by_stream_topic_url
@@ -35,15 +36,21 @@ const R1: { name: string; streamId: number; stream: string; topic: string; id: n
 type Stream = { name: string; invite_only: boolean };
 type Message = { type: 'stream'; stream_id: number; display_recipient: string; subject: string } | { type: 'private'; display_recipient: { id: number }[] };
 
-/** A Zulip that holds these streams and messages; a message or stream it doesn't hold is refused as Zulip refuses it. */
-function zulip(streams: Record<number, Stream>, messages: Record<number, Message>, limit?: number) {
+/**
+ * A Zulip that holds these streams and messages; a message or stream it doesn't hold is refused as Zulip refuses it.
+ * `noAnswer` names messages whose read gets no answer, and `rateLimited` refuses every lookup of a stream's name.
+ */
+function zulip(streams: Record<number, Stream>, messages: Record<number, Message>, limit?: number, opts: { noAnswer?: number[]; rateLimited?: boolean } = {}) {
   let posted = 0;
   const { api, calls } = standInApi({
-    'GET /messages/:id': (_p: unknown, call: StandInCall) =>
-      messages[call.id!] ? { result: 'success', msg: '', message: { id: call.id, ...messages[call.id!] } } : { result: 'error', msg: 'Invalid message(s)', code: 'BAD_REQUEST' },
+    'GET /messages/:id': (_p: unknown, call: StandInCall) => {
+      if (opts.noAnswer?.includes(call.id!)) throw new ZulipNoAnswer('timeout', 'GET', `/messages/${call.id}`, false, `Zulip gave no answer to GET /messages/${call.id} within 15 s.`);
+      return messages[call.id!] ? { result: 'success', msg: '', message: { id: call.id, ...messages[call.id!] } } : { result: 'error', msg: 'Invalid message(s)', code: 'BAD_REQUEST' };
+    },
     'GET /streams/:id': (_p: unknown, call: StandInCall) =>
       streams[call.id!] ? { result: 'success', msg: '', stream: { stream_id: call.id, ...streams[call.id!] } } : { result: 'error', msg: 'Invalid channel ID', code: 'BAD_REQUEST' },
     'GET /get_stream_id': (p: Record<string, unknown>) => {
+      if (opts.rateLimited) return { result: 'error', msg: 'API usage exceeded rate limit', code: 'RATE_LIMIT_HIT' };
       const found = Object.entries(streams).find(([, s]) => s.name.toLowerCase() === String(p.stream).toLowerCase());
       return found ? { result: 'success', msg: '', stream_id: Number(found[0]) } : { result: 'error', msg: `Invalid channel name '${p.stream}'`, code: 'BAD_REQUEST' };
     },
@@ -96,6 +103,13 @@ test('R1: a token becomes the link Zulip\'s own client writes, for each case', a
   }
 });
 
+test('R1: a | in a name is written &#124; in the label, so a link in a table cell keeps its row; the one departure from Zulip\'s client', async () => {
+  const z = zulip({ ...PUBLIC, 47: { name: 'ops|infra', invite_only: false } }, { 138: { type: 'stream', stream_id: 47, display_recipient: 'ops|infra', subject: 'a|b' } });
+  await z.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: '| ref | x |\n|---|---|\n| [[msg:138]] | kept |' });
+  assert.deepEqual(z.posts(), ['| ref | x |\n|---|---|\n| [#ops&#124;infra > a&#124;b @ 💬](#narrow/channel/47-ops.7Cinfra/topic/a.7Cb/near/138) | kept |']);
+  z.done();
+});
+
 test('R1: send_message, send_dm, a plain answer and edit_message each put the link in place of the token', async () => {
   const z = zulip(PUBLIC, MESSAGES);
   await z.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'as [[msg:1001]] said' });
@@ -120,6 +134,10 @@ test('R2: a token Zulip reads as code, or no token at all, is posted byte for by
     'a span `that crosses\n[[msg:1001]] a line` break',
     '[[msg:abc]]',
     '[[msg:]]',
+    'a span `across a\n1) [[msg:1001]] line` that Zulip takes as text',
+    'a span `across a\n-\n[[msg:1001]] lone dash`',
+    'a span `across a\n10. [[msg:1001]] line` in a paragraph',
+    '```spoiler See [[msg:1001]]\nbody\n```',
   ];
   for (const content of unchanged) {
     const z = zulip(PUBLIC, MESSAGES);
@@ -140,6 +158,24 @@ test('R2: a token inside a quote fence, inside a spoiler fence, after an escaped
     ['    code `x\n[[msg:1001]] y`', `    code \`x\n${PUBLIC_LINK} y\``],
     ['a `b\n***\n[[msg:1001]] c`', `a \`b\n***\n${PUBLIC_LINK} c\``],
     ['a \\` then [[msg:1001]] and `x`', `a \\\` then ${PUBLIC_LINK} and \`x\``],
+    ['one \\[[msg:1001]] backslash', `one \\${PUBLIC_LINK} backslash`],
+    ['two \\\\[[msg:1001]] backslashes', `two \\\\${PUBLIC_LINK} backslashes`],
+  ];
+  for (const [content, expected] of replaced) {
+    const z = zulip(PUBLIC, MESSAGES);
+    await z.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content });
+    assert.deepEqual(z.posts(), [expected], JSON.stringify(content));
+    z.done();
+  }
+});
+
+test('R2: a token is replaced in an indented code block, in inline math, inside another link, and in inline code across a list line in a spoiler fence', async () => {
+  const replaced: [string, string][] = [
+    ['    [[msg:1001]]', `    ${PUBLIC_LINK}`],
+    ['a $$x [[msg:1001]]$$ b', `a $$x ${PUBLIC_LINK}$$ b`],
+    ['[see [[msg:1001]]](https://x)', `[see ${PUBLIC_LINK}](https://x)`],
+    ['[see](https://x/[[msg:1001]])', `[see](https://x/${PUBLIC_LINK})`],
+    ['```spoiler S\na `b\n- [[msg:1001]] c` d\n```', `\`\`\`spoiler S\na \`b\n- ${PUBLIC_LINK} c\` d\n\`\`\``],
   ];
   for (const [content, expected] of replaced) {
     const z = zulip(PUBLIC, MESSAGES);
@@ -166,7 +202,7 @@ test('R2: a long message of thousands of headings, rules or table rows in one bl
 
 test('R3: a tool refuses a token for a message Zulip doesn\'t show, or for a direct message, before any upload or post', async () => {
   const cases: [string, RegExp][] = [
-    ['[[msg:404]]', /^\[\[msg:404\]\] can't become a link: Zulip doesn't show message 404 to this bot \(Invalid message\(s\)\)\./],
+    ['[[msg:404]]', /^\[\[msg:404\]\] can't become a link: Zulip refused to show message 404 to this bot \(Invalid message\(s\)\)\./],
     ['[[msg:3001]]', /^\[\[msg:3001\]\] can't become a link: message 3001 is a direct message, and only a stream message can be linked\./],
   ];
   for (const [token, reason] of cases) {
@@ -183,6 +219,24 @@ test('R3: a tool refuses a token for a message Zulip doesn\'t show, or for a dir
     assert.deepEqual(z.uploads, [], `${token}: no upload`);
     z.done();
   }
+});
+
+test('R3: a read that gets no answer, or any refused read, refuses the call and says nothing was sent or edited', async () => {
+  const z = zulip(PUBLIC, MESSAGES, undefined, { noAnswer: [5005] });
+  const noAnswer = "[[msg:5005]] can't become a link: Zulip gave no answer to GET /messages/5005 within 15 s.";
+  await assert.rejects(z.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'see [[msg:5005]]', attachments: file }), (err: Error) => err.message === `${noAnswer} Nothing was sent.`);
+  await assert.rejects(z.runtime.handleToolCall('edit_message', { message_id: 1001, content: 'see [[msg:5005]]' }), (err: Error) => err.message === `${noAnswer} The message wasn't edited.`);
+  await assert.rejects(z.runtime.handleToolCall('edit_message', { message_id: 6006, content: 'see [[msg:1001]]' }), (err: Error) => err.message === "[[msg:1001]] can't become a link: Zulip refused reading message 6006: Invalid message(s). The message wasn't edited.");
+  assert.deepEqual([z.posts(), z.edits(), z.uploads], [[], [], []]);
+  z.done();
+});
+
+test('R3b: in a plain answer, after a read that gets no answer, the other tokens stay as typed, unread', async () => {
+  const z = zulip(PUBLIC, MESSAGES, undefined, { noAnswer: [5005] });
+  await z.adapter.publish('zulip:general', undefined, [{ type: 'text', text: 'see [[msg:5005]] and [[msg:1001]]' }], { threadId: 't' });
+  assert.deepEqual(z.posts(), ['see [[msg:5005]] and [[msg:1001]]']);
+  assert.deepEqual(z.reads('/messages/').map((c) => c.path), ['/messages/5005']);
+  z.done();
 });
 
 test('R3b: a plain answer posts such a token as typed, and the rest of the answer goes out', async () => {
@@ -208,6 +262,26 @@ test('R4: a message in a private stream links only within its own stream', async
   await z.adapter.publish('zulip:general', undefined, [{ type: 'text', text: 'see [[msg:2001]]' }], { threadId: 't' });
   await z.runtime.handleToolCall('send_dm', { to: ['42'], content: 'see [[msg:1001]]' });
   assert.deepEqual(z.posts(), [`see ${SECRET_LINK}`, `see ${SECRET_LINK}`, `see ${SECRET_LINK}`, 'see [[msg:2001]]', `see ${PUBLIC_LINK}`]);
+  z.done();
+});
+
+test('R4: a refused lookup of the destination\'s name, or of a stream\'s privacy, gives its own reason', async () => {
+  const limited = zulip(PUBLIC, MESSAGES, undefined, { rateLimited: true });
+  await assert.rejects(limited.runtime.handleToolCall('send_message', { type: 'stream', to: 'Secret', topic: 't', content: 'see [[msg:2001]]' }), (err: Error) => err.message === "[[msg:2001]] can't become a link: Zulip refused the lookup of the destination stream Secret (API usage exceeded rate limit). Nothing was sent.");
+  limited.done();
+  const unknown = zulip(PUBLIC, { 4001: { type: 'stream', stream_id: 40, display_recipient: 'gone', subject: 'x' } });
+  await assert.rejects(unknown.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'see [[msg:4001]]' }), (err: Error) => err.message === "[[msg:4001]] can't become a link: Zulip didn't say whether message 4001's stream is private (Invalid channel ID). Nothing was sent.");
+  unknown.done();
+});
+
+test('R4: a stream destination is read as Zulip reads `to`, JSON first', async () => {
+  const z = zulip(PUBLIC, MESSAGES);
+  const own: unknown[] = [20, '20', '[20]', [20], '"secret"', '["Secret"]', 'secret'];
+  for (const to of own) await z.runtime.handleToolCall('send_message', { type: 'stream', to, topic: 't', content: 'see [[msg:2001]]' });
+  assert.deepEqual(z.posts(), own.map(() => `see ${SECRET_LINK}`));
+  for (const to of ['[9]', '"general"', '[20, 9]']) {
+    await assert.rejects(z.runtime.handleToolCall('send_message', { type: 'stream', to, topic: 't', content: 'see [[msg:2001]]' }), /is in a private stream/, to);
+  }
   z.done();
 });
 
