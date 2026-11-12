@@ -25,6 +25,7 @@ import { ZulipMcplServer } from '../src/server.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { FiltersPlane } from '../src/filters.ts';
+import { streamKey } from '../src/channel-key.ts';
 import { realm, SELF, type Realm } from './zulip-realm.ts';
 
 const directoryModule = await import('../src/stream-directory.ts').catch(() => null);
@@ -280,6 +281,7 @@ const origin = (p: PushEventParams) => p.origin as { messageId: string; mcplChan
 const payloadText = (p: PushEventParams) => ((p.payload as { content?: { text?: string }[] }).content ?? []).map((c) => c.text ?? '').join('\n');
 const named = (run: Run, id: number) => [...run.incoming.map((m) => m.messageId), ...run.pushed.map((p) => origin(p).messageId)].includes(String(id))
   || run.pushed.some((p) => payloadText(p).includes(`id=${id}]`));
+const deliveriesSettled = (run: Run) => until(() => (run.server as unknown as { inFlight: Set<unknown> }).inFlight.size === 0, 'no delivery in flight');
 
 /** The host's answer to a rename of a channel it had open has landed: the new id counts what it misses. */
 async function tookRename(run: Run, newId = 'zulip:lobby'): Promise<void> {
@@ -300,6 +302,7 @@ scenario('3. a muted stream renamed stays muted, and the filters file holds the 
     const muted = r.post(17, '@bot here', { mentioned: true });
     const control = r.post(18, '@bot there', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
+    await deliveriesSettled(run);
     assert.equal(named(run, muted), false);
   } finally { await run.close(); }
 });
@@ -320,9 +323,18 @@ scenario('3. a stream whose reactions are visible, renamed, keeps them visible: 
   const r = realm({ 17: 'general', 18: 'random' });
   writeFilters(dir, { reactionChannels: ['zulip:general', 'zulip:random'] });
   const run = await start(r, dir);
+  const reactionOn = (messageId: number) => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${messageId}`));
   try {
+    const before = r.post(17, 'before the rename');
+    r.react(before, 'thumbs_up');
+    await until(() => reactionOn(before) !== undefined, 'the reaction before the rename');
+    assert.equal(origin(reactionOn(before)!).mcplChannelId, 'zulip:general');
     r.rename(17, 'lobby');
     await until(() => JSON.stringify(readJson(dir, 'filters.json')?.reactionChannels) === '["zulip:lobby","zulip:random"]', 'the filters file rewritten');
+    const after = r.post(17, 'after the rename');
+    r.react(after, 'thumbs_up');
+    await until(() => reactionOn(after) !== undefined, 'the reaction after the rename');
+    assert.equal(origin(reactionOn(after)!).mcplChannelId, 'zulip:lobby');
   } finally { await run.close(); }
 });
 
@@ -353,6 +365,9 @@ scenario('5. a new stream that takes the old name arrives under the old id, with
     await until(() => JSON.stringify(readJson(dir, 'filters.json')?.mutedStreams) === '["lobby"]', 'the mute under the new name');
     await tookRename(run);
     const reused = r.create('general');
+    await until(() => run.directory?.nameOf(reused) === 'general', 'the new #general in the directory');
+    assert.equal(run.server.delivery.watermark(streamKey(reused)), undefined, 'the new #general has no watermark of stream 17\'s');
+    assert.equal(run.server.delivery.watermark(streamKey(17)), seen, 'stream 17 keeps its own');
     const first = r.post(reused, '@bot new here', { mentioned: true });
     await until(() => run.pushed.some((p) => origin(p).messageId === String(first)), 'its first message, not muted');
     assert.equal(origin(run.pushed.find((p) => origin(p).messageId === String(first))!).mcplChannelId, 'zulip:general');
@@ -428,6 +443,7 @@ scenario('9. a stream named like a direct-message id is not served, and zulip:dm
     const hidden = r.post(42, '@bot hidden', { mentioned: true });
     const control = r.post(17, '@bot here', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
+    await deliveriesSettled(run);
     assert.equal(named(run, hidden), false);
     await publish(run, 'zulip:dm:42', 'hello');
     const sent = r.sends[r.sends.length - 1];
@@ -470,6 +486,7 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     const intruder = r.post(reused, '@bot from the new #general', { mentioned: true });
     const control = r.post(17, '@bot control', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
+    await deliveriesSettled(run);
     assert.equal(gaveUp(), false, 'the announcement is still in flight when the new #general\'s message is handled');
     assert.equal(named(run, intruder), false, 'a new #general sends nothing under the id the host holds for stream 17');
     const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
@@ -711,7 +728,7 @@ scenario('23. two streams swap names while the server is down: each keeps its ow
     const to18 = r.post(18, '@bot to 18', { mentioned: true });
     const after = r.post(17, '@bot after 18\'s', { mentioned: true });
     await until(() => arrivedOn(run, to17) !== null && arrivedOn(run, after) !== null, 'the mentions in 17, the second posted after 18\'s');
-    await until(() => (run.server as unknown as { inFlight: Set<unknown> }).inFlight.size === 0, 'no delivery in flight');
+    await deliveriesSettled(run);
     assert.equal(arrivedOn(run, to17), 'zulip:b');
     assert.equal(named(run, to18), false, 'stream 18 is still muted');
   } finally { await run.close(); }
@@ -1071,14 +1088,15 @@ scenario('41. a stream removed, seen again, and removed again: the agent gets a 
   const r = realm({ 17: 'general', 18: 'random' });
   const run = await start(r, dir);
   const lines = () => run.incoming.filter((m) => m.channelId === 'zulip:general' && /archived/.test(textOf(m))).length;
+  const answered = () => run.logs.filter((l) => l.includes('stream 17 is gone: the host no longer holds zulip:general')).length;
   try {
     await run.open('zulip:general');
     r.archive(17);
-    await until(() => lines() === 1, 'the first line');
+    await until(() => lines() === 1 && answered() === 1, 'the first line, and the host\'s answer to the first removal');
     r.regain(17, 'general');
     await run.tool('refresh_channels', {});
     await run.open('zulip:general');
     r.archive(17);
-    await until(() => lines() === 2, 'the second line');
+    await until(() => lines() === 2 && answered() === 2, 'the second line, and the host\'s answer to the second removal');
   } finally { await run.close(); }
 });

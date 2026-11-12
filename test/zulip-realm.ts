@@ -41,6 +41,8 @@ export interface Realm {
   gap(during: () => void): void;
   /** A message from someone else; returns its id. */
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean }): number;
+  /** Someone else adds a reaction to a message. */
+  react(messageId: number, emoji: string): void;
 }
 
 export const SELF = 790;
@@ -228,6 +230,9 @@ export function realm(initial: Record<number, string>): Realm {
     },
     post(streamId, content, opts = {}) {
       return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false).id;
+    },
+    react(messageId, emoji) {
+      queue({ type: 'reaction', op: 'add', message_id: messageId, emoji_name: emoji, emoji_code: '1f44d', reaction_type: 'unicode_emoji', user_id: PERSON.id, user: { user_id: PERSON.id, full_name: PERSON.full_name, email: PERSON.email } });
     },
   };
   return self;

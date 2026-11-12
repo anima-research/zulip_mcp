@@ -753,14 +753,16 @@ test('a stream renamed while its first announcement waits to be retried: a retry
   } as never;
   const { adapter, ids } = fakeAdapter('zulip', []);
   const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
-  ids.directory.registration([{ stream_id: 17, name: 'a' }]);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }, { stream_id: 18, name: 'c' }]);
   const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
-  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17)])).local, ['zulip:a']);
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17), on('zulip:c', 18)])).local, ['zulip:a', 'zulip:c']);
 
   ids.directory.applyEvent({ op: 'update', stream_id: 17, property: 'name', value: 'b' });
   answer = undefined;
   await manager.registerAdditional([], { retryBacklog: true });
-  assert.equal(sent.slice(1).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:a')), false, 'zulip:a is stream 17\'s old id');
+  const retried = sent.slice(1).flatMap((c) => (c.added ?? []).map((d) => d.id));
+  assert.ok(retried.includes('zulip:c'), 'stream 18\'s descriptor, unchanged, is retried');
+  assert.equal(retried.includes('zulip:a'), false, 'zulip:a is stream 17\'s old id');
 });
 
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {

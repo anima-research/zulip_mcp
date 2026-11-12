@@ -1060,7 +1060,9 @@ test('the reconnect sweep delivers what arrived while offline, by what the host 
     const third = harness({ stateDir: dir, sessionId: 'sw', history: later, visible: [DESCRIPTOR, DEV] });
     await initialize(third, true);
     await settled(third);
-    await new Promise((r) => setTimeout(r, 30));
+    const registered = third.hostSaw.find((r) => r.method === method.CHANNELS_REGISTER)!.params as ChannelsRegisterParams;
+    assert.ok(registered.channels.some((c) => c.id === 'zulip:dev'), 'dev is registered at the third start');
+    assert.ok(third.adapter.historyCalls.some((c) => c.channelId === 'zulip:dev' && c.query.afterMessageId === '70'), 'the sweep read dev from its watermark');
     assert.equal(third.pushed.length, 0);
     await third.close();
   } finally {
