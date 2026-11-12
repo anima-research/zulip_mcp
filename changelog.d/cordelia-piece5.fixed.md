@@ -22,3 +22,10 @@
   the host refused, or one that was waiting or on its way when the
   connection ended. Such a channel had no watermark on disk. It now gets one
   just below that message, so the next start offers it.
+- A message that arrived while the host had `zulip.messaging` disabled was
+  dropped, unless it was already waiting in the batch. It is now held, and
+  offered once the host enables `zulip.messaging` again.
+- A stream muted, or left out of the allowlist, while an addressed message
+  of its closed channel waited for its attachments no longer has that
+  message pushed: the mute and the allowlist are checked again when the
+  attachments are in.

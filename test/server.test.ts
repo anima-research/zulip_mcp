@@ -1646,6 +1646,45 @@ test('after the host refuses a DM conversation\'s first message, the next DM car
   await h.close();
 });
 
+test('a message that arrives while zulip.messaging is disabled is offered once it is enabled again', async () => {
+  const h = harness({ history: [streamMsg(1, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await h.server.quiet();
+  assert.equal(h.pushed.length, 0, 'nothing under a disabled feature set');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.equal(h.pushed.length, 1, 'offered once it is enabled again');
+  assert.match(firstText(h.pushed[0]), /id=1\]/);
+  await h.close();
+});
+
+test('a stream muted while an addressed message of its closed channel waits for its attachments pushes nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-mute-mid-fetch-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
+    fetches.release();
+    await h.server.quiet();
+    assert.equal(h.pushed.length, 0, 'muted while it waited: nothing reaches the agent');
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'and nothing stays held');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('quiet() settles once what the server was handed has reached the host: delivery jobs, the batch window, a replay, and a request being served', async () => {
   const h = harness({ attachments: heldFetches(30).options, batchWindowMs: 30, history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);
@@ -2144,7 +2183,7 @@ test('disabling zulip.messaging stops incoming delivery and its tools until re-e
   await h.server.quiet();
   assert.equal(h.incoming.length, 0, 'no channels/incoming under a disabled feature set');
   assert.equal(h.pushed.length, 0);
-  assert.equal(h.delivery.watermark('zulip:general'), undefined, 'and nothing is pretended forwarded');
+  assert.equal(h.delivery.watermark('zulip:general'), 0, 'just below the held messages: nothing is pretended forwarded');
   const refresh = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { isError?: boolean; content: { text: string }[] };
   assert.equal(refresh.isError, true);
   assert.match(refresh.content[0].text, /not enabled/);

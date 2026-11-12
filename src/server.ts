@@ -1139,9 +1139,9 @@ export class ZulipMcplServer {
     if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
 
     // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
-    // and push alike. Not watermarked: the host asked not to hear it now,
+    // and push alike. Held, not let go: the host asked not to hear it now,
     // which is not the same as having heard it.
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return this.letGo(key, id);
+    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return this.delivery.hold(key, id, 'failed');
 
     // A channel the host has never seen — a DM from someone new, or a stream
     // the bot was added to after startup (#20): make it a registered channel
@@ -1184,6 +1184,8 @@ export class ZulipMcplServer {
         `DMs always reach you; there is nothing to subscribe to.</system>`;
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
+
+    if (this.isMuted(key) || !this.isAllowed(key, message)) return this.letGo(key, id);
 
     // The watermark moves in onDelivered, once the host has accepted it.
     if (this.deliverToOpen(key, message)) return;

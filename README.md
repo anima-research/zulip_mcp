@@ -211,7 +211,8 @@ before inference for open channels).
 Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
 tool sends and `channels/publish` alike. Disabling `zulip.messaging` stops
-its delivery (incoming and push) and its tools at once.
+its delivery (incoming and push) and its tools at once. A message that
+arrives meanwhile is held, and offered once it is enabled again.
 
 **Wake policy.** Closed-channel mentions, quote replies and DMs, new-DM
 announcements and `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
