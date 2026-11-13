@@ -15,8 +15,8 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 **Plain MCP (Claude Code, Cursor, any MCP client)**
 
-- 29 tools: stream/topic history with natural dates or id cursors,
-  `fetch_around`, sending to streams and DMs, editing, deleting, reactions,
+- 31 tools: stream/topic history with natural dates or id cursors,
+  `fetch_around`, sending to streams and DMs, editing, moving, deleting, reactions,
   user lookup, attachments, and a persistent read/unread monitor.
 - Resources: `zulip://unread/summary`, `zulip://monitoring/status`,
   `zulip://channel/{stream}/unread`.
