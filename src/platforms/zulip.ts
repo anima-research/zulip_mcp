@@ -943,14 +943,16 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Zulip delivers stream events only to subscribers — even with
-   * `all_public_streams` on the queue — so opening a channel must also
-   * subscribe the bot, or the host would be listening to silence.
+   * Even with `all_public_streams` on the queue, a bot that isn't subscribed
+   * gets a public stream's edits and reactions only for messages that
+   * mention it, and from a private stream at most the messages that mention
+   * it. So opening a channel must also subscribe the bot, or the host would
+   * miss the rest.
    * Idempotent; subscription persists server-side. DMs need nothing.
    *
    * Asks Zulip every time rather than remembering: the `unlisten` tool
    * removes subscriptions behind this adapter's back, and a remembered
-   * "subscribed" would let a later open succeed onto silence. The add call
+   * "subscribed" would let a later open succeed without it. The add call
    * is cheap and answers `already_subscribed` when there is nothing to do.
    *
    * Throws when the subscription did not happen: an API error, a transport

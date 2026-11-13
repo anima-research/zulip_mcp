@@ -1,6 +1,6 @@
 - `channels/open` subscribes the bot to the stream first and fails
   (`ERR_CHANNEL_OPEN_FAILED`) when it cannot — a private stream the bot was
-  not invited to no longer opens onto silence (#16).
+  not invited to no longer opens without the subscription (#16).
 - A muted stream is silent on every surface: live delivery, mentions,
   backscroll on open, context injection, reactions, catch-up and gap
   recovery. So is a stream outside the `streams` allowlist, and a DM
@@ -20,6 +20,6 @@
   Zulip API error as an error instead of returning it as a result.
 - `channels/open` asks Zulip about the subscription every time rather than
   remembering one, so a subscription dropped through `unlisten` cannot let
-  a later open succeed onto silence.
+  a later open succeed without the subscription.
 - Over TCP, every connection starts from a fresh grant, registration and
   catch-up sweep; nothing of a previous peer's session carries over.
