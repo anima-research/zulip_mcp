@@ -95,6 +95,11 @@ const MISSED_VICINITY = 7;
 const CATCHUP_HARD_CAP = 10_000;
 export const DEFAULT_CATCHUP_LIMIT = 3000;
 const HISTORY_ON_OPEN_CAP = 500;
+// Without a bound, messages that wait behind a read Zulip doesn't answer, or
+// while zulip.messaging is disabled, or on a lane that falls behind, grow
+// until the heap is full. 5,000 at Zulip's longest content take at most
+// 197 MiB of the 4,144 MiB heap that Node 20 gives a 16 GB machine, as
+// measured in https://github.com/anima-research/zulip_mcp/pull/58.
 const MAX_WAITING_MESSAGES = 5000;
 /** How long shutdown waits for deliveries still building their content
  *  (attachment fetches) before flushing what has been queued. */
