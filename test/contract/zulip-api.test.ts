@@ -148,10 +148,10 @@ test('move_messages moves a message to another stream, with or without a new top
   const to = await newStream(env, 'move-to');
   const note = 'To answer this message where it is now, use send_message with reply_to.';
   const alone = (await user.ok('POST', 'messages', { type: 'stream', to: from, topic: 'here', content: 'stream alone' })).id;
-  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: alone, stream: to }), { channelId: `zulip:${to}`, channel: to, topic: 'here', note });
+  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: alone, stream: to, scope: 'one' }), { channelId: `zulip:${to}`, channel: to, topic: 'here', note });
   assert.equal((await user.message(alone)).display_recipient, to);
   const both = (await user.ok('POST', 'messages', { type: 'stream', to: from, topic: 'here', content: 'stream and topic' })).id;
-  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: both, stream: to, topic: 'there' }), { channelId: `zulip:${to}`, channel: to, topic: 'there', note });
+  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: both, stream: to, topic: 'there', scope: 'one' }), { channelId: `zulip:${to}`, channel: to, topic: 'there', note });
   const read = await user.message(both);
   assert.equal(read.display_recipient, to);
   assert.equal(read.subject, 'there');
@@ -160,7 +160,7 @@ test('move_messages moves a message to another stream, with or without a new top
 test('move_messages naming the message\'s own stream: Zulip takes it, and the result has the note', async () => {
   const stream = await newStream(env, 'move-same');
   const id = (await user.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'here', content: 'own stream' })).id;
-  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: id, stream, topic: 'there' }), {
+  assert.deepEqual(await tools.handleToolCall('move_messages', { message_id: id, stream, topic: 'there', scope: 'one' }), {
     channelId: `zulip:${stream}`, channel: stream, topic: 'there', note: 'To answer this message where it is now, use send_message with reply_to.',
   });
 });
