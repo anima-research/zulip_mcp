@@ -6099,6 +6099,32 @@ test("a live message that a break's read decides past before its turn holds noth
   await h.close();
 });
 
+test("a refused message that a held read brings while zulip.messaging is disabled is offered again once it is enabled", async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => { reading = true; await readHeld; return real(key, query); };
+  h.adapter.emit!(streamMsg(2));
+  await until(() => reading, 'the read for the refused message');
+  await disableMessaging(h);
+  h.adapter.fetchHistory = real;
+  releaseRead();
+  await h.server.quiet();
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 2);
+  await h.close();
+});
+
 test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);

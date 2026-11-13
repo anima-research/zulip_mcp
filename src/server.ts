@@ -1307,9 +1307,10 @@ export class ZulipMcplServer {
       const rows = this.projectHistoryReactions(msgs);
       for (const m of rows) {
         if (ctx.ended) return;
+        const offered = this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
         await this.route(ctx, recovered(m), undefined, gap);
         const id = numericId(m);
-        if (id !== null && !ctx.ended) ctx.w.delivery.markReplayed(key, [id]);
+        if (id !== null && offered && !ctx.ended) ctx.w.delivery.markReplayed(key, [id]);
       }
       if (rows.length > 0) console.error(`[zulip-mcp] ${this.label(key)}: replaying ${rows.length} undelivered message(s) from history`);
     };
