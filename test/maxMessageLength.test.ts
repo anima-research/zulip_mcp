@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { maxMessageLengthFromEnv } from '../src/index.ts';
+import { maxMessageLengthFromEnv, parseBackscrollLimits } from '../src/index.ts';
 
 test('a ZULIP_MAX_MESSAGE_LENGTH of 0 is ignored at start, with a line saying so', () => {
   const saved = process.env.ZULIP_MAX_MESSAGE_LENGTH;
@@ -36,5 +36,18 @@ test('a ZULIP_MAX_MESSAGE_LENGTH with anything but digits is ignored at start, w
     console.error = original;
     if (saved === undefined) delete process.env.ZULIP_MAX_MESSAGE_LENGTH;
     else process.env.ZULIP_MAX_MESSAGE_LENGTH = saved;
+  }
+});
+
+test('a ZULIP_BACKSCROLL_CHANNELS limit with anything but digits is skipped, with the line that names its entry, and white space around digits is allowed', () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: string) => lines.push(line);
+  try {
+    const limits = parseBackscrollLimits('general:1e3, dev:50x ,ops: 20 ,#qa:7');
+    assert.deepEqual([...limits], [['ops', 20], ['qa', 7]]);
+    assert.deepEqual(lines, ['general:1e3', 'dev:50x'].map((entry) => `[zulip-mcp] ignoring ZULIP_BACKSCROLL_CHANNELS entry "${entry}" (want "stream:limit")`));
+  } finally {
+    console.error = original;
   }
 });
