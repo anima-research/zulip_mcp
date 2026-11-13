@@ -975,16 +975,7 @@ export class ZulipToolRuntime {
         if (limit !== undefined && !(typeof limit === "number" && Number.isInteger(limit) && limit > 0)) {
           throw new Error("limit must be a positive integer.");
         }
-        let streamId = givenId;
-        if (byName) {
-          try {
-            streamId = (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id;
-          } catch (err) {
-            if (err instanceof ZulipNoAnswer) throw err;
-            const text = (err as Error).message;
-            throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
-          }
-        }
+        const streamId = byName ? await this.streamIdForName(args.stream) : givenId;
         const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];

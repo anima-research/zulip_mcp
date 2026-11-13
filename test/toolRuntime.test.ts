@@ -823,6 +823,20 @@ test('get_stream_topics for a name no stream has gives Zulip\'s refusal, with th
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('get_stream_topics with MCPL reads a name as the send tools do: a former name is refused with their words, and a known one asks Zulip only for its topics', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    const directory = new StreamDirectory();
+    directory.load({ streams: { 12: 'deploys' }, formerNames: { 'old-deploys': 12 } });
+    tools.channelIds = new ChannelIds(directory);
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'old-deploys' }), /^Error: Zulip stream #old-deploys was renamed #deploys\. Nothing went to Zulip\.$/);
+    assert.deepEqual(calls, [], 'Zulip was never asked');
+    const result = await tools.handleToolCall('get_stream_topics', { stream: 'deploys' }) as { topic_count: number };
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /users/me/12/topics']);
+    assert.equal(result.topic_count, 4);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 const MOVE_STREAMS: Record<number, string> = { 7: 'general', 8: 'ops' };
 
 function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknown; readBack?: () => unknown; lookup?: () => unknown; known?: boolean; formerNames?: Record<string, number> } = {}) {
