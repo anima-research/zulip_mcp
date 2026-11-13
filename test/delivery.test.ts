@@ -5,9 +5,10 @@
  * Run: node --import tsx --test test/delivery.test.ts
  */
 
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, type PathLike } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
@@ -377,7 +378,6 @@ function withLogs(run: (logs: string[], dir: string, path: string) => void): voi
     run(logs, dir, join(dir, 's1.delivery.json'));
   } finally {
     console.error = original;
-    chmodSync(dir, 0o700);
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -401,18 +401,48 @@ test('a delivery state file that fails to load stays in place until a save, whic
   });
 });
 
-test('a save that cannot move the unreadable file aside writes nothing, and the next save moves it first', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
-  withLogs((_logs, dir, path) => {
+test('a save that cannot write the new state moves nothing, and the next save moves the file aside first', () => {
+  withLogs((logs, dir, path) => {
     writeFileSync(path, BROKEN);
     const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
-    chmodSync(dir, 0o500);
+    const tmp = `${path}.${process.pid}.tmp`;
+    mkdirSync(tmp);
     state.advance(GENERAL, 7);
     state.save();
-    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'nothing moved, nothing written');
-    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
-    chmodSync(dir, 0o700);
+    assert.ok(logs.some((l) => l.includes('Failed to save delivery state')), 'the save tried to write, and its failure is logged');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN, 'the unreadable file is where it was');
+    assert.deepEqual(readdirSync(dir).filter((f) => f.includes('.unreadable-')), [], 'nothing moved');
+    rmSync(tmp, { recursive: true });
     state.save();
-    const aside = readdirSync(dir).filter((f) => f !== 's1.delivery.json');
+    const aside = readdirSync(dir).filter((f) => f.includes('.unreadable-'));
+    assert.equal(aside.length, 1, 'the next save sets the file aside');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
+});
+
+test('a save that cannot move the unreadable file aside writes nothing and leaves no temporary file, and the next save moves it first', () => {
+  withLogs((logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    const rename = fs.renameSync;
+    mock.method(fs, 'renameSync', (from: PathLike, to: PathLike) => {
+      if (String(to).includes('.unreadable-')) throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' });
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      state.advance(GENERAL, 7);
+      state.save();
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.ok(logs.some((l) => l.includes('could not be moved aside')), 'the save tried the move, and its failure is logged');
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'nothing moved, nothing written, no temporary file left');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f.includes('.unreadable-'));
     assert.equal(aside.length, 1, 'the next save sets the file aside');
     assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN);
     assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);

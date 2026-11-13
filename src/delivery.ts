@@ -30,7 +30,7 @@
  * monitoring state. Best-effort: a failed save is logged, never fatal.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TextContent } from '@animalabs/mcpl-core';
 import { dmKey, isDmKey, parseKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
@@ -201,19 +201,6 @@ export class DeliveryState {
   save(): void {
     const path = this.file();
     if (!path || !this.writes) return;
-    if (this.unreadableFile) {
-      const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-      try {
-        renameSync(path, aside);
-        console.error(`[zulip-mcp] The delivery state file that failed to load is moved aside to ${aside}.`);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          console.error(`[zulip-mcp] Failed to save delivery state: the file that failed to load could not be moved aside: ${(err as Error).message}`);
-          return;
-        }
-      }
-      this.unreadableFile = false;
-    }
     try {
       mkdirSync(this.stateDir!, { recursive: true });
       const entries = <T>(map: Map<ChannelKey, T>): [string, T][] => {
@@ -241,6 +228,20 @@ export class DeliveryState {
       // the next start reads as "no watermarks", catching no channel up.
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+      if (this.unreadableFile) {
+        const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        try {
+          renameSync(path, aside);
+          console.error(`[zulip-mcp] The delivery state file that failed to load is moved aside to ${aside}.`);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            rmSync(tmp, { force: true });
+            console.error(`[zulip-mcp] Failed to save delivery state: the file that failed to load could not be moved aside: ${(err as Error).message}`);
+            return;
+          }
+        }
+        this.unreadableFile = false;
+      }
       renameSync(tmp, path);
       if (copy) this.copy = copy;
     } catch (err) {
