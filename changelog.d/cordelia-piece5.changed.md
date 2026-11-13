@@ -27,14 +27,14 @@
 - A read from history that fills a hole and gets no answer from Zulip, or
   that Zulip refuses by its rate limit, is now tried again: after 2 s, then
   at waits that double up to 60 s, or after Zulip's `retry-after` where that
-  is longer. These are the catch-up at a connection's start, the read of
-  the hole after Zulip's event queue broke, and the read after a channel
-  gave up its waiting messages. Meanwhile the channel's later messages wait behind the
-  read, so the messages of the hole reach the host first, in order. Such a
-  read used to be logged and skipped, and the messages of that stretch were
-  never offered once the host accepted a later one. A read that Zulip
+  is longer. These are the catch-up at a connection's start, the read of the
+  hole after Zulip's event queue broke, and the read after a channel gave up
+  its waiting messages. Meanwhile the channel's later messages wait behind
+  the read, so the messages of the hole reach the host first, in order. Such
+  a read used to be logged and skipped, and the messages of that stretch
+  were never offered once the host accepted a later one. A read that Zulip
   refuses for another reason still ends the hole, as before. Once a
   channel's wait for its history is set to reach 90 s, every open channel
-  gets one line naming the channels whose reads wait then, and one more
-  line when no read waits any more. With no
-  channel open, both lines go to the log.
+  gets one line naming the channels whose reads wait then, and one more line
+  when no read waits any more. With no channel open, both lines go to the
+  log.
