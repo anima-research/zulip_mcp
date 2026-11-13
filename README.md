@@ -25,10 +25,12 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Every stream and DM conversation the bot can see is a channel the host can
   open and close. Opening a channel subscribes the bot to the stream first
-  (Zulip only delivers events to subscribers) — a stream the bot cannot
-  subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically. A stream whose
-  name reads as a DM channel id, such as `dm:42`, isn't served.
+  (without a subscription, a public stream sends the bot a message's edits
+  and reactions only when the message mentions it, and a private stream sends
+  at most the messages that mention it) — a stream the bot cannot subscribe
+  to fails the open rather than opening without it — and can return
+  backscroll atomically. A stream whose name reads as a DM channel id, such
+  as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
@@ -442,9 +444,11 @@ file, or remove it to re-seed from the environment.
 
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
-Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
-Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
-Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
+For a stream message, a `topic` beside `reply_to` sends to that message's stream in the given topic: `{"reply_to":12345,"topic":"follow-up","content":"Thanks!"}`.
+Omit `to`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
+A supplied `to`, a `topic` for a direct message, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+After a send with `reply_to`, the result says where the message went: `channelId` and `channel`, the stream's name, for a stream message, and `topic` when you gave none; `channelId` and `to_user_ids` for a direct message, where `to_user_ids` is the participants other than the bot, or the bot too where its own id isn't known or the conversation is its own.
+Without `reply_to`, provide `type` and `to`, plus `topic` for a stream message: a stream message with neither `topic` nor `reply_to` is refused before uploads or sends. No additional permissions are needed.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes
@@ -570,8 +574,11 @@ environment). Under connectome-host, point it into the data volume, e.g.
 
 ## Notes for operators
 
-- **Subscription is not optional.** Zulip delivers stream events only to
-  subscribers, even with `all_public_streams` on the event queue. Opening a
+- **Subscription is not optional.** Even with `all_public_streams` on the
+  event queue, a public stream sends a bot that isn't subscribed its new
+  messages, with mentions of the bot flagged, but a message's edits and
+  reactions only when the message mentions the bot. A private stream sends
+  it at most the messages that mention it. Opening a
   channel subscribes the bot (and fails if it cannot — a private stream the
   bot was not invited to answers `success` with the stream under
   `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`

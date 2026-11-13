@@ -842,12 +842,14 @@ export class ZulipMcplServer {
     this.channelManager.confirmAnnounced(descriptor.id);
     const result: ChannelsOpenResult = { channel: descriptor };
 
-    // Zulip only delivers stream events to subscribers; an open channel the
-    // bot is not subscribed to would be listening to silence. So the
+    // Without a subscription, Zulip sends a public stream's edits and
+    // reactions only for messages that mention the bot, and from a private
+    // stream at most the messages that mention it; an open channel the bot
+    // is not subscribed to would miss the rest. So the
     // subscription comes FIRST, and a refusal (private stream, permission,
     // rate limit) fails the open: the host records the operation as failed
     // and the agent's tool result says why, instead of an open channel that
-    // hears nothing.
+    // misses the rest.
     if (this.adapter.ensureSubscribed) {
       try {
         await this.adapter.ensureSubscribed(key);

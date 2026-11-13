@@ -1,5 +1,7 @@
 import { isRefusal, type ZulipApi, type ZulipRefusal, type ZulipSuccess } from './zulip-api.js';
 import { withAttachmentLinks, type UploadedFile } from './uploads.js';
+import { blankLineAboveTables } from './tables.js';
+import { audienceOf, linkMessages, type Unlinkable } from './message-links.js';
 
 export interface Destination {
   type: unknown;
@@ -15,6 +17,7 @@ export interface SentChunk {
 export interface SendResult {
   chunks: SentChunk[];
   last: ZulipSuccess<{ id: number }>;
+  uploaded: UploadedFile[];
 }
 
 export class SendRefused extends Error {
@@ -50,18 +53,33 @@ export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LEN
   return out.filter((c) => c.length > 0);
 }
 
+/** A send with no text and nothing uploaded. */
+export class NothingToSend extends Error {
+  constructor() {
+    super('sendMessage was given no text and no files');
+    this.name = 'NothingToSend';
+  }
+}
+
 export function prepareOutgoing(content: string): string {
-  return content;
+  return blankLineAboveTables(content);
 }
 
 export async function sendMessage(
   api: ZulipApi,
   destination: Destination,
   content: string,
-  opts: { limit: number; uploaded?: UploadedFile[]; onChunk?: (chunk: SentChunk) => void },
+  opts: {
+    limit: number;
+    unlinkable: Unlinkable;
+    upload?: () => Promise<UploadedFile[]>;
+    onChunk?: (chunk: SentChunk) => void;
+  },
 ): Promise<SendResult> {
-  const parts = chunkMessage(withAttachmentLinks(prepareOutgoing(content), opts.uploaded ?? []), opts.limit);
-  if (parts.length === 0) throw new Error('sendMessage was given no text and no files');
+  const prepared = await linkMessages(api, prepareOutgoing(content), async () => audienceOf(destination), opts.unlinkable);
+  const uploaded = (await opts.upload?.()) ?? [];
+  const parts = chunkMessage(withAttachmentLinks(prepared, uploaded), opts.limit);
+  if (parts.length === 0) throw new NothingToSend();
   const chunks: SentChunk[] = [];
   let last: ZulipSuccess<{ id: number }> | undefined;
   for (const part of parts) {
@@ -72,5 +90,5 @@ export async function sendMessage(
     last = answer;
     opts.onChunk?.(chunk);
   }
-  return { chunks, last: last! };
+  return { chunks, last: last!, uploaded };
 }
