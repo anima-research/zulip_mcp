@@ -119,7 +119,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   is disabled, as that message comes in. It never advances past a message
   the host was offered but did not accept — a refusal, a batch lost to a
   transport failure — which is replayed from history once the host answers
-  again. On the next connection one or more `<missed>` blocks per channel
+  again. The exception is a channel that is muted or outside the allowlist,
+  at the refusal or at a later read for held messages: there such a message
+  is let go, as it may never reach the agent.
+  On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
   can split a channel into an accepted
@@ -391,7 +394,9 @@ reconciled (a blocking `channels/open` per descriptor) *before* it answered
 this server can already name doesn't wait for the requests ahead of it. It
 waits for what runs on that channel and for the host's earlier requests about
 it, so such a host can answer an announcement made inside a tool call or a
-delivery. A `channels/open` that has to re-discover its channel is the
+delivery. It still waits for the requests ahead of it while one of them is a
+`featureSets/update`, or an open or close whose channel the server couldn't
+name when it came. A `channels/open` that has to re-discover its channel is the
 exception: the host's own open of that channel waits behind it, and the
 announcement times out. Descriptors are recorded before the announcement goes
 out, so that open succeeds when it lands, and the re-announcement is left to

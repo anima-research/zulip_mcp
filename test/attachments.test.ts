@@ -148,6 +148,32 @@ test('fetchCapped ends when its signal aborts', { timeout: 5000 }, async () => {
   }
 });
 
+test('fetchCapped ends when its signal aborts while it waits for more of a body', { timeout: 5000 }, async () => {
+  let wrote!: () => void;
+  const partWritten = new Promise<void>((resolve) => { wrote = resolve; });
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.write('the first part of a body', () => wrote());
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const deadline = new AbortController();
+    const stalled = fetchCapped(`${origin}/user_uploads/1/a/stalled.txt`, {}, 1_000_000, deadline.signal);
+    let settled = false;
+    void stalled.then(() => { settled = true; }, () => { settled = true; });
+    await partWritten;
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(settled, false, 'the fetch waits for the rest of the body');
+    deadline.abort();
+    await assert.rejects(stalled);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test("a message's attachments share one deadline: the fetch it cuts, and every one not yet started, become notes", { timeout: 5000 }, async () => {
   const calls: { path: string; signal: AbortSignal }[] = [];
   let started!: () => void;

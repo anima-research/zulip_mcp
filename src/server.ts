@@ -1078,7 +1078,11 @@ export class ZulipMcplServer {
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
         moved = w.delivery.release(key, id) || moved;
-      } else w.delivery.hold(key, id, 'failed');
+      } else {
+        w.delivery.hold(key, id, 'failed');
+        // Never offered, so a held read that routed it hasn't tried it.
+        w.delivery.clearReplayed(key, [id]);
+      }
     }
     if (moved) this.delivery.save();
   }
@@ -1105,8 +1109,6 @@ export class ZulipMcplServer {
       if (id !== null) this.changesOnTurn.delete(id);
       const ready = await entry.ready(changes);
       if (ctx.ended) return;
-      const placeNow = this.placeOf(key);
-      if (id !== null && placeNow !== undefined && id <= placeNow) return this.letGo(ctx.w, key, id);
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);
@@ -1761,9 +1763,7 @@ export class ZulipMcplServer {
     for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
-      const first = Math.min(...held);
-      for (const id of held) if (id !== first) w.delivery.release(key, id);
-      w.delivery.hold(key, first, 'failed');
+      for (const id of held) w.delivery.hold(key, id, 'failed');
       this.delivery.save();
     }
     const read = this.catchupLimit === 0
@@ -1875,6 +1875,9 @@ export class ZulipMcplServer {
         const id = numericId(m);
         if (id === null) continue;
         if (ctx.ended || id > below()) break;
+        // Taken before it is handed: its live event, arriving while its
+        // attachments are fetched, is dropped as it enters.
+        ctx.decide(id);
         await this.route(ctx, recovered(m), undefined, gap);
       }
     };
