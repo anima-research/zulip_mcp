@@ -5573,6 +5573,24 @@ test("the lines belong to their connection: after a connection ended while the a
   await second.close();
 });
 
+test("a live event for a row that a break's read is handing, which enters while that row's attachments are fetched, doesn't reach the host a second time", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [streamMsg(19), withLog(streamMsg(20))] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(19));
+  await until(() => h.delivery.watermark('zulip:general') === 19, '19 accepted');
+  breakQueue(h);
+  await until(() => fetches.started.length === 1, "the recovered row's attachment fetch");
+  h.adapter.emit!(streamMsg(20));
+  await new Promise((r) => setImmediate(r));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId).filter((id) => /^\d+$/.test(id)), ['19', '20']);
+  await h.close();
+});
+
 test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);

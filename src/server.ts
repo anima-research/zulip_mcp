@@ -1089,6 +1089,8 @@ export class ZulipMcplServer {
     lane.enter(async (ctx) => {
       const ready = await entry.ready();
       if (ctx.ended) return;
+      const placeNow = this.placeOf(key);
+      if (id !== null && placeNow !== undefined && id <= placeNow) return;
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);
