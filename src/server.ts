@@ -2002,19 +2002,24 @@ export class ZulipMcplServer {
           wasOpen.set(key, this.channelManager.retireId(held));
         }
       }
+      const closeIfWasOpen = (key: ChannelKey) => {
+        if (!wasOpen.get(key)) return;
+        lanes?.lane(key).answer((c) => {
+          if (this.channelManager.isKeyOpen(key)) return;
+          c.w.delivery.markClosed(key);
+          this.delivery.save();
+        });
+      };
       for (const { key, held, fresh } of renames) {
         const verdict = answer.get(fresh);
         if (verdict === 'accepted') this.ids.move(key, fresh);
-        if (wasOpen.get(key)) {
-          lanes?.lane(key).answer((c) => {
-            if (this.channelManager.isKeyOpen(key)) return;
-            c.w.delivery.markClosed(key);
-            this.delivery.save();
-          });
-        }
+        closeIfWasOpen(key);
         console.error(`[zulip-mcp] stream ${streamIdOfKey(key)}: the host ${verdict === 'accepted' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
       }
-      for (const { key, held } of removals) console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+      for (const { key, held } of removals) {
+        closeIfWasOpen(key);
+        console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+      }
       this.delivery.save();
     } finally {
       release();
