@@ -118,8 +118,9 @@ export type OnReaction = (entry: ReactionEntry) => void;
 /**
  * A message the agent may have seen was edited, moved to another topic or
  * stream, or deleted — resolved to the channel the message lived in.
- * Adapters drop the bot's own edits before invoking the callback; a change
- * someone else made to the bot's message is news (`onOwnMessage`).
+ * Adapters drop the bot's own edits that move nothing before invoking the
+ * callback, and mark its moves `byBot`; a change someone else made to the
+ * bot's message is news (`onOwnMessage`).
  */
 export interface MessageChangeEvent {
   kind: 'edit' | 'move' | 'delete';
@@ -142,6 +143,10 @@ export interface MessageChangeEvent {
   previousTopic: string | null;
   /** The channel the message moved to, when it left this one. */
   movedToKey: ChannelKey | null;
+  /** The message moved to another stream, which `movedToKey` names when the adapter knows that stream. */
+  leftChannel: boolean;
+  /** The bot made the change. The adapter passes on only such a change that moves a message. */
+  byBot: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -285,6 +290,10 @@ export interface PlatformAdapter {
   noteSelfDeleted?(messageId: number): void;
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
+  /** Null for a message that left for a stream the adapter doesn't know:
+   *  Zulip's move event leaves its cached entry under the old stream with the
+   *  new topic. */
+  whereSeen?(messageId: string): { key: ChannelKey; topic: string } | null;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

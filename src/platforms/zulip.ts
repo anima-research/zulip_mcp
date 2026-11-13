@@ -383,7 +383,8 @@ export class ZulipAdapter implements PlatformAdapter {
 
   private remember(key: ChannelKey, m: ZulipMessage): void {
     this.failedQuoteLookups.delete(m.id);
-    if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
+    this.movedAway.delete(m.id);
+    if (!this.seen.has(m.id) && this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
     }
@@ -628,6 +629,8 @@ export class ZulipAdapter implements PlatformAdapter {
         const now = Date.now();
         for (const [old, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(old);
         for (const moved of change.messageIds) this.movedAway.set(moved, now);
+      } else if (movedToKey !== null) {
+        for (const moved of change.messageIds) this.movedAway.delete(moved);
       }
       return {
         kind: content !== null ? 'edit' : 'move',
@@ -641,6 +644,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic,
         previousTopic: change.topic !== null ? change.origTopic : null,
         movedToKey,
+        leftChannel: crossStream,
+        byBot: self !== null && change.actorId === self,
         content,
         previousContent,
         mentioned,
@@ -684,6 +689,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic: change.topic ?? cached.topic,
         previousTopic: null,
         movedToKey: null,
+        leftChannel: false,
+        byBot: false,
         content: null,
         previousContent: cached.snippet,
         // A deleted mention is the one the agent was about to answer.
@@ -711,6 +718,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic: change.topic ?? '',
         previousTopic: null,
         movedToKey: null,
+        leftChannel: false,
+        byBot: false,
         content: null,
         previousContent: null,
         mentioned: false,
@@ -824,6 +833,13 @@ export class ZulipAdapter implements PlatformAdapter {
 
   forgetSelfDeleted(messageId: number): void {
     this.selfDeleted.delete(messageId);
+  }
+
+  whereSeen(messageId: string): { key: ChannelKey; topic: string } | null {
+    const id = Number(messageId);
+    const seen = this.seen.get(id);
+    if (!seen || seen.isDm || this.movedAway.has(id)) return null;
+    return { key: seen.key, topic: seen.topic };
   }
 
   private wasSelfDeleted(messageId: number): boolean {
@@ -1055,7 +1071,8 @@ export class ZulipAdapter implements PlatformAdapter {
     const current = () => this.eventLoop === loop;
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {
-          if (change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId) return;
+          const byBot = change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId;
+          if (byBot && change.topic === null && change.newStreamId === null) return;
           const kind = change.kind === 'delete' ? 'delete' : change.topic !== null || change.newStreamId !== null ? 'move' : 'edit';
           const enter = (key: ChannelKey, located?: SeenMessage) => {
             const entry: ChangeEntry = { key, messageIds: change.messageIds, kind, ready: (only) => this.onZulipChange(change, located, only) };

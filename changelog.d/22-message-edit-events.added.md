@@ -10,8 +10,9 @@
   (a deleted mention included); re-renders and the bot's own edits and
   deletions never surface; a cross-stream move is reported where the
   message was seen, and a move into a stream the bot cannot see is
-  reported as "no longer visible" rather than deleted. Change lines never retarget reply routing (nor do
-  reaction lines any more). `PlatformAdapter` gains optional
+  reported as "no longer visible" rather than deleted. Change lines don't retarget reply routing, and
+  reaction lines no longer do; the one exception is a move of the message a
+  plain answer follows, to another topic in its stream. `PlatformAdapter` gains optional
   `onMessageChange` (on `startEvents`) and `noteSelfDeleted`. History and
   backscroll render `(edited)` / `(moved)` trailers with
   `metadata.editedAt` / `movedAt` (#22).
