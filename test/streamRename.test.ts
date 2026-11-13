@@ -1591,3 +1591,131 @@ scenario('63. a read of the stream list held for one stream\'s message: a mentio
     await until(() => named(run, unlisted), 'the mention on the stream the read found');
   } finally { release(); await run.close(); }
 });
+
+const quoting = `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`;
+
+async function busyGeneral(r: Realm): Promise<void> {
+  r.post(17, quoting);
+  await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), "general's lane busy with a quote lookup");
+}
+
+const pushesAbout = (run: Run, kind: string, id: number) => run.pushed.filter((p) => origin(p).messageId.startsWith(`${kind}:${id}:`));
+
+scenario('65. a mention that waits behind a quote lookup and is deleted reaches the host as nothing: no push, and no line', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const gone = r.post(17, '@bot soon gone', { mentioned: true });
+    r.remove([gone]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, gone), false);
+    assert.deepEqual(pushesAbout(run, 'delete', gone), []);
+  } finally { release(); await run.close(); }
+});
+
+scenario('66. on a closed channel, an ambient message that waits and is edited into a mention is pushed once, as a mention, with its new text and "(edited)"', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const plain = r.post(17, 'plain words');
+    r.edit(plain, '@bot now a mention', { mentioned: true });
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    const pushes = run.pushed.filter((p) => origin(p).messageId === String(plain));
+    assert.equal(pushes.length, 1);
+    assert.match(payloadText(pushes[0]), /now a mention \(edited\)/);
+    assert.ok(pushes[0].tags?.includes('chat:mention'));
+    assert.deepEqual(pushesAbout(run, 'edit', plain), []);
+  } finally { release(); await run.close(); }
+});
+
+scenario("67. an edit that arrives once its message's job has started follows it as a line: the message comes with its first text", async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+  const before = lists();
+  const release = r.hold('GET /streams');
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot first words', { mentioned: true });
+    await until(() => lists() > before, "the read of the stream list, in the message's job");
+    r.edit(first, '@bot second words', { mentioned: true });
+    const marker = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, marker), 'an event read after the edit');
+    release();
+    await until(() => pushesAbout(run, 'edit', first).length === 1, "the edit's line");
+    const at = run.pushed.findIndex((p) => origin(p).messageId === String(first));
+    assert.ok(at >= 0 && at < run.pushed.indexOf(pushesAbout(run, 'edit', first)[0]));
+    assert.match(payloadText(run.pushed[at]), /first words$/);
+  } finally { release(); await run.close(); }
+});
+
+scenario('68. a deletion that names a message the host has and a message that waits: the waiting one never comes, and the line names the other alone', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const had = r.post(17, '@bot first', { mentioned: true });
+    await until(() => named(run, had), 'the first mention');
+    await busyGeneral(r);
+    const waiting = r.post(17, '@bot second', { mentioned: true });
+    r.remove([had, waiting]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, waiting), false);
+    const lines = run.pushed.filter((p) => origin(p).messageId.startsWith('delete:'));
+    assert.equal(lines.length, 1);
+    assert.equal(origin(lines[0]).messageId.split(':')[1], String(had));
+    assert.doesNotMatch(payloadText(lines[0]), /2 messages/);
+  } finally { release(); await run.close(); }
+});
+
+scenario('69. one event that edits a waiting message and moves it to another topic: the message comes with its first text, and the line follows it', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const moved = r.post(17, '@bot first words', { mentioned: true });
+    r.edit(moved, '@bot second words', { mentioned: true, topic: 'elsewhere' });
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    const at = run.pushed.findIndex((p) => origin(p).messageId === String(moved));
+    assert.match(payloadText(run.pushed[at]), /first words$/);
+    const line = pushesAbout(run, 'edit', moved);
+    assert.equal(line.length, 1);
+    assert.ok(run.pushed.indexOf(line[0]) > at);
+  } finally { release(); await run.close(); }
+});
+
+scenario("70. an edit applied to a waiting message reaches the cache: a reaction after the message was handed over quotes the new text", async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:general'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const edited = r.post(17, '@bot first words', { mentioned: true });
+    r.edit(edited, '@bot second words', { mentioned: true });
+    release();
+    await until(() => named(run, edited), 'the edited mention');
+    r.react(edited, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${edited}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.match(payloadText(reaction()!), /second words/);
+    assert.doesNotMatch(payloadText(reaction()!), /first words/);
+  } finally { release(); await run.close(); }
+});

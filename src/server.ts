@@ -69,7 +69,7 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { IncomingEntry, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
@@ -213,6 +213,7 @@ export class ZulipMcplServer {
   private grantUpdatesOnChain = 0;
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private messagingHold: (() => void) | null = null;
+  private readonly changesOnTurn = new Map<number, ChangeEntry[]>();
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
@@ -361,6 +362,7 @@ export class ZulipMcplServer {
     this.readWaits.clear();
     this.toldReadWait = false;
     this.messagingHold = null;
+    this.changesOnTurn.clear();
     this.lanes = this.makeLanes();
   }
 
@@ -1094,7 +1096,9 @@ export class ZulipMcplServer {
     const place = this.placeOf(key);
     if (id !== null && place !== undefined && id <= place) return;
     lane.enter(async (ctx) => {
-      const ready = await entry.ready();
+      const changes = id !== null ? this.changesOnTurn.get(id) : undefined;
+      if (id !== null) this.changesOnTurn.delete(id);
+      const ready = await entry.ready(changes);
       if (ctx.ended) return;
       const placeNow = this.placeOf(key);
       if (id !== null && placeNow !== undefined && id <= placeNow) return;
@@ -1741,6 +1745,7 @@ export class ZulipMcplServer {
   private giveUp(w: DeliveryWriter, lane: Lane<DeliveryWriter>): void {
     const key = lane.key;
     const ids = lane.replaceMessages((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readGivenUp(r2, key))));
+    for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
       const first = Math.min(...held);
@@ -2400,16 +2405,13 @@ export class ZulipMcplServer {
       (entry) => {
         const lane = this.lanes?.lane(entry.key);
         if (!lane) return;
-        if (this.messagingHold !== null) {
-          const waiting = new Set(lane.waitingMessages());
-          if (!entry.messageIds.some((id) => waiting.has(id))) return;
-        }
-        lane.enter(async (ctx) => {
-          const change = await entry.ready();
-          if (change === null || ctx.ended) return;
-          if (change.key === entry.key) return this.onMessageChange(ctx, change);
-          this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'other', about: entry.messageIds });
-        }, { kind: 'other', about: entry.messageIds });
+        const waiting = new Set(lane.waitingMessages());
+        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => waiting.has(id));
+        for (const id of applied) this.changesOnTurn.set(id, [...(this.changesOnTurn.get(id) ?? []), entry]);
+        const rest = entry.messageIds.filter((id) => !applied.includes(id));
+        if (rest.length === 0) return;
+        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) return;
+        lane.enter((ctx) => this.runChange(ctx, entry, rest), { kind: 'other', about: rest });
       },
     );
   }
@@ -2462,6 +2464,13 @@ export class ZulipMcplServer {
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return false;
     if (this.filters.reactionSuppressed(ev.emoji, ev.emojiCode, ev.emojiType)) return false;
     return this.mcplActive && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
+  }
+
+  private async runChange(ctx: Ctx, entry: ChangeEntry, ids: number[]): Promise<void> {
+    const change = await entry.ready(ids);
+    if (change === null || ctx.ended) return;
+    if (change.key === entry.key) return this.onMessageChange(ctx, change);
+    this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'other', about: ids });
   }
 
   /**

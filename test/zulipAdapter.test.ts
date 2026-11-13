@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipAdapter, type FilterView } from '../src/platforms/zulip.ts';
-import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
+import type { ChangeEntry, IncomingEntry, MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import { inTurn, standInApi } from './zulip-stand-in.ts';
@@ -843,4 +843,36 @@ test('while a change waits for the lookup that places it, later reactions and ch
     while ((placed.length < 4 || placed.includes('change')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     assert.deepEqual(placed, ['edit 30', 'reaction 31', 'edit 31', 'delete 30']);
   } finally { adapter.stopEvents(); }
+});
+
+test("a DM's row is built at its turn: an edit that arrived while it waited gives it the new text and \"(edited)\", and a deletion takes it out", async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: { ...dm(40, 7), content: 'first words' } },
+    { id: 2, type: 'update_message', message_id: 40, message_ids: [40], user_id: 7, edit_timestamp: 1_700_000_900, orig_content: 'first words', content: 'second words', flags: [] },
+    { id: 3, type: 'message', flags: [], message: { ...dm(41, 7), content: 'soon gone' } },
+    { id: 4, type: 'delete_message', message_ids: [41], message_type: 'private' },
+  ];
+  let polls = 0;
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const messages: IncomingEntry[] = [];
+  const changes: ChangeEntry[] = [];
+  adapter.startEvents((entry) => { messages.push(entry); }, undefined, undefined, (entry) => { changes.push(entry); });
+  const deadline = Date.now() + 2000;
+  while (changes.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  adapter.stopEvents();
+  const edited = await messages[0].ready([changes[0]]);
+  assert.equal((edited!.message.content[0] as { text: string }).text, 'second words (edited)');
+  assert.equal(await messages[1].ready([changes[1]]), null);
+  assert.deepEqual(changes.map((c) => c.kind), ['edit', 'delete']);
 });

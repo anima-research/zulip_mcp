@@ -60,7 +60,7 @@ export interface RoutingHints {
 export interface IncomingEntry {
   key: ChannelKey;
   messageId: string;
-  ready(): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null>;
+  ready(changes?: readonly ChangeEntry[]): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null>;
 }
 
 export type OnIncomingMessage = (entry: IncomingEntry) => void;
@@ -171,7 +171,8 @@ export interface MessageChangeEvent {
 export interface ChangeEntry {
   key: ChannelKey;
   messageIds: number[];
-  ready(): Promise<MessageChangeEvent | null>;
+  kind: 'edit' | 'move' | 'delete';
+  ready(only?: readonly number[]): Promise<MessageChangeEvent | null>;
 }
 
 export type OnMessageChange = (entry: ChangeEntry) => void;
