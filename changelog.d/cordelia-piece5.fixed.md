@@ -68,10 +68,12 @@
   host accepts it.
 - A catch-up block the host refused was lost once the host accepted a later
   message of its channel: the watermark moved past the block. The block's
-  first message is now held, so the watermark stays below it, and the block
-  is offered again when the host next accepts something. Where the channel
-  is open by then, only the block's first message is offered again, and the
-  others aren't, as before.
+  first message, and each message its text showed, are now held, so the
+  watermark stays below the block, and the block is offered again when the
+  host next accepts something. Where the channel is open by then, each of
+  those messages is offered again as a message, unless the open's history
+  brought it. The other messages that the block's text left out to fit its
+  size aren't.
 - An offer that the host refused, or that was lost, after its stream was
   muted or left out of the allowlist was held again, so the channel's
   watermark stayed below it until the host accepted something else there.

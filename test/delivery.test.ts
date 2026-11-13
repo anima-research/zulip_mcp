@@ -216,7 +216,7 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
     reason: 'mention',
     count: 1,
     formatTime: () => '12:00',
-  });
+  }).text;
   const lines = block.split('\n');
   assert.equal(lines[0], '<missed stream="#general" channelId="zulip:general" count="1" lines="3" reason="mention">');
   assert.equal(lines[1], '[12:00 id=1] [#general > topic-a] Ann: context');
@@ -229,7 +229,7 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
     reason: 'backscroll',
     count: 3,
     formatTime: () => '',
-  });
+  }).text;
   assert.match(backscroll, /^<missed stream="#general" channelId="zulip:general" count="3" reason="backscroll">/);
   assert.match(backscroll, /\n\[id=1\] /, 'an empty timestamp leaves the id alone');
 });
@@ -239,7 +239,7 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   const block = renderMissedBlock(views, {
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 50, formatTime: () => '',
     maxChars: 1500, moreBeyond: true,
-  });
+  }).text;
   assert.ok(block.length < 1500 + 400, `block is ${block.length} chars`);
   const lines = block.split('\n');
   assert.match(lines[0], /elided="\d+"/);
@@ -254,7 +254,7 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   // Under budget: untouched, no annotations.
   const small = renderMissedBlock(views.slice(0, 2), {
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 2, formatTime: () => '', maxChars: 40_000,
-  });
+  }).text;
   assert.doesNotMatch(small, /elided|truncated/);
 });
 
@@ -264,7 +264,7 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   const tight = renderMissedBlock(views, {
     streamName: 'general', channelId: 'zulip:dm:42', reason: 'backscroll', count: 30, formatTime: () => '',
     maxChars: 1000, moreBeyond: true, newestScannedId: 30,
-  });
+  }).text;
   assert.ok(tight.length <= 1000, `block is ${tight.length} chars`);
   assert.match(tight, /elided="\d+"/);
   assert.match(tight, /fetch_history\(channel="zulip:dm:42", before=\d+\)/, 'a DM conversation is pointed at by its channel id');
@@ -274,7 +274,7 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   // A single 5 000-character message under a 1 000-character budget: cut, and said so.
   const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
-  });
+  }).text;
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });
@@ -345,7 +345,7 @@ test('renderMissedBlock on a DM conversation renders [DM] lines, with no mention
   });
   const views = [viewOf(dmMsg(1, 'hey')), viewOf(dmMsg(2, 'you there?'))];
   assert.equal(views[0].isDM, true, 'selection still treats a DM as addressed');
-  const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' });
+  const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' }).text;
   assert.deepEqual(block.split('\n').slice(1, 3), ['[T id=1] [DM] Bo: hey', '[T id=2] [DM] Bo: you there?']);
 });
 

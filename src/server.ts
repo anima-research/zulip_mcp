@@ -1597,7 +1597,7 @@ export class ZulipMcplServer {
     const streamName = isDmKey(key)
       ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
       : this.streamNameOf(key) ?? channelId;
-    const block = renderMissedBlock(kept, {
+    const { text: block, elided } = renderMissedBlock(kept, {
       streamName,
       channelId,
       reason,
@@ -1625,7 +1625,8 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    ctx.w.delivery.hold(key, firstId, 'queued');
+    const shownIds = [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
+    for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
       reason,
@@ -1634,6 +1635,7 @@ export class ZulipMcplServer {
     }, () => {
       offered = true;
       read.onAttempt?.(ctx.w, newestId);
+      if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
@@ -1655,7 +1657,7 @@ export class ZulipMcplServer {
         w.delivery.hold(key, firstId, 'rejected');
         w.delivery.refuse(key, after, newestId);
       } else {
-        w.delivery.hold(key, firstId, 'failed');
+        for (const id of shownIds) w.delivery.hold(key, id, 'failed');
       }
       this.delivery.save();
     };

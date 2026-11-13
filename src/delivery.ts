@@ -603,9 +603,10 @@ function historyPointer(channelId: string, cursor: 'before' | 'after', id: numbe
  * `maxChars` is a hard cap on the whole serialized block, header and notes
  * included: the oldest lines go first, replaced by one line naming the
  * elided id range so fetch_history can page into it; when the single
- * newest line is itself over budget it is cut and says so.
+ * newest line is itself over budget it is cut and says so. `elided` is how
+ * many of the oldest lines the text left out.
  */
-export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
+export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): { text: string; elided: number } {
   const dm = parseDmChannelId(opts.channelId) !== null;
   const render = (m: MissedView): string => {
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
@@ -659,5 +660,5 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const full = lines[lines.length - 1];
     block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);
   }
-  return block;
+  return { text: block, elided };
 }
