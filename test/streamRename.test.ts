@@ -1871,3 +1871,61 @@ scenario('76. while the host holds a renamed stream\'s old id, a reply to a mess
     run.answerChanged();
   } finally { await run.close(); }
 });
+
+scenario('78. a closed channel counts the ambient messages that a break of the event queue brought it, also when a live ambient message comes after the break', async (dir) => {
+  const r = realm({ 19: 'dev', 20: 'other' });
+  writeFilters(dir, {});
+  const first = await start(r, dir);
+  const gapNotice = () => first.incoming.some((m) => JSON.stringify(m).includes('recoveredMessages'));
+  try {
+    await first.open('zulip:other');
+    await first.open('zulip:dev');
+    const seen = r.post(19, 'seen while open');
+    await until(() => arrivedOn(first, seen) !== null, 'the message while open');
+    await deliveriesSettled(first);
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:dev' });
+    r.gap(() => { r.post(19, 'ambient in dev during the break'); });
+    await until(gapNotice, 'the gap notice on zulip:other');
+    await deliveriesSettled(first);
+    assert.equal(await missedOn(first, 'zulip:dev'), 1, 'the break\'s ambient message is counted');
+    r.post(19, 'ambient in dev after the break');
+    await untilAsync(async () => (await missedOn(first, 'zulip:dev')) === 2, 'the live ambient message counted too');
+  } finally { await first.end(); }
+  const second = await start(r, dir, { reuse: first });
+  try {
+    await deliveriesSettled(second);
+    assert.equal(await missedOn(second, 'zulip:dev'), 2, 'each counted once, at the next connection too');
+  } finally { await second.close(); }
+});
+
+scenario('79. an open stream removed, its removal answered, and the stream back: the host has it closed, so its ambient messages are counted, and its next catch-up holds addressed messages only', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  writeFilters(dir, {});
+  const first = await start(r, dir);
+  try {
+    await first.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => arrivedOn(first, seen) !== null, 'the message while open');
+    await deliveriesSettled(first);
+    r.archive(17);
+    await until(() => first.logs.some((l) => l.includes('stream 17 is gone: the host no longer holds zulip:general')), 'the removal answered');
+    const before = first.changed.length;
+    r.regain(17, 'general');
+    await first.tool('refresh_channels', {});
+    await until(() => first.changed.slice(before).some((c) => (c.added ?? []).some((d) => d.id === 'zulip:general')), 'zulip:general offered again');
+    r.post(17, 'ambient one, with the channel closed at the host');
+    await untilAsync(async () => (await missedOn(first, 'zulip:general')) === 1, 'counted as missed');
+  } finally { await first.end(); }
+  r.post(17, 'early ambient, while no host was connected');
+  for (let n = 1; n <= 8; n++) r.post(17, `near ambient ${n}`);
+  r.post(17, '@bot while no host was connected', { mentioned: true });
+  const second = await start(r, dir, { reuse: first });
+  try {
+    await deliveriesSettled(second);
+    const blocks = second.pushed.map(payloadText).filter((t) => t.includes('channelId="zulip:general"'));
+    assert.equal(blocks.length, 1, 'one catch-up block, for the mention');
+    assert.match(blocks[0], /@bot while no host was connected/);
+    assert.doesNotMatch(blocks[0], /early ambient/, 'the mention and its vicinity, not a backscroll of the channel the host had closed');
+    assert.equal(await missedOn(second, 'zulip:general'), 10);
+  } finally { await second.close(); }
+});

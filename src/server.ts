@@ -1002,11 +1002,15 @@ export class ZulipMcplServer {
       return name !== null && this.filters.streamAllowed(name);
     }
     const sender = message ? senderOf(message) : null;
-    if (sender) return this.filters.dmAllowed(sender);
+    if (sender) return this.senderAllowed(sender);
     const meta = this.channelManager.getChannel(this.ids.channelIdOf(key) ?? '')?.metadata as { participants?: unknown } | undefined;
     const participants = Array.isArray(meta?.participants) ? (meta!.participants as { id?: unknown; email?: unknown }[]) : [];
     if (participants.length === 0) return true;
     return participants.some((p) => this.filters!.dmAllowed({ id: Number(p.id), email: typeof p.email === 'string' ? p.email : '' }));
+  }
+
+  private senderAllowed(sender: { id: number; email: string }): boolean {
+    return !this.filters || this.filters.dmAllowed(sender);
   }
 
   /**
@@ -1584,7 +1588,7 @@ export class ZulipMcplServer {
     const keepAll = read.keepAll || isDmKey(key);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
-      read.onAttempt?.(ctx.w, Infinity);
+      read.onAttempt?.(ctx.w, newestId);
       ctx.w.delivery.advanceThrough(key, newestId, after);
       if (blocked !== undefined) handSecond();
       return;
@@ -1597,7 +1601,7 @@ export class ZulipMcplServer {
     const streamName = isDmKey(key)
       ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
       : this.streamNameOf(key) ?? channelId;
-    const block = renderMissedBlock(kept, {
+    const { text: block, elided } = renderMissedBlock(kept, {
       streamName,
       channelId,
       reason,
@@ -1625,7 +1629,8 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    ctx.w.delivery.hold(key, firstId, 'queued');
+    const shownIds = [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
+    for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
       reason,
@@ -1634,6 +1639,7 @@ export class ZulipMcplServer {
     }, () => {
       offered = true;
       read.onAttempt?.(ctx.w, newestId);
+      if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
@@ -1655,7 +1661,7 @@ export class ZulipMcplServer {
         w.delivery.hold(key, firstId, 'rejected');
         w.delivery.refuse(key, after, newestId);
       } else {
-        w.delivery.hold(key, firstId, 'failed');
+        for (const id of shownIds) w.delivery.hold(key, id, 'failed');
       }
       this.delivery.save();
     };
@@ -1863,7 +1869,13 @@ export class ZulipMcplServer {
     const below = () => this.firstWaiting(key) - 1;
     if (place === undefined || below() <= place) return;
     if (!this.channelManager.isKeyOpen(key)) {
-      return this.readCatchUp(r, key, { keepAll: false, after: place, through: below, answers: gap?.answers, ceiling, fill: true });
+      const catchUp = await this.readCatchUp(r, key, { keepAll: false, after: place, through: below, answers: gap?.answers, ceiling, fill: true });
+      const backfill = !r.ended && this.delivery.tally(key) ? await this.readBackfill(r, key) : undefined;
+      if (!catchUp && !backfill) return;
+      return async (ctx) => {
+        await catchUp?.(ctx);
+        if (!ctx.ended) await backfill?.(ctx);
+      };
     }
     let fetched: HistoryRead;
     const bound = below();
@@ -2000,19 +2012,24 @@ export class ZulipMcplServer {
           wasOpen.set(key, this.channelManager.retireId(held));
         }
       }
+      const closeIfWasOpen = (key: ChannelKey) => {
+        if (!wasOpen.get(key)) return;
+        lanes?.lane(key).answer((c) => {
+          if (this.channelManager.isKeyOpen(key)) return;
+          c.w.delivery.markClosed(key);
+          this.delivery.save();
+        });
+      };
       for (const { key, held, fresh } of renames) {
         const verdict = answer.get(fresh);
         if (verdict === 'accepted') this.ids.move(key, fresh);
-        if (wasOpen.get(key)) {
-          lanes?.lane(key).answer((c) => {
-            if (this.channelManager.isKeyOpen(key)) return;
-            c.w.delivery.markClosed(key);
-            this.delivery.save();
-          });
-        }
+        closeIfWasOpen(key);
         console.error(`[zulip-mcp] stream ${streamIdOfKey(key)}: the host ${verdict === 'accepted' ? `now holds ${fresh}` : `refused ${fresh}`} in place of ${held}`);
       }
-      for (const { key, held } of removals) console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+      for (const { key, held } of removals) {
+        closeIfWasOpen(key);
+        console.error(`[zulip-mcp] stream ${streamIdOfKey(key)} is gone: the host no longer holds ${held}`);
+      }
       this.delivery.save();
     } finally {
       release();
@@ -2538,7 +2555,9 @@ export class ZulipMcplServer {
     if (ev.previousTopic !== null && !ev.leftChannel) ctx.w.channels.followMove(ev.key, ev.messageIds, ev.topic);
     if (ev.byBot) return;
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
-    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
+    const authorId = Number(ev.authorId ?? NaN);
+    const author = isDmKey(ev.key) && !ev.onOwnMessage && Number.isFinite(authorId) ? { id: authorId, email: ev.authorEmail ?? '' } : null;
+    if (this.isMuted(ev.key) || !(author ? this.senderAllowed(author) : this.isAllowed(ev.key))) return;
     if (silent || !this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a
@@ -2557,13 +2576,14 @@ export class ZulipMcplServer {
     const open = this.channelManager.isKeyOpen(ev.key);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
-      // Accepted (at or below the watermark) or offered and not yet accepted
+      // Accepted (at or below the highest id the host accepted, which a
+      // message held below it doesn't lower) or offered and not yet accepted
       // (held): "post, then fix the typo" lands before the host's acceptance
       // round trip and must not be lost.
-      const watermark = this.delivery.watermark(ev.key) ?? 0;
+      const accepted = this.delivery.acceptedThrough(ev.key) ?? 0;
       const held = new Set(this.delivery.heldIds(ev.key));
       const ids = ev.messageIds.map(Number).filter((n) => Number.isFinite(n));
-      if (!ids.some((n) => n <= watermark || held.has(n))) return;
+      if (!ids.some((n) => n <= accepted || held.has(n))) return;
     }
 
     const head = messageLineHead({
@@ -2577,8 +2597,10 @@ export class ZulipMcplServer {
     const others = ev.messageIds.length > 1 ? ` (${ev.messageIds.length} messages)` : '';
     const byOther = ev.actorId !== null && ev.actorId !== ev.authorId ? ` [by user ${ev.actorId}]` : '';
     const wasQuoted = ev.previousContent ? ` — was: "${ev.previousContent}"` : '';
-    const movedToChannelId = ev.movedToKey !== null ? this.ids.channelIdOf(ev.movedToKey) : null;
-    const movedTo = movedToChannelId ? ` (now in ${movedToChannelId})` : '';
+    const destinationId = ev.movedToKey !== null ? this.ids.channelIdOf(ev.movedToKey) : null;
+    const hearsDestination = ev.movedToKey !== null && !this.isMuted(ev.movedToKey) && this.isAllowed(ev.movedToKey);
+    const movedToChannelId = hearsDestination ? destinationId : null;
+    const movedTo = movedToChannelId ? ` (now in ${movedToChannelId})` : destinationId ? ' (now in another stream)' : '';
     const fromTopic = ev.previousTopic !== null ? ` [moved from topic "${ev.previousTopic}"${movedTo}]` : (movedTo ? ` [moved${movedTo}]` : '');
     let line: string;
     if (ev.kind === 'edit') {

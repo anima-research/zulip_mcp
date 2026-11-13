@@ -30,7 +30,7 @@
  * monitoring state. Best-effort: a failed save is logged, never fatal.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TextContent } from '@animalabs/mcpl-core';
 import { dmKey, isDmKey, parseKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
@@ -79,6 +79,7 @@ const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
   writes = true;
+  private unreadableFile = false;
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
@@ -165,6 +166,7 @@ export class DeliveryState {
         place(chan, (key) => this.lastOpen.add(key), (u) => { u.lastOpen = true; });
       }
     } catch (err) {
+      this.unreadableFile = true;
       console.error('[zulip-mcp] Failed to load delivery state:', (err as Error).message);
     }
   }
@@ -226,6 +228,20 @@ export class DeliveryState {
       // the next start reads as "no watermarks", catching no channel up.
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+      if (this.unreadableFile) {
+        const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        try {
+          renameSync(path, aside);
+          console.error(`[zulip-mcp] The delivery state file that failed to load is moved aside to ${aside}.`);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            rmSync(tmp, { force: true });
+            console.error(`[zulip-mcp] Failed to save delivery state: the file that failed to load could not be moved aside: ${(err as Error).message}`);
+            return;
+          }
+        }
+        this.unreadableFile = false;
+      }
       renameSync(tmp, path);
       if (copy) this.copy = copy;
     } catch (err) {
@@ -261,6 +277,10 @@ export class DeliveryState {
       if (held.size === 0) this.held.delete(key);
     }
     return this.advance(key, messageId);
+  }
+
+  acceptedThrough(key: ChannelKey): number | undefined {
+    return this.reached.get(key) ?? this.watermarks.get(key);
   }
 
   restartReached(): void {
@@ -461,6 +481,7 @@ export type DeliveryReader = Pick<
   | 'save'
   | 'directoryCopy'
   | 'watermark'
+  | 'acceptedThrough'
   | 'watermarkedChannels'
   | 'floor'
   | 'heldChannels'
@@ -598,9 +619,10 @@ function historyPointer(channelId: string, cursor: 'before' | 'after', id: numbe
  * `maxChars` is a hard cap on the whole serialized block, header and notes
  * included: the oldest lines go first, replaced by one line naming the
  * elided id range so fetch_history can page into it; when the single
- * newest line is itself over budget it is cut and says so.
+ * newest line is itself over budget it is cut and says so. `elided` is how
+ * many of the oldest lines the text left out.
  */
-export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
+export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): { text: string; elided: number } {
   const dm = parseDmChannelId(opts.channelId) !== null;
   const render = (m: MissedView): string => {
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
@@ -654,5 +676,5 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const full = lines[lines.length - 1];
     block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);
   }
-  return block;
+  return { text: block, elided };
 }

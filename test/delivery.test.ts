@@ -5,9 +5,10 @@
  * Run: node --import tsx --test test/delivery.test.ts
  */
 
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, type PathLike } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
@@ -216,7 +217,7 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
     reason: 'mention',
     count: 1,
     formatTime: () => '12:00',
-  });
+  }).text;
   const lines = block.split('\n');
   assert.equal(lines[0], '<missed stream="#general" channelId="zulip:general" count="1" lines="3" reason="mention">');
   assert.equal(lines[1], '[12:00 id=1] [#general > topic-a] Ann: context');
@@ -229,7 +230,7 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
     reason: 'backscroll',
     count: 3,
     formatTime: () => '',
-  });
+  }).text;
   assert.match(backscroll, /^<missed stream="#general" channelId="zulip:general" count="3" reason="backscroll">/);
   assert.match(backscroll, /\n\[id=1\] /, 'an empty timestamp leaves the id alone');
 });
@@ -239,7 +240,7 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   const block = renderMissedBlock(views, {
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 50, formatTime: () => '',
     maxChars: 1500, moreBeyond: true,
-  });
+  }).text;
   assert.ok(block.length < 1500 + 400, `block is ${block.length} chars`);
   const lines = block.split('\n');
   assert.match(lines[0], /elided="\d+"/);
@@ -254,7 +255,7 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   // Under budget: untouched, no annotations.
   const small = renderMissedBlock(views.slice(0, 2), {
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 2, formatTime: () => '', maxChars: 40_000,
-  });
+  }).text;
   assert.doesNotMatch(small, /elided|truncated/);
 });
 
@@ -264,7 +265,7 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   const tight = renderMissedBlock(views, {
     streamName: 'general', channelId: 'zulip:dm:42', reason: 'backscroll', count: 30, formatTime: () => '',
     maxChars: 1000, moreBeyond: true, newestScannedId: 30,
-  });
+  }).text;
   assert.ok(tight.length <= 1000, `block is ${tight.length} chars`);
   assert.match(tight, /elided="\d+"/);
   assert.match(tight, /fetch_history\(channel="zulip:dm:42", before=\d+\)/, 'a DM conversation is pointed at by its channel id');
@@ -274,7 +275,7 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   // A single 5 000-character message under a 1 000-character budget: cut, and said so.
   const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
-  });
+  }).text;
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });
@@ -345,7 +346,7 @@ test('renderMissedBlock on a DM conversation renders [DM] lines, with no mention
   });
   const views = [viewOf(dmMsg(1, 'hey')), viewOf(dmMsg(2, 'you there?'))];
   assert.equal(views[0].isDM, true, 'selection still treats a DM as addressed');
-  const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' });
+  const block = renderMissedBlock(views, { streamName: 'DM: Bo', channelId: 'zulip:dm:42', reason: 'mention', count: 2, formatTime: () => 'T' }).text;
   assert.deepEqual(block.split('\n').slice(1, 3), ['[T id=1] [DM] Bo: hey', '[T id=2] [DM] Bo: you there?']);
 });
 
@@ -366,4 +367,96 @@ test('a state file as main writes it, saved before a stream list fills the direc
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+function withLogs(run: (logs: string[], dir: string, path: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-delivery-unreadable-'));
+  const original = console.error;
+  const logs: string[] = [];
+  console.error = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+  try {
+    run(logs, dir, join(dir, 's1.delivery.json'));
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const BROKEN = '{"watermarks": {"zulip:general": 42}, ';
+
+test('a delivery state file that fails to load stays in place until a save, which first moves it aside under the name its log line gives', () => {
+  withLogs((logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    assert.ok(logs.some((l) => l.includes('Failed to load delivery state')), 'the failure is logged');
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'a load alone moves nothing');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
+    state.advance(GENERAL, 7);
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f !== 's1.delivery.json');
+    assert.equal(aside.length, 1, 'one file set aside');
+    assert.ok(logs.some((l) => l.includes(join(dir, aside[0]))), 'a log line names where it went');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN, 'the unreadable bytes are kept as they were');
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7, 'the new state is under the old name');
+  });
+});
+
+test('a save that cannot write the new state moves nothing, and the next save moves the file aside first', () => {
+  withLogs((logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    const tmp = `${path}.${process.pid}.tmp`;
+    mkdirSync(tmp);
+    state.advance(GENERAL, 7);
+    state.save();
+    assert.ok(logs.some((l) => l.includes('Failed to save delivery state')), 'the save tried to write, and its failure is logged');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN, 'the unreadable file is where it was');
+    assert.deepEqual(readdirSync(dir).filter((f) => f.includes('.unreadable-')), [], 'nothing moved');
+    rmSync(tmp, { recursive: true });
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f.includes('.unreadable-'));
+    assert.equal(aside.length, 1, 'the next save sets the file aside');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
+});
+
+test('a save that cannot move the unreadable file aside writes nothing and leaves no temporary file, and the next save moves it first', () => {
+  withLogs((logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    const rename = fs.renameSync;
+    mock.method(fs, 'renameSync', (from: PathLike, to: PathLike) => {
+      if (String(to).includes('.unreadable-')) throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' });
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      state.advance(GENERAL, 7);
+      state.save();
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.ok(logs.some((l) => l.includes('could not be moved aside')), 'the save tried the move, and its failure is logged');
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'nothing moved, nothing written, no temporary file left');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f.includes('.unreadable-'));
+    assert.equal(aside.length, 1, 'the next save sets the file aside');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
+});
+
+test('a save after a failed load whose file is gone by then writes the state, with nothing to move', () => {
+  withLogs((_logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    rmSync(path);
+    state.advance(GENERAL, 7);
+    state.save();
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json']);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
 });
