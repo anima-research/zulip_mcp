@@ -354,8 +354,11 @@ export class Lanes<W> {
     this.waitingMessageCount -= n;
   }
 
-  // One read from history at a time, across all lanes. Before lanes, each of
-  // the server's catch-up, recovery and replay loops read one channel after
+  // One read from history at a time, across all lanes, for the reads that a
+  // lane enters: a start's catch-up, a break's read, a read for held ids and
+  // the passes after a give-up. An open's read of its page doesn't take the
+  // turn, since the host waits on its answer. Before lanes, each of the
+  // server's catch-up, recovery and replay loops read one channel after
   // another. Zulip limits each user's API requests, the agent's own among
   // them ("Every user is limited to 200 total API requests per minute" by
   // default, and the rules "can vary by server":
