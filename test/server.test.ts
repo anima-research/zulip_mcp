@@ -2450,6 +2450,7 @@ test('a push the host hasn\'t answered holds back no later message, reaction or 
     assert.deepEqual(h.pushed.map((p) => p.eventId.split('_')[1]), ['msg', 'reaction', 'edit', 'msg']);
 
     h.policy.holdPushes = false;
+    // Keep the answers late: a quiet() that didn't wait for them shows only then.
     setTimeout(() => { for (const answer of h.policy.heldPushes.splice(0)) answer(); }, 30);
     await h.server.quiet();
     assert.equal(h.delivery.watermark('zulip:general'), 4, 'both messages accepted');
@@ -3772,6 +3773,7 @@ test('an open and then a close for a channel id the directory does not hold yet 
   const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }).then(() => answered.push('open'));
   await until(() => h.policy.heldChanged.length === 1, "the open's re-discovery to announce the stream");
   const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' }).then(() => answered.push('close'));
+  // Keep this wait: a server that served the close first shows only within it.
   await new Promise((r) => setTimeout(r, 50));
   h.policy.heldChanged.shift()!();
   await Promise.all([open, close]);
