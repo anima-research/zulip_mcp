@@ -1,10 +1,6 @@
 /**
  * Channel Manager — Maps platform channels to MCPL channels.
  *
- * Routes every operation to a PlatformAdapter by the channel ID prefix (the
- * part before the first ':'). Channel ID formats are owned by the adapters
- * (zulip:{stream_name}).
- *
  * Handles registration, open/close lifecycle, incoming message batching,
  * publish routing (with last-incoming thread tracking for in-thread replies),
  * and channel listing.
@@ -22,6 +18,8 @@ import type {
   ChannelsRegisterResult,
   IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
+import { toWire, type ChannelKey, type KeyedMessage } from './channel-key.js';
+import type { ChannelIds } from './channel-ids.js';
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
@@ -36,9 +34,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   /** `channels/changed`, Request form (§14.5) — itemized like register.
-   *  `timeoutMs` bounds the wait: a host that reconciles before answering
-   *  cannot be served while this server is inside a request of its own, so
-   *  waiting out the default 30s would stall the whole loop. */
+   *  `timeoutMs` bounds the wait. */
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
@@ -50,12 +46,12 @@ type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: str
 const MAX_PENDING_ANNOUNCEMENTS = 100;
 
 /** A batch that failed as a whole is retried this many times before it is
- *  given up on (the watermark then stays put and the next catch-up sweep
- *  re-fetches what was lost). */
+ *  given up on (the watermark then stays put and a later read from history
+ *  fetches what was lost again). */
 const MAX_BATCH_ATTEMPTS = 2;
 
 interface Queued {
-  message: IncomingChannelMessage;
+  message: KeyedMessage;
   attempts: number;
 }
 
@@ -78,37 +74,39 @@ export interface ChannelManagerHooks {
    * reports nothing — this is the only signal on which a delivery watermark
    * may advance.
    */
-  onDelivered?: (channelId: string, accepted: IncomingChannelMessage[], rejected: IncomingChannelMessage[]) => void;
+  onDelivered?: (key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]) => void;
   /**
    * Decides at send time whether a queued message may still go out. A mute,
    * an allowlist narrowing or a feature-set reduction that landed while the
    * message sat in the batch window (or waited for its retry) is honoured
    * here, not only at enqueue.
    */
-  deliverable?: (message: IncomingChannelMessage) => boolean;
-  /** Messages removed from a batch by policy — `deliverable`, or a missing
-   *  `channels.incoming` grant — grouped per channel. Not sent, not answered. */
-  onWithheld?: (channelId: string, messages: IncomingChannelMessage[]) => void;
+  deliverable?: (message: KeyedMessage) => boolean;
+  /** Messages removed from a batch by policy — `deliverable`, a channel no
+   *  longer open under the id the host holds, or a missing `channels.incoming`
+   *  grant — grouped per channel. Not sent, not answered. */
+  onWithheld?: (key: ChannelKey, messages: KeyedMessage[]) => void;
   /** Messages given up on after the transport retry, per channel: never
    *  accepted, never rejected — the host simply did not answer. */
-  onGivenUp?: (channelId: string, messages: IncomingChannelMessage[]) => void;
+  onGivenUp?: (key: ChannelKey, messages: KeyedMessage[]) => void;
 }
 
 export class ChannelManager {
   private allChannels = new Map<string, ChannelDescriptor>();
   private openChannels = new Set<string>();
-  private batchBuffer = new Map<string, Queued[]>();
+  private batchBuffer = new Map<ChannelKey, Queued[]>();
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
   private flushing: Promise<void> | null = null;
+  private idleWaiters: (() => void)[] = [];
   /** Per-channel routing hints from the newest message noteConversation
    *  took, so publishes can land in the active thread/topic, with the id of
    *  the message they came from, so an older message delivered late doesn't
    *  move them back. */
-  private lastIncoming = new Map<string, { hints: RoutingHints; from?: number }>();
+  private lastIncoming = new Map<ChannelKey, { hints: RoutingHints; from?: number }>();
   /** Per-channel topic the current typing run started in, so a refresh that
    *  moves to a newer topic, and the final stop, cancel it there. */
-  private typingTopic = new Map<string, string | undefined>();
+  private typingTopic = new Map<ChannelKey, string | undefined>();
 
   /**
    * @param grant the effective capability grant for this connection (§5.4).
@@ -119,6 +117,7 @@ export class ChannelManager {
     private host: HostClient,
     private adapters: Map<string, PlatformAdapter>,
     private grant: CapabilityGrant,
+    readonly ids: ChannelIds,
     batchWindowMs?: number,
     private hooks: ChannelManagerHooks = {},
   ) {
@@ -161,7 +160,7 @@ export class ChannelManager {
       const accepted = this.acceptedIds(result, channels);
       for (const id of accepted) {
         const descriptor = discovered.get(id);
-        if (descriptor) this.allChannels.set(id, descriptor);
+        if (descriptor) this.record(descriptor);
       }
       const rejected = channels.length - accepted.size;
       console.error(
@@ -198,6 +197,10 @@ export class ChannelManager {
      *  verdict can be applied without inventing a state it never had. */
     const before = new Map<string, 'confirmed' | 'pending' | 'refused' | 'new'>();
     for (const d of descriptors) {
+      const key = this.ids.keyOfDescriptor(d);
+      const held = key === null ? undefined : this.ids.heldIdOf(key);
+      const holder = this.ids.holderOf(d.id);
+      if ((held !== undefined && held !== d.id) || (holder !== undefined && holder !== key)) continue;
       if (this.announcing.has(d.id)) continue; // already going out
       if (this.refused.has(d.id)) {
         if (!opts.retryRefused) {
@@ -209,7 +212,7 @@ export class ChannelManager {
         continue;
       }
       if (this.allChannels.has(d.id) && !this.unannounced.has(d.id)) {
-        this.allChannels.set(d.id, d); // confirmed already; refresh the local copy
+        this.record(d); // confirmed already; refresh the local copy
         continue;
       }
       before.set(d.id, this.unannounced.has(d.id) ? 'pending' : 'new');
@@ -222,6 +225,8 @@ export class ChannelManager {
       const queued = new Set(added.map((d) => d.id));
       for (const [id, d] of this.unannounced) {
         if (queued.has(id) || this.announcing.has(id)) continue;
+        const key = this.ids.keyOfDescriptor(d);
+        if (key !== null && this.ids.freshIdOf(key) !== id) continue;
         before.set(id, 'pending');
         added.push(d);
       }
@@ -237,7 +242,7 @@ export class ChannelManager {
     // reconciles before it answers) would otherwise be told `Unknown channel`
     // for the very descriptor it is processing.
     for (const d of added) {
-      this.allChannels.set(d.id, d);
+      this.record(d);
       this.announcing.add(d.id);
     }
     try {
@@ -265,9 +270,7 @@ export class ChannelManager {
             }
             this.refused.add(d.id);
             refusedNow.push(d.id);
-            this.allChannels.delete(d.id);
-            this.openChannels.delete(d.id);
-            this.lastIncoming.delete(d.id);
+            this.unrecord(d.id);
             break;
           default:
             // Not in the itemization at all: a host that answers only for
@@ -304,6 +307,49 @@ export class ChannelManager {
     }
   }
 
+  async announceChanges(removed: string[], added: ChannelDescriptor[], timeoutMs?: number): Promise<Map<string, 'accepted' | 'refused'> | 'unanswered'> {
+    if (!this.grant.has('channels.register')) return 'unanswered';
+    if (added.some((d) => this.announcing.has(d.id))) return 'unanswered';
+    const addedIds = added.map((d) => d.id);
+    const doubtful = this.ids.inDoubt().filter((id) => !addedIds.includes(id));
+    const keys = removed.map((id) => this.ids.holderOf(id)).filter((key): key is ChannelKey => key !== undefined);
+    const before = added.map((d) => ({ id: d.id, descriptor: this.allChannels.get(d.id), open: this.openChannels.has(d.id) }));
+    for (const d of added) {
+      this.allChannels.set(d.id, d);
+      if (removed.includes(d.id)) this.openChannels.delete(d.id);
+      this.announcing.add(d.id);
+    }
+    try {
+      const result = await this.host.channelsChanged({ removed: [...removed, ...doubtful], added }, timeoutMs);
+      this.ids.answered(keys, doubtful);
+      const verdicts = this.readVerdicts(result, added);
+      const out = new Map<string, 'accepted' | 'refused'>();
+      for (const d of added) {
+        if (verdicts.get(d.id) === 'refused') {
+          this.refused.add(d.id);
+          this.allChannels.delete(d.id);
+          this.openChannels.delete(d.id);
+          out.set(d.id, 'refused');
+        } else {
+          this.refused.delete(d.id);
+          out.set(d.id, 'accepted');
+        }
+      }
+      return out;
+    } catch (error) {
+      console.error(`[channels] changing ${removed.join(', ') || 'nothing'} for ${added.map((d) => d.id).join(', ') || 'nothing'} got no answer (${(error as Error).message}); offered again at the next pass`);
+      for (const { id, descriptor, open } of before) {
+        if (descriptor) this.allChannels.set(id, descriptor);
+        else this.allChannels.delete(id);
+        if (open) this.openChannels.add(id);
+      }
+      this.ids.unanswered(keys, addedIds);
+      return 'unanswered';
+    } finally {
+      for (const d of added) this.announcing.delete(d.id);
+    }
+  }
+
   /**
    * The host proved it knows a channel by acting on it — it opened or closed
    * one this server is still waiting to hear about. Against a host that
@@ -323,9 +369,27 @@ export class ChannelManager {
   private restoreRefusal(channelId: string): void {
     this.refused.add(channelId);
     this.unannounced.delete(channelId);
+    this.unrecord(channelId);
+  }
+
+  private record(descriptor: ChannelDescriptor): void {
+    this.allChannels.set(descriptor.id, descriptor);
+    const key = this.ids.keyOfDescriptor(descriptor);
+    if (key !== null) this.ids.noteHeld(key, descriptor.id);
+  }
+
+  private unrecord(channelId: string): void {
     this.allChannels.delete(channelId);
     this.openChannels.delete(channelId);
-    this.lastIncoming.delete(channelId);
+    this.ids.forget(channelId);
+  }
+
+  retireId(channelId: string): boolean {
+    const wasOpen = this.openChannels.has(channelId);
+    this.unannounced.delete(channelId);
+    this.refused.delete(channelId);
+    this.unrecord(channelId);
+    return wasOpen;
   }
 
   /** Queue a descriptor for re-announcement, oldest dropped past the cap. */
@@ -454,6 +518,16 @@ export class ChannelManager {
     return this.openChannels.has(channelId);
   }
 
+  isKeyOpen(key: ChannelKey): boolean {
+    const channelId = this.ids.channelIdOf(key);
+    return channelId !== null && this.openChannels.has(channelId);
+  }
+
+  keyOfHeld(channelId: string): ChannelKey | null {
+    const answer = this.ids.resolve(channelId);
+    return answer && 'key' in answer ? answer.key : null;
+  }
+
   /**
    * Handle channels/close from the host. Requires `channels.lifecycle` (§14.1).
    */
@@ -476,10 +550,10 @@ export class ChannelManager {
    * Called when a new message arrives from a platform.
    * Buffers messages and flushes in batches.
    */
-  onIncomingMessage(channelId: string, message: IncomingChannelMessage): void {
-    if (!this.openChannels.has(channelId)) return; // channel not opened by host
-    this.noteConversation(channelId, message);
-    this.enqueue(channelId, message);
+  onIncomingMessage(key: ChannelKey, message: KeyedMessage): void {
+    if (!this.isKeyOpen(key)) return; // channel not opened by host
+    this.noteConversation(key, message);
+    this.enqueue(key, message);
   }
 
   /**
@@ -499,13 +573,13 @@ export class ChannelManager {
    * must not retarget the reply the agent is composing in `support`. Returns
    * whether the hints moved.
    */
-  noteConversation(channelId: string, message: IncomingChannelMessage): boolean {
+  noteConversation(key: ChannelKey, message: Pick<KeyedMessage, 'messageId' | 'threadId' | 'metadata'>): boolean {
     const meta = isRecord(message.metadata) ? message.metadata : undefined;
     if (meta?.reaction === true || typeof meta?.change === 'string') return false;
     const id = Number(message.messageId);
-    const from = this.lastIncoming.get(channelId)?.from;
+    const from = this.lastIncoming.get(key)?.from;
     if (Number.isFinite(id) && from !== undefined && id < from) return false;
-    this.lastIncoming.set(channelId, {
+    this.lastIncoming.set(key, {
       hints: { threadId: message.threadId, metadata: meta },
       ...(Number.isFinite(id) ? { from: id } : {}),
     });
@@ -532,17 +606,35 @@ export class ChannelManager {
 
     const timestamp = new Date().toISOString();
     for (const channelId of targets) {
-      this.enqueue(channelId, {
-        channelId,
-        messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
-        author: { id: 'system', name: `${platformType} connection` },
-        timestamp,
-        content: [{ type: 'text', text: event.text }],
-        // Spread adapter metadata FIRST so it can never clobber the
-        // discriminators consumers filter on (system / kind).
-        metadata: { ...event.metadata, system: true, kind: event.kind },
-      });
+      const key = this.keyOfHeld(channelId);
+      if (key !== null) this.systemEventTo(key, platformType, event, timestamp);
     }
+  }
+
+  systemEventTo(key: ChannelKey, platformType: string, event: PlatformSystemEvent, timestamp = new Date().toISOString()): void {
+    if (!this.isKeyOpen(key)) return;
+    this.enqueue(key, {
+      key,
+      messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
+      author: { id: 'system', name: `${platformType} connection` },
+      timestamp,
+      content: [{ type: 'text', text: event.text }],
+      // Spread adapter metadata FIRST so it can never clobber the
+      // discriminators consumers filter on (system / kind).
+      metadata: { ...event.metadata, system: true, kind: event.kind },
+    });
+  }
+
+  notifyChannel(key: ChannelKey, text: string, metadata: Record<string, unknown>): void {
+    if (!this.isKeyOpen(key)) return;
+    this.enqueue(key, {
+      key,
+      messageId: `system:${String(metadata.kind ?? 'notice')}:${Date.now()}`,
+      author: { id: 'system', name: 'zulip connection' },
+      timestamp: new Date().toISOString(),
+      content: [{ type: 'text', text }],
+      metadata: { ...metadata, system: true },
+    });
   }
 
   /**
@@ -556,13 +648,20 @@ export class ChannelManager {
     if (!adapter) {
       throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel format: ${channelId}`, { channelId });
     }
-
+    const target = await this.resolveTarget(channelId);
+    if (typeof target !== 'string') return adapter.publish(target, undefined, params.content, undefined);
     return adapter.publish(
-      channelId,
-      this.allChannels.get(channelId),
+      target,
+      this.allChannels.get(this.ids.channelIdOf(target) ?? channelId),
       params.content,
-      this.lastIncoming.get(channelId)?.hints,
+      this.lastIncoming.get(target)?.hints,
     );
+  }
+
+  private async resolveTarget(channelId: string): Promise<ChannelKey | { streamName: string }> {
+    const answer = await this.ids.keyOf(channelId);
+    if ('refusal' in answer) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, answer.refusal, { channelId });
+    return 'key' in answer ? answer.key : { streamName: answer.unknownName };
   }
 
   /**
@@ -577,7 +676,12 @@ export class ChannelManager {
     if (!this.grant.has('channels.typing')) throw capabilityDenied('channels.typing');
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
-    const descriptor = this.allChannels.get(channelId);
+    const key = await this.resolveTarget(channelId);
+    if (typeof key !== 'string') {
+      console.error(`[zulip-mcp] typing on ${channelId}: no Zulip stream is named #${key.streamName}, so nothing was sent`);
+      return;
+    }
+    const descriptor = this.allChannels.get(this.ids.channelIdOf(key) ?? channelId);
     // A topic the host names wins. Like publish, a host that names none means
     // the conversation's current one, the topic of the newest message
     // noteConversation took.
@@ -587,20 +691,20 @@ export class ChannelManager {
     const hostTopic = metadata?.topic;
     const named = typeof hostTopic === 'string';
     const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });
-    const current = named ? hostTopic : this.lastIncoming.get(channelId)?.hints.threadId;
-    const running = this.typingTopic.has(channelId);
-    const started = this.typingTopic.get(channelId);
+    const current = named ? hostTopic : this.lastIncoming.get(key)?.hints.threadId;
+    const running = this.typingTopic.has(key);
+    const started = this.typingTopic.get(key);
     if (op === 'stop') {
-      this.typingTopic.delete(channelId);
+      this.typingTopic.delete(key);
       // A channel-only stop cancels the run where it is; a named stop cancels
       // that topic too.
-      if (running && (!named || started !== current)) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
-      if (named || !running) await adapter.sendTyping(channelId, descriptor, at(current), 'stop');
+      if (running && (!named || started !== current)) await adapter.sendTyping(key, descriptor, at(started), 'stop');
+      if (named || !running) await adapter.sendTyping(key, descriptor, at(current), 'stop');
       return;
     }
-    if (running && started !== current) await adapter.sendTyping(channelId, descriptor, at(started), 'stop');
-    this.typingTopic.set(channelId, current);
-    await adapter.sendTyping(channelId, descriptor, at(current), 'start');
+    if (running && started !== current) await adapter.sendTyping(key, descriptor, at(started), 'stop');
+    this.typingTopic.set(key, current);
+    await adapter.sendTyping(key, descriptor, at(current), 'start');
   }
 
   /**
@@ -639,15 +743,29 @@ export class ChannelManager {
    * Awaits an in-flight flush first so batches never interleave. Used at
    * shutdown so a message received in the last window is not stranded with
    * its watermark unadvanced — and, if the connection is already gone, the
-   * failure leaves the watermark alone for the next sweep.
+   * failure leaves the watermark alone for the next start's catch-up.
    */
   async flush(): Promise<void> {
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
-    if (this.flushing) await this.flushing;
-    await this.flushBatch();
+    while (this.flushing) await this.flushing;
+    const flushing: Promise<void> = this.flushBatch().finally(() => {
+      if (this.flushing === flushing) this.flushing = null;
+      this.wakeIdleWaiters();
+    });
+    this.flushing = flushing;
+    await flushing;
+  }
+
+  isIdle(): boolean {
+    return this.batchTimer === null && this.flushing === null;
+  }
+
+  idle(): Promise<void> {
+    if (this.isIdle()) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.push(resolve));
   }
 
   /** Buffered messages not yet delivered (for tests and diagnostics). */
@@ -666,13 +784,14 @@ export class ChannelManager {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
+    this.wakeIdleWaiters();
   }
 
   /**
    * Forget everything that belonged to a connection: the descriptors the
    * peer accepted, what it had open, what was buffered for it. A new peer
    * registers and opens afresh; whatever was buffered is re-offered by the
-   * catch-up sweep, not sent to a host that never asked for it.
+   * new connection's catch-up, not sent to a host that never asked for it.
    */
   reset(): void {
     this.destroy();
@@ -688,15 +807,16 @@ export class ChannelManager {
     this.unannounced.clear();
     this.refused.clear();
     this.announcing.clear();
+    this.ids.reset();
   }
 
   // -- Private --
 
-  private enqueue(channelId: string, message: IncomingChannelMessage, attempts = 0): void {
-    let buffer = this.batchBuffer.get(channelId);
+  private enqueue(key: ChannelKey, message: KeyedMessage, attempts = 0): void {
+    let buffer = this.batchBuffer.get(key);
     if (!buffer) {
       buffer = [];
-      this.batchBuffer.set(channelId, buffer);
+      this.batchBuffer.set(key, buffer);
     }
     buffer.push({ message, attempts });
 
@@ -714,8 +834,16 @@ export class ChannelManager {
       }
       this.flushing = this.flushBatch().finally(() => {
         this.flushing = null;
+        this.wakeIdleWaiters();
       });
     }, this.batchWindowMs);
+  }
+
+  private wakeIdleWaiters(): void {
+    if (this.idleWaiters.length === 0 || !this.isIdle()) return;
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   /**
@@ -738,18 +866,19 @@ export class ChannelManager {
     // Policy is rechecked at send time, not only at enqueue: what changed
     // during the batch window (a mute, a narrowed allowlist, a reduced
     // grant) applies to what is still waiting.
-    if (this.hooks.deliverable) {
-      const withheld = new Map<string, IncomingChannelMessage[]>();
-      queued = queued.filter((q) => {
-        if (this.hooks.deliverable!(q.message)) return true;
-        const list = withheld.get(q.message.channelId) ?? [];
-        list.push(q.message);
-        withheld.set(q.message.channelId, list);
+    const wire = new Map<KeyedMessage, IncomingChannelMessage>();
+    const withheld: KeyedMessage[] = [];
+    queued = queued.filter((q) => {
+      const channelId = this.ids.channelIdOf(q.message.key);
+      if (channelId === null || !this.openChannels.has(channelId) || (this.hooks.deliverable && !this.hooks.deliverable(q.message))) {
+        withheld.push(q.message);
         return false;
-      });
-      for (const [channelId, messages] of withheld) this.report(this.hooks.onWithheld, channelId, messages);
-      if (queued.length === 0) return;
-    }
+      }
+      wire.set(q.message, toWire(q.message, channelId));
+      return true;
+    });
+    for (const [key, messages] of groupByKey(withheld)) this.report(this.hooks.onWithheld, key, messages);
+    if (queued.length === 0) return;
     const allMessages = queued.map((q) => q.message);
 
     // §14.1: `channels/incoming` is server→host content injection plus wake
@@ -760,13 +889,13 @@ export class ChannelManager {
       console.error(
         `channels.incoming not granted; dropping ${allMessages.length} inbound message(s)`,
       );
-      for (const [channelId, messages] of groupByChannel(allMessages)) this.report(this.hooks.onWithheld, channelId, messages);
+      for (const [key, messages] of groupByKey(allMessages)) this.report(this.hooks.onWithheld, key, messages);
       return;
     }
 
     let result: ChannelsIncomingResult | undefined;
     try {
-      result = await this.host.sendIncoming(allMessages);
+      result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!));
     } catch (error) {
       const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
       const givenUp = queued.filter((q) => q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
@@ -777,18 +906,18 @@ export class ChannelManager {
           ':',
         (error as Error).message ?? error,
       );
-      for (const [channelId, messages] of groupByChannel(givenUp)) this.report(this.hooks.onGivenUp, channelId, messages);
+      for (const [key, messages] of groupByKey(givenUp)) this.report(this.hooks.onGivenUp, key, messages);
       // Put the retry set back ahead of anything buffered meanwhile.
-      const requeued = new Map<string, Queued[]>();
+      const requeued = new Map<ChannelKey, Queued[]>();
       for (const q of retry) {
-        const list = requeued.get(q.message.channelId) ?? [];
+        const list = requeued.get(q.message.key) ?? [];
         list.push({ message: q.message, attempts: q.attempts + 1 });
-        requeued.set(q.message.channelId, list);
+        requeued.set(q.message.key, list);
       }
-      for (const [channelId, later] of this.batchBuffer) {
-        const list = requeued.get(channelId) ?? [];
+      for (const [key, later] of this.batchBuffer) {
+        const list = requeued.get(key) ?? [];
         list.push(...later);
-        requeued.set(channelId, list);
+        requeued.set(key, list);
       }
       this.batchBuffer = requeued;
       if (retry.length > 0) this.scheduleBatchFlush();
@@ -796,23 +925,23 @@ export class ChannelManager {
     }
 
     const accepted = this.acceptedMessageIds(result, allMessages);
-    const byChannel = new Map<string, { accepted: IncomingChannelMessage[]; rejected: IncomingChannelMessage[] }>();
+    const byKey = new Map<ChannelKey, { accepted: KeyedMessage[]; rejected: KeyedMessage[] }>();
     let rejected = 0;
     for (const m of allMessages) {
-      const entry = byChannel.get(m.channelId) ?? { accepted: [], rejected: [] };
+      const entry = byKey.get(m.key) ?? { accepted: [], rejected: [] };
       if (accepted.has(m.messageId)) entry.accepted.push(m);
       else {
         entry.rejected.push(m);
         rejected++;
       }
-      byChannel.set(m.channelId, entry);
+      byKey.set(m.key, entry);
     }
     if (rejected > 0) {
       console.error(`Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
     }
-    for (const [channelId, entry] of byChannel) {
+    for (const [key, entry] of byKey) {
       try {
-        this.hooks.onDelivered?.(channelId, entry.accepted, entry.rejected);
+        this.hooks.onDelivered?.(key, entry.accepted, entry.rejected);
       } catch (error) {
         console.error('onDelivered hook failed:', (error as Error).message ?? error);
       }
@@ -820,13 +949,13 @@ export class ChannelManager {
   }
 
   private report(
-    hook: ((channelId: string, messages: IncomingChannelMessage[]) => void) | undefined,
-    channelId: string,
-    messages: IncomingChannelMessage[],
+    hook: ((key: ChannelKey, messages: KeyedMessage[]) => void) | undefined,
+    key: ChannelKey,
+    messages: KeyedMessage[],
   ): void {
     if (!hook || messages.length === 0) return;
     try {
-      hook(channelId, messages);
+      hook(key, messages);
     } catch (error) {
       console.error('channel manager hook failed:', (error as Error).message ?? error);
     }
@@ -836,7 +965,7 @@ export class ChannelManager {
    *  itemize has accepted the batch as a whole. */
   private acceptedMessageIds(
     result: ChannelsIncomingResult | undefined,
-    sent: IncomingChannelMessage[],
+    sent: KeyedMessage[],
   ): Set<string> {
     if (result && Array.isArray(result.results)) {
       return new Set(result.results.filter((r) => r?.accepted).map((r) => r.messageId));
@@ -845,12 +974,12 @@ export class ChannelManager {
   }
 }
 
-function groupByChannel(messages: IncomingChannelMessage[]): Map<string, IncomingChannelMessage[]> {
-  const out = new Map<string, IncomingChannelMessage[]>();
+function groupByKey(messages: KeyedMessage[]): Map<ChannelKey, KeyedMessage[]> {
+  const out = new Map<ChannelKey, KeyedMessage[]>();
   for (const m of messages) {
-    const list = out.get(m.channelId) ?? [];
+    const list = out.get(m.key) ?? [];
     list.push(m);
-    out.set(m.channelId, list);
+    out.set(m.key, list);
   }
   return out;
 }

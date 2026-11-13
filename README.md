@@ -25,27 +25,124 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Every stream and DM conversation the bot can see is a channel the host can
   open and close. Opening a channel subscribes the bot to the stream first
-  (Zulip only delivers events to subscribers) — a stream the bot cannot
-  subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically.
+  (without a subscription, a public stream sends the bot a message's edits
+  and reactions only when the message mentions it, and a private stream sends
+  at most the messages that mention it) — a stream the bot cannot subscribe
+  to fails the open rather than opening without it — and can return
+  backscroll atomically. A stream whose name reads as a DM channel id, such
+  as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
-  **mentions and DMs on closed channels** arrive as `push/event` so they always
-  reach the agent; ambient traffic on closed channels is dropped and counted
-  (`channel_missed`).
+  **mentions, quote replies and DMs on closed channels** arrive as
+  `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
+  (`channel_missed`). On live delivery, each channel's messages, reactions and
+  changes are offered to the host in the order the server received them. An
+  edit that doesn't move its message, or a deletion, that arrives while the
+  message still waits for its turn is applied to the message instead: the
+  message comes once with its new text and "(edited)", or doesn't come, and
+  no line is offered about it, nor for a reaction or a move that waited
+  about the deleted message alone. A change or a reaction to a
+  message that arrives while the message's move to another stream still
+  waits is offered in the new stream's channel, after what waits there, so it
+  can follow a message the server received after it. A message waiting for
+  its quote lookup or its attachments holds back only its own channel. An
+  event that only a lookup can place waits for it, such as a
+  reaction to a message the server hasn't seen, and the reactions after it,
+  and the changes and stream messages after it that carry no stream id, wait
+  behind it. A direct message doesn't wait. When delivery
+  stops, a message the server already holds is offered by the next
+  connection's catch-up, as any message above the watermark is, if Zulip's
+  history still has it there; one still waiting for the lookup that places
+  it is dropped, and the next catch-up recovers what it can.
+
+  A stream quote reply counts as addressed when a message link ending in
+  `/near/N` immediately heads a `quote` fence and N resolves to a message
+  the bot authored. It carries `metadata.replyToSelf` on channel messages,
+  `origin.isReplyToBot` on pushes, and `chat:reply`, not `chat:mention`.
+  Push origins and channel-message metadata expose umbrella `isMention`
+  (explicit mention or reply to the bot), plus `isExplicitMention` and `isReplyToBot` for precise gate
+  matching. `metadata.mentioned` remains Zulip's verdict, and the line has no
+  `(mention)` label unless Zulip reports one. When Zulip already reports an
+  explicit mention, quote classification is skipped and `isReplyToBot` is
+  false even if the message also quotes the bot. Silent mentions and links alone
+  do not count. The same rule applies to live delivery, content edits, and
+  channel history used by backscroll, refused-push healing, reconnect sweeps
+  and queue-gap recovery. Removing the quote removes reply addressing;
+  moves and deletions retain the current cached verdict. Inconclusive history
+  reads and content edits retain a cached verified reply only when the quote
+  targets are unchanged and the message remains eligible (not an explicit
+  mention, DM, self-authored or bot-authored message). Only the first two
+  distinct quote targets are checked; page/cache authors are preferred,
+  otherwise live messages/edits share a three-second wait budget each and
+  history reads share eight target GETs and a three-second wait budget per
+  page. Closed-channel catch-up additionally shares at most six seconds of
+  quote-lookup waiting across all pages and both walks. The initial walk
+  waits at most three seconds; the retry walk uses whatever remains of the
+  shared six-second allowance. Only time awaiting quote GETs spends it, not
+  history HTTP or host acceptance. A channel's catch-up at a connection's
+  start can wait about six seconds with uncached quote targets, in addition
+  to those other waits, and the channels' catch-ups take turns at Zulip.
+  Other channels have separate call allowances.
+  Cache/page matches remain usable after exhaustion. All uncached quote-target GETs, live and
+  history, also share a process-wide token bucket: a burst of 30 and refill
+  of 30 per minute (one token every two seconds). A page, channel, reconnect
+  or additional adapter cannot reset it. Exhaustion reports budget-skipped
+  rows without waiting for a token or negative-caching the target; ordinary
+  sends, reactions and edit-placement lookups do not spend these tokens.
+  This limits quote traffic only, not all Zulip API requests. The sweep can
+  exhaust the bucket shared with live delivery: live quotes to uncached
+  targets then degrade to ambient, with no immediate retry (a later sweep
+  may revisit them). Cached targets and explicit mentions remain usable.
+  A budget-starved quote row stops the
+  initial catch-up block short of that row; the single retry stays within
+  the original catch-up ceiling. Rows still unverified on retry without a
+  retained verified verdict fail closed, allowing the backlog to proceed
+  without another gap or reconnect. An unknown bot identity fails closed;
+  unreadable targets fail closed except for the unchanged-target cached
+  verdict described above. An unaccepted live-verified
+  reply keeps its verdict while it is held, across a reconnect within one
+  process too, and its retries use it even when history cannot verify it
+  again. Only API errors with
+  `result: "error"` and `code: "BAD_REQUEST"` (missing or inaccessible targets)
+  are cached for three minutes. On pre-5.0 servers without a code, the legacy
+  `msg: "Invalid message(s)"` is used instead. Other API errors, missing message objects, mismatched message ids,
+  absent/invalid numeric sender ids, non-JSON responses, transport errors and
+  timeouts are uncached and eligible for the retry pass. This is not full
+  response-schema validation.
+  A quote GET ends when the wait budget runs out. The history page's own
+  request has its own bound.
+  Locale/forward-heading limits and the bot-author exclusion are detailed
+  below.
+
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`), and never past a message the host was offered but did not
-  accept — a refusal, a batch lost to a transport failure — which is
-  replayed from history once the host answers again. On the next connection
-  a `<missed>` block per channel delivers what arrived meanwhile (full
-  backscroll for channels the host had open, mention ± 7 messages for the
-  rest), paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
+  `push/event`). A channel the host has accepted nothing on gets one just
+  below its first message that isn't accepted, and while `zulip.messaging`
+  is disabled, as that message comes in. It never advances past a message
+  the host was offered but did not accept — a refusal, a batch lost to a
+  transport failure — which is replayed from history once the host answers
+  again. The exception is a channel that is muted or outside the allowlist
+  when the offer is refused or fails, or at a later read for held messages:
+  there such a message is let go, as it may never reach the agent.
+  On the next connection one or more `<missed>` blocks per channel
+  deliver what arrived meanwhile (full backscroll for channels the host had
+  open, addressed message ± 7 for the rest). Deferred quote verification
+  can split a channel into an accepted
+  prefix block and a retry block; consumers must not assume one block per
+  channel. Closed-DM catch-up uses `chat:dm` and `chat:private`, not a
+  synthesized `chat:mention`; unmentioned DMs have `metadata.mentioned: false`
+  and `origin.isMention: false`. Policies that previously matched DM catch-up
+  via mention tags or flags should match the DM/private tags instead.
+  Addressed-only blocks use `reason="mention"` when every counted
+  addressed message is a mention, otherwise `reason="addressed"`; full
+  backscroll uses `reason="backscroll"`. Blocks are paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
   event-queue expiry is healed the same way — open channels replayed, closed
-  channels' mentions pushed — not merely reported. Live events that arrive
-  before the sweep has run are held and released in order after it, so a
-  live delivery can never jump the watermark over the offline gap.
-- RFC-001 tags on every message (`chat:mention`, `chat:dm`, `chat:ambient`,
-  `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
+  channels' addressed messages pushed — not merely reported. A message
+  that arrives before its channel's catch-up has run waits for it and
+  follows it, as a message, so a live delivery can never jump the watermark
+  over the offline gap. Past 5,000 waiting messages, the channel with the
+  most gives its waiting messages up to a read from history in their place.
+- RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
+  `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
   policy. Images are inlined on live delivery, downsampled to model-max.
 - Reactions, opt-in per channel, carry only reaction tags so a tag-keyed
   wake policy ignores them; operator-owned suppression of reaction markers
@@ -54,8 +151,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   active topic.
 - Edits, topic moves and deletions of messages the agent has seen arrive as
   `[edited]` / `[moved]` / `[deleted]` lines carrying the message's own id
-  (`chat:edited` / `chat:deleted`, plus `chat:mention` when the edit now
-  addresses the bot); history marks edited messages `(edited)`.
+  (`chat:edited` / `chat:deleted`, plus `chat:mention` / `chat:reply` when
+  the edited message mentions / quote-replies to the bot); history marks
+  edited messages `(edited)`.
 
 ## Installation
 
@@ -85,7 +183,7 @@ are likely to touch:
 |---|---|---|
 | `ZULIP_SESSION_ID` | bot email (from env or zuliprc) | Keys the persistent state files (monitoring, delivery, filters); set it when two sessions of one bot share a state dir |
 | `ZULIP_STATE_DIR` | `~/.zulip_mcp_state` | Where those files live |
-| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to on startup |
+| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read, or, for a client without MCPL, once its read of the list got no answer |
 | `ZULIP_FILTERS_FILE` | `<state dir>/<session>.filters.json` | The filters plane file (hot-reloaded) |
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
@@ -131,10 +229,16 @@ before inference for open channels).
 Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
 tool sends and `channels/publish` alike. Disabling `zulip.messaging` stops
-its delivery (incoming and push) and its tools at once.
+its delivery (incoming and push) and its tools at once. A message that
+arrives meanwhile waits in its channel until it is enabled again. An edit or
+a deletion of it that arrives meanwhile is applied to it, unless the change
+also moves it, and a change that moves it is offered after it. A change about
+no message that waits, and any reaction placed in its channel meanwhile,
+isn't told. A catch-up, and a recovery after a break of Zulip's event queue,
+wait too, and are made once it is enabled.
 
-**Wake policy.** Closed-channel mentions and DMs, new-DM announcements and
-`<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
+**Wake policy.** Closed-channel mentions, quote replies and DMs, new-DM
+announcements and `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
 A host whose gate defaults to skip needs a policy on the `mcpl:push-event`
 scope or they land in context without a turn — for connectome-host's gate:
 
@@ -145,11 +249,23 @@ scope or they land in context without a turn — for connectome-host's gate:
 ```
 
 (the gate matches on `tagsAny` / `tagsAll` / `tagsNone`; the host expands
-`chat:mention` and `chat:dm` into `chat:addressed`). Conversely, reactions
-on an open channel are ordinary `channels/incoming` messages carrying only
+`chat:mention`, `chat:reply` and `chat:dm` into `chat:addressed`). Conversely,
+reactions on an open channel are ordinary `channels/incoming` messages carrying only
 `chat:reaction` / `chat:reaction-remove` — a policy keyed on tags ignores
 them, but an unconditional "always wake on this channel" policy wakes on
 them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
+
+**Quote heading formats.** Reply detection accepts translated link text,
+whitespace between the link label and URL or before the colon (including
+non-breaking spaces), and ASCII or full-width colons. Headings ending in
+` in …:` or ` to …:` are deliberately excluded: these also describe
+forwarded messages, not necessarily replies. Thus the first quote in a
+multi-message quote using a forwarding-style heading does not count; a
+later ordinary reply heading can still count.
+
+Quote-based addressing is disabled for authors whose email looks like a bot
+account (the `-bot@` heuristic), to avoid bots waking each other by quoting.
+Explicit Zulip mentions and DMs from bots retain their usual addressing.
 
 ### Edits, moves and deletions
 
@@ -165,25 +281,37 @@ one line in the shared shape, carrying the message's own id:
 ```
 
 On a closed channel only an addressed change is pushed — the mention the
-agent is about to answer was rewritten or deleted, or a DM it is reading
-changed — the same rule as for messages. A change to a message the host was
-never offered is dropped. Zulip re-renders (a link preview arriving) are
+agent is about to answer was rewritten or deleted, a quote reply changed,
+or a DM it is reading changed — the same rule as for messages. On an open
+channel, a change goes when its message is at or below the channel's
+watermark or held, when the change addresses the agent, or when the
+message is the bot's own. A change to any other message is dropped, unless
+it arrives while that message still waits for its turn: the delivery model
+above says what then happens to it. While `zulip.messaging` is disabled, a
+channel's first message can set the watermark just below it, so once it is
+enabled again, a change to an older message that the host never received
+goes too.
+Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits and deletions (rollback,
-`delete_message`) are its own doing and never surface either. A moved
+`delete_message`) are its own doing and don't surface either. A deletion's
+mark lasts 10 minutes and holds the bot's latest 500 deletes, so one whose
+event comes later can surface. A moved
 message is reported on the channel it left, naming where it went.
 
 The lines carry `chat:edited` (moves add `zulip:moved`) or `chat:deleted`,
 plus the same addressing tag a message would: `chat:mention` when the
-message mentions the bot as it now reads, `chat:dm` for a DM, else
+message mentions the bot as it now reads, `chat:reply` for a verified quote
+reply to the bot (including after an edit), `chat:dm` for a DM, else
 `chat:ambient` — so a tag-keyed wake policy wakes on an edit exactly when
 it would wake on the message, and a debounced ambient policy debounces
 ambient edits. An unconditional per-channel policy wakes on every change;
 add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `metadata` carries `change`, `targetMessageId(s)`, `previousContent`,
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
-`previouslyMentioned` (absent when only the post-change state could be
-read). A change line never sets `threadId` and never moves this server's
-reply routing: a moderator archiving an old message does not retarget the
+`previouslyMentioned`, plus `replyToSelf` and `previouslyReplyToSelf` for
+quote addressing (previous verdicts are absent when only the post-change
+state could be read). A change line never sets `threadId` and never moves
+this server's reply routing: a moderator archiving an old message does not retarget the
 reply the agent is composing. A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
@@ -195,7 +323,7 @@ render `(edited)` and `(moved)` trailers with `metadata.editedAt` /
 
 | Channel id | What it is |
 |---|---|
-| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the newest of these there, else `mcpl`: a message queued for the host while the stream is open, even one the batch then withholds or the host refuses; while the stream is closed, a mention the host accepted as a push, or a `<missed>` block it accepted, from its newest mention or, in a full backscroll, its newest message; or the newest message of the history `channels/open` returned, unless that history was fetched before a given message. Streams visible at startup are registered then; one the bot joins later announces itself (see below). |
+| `zulip:<stream>` | A stream. Topics are threads: incoming messages carry the topic as `threadId`; publishes go to the topic of the newest of these there, else `mcpl`: a message queued for the host while the stream is open, even one the batch then withholds or the host refuses; while the stream is closed, an addressed message the host accepted as a push, or a `<missed>` block it accepted, from its newest addressed message or, in a full backscroll, its newest message; or the newest message of the history `channels/open` returned, unless that history was fetched before a given message. Streams visible at startup are registered then; one the bot joins later announces itself (see below). |
 | `zulip:dm:<ids>` | A DM conversation, keyed by the other parties' sorted user ids (`zulip:dm:42`, `zulip:dm:7+42`). Discovered from recent DM history and announced on the fly (`channels/changed`) when someone new writes. |
 
 Descriptors carry `capabilities.history` (`maxMessages`, `supportsBeforeMessage`,
@@ -205,12 +333,37 @@ before the lifecycle commits.
 **Channels that appear after startup.** The bot does not have to be
 restarted to use a stream it was added to later. Four things register one,
 whichever happens first: the `listen` tool registers what it subscribes the
-bot to; every message from the stream carries its descriptor, the way a DM
-from a new conversation does, so the mention that wakes the agent also
-makes the channel openable; `refresh_channels` re-enumerates everything
-visible; and `channels/open` on an unknown exact `channelId` re-enumerates
-once before it fails. Only a channel none of these can find answers
+bot to; every message from the stream carries its descriptor, the way every
+DM does, so the mention that wakes the agent also makes the channel
+openable; `refresh_channels` re-enumerates everything visible; and
+`channels/open` on an unknown exact `channelId` re-enumerates once before it
+fails. Only a channel none of these can find answers
 `-32023 Unknown channel`.
+
+**A stream that is renamed or archived.** A stream's channel id holds its
+current name, so a rename changes it. When Zulip renames a stream, the host
+gets one `channels/changed` that removes `zulip:<old name>` and adds
+`zulip:<new name>`, and an agent that has the channel open gets one line
+naming both. Renames and removals waiting together go in one
+`channels/changed`, so two streams can swap names. Until the host answers,
+the old id is still the stream's id. A rename the host doesn't answer is
+offered again, and the server can't tell whether the host applied it, so
+the next `channels/changed` also removes each id the unanswered one added,
+unless a stream holds that id now. The watermark, the missed tally and
+the filters entries carry to the new name. Where the filters file can't be
+read or written at the rename, the old name stays in it, and the log says
+so. Once the host answers, `channels/open`, `channels/publish`,
+`channels/typing`, `channel_missed` and, with MCPL, `fetch_history` refuse
+the old id, and the refusal names the new id, unless another stream has
+taken the old name, as in a swap. A `channels/acknowledge` adds its
+reaction whatever channel id it names, since Zulip takes a reaction by the
+message's id. With MCPL, `send_message`, `listen` and `unlisten` given the old name are refused
+the same way, and send nothing to Zulip. A stream that was open at last
+sight and was renamed while the server was down, or while no host was
+connected, gets one push from its new channel when a host next connects, if
+the allowlist holds the stream then, and then its backlog, as any stream
+open at last sight does. An archived stream, or one the bot lost access to,
+is removed at the host the same way, with nothing added.
 
 A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit
@@ -222,12 +375,10 @@ oldest stops being retried and stays usable. One consequence worth knowing:
 `channels/list` can name a channel the host never confirmed.
 
 A host that opens or closes a channel has confirmed it, whatever became of
-the announcement, and it leaves the retry set at that point. Against
-agent-framework that is the only confirmation available for an announcement
-made inside a tool call: it reconciles (a blocking `channels/open` or
-`channels/close` per descriptor) before it answers, and this server serves
-one request at a time, so the answer cannot arrive until the tool returns.
-Without that rule the backlog would be retried on every refresh forever.
+the announcement, and it leaves the retry set at that point. For a host that
+takes `channels/changed` as a notification and never answers it, that is
+the only confirmation available. Without that rule the backlog would be
+retried on every refresh forever.
 
 Silence is not refusal either. A host that itemizes only the descriptors it
 changed leaves the rest unstated, and they are treated as pending, not
@@ -236,15 +387,20 @@ unregistered and closed, it is not announced again, and `refresh_channels`
 lists it under `refused`. Asking again is an agent decision — an explicit
 `refresh_channels` retries refused channels.
 
-An announcement waits 5 seconds, not the protocol default of 30. This
-server answers one request at a time, and agent-framework's
-`channels/changed` handler reconciles (a blocking `channels/open` per
-descriptor) *before* it answers, while its `channels/register` handler
-answers first. So an announcement made inside a tool call cannot be
-answered until that call returns. Timing out quickly keeps the channel
-usable, lets the host's own `channels/open` be served, and leaves the
-re-announcement to the next refresh; descriptors are recorded before the
-announcement goes out so that open succeeds when it lands.
+An announcement waits 5 seconds, not the protocol default of 30, since the
+channel's messages wait behind it. agent-framework 0.18.0 and older
+reconciled (a blocking `channels/open` per descriptor) *before* it answered
+`channels/changed`. A host's `channels/open` or `channels/close` of a channel
+this server can already name doesn't wait for the requests ahead of it. It
+waits for what runs on that channel and for the host's earlier requests about
+it, so such a host can answer an announcement made inside a tool call or a
+delivery. It still waits for the requests ahead of it while one of them is a
+`featureSets/update`, or an open or close whose channel the server couldn't
+name when it came. A `channels/open` that has to re-discover its channel is the
+exception: the host's own open of that channel waits behind it, and the
+announcement times out. Descriptors are recorded before the announcement goes
+out, so that open succeeds when it lands, and the re-announcement is left to
+the next refresh.
 
 ## Filters plane
 
@@ -303,6 +459,14 @@ file, or remove it to re-seed from the environment.
 **Writing**
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
 `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+
+`send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
+Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
+For a stream message, a `topic` beside `reply_to` sends to that message's stream in the given topic: `{"reply_to":12345,"topic":"follow-up","content":"Thanks!"}`.
+Omit `to`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
+A supplied `to`, a `topic` for a direct message, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+After a send with `reply_to`, the result says where the message went: `channelId` and `channel`, the stream's name, for a stream message, and `topic` when you gave none; `channelId` and `to_user_ids` for a direct message, where `to_user_ids` is the participants other than the bot, or the bot too where its own id isn't known or the conversation is its own.
+Without `reply_to`, provide `type` and `to`, plus `topic` for a stream message: a stream message with neither `topic` nor `reply_to` is refused before uploads or sends. No additional permissions are needed.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes
@@ -377,8 +541,8 @@ history injected before inference, and `fetch_history` / `fetch_around`:
 
 The time follows `AGENT_TIMEZONE` / `AGENT_TIMESTAMP_STYLE`; `full` drops its
 `[Zone]` suffix on these lines (the offset fixes the instant), and `none`
-keeps the id. `(mention)` marks a stream message that mentions the bot; a
-direct message says `[DM]` instead. The reply affordance on a new DM precedes
+keeps the id. `(mention)` marks a stream message that Zulip says mentions
+the bot, not a quote-only reply; a direct message says `[DM]` instead. The reply affordance on a new DM precedes
 the line; the attachment note and inlined images follow it. Header fields are
 folded onto one line but not escaped, so a topic containing `]: ` reads
 ambiguously to a regex. The backscroll returned on `channels/open` is not
@@ -414,7 +578,8 @@ head (`\] [^:]*: pattern`), or match on channel, scope or tags instead.
 Under `ZULIP_STATE_DIR`, keyed by session:
 
 - `<session>.json` — the plain-MCP monitor (streams, last-read ids)
-- `<session>.delivery.json` — watermarks, missed tallies, last-open channels
+- `<session>.delivery.json` — watermarks, missed tallies, last-open channels,
+  and the stream names they were saved under (written only with MCPL)
 - `<session>.filters.json` — the filters plane (unless `ZULIP_FILTERS_FILE`)
 
 Put `ZULIP_STATE_DIR` on storage that survives a redeploy. In a container
@@ -427,24 +592,30 @@ environment). Under connectome-host, point it into the data volume, e.g.
 
 ## Notes for operators
 
-- **Subscription is not optional.** Zulip delivers stream events only to
-  subscribers, even with `all_public_streams` on the event queue. Opening a
+- **Subscription is not optional.** Even with `all_public_streams` on the
+  event queue, a public stream sends a bot that isn't subscribed its new
+  messages, with mentions of the bot flagged, but a message's edits and
+  reactions only when the message mentions the bot. A private stream sends
+  it at most the messages that mention it. Opening a
   channel subscribes the bot (and fails if it cannot — a private stream the
   bot was not invited to answers `success` with the stream under
   `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`
   and `listen` do it explicitly. `listen` alone leaves the channel *closed*:
-  ambient is tallied and mentions become push events — the host must open
+  ambient is tallied and addressed messages become push events — the host must open
   the channel to receive its traffic.
 - **State from 2.x.** The plain-MCP monitor cursors (`<session>.json`) are
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
-- **No per-call timeouts** on the Zulip API yet: the serve loop handles one
-  host request at a time, so a hung Zulip call stalls the requests behind
-  it. The host's own timeout abandons its request but does not unstall the
-  loop; a server in that state needs a restart.
-- **zulip-js quirks** (in `platforms/zulip-events.ts`): booleans in POST bodies
-  must be strings, arrays must be raw arrays; API errors come back as values
-  (`result: 'error'`), which this server turns into thrown errors.
+- **Zulip calls have a bound:** 15 s, and 90 s for the event long poll, for
+  the history reads that recover or count missed messages, and for the start's
+  reads of the bot's profile and the realm's settings.
+  A call that reaches it is ended and fails. A send, an edit or a delete that
+  may have reached Zulip without an answer fails with an error saying so.
+  `fetch_attachment`'s download ends when it gets no data for 15 s. File
+  uploads have no bound.
+- **A message's attachments share one bound on live delivery:** 15 s for
+  all its fetches together. An attachment not fetched by then gets a note
+  with its path for `fetch_attachment`.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

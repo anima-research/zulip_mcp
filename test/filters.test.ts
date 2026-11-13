@@ -165,6 +165,31 @@ test('the plane seeds from env, hot-reloads edits, and refuses updates while bro
   }
 });
 
+test('an update builds on an operator\'s edit that no poll has seen yet, and refuses over an unparseable one', () => {
+  const dir = tmp();
+  try {
+    const path = join(dir, 'filters.json');
+    writeFileSync(path, JSON.stringify({ streams: ['general'] }));
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    quiet(() => plane.start());
+
+    writeFileSync(path, JSON.stringify({ streams: ['general', 'dev'] }));
+    utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
+    assert.equal(quiet(() => plane.update((f) => ({ ...f, mutedStreams: ['random'] }))).ok, true);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), { streams: ['general', 'dev'], mutedStreams: ['random'] });
+    assert.equal(plane.streamAllowed('dev'), true);
+
+    writeFileSync(path, '{broken');
+    utimesSync(path, new Date(Date.now() + 10_000), new Date(Date.now() + 10_000));
+    const refused = quiet(() => plane.update((f) => ({ ...f, mutedStreams: [] })));
+    assert.equal(refused.ok, false);
+    assert.equal(readFileSync(path, 'utf-8'), '{broken');
+    plane.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the host baseline is enforced every start, is never written to the file, and merges with file entries', () => {
   const dir = tmp();
   try {

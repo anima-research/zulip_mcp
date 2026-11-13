@@ -10,8 +10,10 @@
  *   - fetching recent history for context/beforeInference injections
  *   - streaming real-time incoming messages (self-filtered)
  *
- * Channel IDs are prefixed with the adapter's `type` ('zulip:...'); the MCPL
- * layer routes purely on that prefix and never inspects the remainder.
+ * Everything that crosses this seam names a channel by its key (see
+ * channel-key.ts); channel ids are made only where something leaves for the
+ * host, and descriptors carry the id the host is told. The rollback record
+ * is the exception: `onSent` and `deleteMessage` carry the channel id.
  */
 
 import type {
@@ -19,8 +21,15 @@ import type {
   ChannelsPublishResult,
   ContentBlock,
   ContextInjection,
-  IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
+import type { ChannelKey, KeyedMessage } from '../channel-key.js';
+
+/** A message this server sent, as the rollback record keeps it. */
+export interface SentRecord {
+  messageId: string;
+  channelId: string;
+  content: string;
+}
 
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
@@ -41,11 +50,20 @@ export interface RoutingHints {
 }
 
 /**
- * Delivery callback. `newChannel` is set when the message belongs to a
- * channel the adapter has not described before (a DM from a new
- * conversation) — the server registers it with the host before routing.
+ * A message from the event stream, placed in its channel when it arrives.
+ * The server runs `ready` in the channel's turn: it does what may wait on
+ * the platform, and answers null for a message that isn't for the host.
+ * `newChannel` describes the message's channel wherever the adapter can
+ * describe it, on every message; the server registers it with the host
+ * when it routes the message, if the host holds no id for that channel.
  */
-export type OnIncomingMessage = (message: IncomingChannelMessage, newChannel?: ChannelDescriptor) => void;
+export interface IncomingEntry {
+  key: ChannelKey;
+  messageId: string;
+  ready(changes?: readonly ChangeEntry[]): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null>;
+}
+
+export type OnIncomingMessage = (entry: IncomingEntry) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -72,7 +90,7 @@ export type OnSystemEvent = (event: PlatformSystemEvent) => void;
 /** A reaction added to or removed from a message, resolved to its channel. */
 export interface ReactionEvent {
   action: 'add' | 'remove';
-  channelId: string;
+  key: ChannelKey;
   messageId: string;
   /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
   emoji: string;
@@ -91,7 +109,11 @@ export interface ReactionEvent {
   timestamp: Date;
 }
 
-export type OnReaction = (event: ReactionEvent) => void;
+export interface ReactionEntry extends ReactionEvent {
+  placed(): ReactionEvent;
+}
+
+export type OnReaction = (entry: ReactionEntry) => void;
 
 /**
  * A message the agent may have seen was edited, moved to another topic or
@@ -101,7 +123,7 @@ export type OnReaction = (event: ReactionEvent) => void;
  */
 export interface MessageChangeEvent {
   kind: 'edit' | 'move' | 'delete';
-  channelId: string;
+  key: ChannelKey;
   /** The changed message; a move or bulk delete names the one acted on and
    *  lists every affected id in `messageIds`. */
   messageId: string;
@@ -119,7 +141,7 @@ export interface MessageChangeEvent {
   /** The topic before a move; null when the topic did not change. */
   previousTopic: string | null;
   /** The channel the message moved to, when it left this one. */
-  movedToChannelId: string | null;
+  movedToKey: ChannelKey | null;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;
@@ -127,6 +149,11 @@ export interface MessageChangeEvent {
   previousContent: string | null;
   /** The bot is mentioned in the message as it now reads (Zulip's verdict). */
   mentioned: boolean;
+  /** Verified quote-reply addressing, independent of Zulip's mention flag. */
+  replyToSelf?: boolean;
+  /** True only for a resolved verdict (including content with no quote targets). */
+  replyToSelfVerified?: boolean;
+  previouslyReplyToSelf?: boolean | null;
   /** The bot was mentioned in the message as it read before the change, as
    *  far as the adapter knows (a deleted message keeps its last verdict);
    *  null when the message was not in the adapter's cache and only its
@@ -141,15 +168,26 @@ export interface MessageChangeEvent {
   timestamp: Date;
 }
 
-export type OnMessageChange = (event: MessageChangeEvent) => void;
+export interface ChangeEntry {
+  key: ChannelKey;
+  messageIds: number[];
+  kind: 'edit' | 'move' | 'delete';
+  ready(only?: readonly number[]): Promise<MessageChangeEvent | null>;
+}
 
-/** History request against one channel, in the platform's own id space. */
+export type OnMessageChange = (entry: ChangeEntry) => void;
+
+/** History request against one channel. */
 export interface ChannelHistoryQuery {
   limit: number;
+  /** Mutable allowance shared across a catch-up walk. Adapters subtract only
+   *  milliseconds awaiting quote GETs, not history HTTP or host acceptance. */
+  quoteLookupBudget?: { remainingMs: number };
   /** Exclusive: only messages older than this id. */
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
   afterMessageId?: string;
+  timeoutMs?: number;
 }
 
 /**
@@ -161,11 +199,13 @@ export interface ChannelHistoryQuery {
  */
 export interface ChannelHistoryPage {
   /** Oldest first. */
-  messages: IncomingChannelMessage[];
+  messages: KeyedMessage[];
   /** Newest id scanned (filtered rows included); null when the page was empty. */
   scannedThrough: number | null;
   /** The platform reports nothing newer than this page. */
   reachedNewest: boolean;
+  /** Quote verdicts skipped for this page's GET/wait budget, not verified ambient. */
+  unverifiedMessageIds?: string[];
 }
 
 export interface PlatformAdapter {
@@ -175,30 +215,35 @@ export interface PlatformAdapter {
   /** Discover all channels visible to this connection. */
   discoverChannels(): Promise<ChannelDescriptor[]>;
 
+  /** Set by the MCPL server: each message a publish posts is reported here
+   *  as it is posted, so a rollback checkpoint can undo it. */
+  onSent?: ((sent: SentRecord) => void) | null;
+
   /**
    * Deliver content to a channel. `descriptor` is the registered descriptor
-   * when known; adapters fall back to parsing the channelId.
+   * when known. A stream name the directory does not hold is sent to as given.
    */
   publish(
-    channelId: string,
+    target: ChannelKey | { streamName: string },
     descriptor: ChannelDescriptor | undefined,
     content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult>;
 
   /**
-   * Describe channels by id without enumerating the platform — for a channel
-   * the bot just joined, whose descriptor the server wants to register
-   * without a full discovery pass. Unknown ids are omitted. Optional.
+   * Describe channels — for a channel the bot just joined, whose descriptor
+   * the server wants to register without a full discovery pass. A key the
+   * adapter doesn't know can cost one read of the platform's channel list.
+   * Unknown keys are omitted. Optional.
    */
-  describeChannels?(channelIds: string[]): Promise<ChannelDescriptor[]>;
+  describeChannels?(keys: ChannelKey[]): Promise<ChannelDescriptor[]>;
 
   /**
    * Best-effort typing indicator. Optional — platforms without a usable
    * typing API simply omit it.
    */
   sendTyping?(
-    channelId: string,
+    key: ChannelKey,
     descriptor: ChannelDescriptor | undefined,
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
@@ -209,26 +254,28 @@ export interface PlatformAdapter {
    * context/beforeInference. Returns null when there's nothing to inject.
    */
   fetchContext(
-    channelId: string,
+    key: ChannelKey,
     descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<ContextInjection | null>;
+  ): Promise<Omit<ContextInjection, 'namespace'> | null>;
 
   /**
    * Channel history as incoming-shaped messages, oldest first. Optional —
-   * without it channels/open cannot return backscroll and the reconnect
-   * sweep has nothing to scan.
+   * without it channels/open cannot return backscroll and no catch-up
+   * has anything to read.
    */
-  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
+  fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
-   * Make sure the platform delivers events for this channel — Zulip only
-   * sends stream events to subscribers. Optional; idempotent; best-effort.
+   * Make sure the platform delivers events for this channel. Without a
+   * subscription, a public stream's edits and reactions come only for
+   * messages that mention the bot, and a private stream sends at most the
+   * messages that mention it. Optional; idempotent.
    */
-  ensureSubscribed?(channelId: string): Promise<void>;
+  ensureSubscribed?(key: ChannelKey): Promise<void>;
 
   /** channels/acknowledge — mark a message as seen on the surface (a reaction). Returns the representation used. */
-  acknowledge?(channelId: string, messageId: string, value?: string): Promise<string>;
+  acknowledge?(key: ChannelKey | null, messageId: string, value?: string): Promise<string>;
 
   /** Delete one of the bot's own messages (rollback). */
   deleteMessage?(channelId: string, messageId: string): Promise<void>;
@@ -258,4 +305,6 @@ export interface PlatformAdapter {
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;
+
+  refreshStreams?(why?: string, force?: boolean): Promise<void>;
 }

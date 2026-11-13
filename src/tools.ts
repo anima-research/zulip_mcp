@@ -45,7 +45,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "listen",
     description:
-      "Subscribe the bot to one or more Zulip streams. Required before the bot can receive real-time message events from a stream — event queues with all_public_streams only deliver events for streams the bot is subscribed to. Subscription persists server-side across session restarts.",
+      "Subscribe the bot to one or more Zulip streams. Without a subscription, a public stream still sends its new messages, with mentions of the bot flagged, but a message's edits and reactions only when the message mentions the bot. A private stream sends at most the messages that mention the bot. Subscription persists server-side across session restarts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -61,7 +61,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "unlisten",
     description:
-      "Unsubscribe the bot from one or more Zulip streams. After this, the bot stops receiving real-time events for those streams until listen is called again. Unsubscription persists server-side.",
+      "Unsubscribe the bot from one or more Zulip streams. After this, a public stream still sends its new messages, but edits and reactions only for messages that mention the bot. A private stream sends at most the messages that mention the bot. This lasts until the bot is subscribed again: by listen, by opening the stream's channel, or, for a stream that the operator named in ZULIP_SUBSCRIBE, after the server next starts. Unsubscription persists server-side.",
     inputSchema: {
       type: "object",
       properties: {
@@ -155,23 +155,26 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a message to a stream or as a direct message. For streams, provide 'stream' and 'topic'. For DMs, provide 'to' as user email(s). " +
-      "Pass 'attachments' to send files (root-relative paths under a configured upload root, or base64) with the message.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination; after 'reply_to' the result says where the message went. Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id.",
     inputSchema: {
       type: "object",
       properties: {
         type: {
           type: "string",
           enum: ["stream", "private"],
-          description: "Type of message: 'stream' for stream messages, 'private' for direct messages",
+          description: "'stream' or 'private' (DM). Required without reply_to; otherwise inferred, and must match if supplied.",
         },
         to: {
           type: "string",
-          description: "For stream: stream name. For private: comma-separated email addresses",
+          description: "For stream: stream name. For private: comma-separated email addresses. Required without reply_to; omit with reply_to.",
         },
         topic: {
           type: "string",
-          description: "Topic for stream messages (required for type='stream')",
+          description: "Required for a stream message without reply_to. With reply_to on a stream message, optional: it sends to that message's stream in this topic. To see a stream's recent topics first, call get_stream_topics.",
+        },
+        reply_to: {
+          type: "integer",
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; a supplied to, a topic on a direct message, or an unreadable ID fails before uploads or sends. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -195,7 +198,6 @@ export const toolDefinitions: ToolDefinition[] = [
           },
         },
       },
-      required: ["type", "to"],
     },
   },
   {
@@ -307,13 +309,22 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "get_stream_topics",
-    description: "Get all topics in a specific stream",
+    description: "List a stream's topics, newest first.",
     inputSchema: {
       type: "object",
       properties: {
+        stream: {
+          type: "string",
+          description: "The stream's name. Give this or stream_id.",
+        },
         stream_id: {
           type: "number",
-          description: "ID of the stream",
+          description: "The stream's ID. Give this or stream.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Only the newest N topics.",
         },
         verbose: {
           type: "boolean",
@@ -321,7 +332,6 @@ export const toolDefinitions: ToolDefinition[] = [
           default: false,
         },
       },
-      required: ["stream_id"],
     },
   },
   {

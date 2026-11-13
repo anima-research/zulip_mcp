@@ -11,6 +11,7 @@ import type {
   ContextBeforeInferenceResult,
   ContextInjection,
 } from '@animalabs/mcpl-core';
+import type { ChannelKey } from './channel-key.js';
 import type { ChannelManager } from './channels.js';
 import type { CapabilityGrant } from './grant.js';
 
@@ -25,15 +26,15 @@ const POSITION_CAPABILITY: Record<ContextInjection['position'], string> = {
 
 export interface ContextProviderOptions {
   /** Open channels for which nothing is injected (a muted stream). */
-  excludeChannel?: (channelId: string) => boolean;
+  excludeChannel?: (key: ChannelKey) => boolean;
 }
 
 export class ContextProvider {
   private historySize: number;
-  private readonly excludeChannel: (channelId: string) => boolean;
+  private readonly excludeChannel: (key: ChannelKey) => boolean;
 
   constructor(
-    private channelManager: ChannelManager,
+    private channelManager: Pick<ChannelManager, 'getOpenChannels' | 'keyOfHeld' | 'adapterFor' | 'getChannel' | 'firstAdapterType'>,
     private grant: CapabilityGrant,
     historySize?: number,
     options: ContextProviderOptions = {},
@@ -59,7 +60,8 @@ export class ContextProvider {
     const openChannels = this.channelManager.getOpenChannels();
 
     for (const channelId of openChannels) {
-      if (this.excludeChannel(channelId)) continue;
+      const key = this.channelManager.keyOfHeld(channelId);
+      if (key === null || this.excludeChannel(key)) continue;
       const adapter = this.channelManager.adapterFor(channelId);
       if (!adapter) continue;
       // §6.7: a server must immediately respect a reduction. The response
@@ -69,12 +71,13 @@ export class ContextProvider {
       // each injection again at response-receipt (§5.4).
       if (!this.grant.isFeatureSetActive(`${adapter.type}.context`)) continue;
       try {
-        const injection = await adapter.fetchContext(
-          channelId,
+        const fetched = await adapter.fetchContext(
+          key,
           this.channelManager.getChannel(channelId),
           this.historySize,
         );
-        if (injection) {
+        if (fetched) {
+          const injection: ContextInjection = { ...fetched, namespace: channelId };
           if (!this.grant.has(POSITION_CAPABILITY[injection.position])) {
             console.error(
               `Dropping ${injection.position} injection for ${channelId}: ` +

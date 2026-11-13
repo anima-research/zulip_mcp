@@ -18,8 +18,13 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, editedTrailer } from './history.js';
-import { chunkMessage } from "./content.js";
+import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
+import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
+import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import type { SentRecord } from "./platforms/adapter.js";
+import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
+import { parseKey, streamKey } from './channel-key.js';
+import type { ChannelIds } from './channel-ids.js';
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -29,7 +34,6 @@ import {
   prepareAttachments,
   resolveUploadPolicy,
   uploadPrepared,
-  withAttachmentLinks,
   type UploadPolicy,
   type Uploader,
 } from "./uploads.js";
@@ -40,13 +44,6 @@ export interface SubscriptionRegistration {
   local: string[];
   refused: string[];
   reason?: string;
-}
-
-/** A message this server sent through a tool — recorded for rollback. */
-export interface SentRecord {
-  messageId: string;
-  channelId: string;
-  content: string;
 }
 
 /** What of a message's reactions the model may see. */
@@ -168,6 +165,12 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   return Math.max(min, Math.min(max, n));
 }
 
+function positiveIdArg(name: string, value: unknown): number {
+  const id = typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : value;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error(`${name} must be a positive integer`);
+  return id;
+}
+
 function numberOrUndefined(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
@@ -197,7 +200,7 @@ export function formatHistoryLines(
     const head = messageLineHead({
       id: m.id,
       time: Number.isNaN(m.timestamp.getTime()) ? "" : formatTime(m.timestamp),
-      stream: m.isDm ? null : (m.streamName ?? ""),
+      stream: m.isDm ? null : (m.streamNameShown ?? ""),
       topic: m.topic,
       author: m.authorName,
       mentioned: m.mentioned,
@@ -221,7 +224,7 @@ export function toToolCallResult(result: unknown): ToolCallResult {
 }
 
 export class ZulipToolRuntime {
-  private readonly zulipClient: any;
+  private readonly api: ZulipApi;
   private readonly sessionId: string;
   private readonly monitoredChannels = new Map<string, ChannelState>();
 
@@ -233,8 +236,6 @@ export class ZulipToolRuntime {
   /** Called BEFORE delete_message is sent (the delete event can arrive before
    *  the response does), so the adapter recognises the echo as its own. */
   onDeleted: ((messageId: string) => void) | null = null;
-  /** Called when that delete_message failed: the message still exists, and
-   *  someone else's later deletion must surface. */
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
   /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
@@ -243,19 +244,42 @@ export class ZulipToolRuntime {
    *  host did not confirm is the agent's business, not a stderr line. */
   onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
 
+  channelIds: ChannelIds | null = null;
+
+  private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const ids = this.channelIds;
+    if (!ids) return out;
+    const renamed: string[] = [];
+    for (const name of names) {
+      const answer = await ids.keyOf(`zulip:${name}`, { byName: true });
+      if ("key" in answer) {
+        const parsed = parseKey(answer.key);
+        if (parsed.kind === "stream") out.set(name, parsed.streamId);
+        continue;
+      }
+      const former = "refusal" in answer ? ids.directory.formerOf(name) : undefined;
+      if (former) renamed.push(`Zulip stream #${name} was renamed #${former.current}.`);
+    }
+    if (renamed.length > 0) throw new Error(`${renamed.join(" ")} Nothing went to Zulip.`);
+    return out;
+  }
+
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
   /** Line time for fetch_history / fetch_around, shared with live delivery. */
   private readonly formatTime: (d: Date) => string;
+  private readonly maxMessageLength: number;
 
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
-    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string } = {},
+    options: { uploader?: Uploader; uploadPolicy?: UploadPolicy; formatTime?: (d: Date) => string; maxMessageLength?: number } = {},
   ) {
-    this.zulipClient = session.client;
+    this.api = session.api;
     this.sessionId = session.sessionId;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
+    this.maxMessageLength = options.maxMessageLength ?? ZULIP_MAX_MESSAGE_LENGTH;
     this.uploader = options.uploader ?? (session.realm ? createZulipUploader(session) : null);
     this.uploadPolicy = options.uploadPolicy ?? resolveUploadPolicy(process.env, session.maxUploadBytes);
     this.loadState();
@@ -277,6 +301,80 @@ export class ZulipToolRuntime {
   /** Reaction suppression for history rendering (the filters plane). */
   setReactionPolicy(policy: ReactionPolicy): void {
     this.reactionPolicy = policy;
+  }
+
+  private async send(destination: Destination, content: string, args: Record<string, any>, channelId: string) {
+    try {
+      return await sendMessage(this.api, destination, content, {
+        limit: this.maxMessageLength,
+        unlinkable: "refuse",
+        upload: () => this.uploadFor(args),
+        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+      });
+    } catch (err) {
+      if (err instanceof SendRefused) throw new Error(err.answer.msg ?? "Zulip refused the message");
+      if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
+      throw err;
+    }
+  }
+
+  /** Resolve and check a reply before uploading files or sending any chunks. */
+  private async replyDestination(args: Record<string, any>) {
+    const id = numberOrUndefined(args.reply_to);
+    if (!Number.isSafeInteger(id)) throw new Error("reply_to must be an integer message id");
+    if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to");
+    const result = await this.api.requestAnswer<{ message?: any }>("GET", `/messages/${id}`);
+    if (result.result === "error") {
+      // Keep the API code as well as its wording: missing/deleted/inaccessible
+      // messages must never fall back to a caller-supplied destination.
+      throw new Error(`Zulip refused reply_to ${id}${result.code ? ` (${result.code})` : ""}: ${result.msg ?? "unknown error"}`);
+    }
+    const message = result.message;
+    const unreadable = () => new Error(`reply_to ${id} has no readable destination`);
+    if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
+    const type = args.type === "direct" ? "private" : args.type === "channel" ? "stream" : args.type;
+    if (type !== undefined && type !== message.type) {
+      throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
+    }
+    if (message.type === "stream") {
+      const name = message.display_recipient;
+      if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
+      const named = `zulip:${name}`;
+      // The receipt names the stream by the id the host holds for it, or by none
+      // while the host holds its name's id for another stream.
+      const channelId = this.channelIds != null && Number.isSafeInteger(message.stream_id) ? this.channelIds.channelIdOf(streamKey(message.stream_id)) : named;
+      return args.topic === undefined
+        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: channelId ?? named, receipt: { channelId, channel: name, topic: message.subject } }
+        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId: channelId ?? named, receipt: { channelId, channel: name } };
+    }
+    if (args.topic !== undefined) throw new Error(`reply_to ${id} is a direct message, which has no topic; omit topic`);
+
+    const recipients: ZulipRecipient[] = message.display_recipient;
+    if (!Array.isArray(recipients) || recipients.length === 0 || recipients.some((r) => !Number.isSafeInteger(r?.id))) {
+      throw unreadable();
+    }
+    const ids = recipients.map((r) => r.id);
+    const others = dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id);
+    const channelId = dmChannelIdFor(others);
+    return { type: message.type, to: ids, topic: undefined, channelId, receipt: { channelId, to_user_ids: others } };
+  }
+
+  private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string | null; isDm: boolean }> {
+    const asId = channel.startsWith("zulip:") ? channel : `zulip:${channel}`;
+    const dmIds = parseDmChannelId(asId);
+    if (dmIds) return { query: { dmUserIds: dmIds }, channel: dmChannelIdFor(dmIds), channelId: dmChannelIdFor(dmIds), isDm: true };
+    const ids = this.channelIds;
+    const answer = ids ? await ids.keyOf(asId, { byName: !channel.startsWith("zulip:") }) : null;
+    if (answer && "refusal" in answer) throw new Error(answer.refusal);
+    if (ids && answer && "key" in answer) {
+      const parsed = parseKey(answer.key);
+      if (parsed.kind === "stream") {
+        const name = ids.directory.nameOf(parsed.streamId) ?? "";
+        return { query: { streamId: parsed.streamId }, channel: name, channelId: ids.channelIdOf(answer.key), isDm: false };
+      }
+    }
+    const name = asId.slice("zulip:".length);
+    return { query: { streamName: name }, channel: name, channelId: asId, isDm: false };
   }
 
   // ── Persistent monitoring state ──
@@ -328,7 +426,7 @@ export class ZulipToolRuntime {
 
   /** Execute a tool. Returns the raw handler result; see toToolCallResult. */
   async handleToolCall(name: string, args: any): Promise<any> {
-    const zulipClient = this.zulipClient;
+    const api = this.api;
     const monitoredChannels = this.monitoredChannels;
     args = args ?? {};
 
@@ -340,7 +438,7 @@ export class ZulipToolRuntime {
         for (const channelName of channels) {
           try {
             // Get latest message to establish baseline
-            const messages = await zulipClient.messages.retrieve({
+            const messages = await api.request<{ messages: any[] }>("GET", "/messages", `the newest message in #${channelName}`, {
               anchor: "newest",
               num_before: 1,
               num_after: 0,
@@ -416,7 +514,8 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
-          const result = await zulipClient.users.me.subscriptions.add({
+          await this.streamIdsByName(channels);
+          const result = await api.requestAnswer<any>("POST", "/users/me/subscriptions", {
             subscriptions: channels.map(name => ({ name })),
           });
           // A stream the bot just joined is not in the host's channel list
@@ -459,8 +558,9 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
-          const result = await zulipClient.users.me.subscriptions.remove({
-            subscriptions: JSON.stringify(channels),
+          await this.streamIdsByName(channels);
+          const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
+            subscriptions: channels,
           });
           return {
             result: result?.result,
@@ -506,7 +606,7 @@ export class ZulipToolRuntime {
 
         // Retrieve messages
         const maxMessages = args.max_messages || 500;
-        const result = await zulipClient.messages.retrieve({
+        const result = await api.request<{ messages: any[] }>("GET", "/messages", `history of #${args.channel}`, {
           anchor: "newest",
           num_before: maxMessages,
           num_after: 0,
@@ -587,7 +687,7 @@ export class ZulipToolRuntime {
 
           try {
             // Get messages since last read
-            const result = await zulipClient.messages.retrieve({
+            const result = await api.request<{ messages: any[] }>("GET", "/messages", `unread messages in #${channelName}`, {
               anchor: "newest",
               num_before: 200,
               num_after: 0,
@@ -643,24 +743,33 @@ export class ZulipToolRuntime {
       }
 
       case "send_message": {
+        args = { ...args, reply_to: args.reply_to ?? undefined, to: args.to ?? undefined,
+          topic: args.topic ?? undefined, type: args.type ?? undefined };
+        if (args.reply_to === undefined && (args.to === undefined || args.type === undefined)) throw new Error("type and to are required without reply_to");
         const hasText = typeof args.content === "string" && args.content.trim() !== "";
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
-        const uploaded = await this.uploadFor(args);
-        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
-        const ids: number[] = [];
-        let last: any = null;
-        const channelId = args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
-          ? dmChannelIdFor(args.to as number[])
-          : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`;
-        for (const chunk of chunkMessage(content)) {
-          last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
-          if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
-          ids.push(last.id);
-          this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
+        if (args.reply_to === undefined && args.topic === undefined && (args.type === "stream" || args.type === "channel")) {
+          throw new Error("topic is required for a stream message: name one, or use reply_to to answer a message where it is");
         }
+        const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
+        if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
+        const isDm = args.type === "private" || args.type === "direct";
+        let channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
+          ? dmChannelIdFor(args.to as number[])
+          : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
+        if (!reply && !isDm && typeof args.to === "string") {
+          const streamId = (await this.streamIdsByName([args.to])).get(args.to);
+          if (streamId !== undefined) {
+            channelId = this.channelIds?.channelIdOf(streamKey(streamId)) ?? channelId;
+            args = { ...args, to: streamId };
+          }
+        }
+        const { chunks, last, uploaded } = await this.send({ type: args.type, to: args.to, topic: args.topic }, hasText ? args.content : "", args, channelId);
+        const ids = chunks.map((c) => c.id);
         return {
           ...last,
+          ...(reply ? reply.receipt : {}),
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
           ...(ids.length > 1 ? { ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : {}),
         };
@@ -673,17 +782,8 @@ export class ZulipToolRuntime {
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
-        const uploaded = await this.uploadFor(args);
-        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
-        const channelId = dmChannelIdFor(ids);
-        const sent: number[] = [];
-        let result: any = null;
-        for (const chunk of chunkMessage(content)) {
-          result = await zulipClient.messages.send({ type: "private", to: ids, content: chunk });
-          if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
-          sent.push(result.id);
-          this.onSent?.({ messageId: String(result.id), channelId, content: chunk });
-        }
+        const { chunks, last: result, uploaded } = await this.send({ type: "private", to: ids }, hasText ? args.content : "", args, dmChannelIdFor(ids));
+        const sent = chunks.map((c) => c.id);
         return {
           ...result,
           to_user_ids: ids,
@@ -705,36 +805,50 @@ export class ZulipToolRuntime {
       }
 
       case "edit_message": {
-        const result = await zulipClient.messages.update({
-          message_id: args.message_id,
-          content: args.content,
-        });
-        assertApiSuccess(result, `editing message ${args.message_id}`);
-        return result;
+        const messageId = positiveIdArg("message_id", args.message_id);
+        if (typeof args.content !== "string") throw new Error("content must be a string");
+        const edited = async (): Promise<Audience> => {
+          const { message } = await api.request<{ message?: { type?: unknown; stream_id?: unknown } }>("GET", `/messages/${messageId}`, `reading message ${messageId}`, { apply_markdown: false, allow_empty_topic_name: true });
+          return message?.type === "stream" && typeof message.stream_id === "number" ? { kind: "stream", id: message.stream_id } : { kind: "direct" };
+        };
+        const tabled = prepareOutgoing(args.content);
+        let content: string;
+        try {
+          content = await linkMessages(api, tabled, edited, "refuse");
+        } catch (err) {
+          if (err instanceof MessageLinkRefused) throw new Error(`${err.message} The message wasn't edited.`);
+          throw err;
+        }
+        const length = [...content].length;
+        if (length > this.maxMessageLength) {
+          const changes = [
+            ...(tabled === args.content ? [] : ["a blank line above each table under a line of text"]),
+            ...(content === tabled ? [] : ["each [[msg:ID]] as its link"]),
+          ];
+          const posted = changes.length === 0 ? "" : ` as it would be posted, with ${changes.join(" and ")} (${[...args.content].length} as written)`;
+          throw new Error(`content is ${length} characters${posted}, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
+        }
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content });
       }
 
       case "delete_message": {
         // Noted before the call: the delete event can arrive before the
-        // response does. Un-noted on failure: nothing will echo.
+        // response does. Un-noted once the delete surely failed: nothing will echo.
+        const messageId = positiveIdArg("message_id", args.message_id);
         this.onDeleted?.(String(args.message_id));
         try {
-          const result = await zulipClient.messages.deleteById({
-            message_id: args.message_id,
-          });
-          assertApiSuccess(result, `deleting message ${args.message_id}`);
-          return result;
+          return await api.request("DELETE", `/messages/${messageId}`, `deleting message ${args.message_id}`);
         } catch (err) {
-          this.onDeleteFailed?.(String(args.message_id));
+          if (!mayHaveBeenApplied(err)) this.onDeleteFailed?.(String(args.message_id));
           throw err;
         }
       }
 
       case "list_streams": {
-        const result = await zulipClient.streams.retrieve({
+        const result = await api.request<{ streams?: any[] }>("GET", "/streams", "listing streams", {
           include_public: args.include_public ?? true,
           include_subscribed: args.include_subscribed ?? true,
         });
-        assertApiSuccess(result, "listing streams");
 
         // Format streams nicely
         const streams = result.streams || [];
@@ -757,28 +871,47 @@ export class ZulipToolRuntime {
       }
 
       case "get_stream_topics": {
-        const result = await zulipClient.streams.topics.retrieve({
-          stream_id: args.stream_id,
-        });
-        assertApiSuccess(result, `topics of stream ${args.stream_id}`);
+        const byName = args.stream !== undefined && args.stream !== null;
+        const byId = args.stream_id !== undefined && args.stream_id !== null;
+        if (byName === byId) throw new Error("Give exactly one of stream and stream_id.");
+        if (byName && (typeof args.stream !== "string" || args.stream === "")) throw new Error("stream must be a stream's name.");
+        const givenId = byId ? positiveIdArg("stream_id", args.stream_id) : undefined;
+        const limit = args.limit ?? undefined;
+        if (limit !== undefined && !(typeof limit === "number" && Number.isInteger(limit) && limit > 0)) {
+          throw new Error("limit must be a positive integer.");
+        }
+        let streamId = givenId;
+        if (byName) {
+          try {
+            streamId = (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id;
+          } catch (err) {
+            if (err instanceof ZulipNoAnswer) throw err;
+            const text = (err as Error).message;
+            throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
+          }
+        }
+        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];
-        const formatted = topics
+        const shown = limit === undefined ? topics : topics.slice(0, limit);
+        const formatted = shown
           .map((t: any, idx: number) => `${idx + 1}. **${t.name}** (latest msg: ${t.max_id})`)
           .join("\n");
+        const heading = shown.length < topics.length
+          ? `${topics.length} Topics, the newest ${shown.length} shown`
+          : `${topics.length} Topics`;
 
         return {
           topic_count: topics.length,
-          formatted_list: `📑 **${topics.length} Topics**\n\n${formatted}`,
+          formatted_list: `📑 **${heading}**\n\n${formatted}`,
           ...(args.verbose && { raw_data: result }),
         };
       }
 
       case "list_users": {
-        const result = await zulipClient.users.retrieve({
+        const result = await api.request<{ members?: any[] }>("GET", "/users", "listing users", {
           client_gravatar: args.client_gravatar || false,
         });
-        assertApiSuccess(result, "listing users");
 
         const users = result.members || [];
         const formatted = users
@@ -799,22 +932,22 @@ export class ZulipToolRuntime {
       }
 
       case "get_user_profile": {
-        const result = await zulipClient.users.me.getProfile();
-        assertApiSuccess(result, "fetching the bot profile");
-        return result;
+        return api.request("GET", "/users/me", "fetching the bot profile");
       }
 
       case "add_reaction": {
+        const messageId = positiveIdArg("message_id", args.message_id);
         const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
-        const result = await zulipClient.reactions.add({ message_id: args.message_id, ...emoji });
-        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the reaction");
+        const result = await api.requestAnswer("POST", `/messages/${messageId}/reactions`, emoji);
+        if (result.result === "error") throw new Error(result.msg ?? "Zulip refused the reaction");
         return result;
       }
 
       case "remove_reaction": {
+        const messageId = positiveIdArg("message_id", args.message_id);
         const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
-        const result = await zulipClient.reactions.remove({ message_id: args.message_id, ...emoji });
-        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused removing the reaction");
+        const result = await api.requestAnswer("DELETE", `/messages/${messageId}/reactions`, emoji);
+        if (result.result === "error") throw new Error(result.msg ?? "Zulip refused removing the reaction");
         return result;
       }
 
@@ -828,8 +961,7 @@ export class ZulipToolRuntime {
       }
 
       case "find_user": {
-        const usersResult = await zulipClient.users.retrieve();
-        assertApiSuccess(usersResult, "listing users");
+        const usersResult = await api.request<{ members?: any[] }>("GET", "/users", "listing users");
         const members = usersResult.members || [];
         const query = args.query.toLowerCase();
 
@@ -867,22 +999,19 @@ export class ZulipToolRuntime {
       case "fetch_history": {
         const channel = String(args.channel ?? "").trim().replace(/^#/, "");
         if (!channel) throw new Error("channel is required");
-        // A DM conversation reads by its channel id (`zulip:dm:<ids>`, the
-        // form every catch-up note and history line quotes); anything else
-        // is a stream name or stream channel id.
-        const dmIds = parseDmChannelId(channel.startsWith("zulip:") ? channel : `zulip:${channel}`);
-        const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
+        const target = await this.historyTarget(channel);
         const limit = clampInt(args.limit, 50, 1, 1000);
-        const page = await fetchHistory(zulipClient, {
-          ...(dmIds ? { dmUserIds: dmIds } : { streamName, topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
+        const page = await fetchHistory(api, {
+          ...target.query,
+          ...(target.isDm ? {} : { topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
           limit,
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
         return {
-          channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
-          channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
-          topic: dmIds ? undefined : args.topic,
+          channel: target.channel,
+          channelId: target.channelId,
+          topic: target.isDm ? undefined : args.topic,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
@@ -896,12 +1025,15 @@ export class ZulipToolRuntime {
         const messageId = numberOrUndefined(args.message_id);
         if (messageId === undefined) throw new Error("message_id must be a number");
         const limit = clampInt(args.limit, 50, 1, 200);
-        const page = await fetchAround(zulipClient, messageId, limit);
+        const page = await fetchAround(api, messageId, limit);
         const anchor = page.messages.find((m) => m.id === messageId);
+        const shown = anchor?.streamNameShown ?? null;
+        const known = this.channelIds != null && anchor?.streamId != null;
+        const held = known ? this.channelIds!.channelIdOf(streamKey(anchor!.streamId!)) : null;
         return {
           message_id: messageId,
-          channel: anchor?.streamName ?? null,
-          channelId: anchor?.streamName ? `zulip:${anchor.streamName}` : null,
+          channel: shown,
+          channelId: known ? held : shown ? `zulip:${shown}` : null,
           topic: anchor?.topic ?? null,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
@@ -933,9 +1065,8 @@ export class ZulipToolRuntime {
   private async realmEmoji(): Promise<Record<string, { id: string; name: string; deactivated?: boolean }>> {
     const now = Date.now();
     if (this.emojiCache && now - this.emojiCache.at < 300_000) return this.emojiCache.emoji;
-    const result = await this.zulipClient.emojis.retrieve();
     // An API error is an error, not an empty realm — and never cached as one.
-    assertApiSuccess(result, "listing realm emoji");
+    const result = await this.api.request<{ emoji?: Record<string, { id: string; name: string; deactivated?: boolean }> }>("GET", "/realm/emoji", "listing realm emoji");
     const emoji = (result?.emoji ?? {}) as Record<string, { id: string; name: string; deactivated?: boolean }>;
     this.emojiCache = { at: now, emoji };
     return emoji;
@@ -962,7 +1093,7 @@ export class ZulipToolRuntime {
   private async members(): Promise<any[]> {
     const now = Date.now();
     if (this.userCache && now - this.userCache.at < 60_000) return this.userCache.members;
-    const result = await this.zulipClient.users.retrieve({});
+    const result = await this.api.request<{ members?: unknown }>("GET", "/users", "listing users", {});
     const members = Array.isArray(result?.members) ? result.members : [];
     this.userCache = { at: now, members };
     return members;
@@ -1021,7 +1152,7 @@ export class ZulipToolRuntime {
   }
 
   async readResource(uri: string): Promise<ResourceContents> {
-    const zulipClient = this.zulipClient;
+    const api = this.api;
     const monitoredChannels = this.monitoredChannels;
 
     // Handle unread summary
@@ -1031,7 +1162,7 @@ export class ZulipToolRuntime {
 
       for (const [channelName, state] of monitoredChannels) {
         try {
-          const result = await zulipClient.messages.retrieve({
+          const result = await api.request<{ messages: any[] }>("GET", "/messages", `unread messages in #${channelName}`, {
             anchor: "newest",
             num_before: 50,
             num_after: 0,
@@ -1081,7 +1212,7 @@ export class ZulipToolRuntime {
       }
 
       try {
-        const result = await zulipClient.messages.retrieve({
+        const result = await api.request<{ messages: any[] }>("GET", "/messages", `messages in #${channelName}`, {
           anchor: "newest",
           num_before: 50,
           num_after: 0,

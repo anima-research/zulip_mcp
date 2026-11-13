@@ -32,7 +32,7 @@ test('header fields are folded onto one line; the body is not the header\'s busi
 
 function zmsg(over: Partial<ZulipMessage>): ZulipMessage {
   return {
-    id: 1, streamName: 'qa', topic: 'router', isDm: false, recipients: [], authorId: 9, authorName: 'Ann',
+    id: 1, streamId: 4, streamNameShown: 'qa', topic: 'router', isDm: false, recipients: [], authorId: 9, authorName: 'Ann',
     authorEmail: 'ann@example.com', timestamp: new Date('2026-09-14T08:42:52.123Z'), rawContent: 'hi', cleanContent: 'hi',
     mentioned: false, wildcardMentioned: false, attachments: [], reactions: [],
     ...over,
@@ -41,7 +41,7 @@ function zmsg(over: Partial<ZulipMessage>): ZulipMessage {
 
 test('fetch_history lines use the same head as live delivery: agent time when given, UTC otherwise, no mention mark on DMs', () => {
   const lines = formatHistoryLines(
-    [zmsg({ id: 1, mentioned: true }), zmsg({ id: 2, isDm: true, streamName: null, topic: '', mentioned: true, authorName: 'Bo', cleanContent: 'yo' })],
+    [zmsg({ id: 1, mentioned: true }), zmsg({ id: 2, isDm: true, streamId: null, streamNameShown: null, topic: '', mentioned: true, authorName: 'Bo', cleanContent: 'yo' })],
     2,
     undefined,
     null,

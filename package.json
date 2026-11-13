@@ -11,6 +11,7 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:contract": "node --import tsx test/contract/preflight.ts && npm run --silent build && node --import tsx --test --test-concurrency=1 --test-force-exit --test-timeout=120000 test/contract/*.test.ts",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepare": "npm run build"
   },
@@ -40,12 +41,13 @@
   ],
   "dependencies": {
     "@animalabs/mcpl-core": "^0.3.0",
-    "sharp": "^0.35.5",
-    "zulip-js": "^2.1.0"
+    "ini": "^5.0.0",
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
+    "@types/ini": "^4.1.1",
     "@types/node": "^22.10.1",
     "tsx": "^4.22.4",
-    "typescript": "^5.7.2"
+    "typescript": "^7.0.2"
   }
 }

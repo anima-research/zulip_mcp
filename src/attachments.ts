@@ -177,41 +177,35 @@ export interface FetchedBytes {
 
 /** GET with an enforced byte ceiling: the read is cancelled the moment the
  *  body passes `maxBytes`, so a lying or absent Content-Length cannot OOM
- *  the process. */
+ *  the process. It ends, rejected, when `signal` aborts. */
 export async function fetchCapped(
   url: string,
   headers: Record<string, string>,
   maxBytes: number,
-  timeoutMs = 15_000,
+  signal: AbortSignal,
 ): Promise<FetchedBytes> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { headers, redirect: 'follow', signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
-    const declared = Number(res.headers.get('content-length') ?? '');
-    if (Number.isFinite(declared) && declared > maxBytes) {
+  const res = await fetch(url, { headers, redirect: 'follow', signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
+  const declared = Number(res.headers.get('content-length') ?? '');
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { buf: Buffer.alloc(0), mimeType, overflow: true };
+  }
+  if (!res.body) return { buf: Buffer.alloc(0), mimeType, overflow: true };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      void reader.cancel().catch(() => {});
       return { buf: Buffer.alloc(0), mimeType, overflow: true };
     }
-    if (!res.body) return { buf: Buffer.alloc(0), mimeType, overflow: true };
-    const reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.length;
-      if (total > maxBytes) {
-        void reader.cancel().catch(() => {});
-        return { buf: Buffer.alloc(0), mimeType, overflow: true };
-      }
-      chunks.push(value);
-    }
-    return { buf: Buffer.concat(chunks), mimeType, overflow: false };
-  } finally {
-    clearTimeout(timer);
+    chunks.push(value);
   }
+  return { buf: Buffer.concat(chunks), mimeType, overflow: false };
 }
 
 // ── Blocks ──
@@ -224,8 +218,8 @@ export function isTextAttachment(ref: AttachmentRef): boolean {
 }
 
 export interface AttachmentSource {
-  /** Fetch an upload by its `/user_uploads/...` path with the bot's credentials. */
-  fetch(path: string, maxBytes: number): Promise<FetchedBytes>;
+  /** Fetch an upload by its `/user_uploads/...` path with the bot's credentials, until `signal` aborts. */
+  fetch(path: string, maxBytes: number, signal: AbortSignal): Promise<FetchedBytes>;
 }
 
 export interface InlineOptions {
@@ -257,16 +251,38 @@ function text(t: string): TextContent {
   return { type: 'text', text: t };
 }
 
+function outOfTime(): Error {
+  return new Error("out of time for this message's attachments");
+}
+
+async function fetchBefore(source: AttachmentSource, path: string, maxBytes: number, deadline: AbortSignal): Promise<FetchedBytes> {
+  if (deadline.aborted) throw outOfTime();
+  const fetching = source.fetch(path, maxBytes, deadline);
+  let expire!: () => void;
+  const expired = new Promise<never>((_, reject) => {
+    expire = () => reject(outOfTime());
+    deadline.addEventListener('abort', expire, { once: true });
+  });
+  try {
+    return await Promise.race([fetching, expired]);
+  } finally {
+    deadline.removeEventListener('abort', expire);
+    fetching.catch(() => {});
+  }
+}
+
 /**
  * Content blocks for a message's attachments: inlined images (after
  * normalization) and small text files, notes for the rest. Never throws —
  * a failed fetch becomes a note naming the path so the agent can still
- * fetch_attachment it.
+ * fetch_attachment it. So does a fetch that `deadline` ends, and each fetch
+ * after it, which isn't started.
  */
 export async function buildAttachmentBlocks(
   refs: AttachmentRef[],
   source: AttachmentSource,
   options: InlineOptions,
+  deadline: AbortSignal,
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   let imagesLeft = options.inlineImages ? options.maxImages : 0;
@@ -277,7 +293,7 @@ export async function buildAttachmentBlocks(
           blocks.push(text(`[image attachment "${ref.name}" not inlined (${options.inlineImages ? 'per-message image limit reached' : 'image inlining is off'}) — fetch_attachment ${ref.path}]`));
           continue;
         }
-        const got = await source.fetch(ref.path, IMAGE_FETCH_CEILING);
+        const got = await fetchBefore(source, ref.path, IMAGE_FETCH_CEILING, deadline);
         if (got.overflow) {
           blocks.push(text(`[image attachment "${ref.name}" too large to fetch (over ${fmt(IMAGE_FETCH_CEILING)}) — ${ref.path}]`));
           continue;
@@ -291,7 +307,7 @@ export async function buildAttachmentBlocks(
         blocks.push({ type: 'image', data: norm.data, mimeType: norm.mimeType });
         blocks.push(text(`[image attachment: ${ref.name}]`));
       } else if (isTextAttachment(ref) && options.inlineTextMaxBytes > 0) {
-        const got = await source.fetch(ref.path, options.inlineTextMaxBytes);
+        const got = await fetchBefore(source, ref.path, options.inlineTextMaxBytes, deadline);
         if (got.overflow) {
           blocks.push(text(`[attachment: ${ref.name} over the ${fmt(options.inlineTextMaxBytes)} inline cap — not inlined: fetch_attachment ${ref.path}]`));
           continue;

@@ -339,12 +339,14 @@ export class FiltersPlane {
   }
 
   /**
-   * Change the desired state: write the file atomically, apply, notify.
-   * Refused while the plane is broken — an operator repairs the file (hot
-   * reload applies it within seconds) and the update can be retried; the
-   * agent must never overwrite a file it could not read.
+   * Change the desired state: run one poll cycle, so an edit on disk that
+   * no poll has seen yet is applied first; then write the file atomically,
+   * apply, notify. Refused while the plane is broken — an operator repairs
+   * the file (hot reload applies it within seconds) and the update can be
+   * retried; the agent must never overwrite a file it could not read.
    */
   update(edit: (current: ZulipFilters) => ZulipFilters): { ok: true; filters: ZulipFilters } | { ok: false; reason: string } {
+    this.tick();
     if (this.broken) {
       return {
         ok: false,

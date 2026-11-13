@@ -1,22 +1,14 @@
-/**
- * History — the one message shape every reader shares, the RFC-001 tags it
- * carries, and the cursor semantics of the fetch helpers against a fake
- * zulip-js client.
- *
- * Run: node --import tsx --test test/history.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   attachmentNote,
-  channelIdOf,
   dmChannelIdFor,
   dmCounterparts,
   dmDescriptor,
   fetchAround,
   fetchHistory,
   isDmChannelId,
+  keyOfMessage,
   normalizeMessage,
   parseDmChannelId,
   renderReactions,
@@ -25,6 +17,10 @@ import {
   toIncoming,
   type ZulipRawMessage,
 } from '../src/history.ts';
+import { standInApi } from './zulip-stand-in.ts';
+import { dmKey, streamKey } from '../src/channel-key.ts';
+
+const GENERAL = streamKey(17);
 
 function raw(over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
   return {
@@ -33,6 +29,7 @@ function raw(over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
     sender_full_name: 'Ann',
     sender_email: 'ann@example.com',
     display_recipient: 'general',
+    stream_id: 17,
     subject: 'deploys',
     content: 'ship it? [log](/user_uploads/1/ab/cd/log.txt) ![shot](/user_uploads/1/ab/ce/shot.png)',
     timestamp: 1_700_000_000,
@@ -46,7 +43,7 @@ test('normalizeMessage keeps XML/HTML in raw markdown intact (#24)', () => {
   const content = '```\n<tag_mapping>\n  <tag id="6001" len="127"/>\n</tag_mapping>\n```\nAT&amp;T and Map<string, T> when a < b > c';
   const m = normalizeMessage(raw({ content }));
   assert.equal(m.cleanContent, content);
-  const text = toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }).content[0];
+  const text = toIncoming(GENERAL, m, { selfUserId: 790, sessionId: 's' }).content[0];
   assert.equal(text.type, 'text');
   assert.ok(text.text.includes('<tag id="6001" len="127"/>'), 'wake/history text carries the tags verbatim');
   assert.ok(text.text.includes('AT&amp;T'), 'entities are not unescaped on the raw path');
@@ -55,7 +52,8 @@ test('normalizeMessage keeps XML/HTML in raw markdown intact (#24)', () => {
 test('normalizeMessage reads the fields the rest of the server relies on', () => {
   const m = normalizeMessage(raw());
   assert.equal(m.id, 42);
-  assert.equal(m.streamName, 'general');
+  assert.equal(m.streamId, 17);
+  assert.equal(m.streamNameShown, 'general');
   assert.equal(m.topic, 'deploys');
   assert.equal(m.isDm, false);
   assert.equal(m.mentioned, true);
@@ -65,7 +63,8 @@ test('normalizeMessage reads the fields the rest of the server relies on', () =>
 
   const dm = normalizeMessage(raw({ type: 'private', display_recipient: [{ email: 'x', full_name: 'X', id: 1 }], flags: [] }));
   assert.equal(dm.isDm, true);
-  assert.equal(dm.streamName, null);
+  assert.equal(dm.streamId, null);
+  assert.equal(dm.streamNameShown, null);
   assert.equal(dm.mentioned, false);
 });
 
@@ -83,8 +82,9 @@ test('tagsFor emits the most specific addressing tag plus sender and content tag
 
 test('toIncoming renders the incoming shape, with the attachment note as a second block', () => {
   const m = normalizeMessage(raw());
-  const incoming = toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }, { backscroll: true });
-  assert.equal(incoming.channelId, 'zulip:general');
+  const incoming = toIncoming(GENERAL, m, { selfUserId: 790, sessionId: 's' }, { backscroll: true });
+  assert.equal(incoming.key, GENERAL);
+  assert.equal('channelId' in incoming, false);
   assert.equal(incoming.messageId, '42');
   assert.equal(incoming.threadId, 'deploys');
   assert.deepEqual(incoming.author, { id: '7', name: 'Ann' });
@@ -101,36 +101,32 @@ test('toIncoming renders the incoming shape, with the attachment note as a secon
 
   // Without a known self id the session id stands in, so a consumer can
   // still express "not from me".
-  const anon = toIncoming('zulip:general', m, { selfUserId: null, sessionId: 'sess' });
+  const anon = toIncoming(GENERAL, m, { selfUserId: null, sessionId: 'sess' });
   assert.equal((anon.metadata as Record<string, unknown>).botUserId, 'sess');
 });
 
-/** A zulip-js stand-in that records the query and answers with a fixed page. */
 function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}) {
   const calls: Record<string, unknown>[] = [];
   const byId: Record<string, unknown>[] = [];
-  return {
-    calls,
-    byId,
-    messages: {
-      async retrieve(params: Record<string, unknown>) {
-        calls.push(params);
-        return { messages: rows, ...extra };
-      },
-      async getById(params: Record<string, unknown>) {
-        byId.push(params);
-        const found = rows.find((r) => r.id === params.message_id);
-        return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
-      },
+  const { api } = standInApi({
+    'GET /messages': (params) => {
+      calls.push(params);
+      return { result: 'success', messages: rows, ...extra };
     },
-  };
+    'GET /messages/:id': (params, { id }) => {
+      byId.push({ id, ...params });
+      const found = rows.find((r) => r.id === id);
+      return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
+    },
+  });
+  return { calls, byId, api };
 }
 
 test('fetchHistory: newest page by default, exclusive cursors, raw markdown, oldest first', async () => {
   const rows = [raw({ id: 3 }), raw({ id: 1 }), raw({ id: 2 })];
   const client = fakeClient(rows, { found_newest: true, found_oldest: false });
 
-  const page = await fetchHistory(client, { streamName: 'general', topic: 'deploys', limit: 50 });
+  const page = await fetchHistory(client.api, { streamName: 'general', topic: 'deploys', limit: 50 });
   assert.deepEqual(page.messages.map((m) => m.id), [1, 2, 3]);
   assert.equal(page.foundNewest, true);
   assert.equal(page.foundOldest, false);
@@ -143,40 +139,48 @@ test('fetchHistory: newest page by default, exclusive cursors, raw markdown, old
     include_anchor: true,
   });
 
-  await fetchHistory(client, { streamName: 'general', limit: 10, after: 100 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 10, after: 100 });
   assert.deepEqual(client.calls[1], {
     anchor: 100, num_before: 0, num_after: 10, narrow: [['stream', 'general']], apply_markdown: false, include_anchor: false,
   });
 
-  await fetchHistory(client, { streamName: 'general', limit: 10, before: 100 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 10, before: 100 });
   assert.deepEqual(client.calls[2], {
     anchor: 100, num_before: 10, num_after: 0, narrow: [['stream', 'general']], apply_markdown: false, include_anchor: false,
   });
 
   // limit 0 never hits the API; oversize limits are clamped to Zulip's page cap.
-  const empty = await fetchHistory(client, { streamName: 'general', limit: 0 });
+  const empty = await fetchHistory(client.api, { streamName: 'general', limit: 0 });
   assert.deepEqual(empty.messages, []);
   assert.equal(client.calls.length, 3);
-  await fetchHistory(client, { streamName: 'general', limit: 99_999 });
+  await fetchHistory(client.api, { streamName: 'general', limit: 99_999 });
   assert.equal(client.calls[3].num_before, 5000);
+
+  // By id, in the object form: a pair's operand must be a string.
+  await fetchHistory(client.api, { streamId: 17, topic: 'deploys', limit: 10 });
+  assert.deepEqual(client.calls[4].narrow, [{ operator: 'stream', operand: 17 }, { operator: 'topic', operand: 'deploys' }]);
 });
 
 test('fetchAround centres a window on the anchor within its own conversation', async () => {
   const client = fakeClient([raw({ id: 41 }), raw({ id: 42 }), raw({ id: 43 })]);
-  const page = await fetchAround(client, 42, 50);
+  const page = await fetchAround(client.api, 42, 50);
   assert.deepEqual(page.messages.map((m) => m.id), [41, 42, 43]);
-  assert.deepEqual(client.byId[0], { message_id: 42, apply_markdown: false });
+  assert.deepEqual(client.byId[0], { id: 42, apply_markdown: false });
   assert.deepEqual(client.calls[0], {
-    anchor: 42, num_before: 25, num_after: 25, narrow: [['stream', 'general'], ['topic', 'deploys']], apply_markdown: false, include_anchor: true,
+    anchor: 42, num_before: 25, num_after: 25, narrow: [{ operator: 'stream', operand: 17 }, { operator: 'topic', operand: 'deploys' }], apply_markdown: false, include_anchor: true,
   });
+
+  const noId = fakeClient([raw({ id: 42, stream_id: undefined })]);
+  await fetchAround(noId.api, 42, 10);
+  assert.deepEqual(noId.calls[0].narrow, [['stream', 'general'], ['topic', 'deploys']]);
 
   // A DM anchor narrows on its conversation.
   const dm = fakeClient([raw({ id: 5, type: 'private', display_recipient: [{ id: 790, full_name: 'Bot', email: 'b' }, { id: 42, full_name: 'Bo', email: 'bo' }] })]);
-  await fetchAround(dm, 5, 10);
+  await fetchAround(dm.api, 5, 10);
   assert.deepEqual(dm.calls[0].narrow, [{ operator: 'dm', operand: [790, 42] }]);
 
   // An unreadable anchor fails loudly instead of widening to the realm timeline.
-  await assert.rejects(fetchAround(client, 999, 10), /Invalid message/);
+  await assert.rejects(fetchAround(client.api, 999, 10), /Invalid message/);
 });
 
 test('DM channel ids are the sorted counterpart ids, bot excluded, and round-trip', () => {
@@ -197,8 +201,9 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
   assert.deepEqual(dmCounterparts([recipients[0]], 790).map((r) => r.id), [790]);
 
   const m = normalizeMessage(raw({ type: 'private', display_recipient: recipients, flags: [] }));
-  assert.equal(channelIdOf(m, 790), 'zulip:dm:7+42');
-  assert.equal(channelIdOf(normalizeMessage(raw()), 790), 'zulip:general');
+  assert.equal(keyOfMessage(m, 790), dmKey([7, 42]));
+  assert.equal(keyOfMessage(normalizeMessage(raw()), 790), GENERAL);
+  assert.equal(keyOfMessage(normalizeMessage(raw({ stream_id: undefined })), 790), null);
 
   const single = dmDescriptor(dmCounterparts(recipients.slice(0, 2), 790), 100);
   assert.equal(single.id, 'zulip:dm:42');
@@ -216,7 +221,7 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
 
 test('fetchHistory narrows on a DM conversation when asked', async () => {
   const client = fakeClient([]);
-  await fetchHistory(client, { dmUserIds: [7, 42], limit: 5 });
+  await fetchHistory(client.api, { dmUserIds: [7, 42], limit: 5 });
   // The object form: a pair with a list operand is refused by Zulip.
   assert.deepEqual(client.calls[0].narrow, [{ operator: 'dm', operand: [7, 42] }]);
 });
@@ -238,8 +243,8 @@ test('reactions are bucketed by emoji and rendered with counts and self-marking'
   assert.equal(renderReactions(m.reactions, null), ' [reactions: :thumbs_up: x2, :eyes: x1]');
   assert.equal(renderReactions([], 790), '');
   assert.deepEqual(summarizeReactions(undefined), []);
-  assert.deepEqual((toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }).metadata as { reactions: unknown }).reactions, m.reactions);
-  assert.equal((toIncoming('zulip:general', normalizeMessage(raw()), { selfUserId: 790, sessionId: 's' }).metadata as { reactions?: unknown }).reactions, undefined);
+  assert.deepEqual((toIncoming(GENERAL, m, { selfUserId: 790, sessionId: 's' }).metadata as { reactions: unknown }).reactions, m.reactions);
+  assert.equal((toIncoming(GENERAL, normalizeMessage(raw()), { selfUserId: 790, sessionId: 's' }).metadata as { reactions?: unknown }).reactions, undefined);
 });
 
 test('an edited message carries editedAt and reads "(edited)" wherever history is rendered (#22)', () => {
@@ -247,19 +252,19 @@ test('an edited message carries editedAt and reads "(edited)" wherever history i
   assert.equal(never.editedAt, null);
   const edited = normalizeMessage(raw({ last_edit_timestamp: 1_700_000_500 }));
   assert.deepEqual(edited.editedAt, new Date(1_700_000_500_000));
-  const incoming = toIncoming('zulip:general', edited, { selfUserId: 790, sessionId: 's' });
+  const incoming = toIncoming(GENERAL, edited, { selfUserId: 790, sessionId: 's' });
   assert.match((incoming.content[0] as { text: string }).text, / \(edited\)$/);
   assert.equal((incoming.metadata as { editedAt: string }).editedAt, '2023-11-14T22:21:40.000Z');
-  const plain = toIncoming('zulip:general', never, { selfUserId: 790, sessionId: 's' });
+  const plain = toIncoming(GENERAL, never, { selfUserId: 790, sessionId: 's' });
   assert.doesNotMatch((plain.content[0] as { text: string }).text, /\(edited\)/);
   assert.equal('editedAt' in (plain.metadata as object), false);
   // Since Zulip 10 last_edit_timestamp is content-only; a move has its own stamp.
   const moved = normalizeMessage(raw({ last_moved_timestamp: 1_700_000_600 }));
   assert.equal(moved.editedAt, null);
   assert.deepEqual(moved.movedAt, new Date(1_700_000_600_000));
-  const movedLine = toIncoming('zulip:general', moved, { selfUserId: 790, sessionId: 's' });
+  const movedLine = toIncoming(GENERAL, moved, { selfUserId: 790, sessionId: 's' });
   assert.match((movedLine.content[0] as { text: string }).text, / \(moved\)$/);
   assert.equal((movedLine.metadata as { movedAt: string }).movedAt, '2023-11-14T22:23:20.000Z');
   const both = normalizeMessage(raw({ last_edit_timestamp: 1_700_000_500, last_moved_timestamp: 1_700_000_600 }));
-  assert.match((toIncoming('zulip:general', both, { selfUserId: 790, sessionId: 's' }).content[0] as { text: string }).text, / \(edited\) \(moved\)$/);
+  assert.match((toIncoming(GENERAL, both, { selfUserId: 790, sessionId: 's' }).content[0] as { text: string }).text, / \(edited\) \(moved\)$/);
 });

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { StateTracker } from '../src/state.ts';
-import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from '../src/content.ts';
+import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from '../src/outgoing.ts';
 
 test('rollback hands back what was sent after the checkpoint and truncates the record', () => {
   const t = new StateTracker();

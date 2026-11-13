@@ -1,6 +1,6 @@
 /**
  * Zulip message history — one fetch shape for every reader (context
- * injection, channel-open backscroll, the reconnect sweep, and the
+ * injection, channel-open backscroll, the catch-up reads, and the
  * fetch_history / fetch_around tools), and one conversion from a Zulip
  * message to the MCPL incoming shape so history and live delivery render
  * identically.
@@ -10,9 +10,11 @@
  * watermark is just the highest id already forwarded.
  */
 
-import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
+import type { ChannelDescriptor, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
+import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
 import { cleanMarkdown, extractZulipAttachments, type AttachmentRef } from './content.js';
+import type { ZulipApi } from './zulip-api.js';
 
 /** A Zulip message as `GET /messages` and the event queue both deliver it. */
 export interface ZulipRawMessage {
@@ -87,7 +89,8 @@ export interface ZulipRecipient {
 /** The normalized, model-facing view of one message. */
 export interface ZulipMessage {
   id: number;
-  streamName: string | null;
+  streamId: number | null;
+  streamNameShown: string | null;
   topic: string;
   isDm: boolean;
   /** Every party to a DM (the bot included); empty for stream messages. */
@@ -100,7 +103,10 @@ export interface ZulipMessage {
   rawContent: string;
   /** Raw markdown with line endings normalised and trimmed; not HTML-stripped (#24). */
   cleanContent: string;
+  /** Zulip's explicit mention verdict. */
   mentioned: boolean;
+  /** A verified quote reply to one of our messages. */
+  replyToSelf: boolean;
   wildcardMentioned: boolean;
   attachments: AttachmentRef[];
   /** Reactions currently on the message (history fetches carry them; events do not). */
@@ -112,7 +118,8 @@ export interface ZulipMessage {
 }
 
 export interface HistoryQuery {
-  /** Stream to read; omit for a cross-stream window (fetch_around). */
+  /** Stream to read, by id; omit for a cross-stream window (fetch_around). */
+  streamId?: number;
   streamName?: string;
   topic?: string;
   /** The other parties of a DM conversation (user ids); reads that conversation instead of a stream. */
@@ -122,6 +129,7 @@ export interface HistoryQuery {
   before?: number;
   /** Exclusive lower id bound — everything newer than here. */
   after?: number;
+  timeoutMs?: number;
 }
 
 export interface HistoryPage {
@@ -132,35 +140,27 @@ export interface HistoryPage {
   foundOldest: boolean;
 }
 
+interface MessagesPage {
+  messages?: ZulipRawMessage[];
+  found_newest?: boolean;
+  found_oldest?: boolean;
+}
+
 /** Zulip caps a single GET /messages at 5000 rows. */
 export const ZULIP_MAX_PAGE = 5000;
 
 /**
- * zulip-js resolves API errors as values (`{ result: 'error', code, msg }`)
- * rather than rejecting — an unknown stream would otherwise read as "no
- * messages". Turn them into thrown errors with Zulip's own wording.
+ * The narrow for a query. A stream id and a DM conversation's user ids need
+ * the `{operator, operand}` object form: Zulip rejects a pair whose operand
+ * is not a string ("element is not a string pair"). The `dm` operator needs
+ * Zulip 7.0 (June 2023).
  */
-export function assertApiSuccess(result: unknown, what: string): void {
-  const r = result as { result?: string; msg?: string; code?: string } | null | undefined;
-  if (r && r.result === 'error') {
-    throw new Error(`Zulip refused ${what}: ${r.msg ?? r.code ?? 'unknown error'}`);
+function narrowFor(q: Pick<HistoryQuery, 'streamId' | 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
+  if (q.dmUserIds && q.dmUserIds.length > 0) return [{ operator: 'dm', operand: q.dmUserIds }];
+  if (q.streamId !== undefined) {
+    return [{ operator: 'stream', operand: q.streamId }, ...(q.topic ? [{ operator: 'topic', operand: q.topic }] : [])];
   }
-}
-
-/**
- * The narrow for a query. Stream and topic use the `[operator, operand]`
- * pair form. A DM conversation cannot: its operand is a list of user ids,
- * and Zulip rejects a pair whose operand is not a string ("element is not
- * a string pair") while a stringified id is read as an email ("unknown
- * user"). The `{operator, operand}` object form takes the list as is. The
- * `dm` operator needs Zulip 7.0 (June 2023).
- */
-function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
   const narrow: unknown[] = [];
-  if (q.dmUserIds && q.dmUserIds.length > 0) {
-    narrow.push({ operator: 'dm', operand: q.dmUserIds });
-    return narrow;
-  }
   if (q.streamName) narrow.push(['stream', q.streamName]);
   if (q.topic) narrow.push(['topic', q.topic]);
   return narrow;
@@ -198,10 +198,10 @@ export function isDmChannelId(channelId: string): boolean {
   return parseDmChannelId(channelId) !== null;
 }
 
-/** The channel a message belongs to: its stream, or its DM conversation. */
-export function channelIdOf(m: ZulipMessage, selfUserId: number | null): string {
-  if (m.isDm) return dmChannelIdFor(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
-  return `zulip:${m.streamName ?? ''}`;
+/** The key of a message's channel: its stream, or its DM conversation; null for a stream message with no stream id. */
+export function keyOfMessage(m: ZulipMessage, selfUserId: number | null): ChannelKey | null {
+  if (m.isDm) return dmKey(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
+  return m.streamId === null ? null : streamKey(m.streamId);
 }
 
 /** Bot accounts in Zulip carry a `-bot@` local part; the event envelope has no is_bot. */
@@ -217,7 +217,8 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     : [];
   return {
     id: raw.id,
-    streamName: !isDm && typeof raw.display_recipient === 'string' ? raw.display_recipient : null,
+    streamId: !isDm && typeof raw.stream_id === 'number' ? raw.stream_id : null,
+    streamNameShown: !isDm && typeof raw.display_recipient === 'string' ? raw.display_recipient : null,
     topic: raw.subject ?? '',
     isDm,
     recipients,
@@ -228,6 +229,7 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     rawContent: raw.content,
     cleanContent: cleanMarkdown(raw.content),
     mentioned: flags.includes('mentioned'),
+    replyToSelf: false,
     wildcardMentioned: flags.includes('wildcard_mentioned'),
     attachments: extractZulipAttachments(raw.content),
     reactions: summarizeReactions(raw.reactions),
@@ -245,7 +247,7 @@ export function editedTrailer(m: Pick<ZulipMessage, 'editedAt' | 'movedAt'>): st
  * Fetch one page of history, oldest first. `before` and `after` are
  * exclusive; with neither the page is the newest `limit` messages.
  */
-export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<HistoryPage> {
+export async function fetchHistory(api: ZulipApi, q: HistoryQuery): Promise<HistoryPage> {
   const limit = Math.max(0, Math.min(ZULIP_MAX_PAGE, Math.floor(q.limit)));
   if (limit === 0) return { messages: [], foundNewest: true, foundOldest: false };
 
@@ -266,7 +268,7 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
     numAfter = 0;
   }
 
-  const result = await zulipClient.messages.retrieve({
+  const result = await api.request<MessagesPage>('GET', '/messages', `history of ${q.streamId !== undefined ? `stream ${q.streamId}` : q.streamName ? `#${q.streamName}` : q.dmUserIds ? 'a direct-message conversation' : 'all'}`, {
     anchor,
     num_before: numBefore,
     num_after: numAfter,
@@ -275,8 +277,7 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
     apply_markdown: false,
     // Exclusive cursors; 'newest' already excludes nothing real.
     include_anchor: q.after === undefined && q.before === undefined,
-  });
-  assertApiSuccess(result, `history of ${q.streamName ?? 'all'}`);
+  }, { timeoutMs: q.timeoutMs });
 
   const messages: ZulipMessage[] = ((result?.messages ?? []) as ZulipRawMessage[])
     .map(normalizeMessage)
@@ -297,16 +298,15 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
  * looked up first to learn where it lives; a message that cannot be read
  * fails loudly rather than silently widening to everything.
  */
-export async function fetchAround(zulipClient: any, messageId: number, limit: number): Promise<HistoryPage> {
+export async function fetchAround(api: ZulipApi, messageId: number, limit: number): Promise<HistoryPage> {
   const half = Math.max(0, Math.floor(Math.min(ZULIP_MAX_PAGE, limit) / 2));
-  const single = await zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
-  assertApiSuccess(single, `message ${messageId}`);
+  const single = await api.request<{ message?: ZulipRawMessage }>('GET', `/messages/${messageId}`, `message ${messageId}`, { apply_markdown: false });
   const anchorMsg = single?.message ? normalizeMessage(single.message as ZulipRawMessage) : null;
   if (!anchorMsg) throw new Error(`message ${messageId} is not readable by this bot`);
   const narrow = anchorMsg.isDm
     ? narrowFor({ dmUserIds: anchorMsg.recipients.map((r) => r.id) })
-    : narrowFor({ streamName: anchorMsg.streamName ?? undefined, topic: anchorMsg.topic || undefined });
-  const result = await zulipClient.messages.retrieve({
+    : narrowFor({ streamId: anchorMsg.streamId ?? undefined, streamName: anchorMsg.streamNameShown ?? undefined, topic: anchorMsg.topic || undefined });
+  const result = await api.request<MessagesPage>('GET', '/messages', `messages around ${messageId}`, {
     anchor: messageId,
     num_before: half,
     num_after: half,
@@ -314,7 +314,6 @@ export async function fetchAround(zulipClient: any, messageId: number, limit: nu
     apply_markdown: false,
     include_anchor: true,
   });
-  assertApiSuccess(result, `messages around ${messageId}`);
   const messages: ZulipMessage[] = ((result?.messages ?? []) as ZulipRawMessage[])
     .map(normalizeMessage)
     .sort((a, b) => a.id - b.id);
@@ -332,6 +331,7 @@ export function tagsFor(m: ZulipMessage): string[] {
   const tags: string[] = [];
   if (m.isDm) tags.push(CHAT_TAGS.dm, CHAT_TAGS.private);
   else if (m.mentioned) tags.push(CHAT_TAGS.mention);
+  else if (m.replyToSelf) tags.push(CHAT_TAGS.reply);
   else tags.push(CHAT_TAGS.ambient);
   if (m.wildcardMentioned) tags.push('zulip:wildcard-mention');
   tags.push(looksLikeBotEmail(m.authorEmail) ? CHAT_TAGS.fromBot : CHAT_TAGS.fromHuman);
@@ -352,21 +352,22 @@ export function attachmentNote(attachments: AttachmentRef[]): TextContent | null
 }
 
 /**
- * The MCPL incoming shape for a message on `channelId`. Used for live
+ * The server's incoming shape for a message on `key`. Used for live
  * delivery and for history handed back on channels/open (`backscroll: true`
  * in metadata marks the latter).
  */
 export function toIncoming(
-  channelId: string,
+  key: ChannelKey,
   m: ZulipMessage,
   identity: ZulipIdentity,
   extra: Record<string, unknown> = {},
-): IncomingChannelMessage {
+): KeyedMessage {
   const content: TextContent[] = [{ type: 'text', text: m.cleanContent + editedTrailer(m) }];
   const note = attachmentNote(m.attachments);
   if (note) content.push(note);
   return {
-    channelId,
+    key,
+    ...(m.streamNameShown !== null ? { streamNameShown: m.streamNameShown } : {}),
     messageId: String(m.id),
     threadId: m.topic || undefined,
     author: { id: String(m.authorId), name: m.authorName },
@@ -376,9 +377,12 @@ export function toIncoming(
     metadata: {
       senderEmail: m.authorEmail,
       topic: m.topic,
-      // Zulip's server-computed flag: personal or user-group mention of the
-      // bot. Wildcards (@all/@everyone) deliberately don't count.
+      // Zulip's personal/user-group mention verdict; wildcards don't count.
       mentioned: m.mentioned,
+      replyToSelf: m.replyToSelf,
+      isMention: m.mentioned || m.replyToSelf,
+      isExplicitMention: m.mentioned,
+      isReplyToBot: m.replyToSelf,
       isDM: m.isDm,
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),

@@ -8,24 +8,51 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelManager } from '../src/channels.ts';
 import { CapabilityGrant } from '../src/grant.ts';
-import { normalizeMessage, toIncoming, type ZulipRawMessage } from '../src/history.ts';
+import { normalizeMessage, parseDmChannelId, toIncoming, type ZulipRawMessage } from '../src/history.ts';
+import { ChannelIds } from '../src/channel-ids.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
+import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import type { PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import type { ChannelDescriptor, ContentBlock } from '@animalabs/mcpl-core';
 
+const streamIds = new Map<string, number>();
+function streamIdFor(name: string): number {
+  if (!streamIds.has(name)) streamIds.set(name, streamIds.size + 1);
+  return streamIds.get(name)!;
+}
+
+function fixtureKey(channelId: string): ChannelKey {
+  const dm = parseDmChannelId(channelId);
+  return dm ? dmKey(dm) : streamKey(streamIdFor(channelId.slice('zulip:'.length)));
+}
+
 function fakeAdapter(type: string, descriptors: ChannelDescriptor[]) {
+  const directory = new StreamDirectory();
+  const streams = descriptors.filter((d) => !parseDmChannelId(d.id));
+  directory.registration(streams.map((d) => ({ stream_id: streamIdFor(d.id.slice('zulip:'.length)), name: d.id.slice('zulip:'.length) })));
+  const ids = new ChannelIds(directory);
+  const described = descriptors.map((d) => (parseDmChannelId(d.id)
+    ? d
+    : { ...d, address: { ...(d.address as object | undefined), stream_id: streamIdFor(d.id.slice('zulip:'.length)) } }));
   const calls: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[] = [];
   const adapter: PlatformAdapter = {
     type,
-    async discoverChannels() { return descriptors; },
-    async publish(channelId, _descriptor, content, hints) {
-      calls.push({ channelId, content, hints });
+    async discoverChannels() { return described; },
+    async publish(target, _descriptor, content, hints) {
+      calls.push({ channelId: typeof target === 'string' ? ids.channelIdOf(target)! : `zulip:${target.streamName}`, content, hints });
       return { delivered: true, messageId: 'm1' };
     },
     async fetchContext() { return null; },
     startEvents() {},
     stopEvents() {},
   };
-  return { adapter, calls };
+  return { adapter, calls, ids };
+}
+
+function deliver(manager: ChannelManager, channelId: string, message: Omit<KeyedMessage, 'key'> & { channelId?: string; key?: ChannelKey }): void {
+  const { channelId: _wire, key: _key, ...rest } = message;
+  const key = fixtureKey(channelId);
+  manager.onIncomingMessage(key, { ...rest, key });
 }
 
 const fakeMcplClient = {
@@ -59,9 +86,9 @@ function makeManager() {
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('zulip', [zulipDesc]);
+  const { adapter, calls, ids } = fakeAdapter('zulip', [zulipDesc]);
   const adapters = new Map<string, PlatformAdapter>([['zulip', adapter]]);
-  const manager = new ChannelManager(fakeMcplClient, adapters, grantedChannels(), 10);
+  const manager = new ChannelManager(fakeMcplClient, adapters, grantedChannels(), ids, 10);
   return { manager, calls };
 }
 
@@ -85,7 +112,7 @@ test('publish forwards last-incoming thread hints to the adapter', async () => {
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
 
-  manager.onIncomingMessage('zulip:C1', {
+  deliver(manager, 'zulip:C1', {
     channelId: 'zulip:C1',
     messageId: '1718012345.000200',
     threadId: '1718000000.000100',
@@ -112,18 +139,18 @@ function makeTypingManager() {
   const desc: ChannelDescriptor = {
     id: 'zulip:support', type: 'zulip', label: '#support', direction: 'bidirectional', address: { stream_id: 7 },
   };
-  const { adapter } = fakeAdapter('zulip', [desc]);
+  const { adapter, ids } = fakeAdapter('zulip', [desc]);
   const typed: { channelId: string; metadata?: Record<string, unknown>; op: string }[] = [];
   adapter.sendTyping = async (channelId, _d, metadata, op) => { typed.push({ channelId, metadata, op }); };
   const grant = grantedChannels();
   grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle', 'channels.publish', 'channels.incoming', 'channels.typing'] });
-  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, 10);
+  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, ids, 10);
   return { manager, typed };
 }
 
 /** A message as the Zulip adapter delivers it, `metadata.topic` included. */
 function zulipMessage(channelId: string, over: Partial<ZulipRawMessage> = {}) {
-  return toIncoming(channelId, normalizeMessage({
+  return toIncoming(fixtureKey(channelId), normalizeMessage({
     id: 42,
     sender_id: 1,
     sender_full_name: 'alice',
@@ -146,7 +173,7 @@ test('typing without a topic from the host goes to the topic of the newest incom
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router A', 'stop']]);
@@ -157,12 +184,12 @@ test('a newer message in another topic stops typing where it started before star
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
-  manager.onIncomingMessage('zulip:support', { ...supportMessage('router B'), messageId: '43' });
+  deliver(manager, 'zulip:support', { ...supportMessage('router B'), messageId: '43' });
   await manager.sendTyping('zulip:support'); // the ~7s refresh
   await manager.sendTyping('zulip:support');
-  manager.onIncomingMessage('zulip:support', { ...supportMessage('router A'), messageId: '44' });
+  deliver(manager, 'zulip:support', { ...supportMessage('router A'), messageId: '44' });
   await manager.sendTyping('zulip:support', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [
     ['router A', 'start'],
@@ -178,14 +205,14 @@ test('the newest message sets the topic: one older than the message it came from
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
   const at = (id: number, topic: string) => zulipMessage('zulip:support', { id, subject: topic });
-  manager.onIncomingMessage('zulip:support', at(50, 'router B'));
+  deliver(manager, 'zulip:support', at(50, 'router B'));
   // A held message offered again, older than the one the topic came from.
-  manager.onIncomingMessage('zulip:support', at(42, 'router A'));
+  deliver(manager, 'zulip:support', at(42, 'router A'));
   await manager.sendTyping('zulip:support');
   // A pushed mention accepted after a newer one's, as noteConversation hears of it.
-  assert.equal(manager.noteConversation('zulip:support', at(45, 'router C')), false, 'older: the topic stays');
+  assert.equal(manager.noteConversation(fixtureKey('zulip:support'), at(45, 'router C')), false, 'older: the topic stays');
   await manager.sendTyping('zulip:support');
-  assert.equal(manager.noteConversation('zulip:support', at(51, 'router D')), true, 'newer: it moves');
+  assert.equal(manager.noteConversation(fixtureKey('zulip:support'), at(51, 'router D')), true, 'newer: it moves');
   await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [['router B', 'start'], ['router B', 'start'], ['router B', 'stop'], ['router D', 'start'], ['router D', 'stop']]);
@@ -193,7 +220,7 @@ test('the newest message sets the topic: one older than the message it came from
   manager.reset();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  assert.equal(manager.noteConversation('zulip:support', at(44, 'router E')), true);
+  assert.equal(manager.noteConversation(fixtureKey('zulip:support'), at(44, 'router E')), true);
   manager.destroy();
 });
 
@@ -201,11 +228,11 @@ test('a reaction or change marker does not retarget typing', async () => {
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
   const marker = { channelId: 'zulip:support', author: { id: '2', name: 'bob' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: '[marker]' }] };
-  manager.onIncomingMessage('zulip:support', { ...marker, messageId: 'reaction:add:42:2:0', metadata: { reaction: true } });
-  manager.onIncomingMessage('zulip:support', { ...marker, messageId: 'move:42:0.1', metadata: { change: 'move', topic: 'archive' } });
+  deliver(manager, 'zulip:support', { ...marker, messageId: 'reaction:add:42:2:0', metadata: { reaction: true } });
+  deliver(manager, 'zulip:support', { ...marker, messageId: 'move:42:0.1', metadata: { change: 'move', topic: 'archive' } });
   await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router A', 'start'], ['router A', 'stop']]);
@@ -214,20 +241,20 @@ test('a reaction or change marker does not retarget typing', async () => {
 
 test('typing in a DM carries no topic and sends no extra stops', async () => {
   const dm: ChannelDescriptor = { id: 'zulip:dm:1+790', type: 'zulip', label: 'DM: alice', direction: 'bidirectional' };
-  const { adapter } = fakeAdapter('zulip', [dm]);
+  const { adapter, ids } = fakeAdapter('zulip', [dm]);
   const typed: { metadata?: Record<string, unknown>; op: string }[] = [];
   adapter.sendTyping = async (_c, _d, metadata, op) => { typed.push({ metadata, op }); };
   const grant = grantedChannels();
   grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle', 'channels.publish', 'channels.incoming', 'channels.typing'] });
-  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, 10);
+  const manager = new ChannelManager(fakeMcplClient, new Map([['zulip', adapter]]), grant, ids, 10);
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
   const fromAlice = (id: number) => zulipMessage('zulip:dm:1+790', {
     id, type: 'private', subject: '', display_recipient: [{ id: 1, email: 'alice@example.com', full_name: 'alice' }],
   });
-  manager.onIncomingMessage('zulip:dm:1+790', fromAlice(1));
+  deliver(manager, 'zulip:dm:1+790', fromAlice(1));
   await manager.sendTyping('zulip:dm:1+790');
-  manager.onIncomingMessage('zulip:dm:1+790', fromAlice(2));
+  deliver(manager, 'zulip:dm:1+790', fromAlice(2));
   await manager.sendTyping('zulip:dm:1+790');
   await manager.sendTyping('zulip:dm:1+790', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [[undefined, 'start'], [undefined, 'start'], [undefined, 'stop']]);
@@ -238,12 +265,12 @@ test('reset() forgets the topic a typing run started in', async () => {
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
   manager.reset();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router B'));
+  deliver(manager, 'zulip:support', supportMessage('router B'));
   await manager.sendTyping('zulip:support');
   // A new connection's run: no stop for the old connection's topic.
   assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router B', 'start']]);
@@ -254,7 +281,7 @@ test('a topic the host names wins over the newest incoming one', async () => {
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support', { topic: 'billing' });
   assert.equal(typed[0].metadata?.topic, 'billing');
   manager.destroy();
@@ -264,7 +291,7 @@ test('a run started in a topic the host named is stopped there by a channel-only
   const { manager, typed } = makeTypingManager();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:support', supportMessage('router A'));
+  deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support', { topic: 'billing' });
   await manager.sendTyping('zulip:support', undefined, 'stop');
   await manager.sendTyping('zulip:support');
@@ -312,13 +339,13 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
     label: '#general',
     direction: 'bidirectional',
   };
-  const { adapter, calls } = fakeAdapter('zulip', [desc]);
-  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), 10);
+  const { adapter, calls, ids } = fakeAdapter('zulip', [desc]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 10);
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
 
   // Real conversation establishes thread routing.
-  manager.onIncomingMessage('zulip:general', {
+  deliver(manager, 'zulip:general', {
     channelId: 'zulip:general',
     messageId: '7',
     threadId: 'deploys',
@@ -373,11 +400,11 @@ function ungatedManager(client: any = fakeMcplClient) {
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('zulip', [desc]);
+  const { adapter, calls, ids } = fakeAdapter('zulip', [desc]);
   // A grant that names nothing: §5.4 makes absence the denial.
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: [] });
-  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, ids, 10);
   return { manager, calls };
 }
 
@@ -450,14 +477,14 @@ test('inbound batches are dropped, not queued, without channels.incoming (§14.1
   const desc: ChannelDescriptor = {
     id: 'zulip:C1', type: 'zulip', label: '#general', direction: 'bidirectional',
   };
-  const { adapter } = fakeAdapter('zulip', [desc]);
+  const { adapter, ids } = fakeAdapter('zulip', [desc]);
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle'] });
-  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, ids, 10);
 
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
-  manager.onIncomingMessage('zulip:C1', {
+  deliver(manager, 'zulip:C1', {
     channelId: 'zulip:C1',
     messageId: '1',
     author: { id: 'U1', name: 'alice' },
@@ -478,15 +505,15 @@ function makeManagerWith(client: any) {
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('zulip', [desc]);
-  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), 10);
+  const { adapter, calls, ids } = fakeAdapter('zulip', [desc]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 10);
   return { manager, calls };
 }
 
 test('incoming messages on unopened channels are ignored', () => {
   const { manager } = makeManager();
   // Channel never opened by host — should not record hints or buffer.
-  manager.onIncomingMessage('zulip:C1', {
+  deliver(manager, 'zulip:C1', {
     channelId: 'zulip:C1',
     messageId: '1',
     author: { id: 'U1', name: 'alice' },
@@ -514,12 +541,12 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
       },
     } as any;
     const desc: ChannelDescriptor = { id: 'zulip:C1', type: 'zulip', label: '#general', direction: 'bidirectional' };
-    const { adapter } = fakeAdapter('zulip', [desc]);
+    const { adapter, ids } = fakeAdapter('zulip', [desc]);
     const withheld: string[] = [];
     const givenUp: string[] = [];
     const delivered: string[] = [];
     let allow = true;
-    const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), 10, {
+    const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 10, {
       deliverable: () => allow,
       onWithheld: (_channelId, messages) => withheld.push(...messages.map((m) => m.messageId)),
       onGivenUp: (_channelId, messages) => givenUp.push(...messages.map((m) => m.messageId)),
@@ -533,7 +560,7 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
     });
 
     // Queued while allowed, policy flips before the window closes: withheld, never sent.
-    manager.onIncomingMessage('zulip:C1', msg('1'));
+    deliver(manager, 'zulip:C1', msg('1'));
     allow = false;
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(sent, []);
@@ -542,20 +569,20 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
     // Allowed again; the host fails the attempt and the retry: given up, not dropped silently.
     allow = true;
     fail = 2;
-    manager.onIncomingMessage('zulip:C1', msg('2'));
+    deliver(manager, 'zulip:C1', msg('2'));
     await new Promise((r) => setTimeout(r, 60));
     assert.deepEqual(sent, []);
     assert.deepEqual(givenUp, ['2']);
     assert.equal(manager.pendingCount(), 0);
 
     // A healthy host: delivered and reported as such.
-    manager.onIncomingMessage('zulip:C1', msg('3'));
+    deliver(manager, 'zulip:C1', msg('3'));
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(sent.map((b) => b.map((m: any) => m.messageId)), [['3']]);
     assert.deepEqual(delivered, ['3']);
 
     // reset() forgets the connection's registrations, opens and buffer.
-    manager.onIncomingMessage('zulip:C1', msg('4'));
+    deliver(manager, 'zulip:C1', msg('4'));
     assert.equal(manager.pendingCount(), 1);
     manager.reset();
     assert.equal(manager.pendingCount(), 0);
@@ -569,7 +596,8 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
 // ── Announcing channels that appear after startup (#20) ──
 
 function desc(id: string): ChannelDescriptor {
-  return { id, type: 'zulip', label: `#${id.slice('zulip:'.length)}`, direction: 'bidirectional', address: { stream_name: id.slice('zulip:'.length) } };
+  const name = id.slice('zulip:'.length);
+  return { id, type: 'zulip', label: `#${name}`, direction: 'bidirectional', address: { stream_id: streamIdFor(name), stream_name: name } };
 }
 
 /** A ChannelManager whose host answers `channels/changed` however the test says. */
@@ -585,8 +613,9 @@ function announcing(answer: () => unknown) {
     },
     sendIncoming: async () => {},
   } as never;
-  const { adapter } = fakeAdapter('zulip', []);
-  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), 5);
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  ids.directory.registration(['ops', 'dev', 'gone', ...Array.from({ length: 200 }, (_, i) => `s${i}`)].map((name) => ({ stream_id: streamIdFor(name), name })));
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
   return { manager, sent };
 }
 
@@ -675,6 +704,85 @@ test('two callers announcing the same new channel send one announcement (#20)', 
   assert.deepEqual([a.announced, b.announced].flat(), ['zulip:ops']);
 });
 
+test('an id that an unanswered change added stays at the host once a new stream holds it: the next change does not remove it', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown;
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  await manager.registerAdditional([on('zulip:a', 17)]);
+
+  answer = new Error('timed out');
+  assert.equal(await manager.announceChanges(['zulip:a'], [on('zulip:tmp', 17)]), 'unanswered');
+
+  answer = undefined;
+  assert.deepEqual((await manager.registerAdditional([on('zulip:tmp', 101)])).announced, ['zulip:tmp']);
+
+  await manager.announceChanges(['zulip:a'], [on('zulip:b', 17)]);
+  assert.deepEqual(sent.at(-1)?.removed, ['zulip:a'], 'stream 101 holds zulip:tmp at the host');
+});
+
+test('a stream renamed while its first announcement waits to be retried: a retry of the backlog doesn\'t offer its old id', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown = new Error('timed out');
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }, { stream_id: 18, name: 'c' }]);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17), on('zulip:c', 18)])).local, ['zulip:a', 'zulip:c']);
+
+  ids.directory.applyEvent({ op: 'update', stream_id: 17, property: 'name', value: 'b' });
+  answer = undefined;
+  await manager.registerAdditional([], { retryBacklog: true });
+  const retried = sent.slice(1).flatMap((c) => (c.added ?? []).map((d) => d.id));
+  assert.ok(retried.includes('zulip:c'), 'stream 18\'s descriptor, unchanged, is retried');
+  assert.equal(retried.includes('zulip:a'), false, 'zulip:a is stream 17\'s old id');
+});
+
+test('a stream archived while its first announcement waits to be retried: a retry of the backlog doesn\'t offer it', async () => {
+  const sent: { removed?: string[]; added?: ChannelDescriptor[] }[] = [];
+  let answer: unknown = new Error('timed out');
+  const host = {
+    registerChannels: async () => ({}),
+    channelsChanged: async (params: { removed?: string[]; added?: ChannelDescriptor[] }) => {
+      sent.push(params);
+      if (answer instanceof Error) throw answer;
+      return acceptAll(params.added ?? []);
+    },
+    sendIncoming: async () => {},
+  } as never;
+  const { adapter, ids } = fakeAdapter('zulip', []);
+  const manager = new ChannelManager(host, new Map([['zulip', adapter]]), grantedChannels(), ids, 5);
+  ids.directory.registration([{ stream_id: 17, name: 'a' }, { stream_id: 18, name: 'c' }]);
+  const on = (id: string, streamId: number): ChannelDescriptor => ({ ...desc(id), address: { stream_id: streamId, stream_name: id.slice('zulip:'.length) } });
+  assert.deepEqual((await manager.registerAdditional([on('zulip:a', 17), on('zulip:c', 18)])).local, ['zulip:a', 'zulip:c']);
+
+  ids.directory.applyEvent({ op: 'delete', streams: [{ stream_id: 17, name: 'a' }] });
+  answer = undefined;
+  await manager.registerAdditional([], { retryBacklog: true });
+  const retried = sent.slice(1).flatMap((c) => (c.added ?? []).map((d) => d.id));
+  assert.ok(retried.includes('zulip:c'), 'stream 18\'s descriptor, unchanged, is retried');
+  assert.equal(retried.includes('zulip:a'), false, 'stream 17 is gone');
+});
+
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
   // The descriptor is recorded before the announcement, so "already in
   // allChannels" cannot mean "the host accepted it" — only a verdict can.
@@ -714,4 +822,53 @@ test('a host that acts on a pending channel has confirmed it (#20)', async () =>
   manager.confirmAnnounced('zulip:ops'); // the host opened or closed it
   await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(sent.length, 1, 'nothing left to re-announce');
+});
+
+test('a flush() batch on the wire counts for isIdle(), a timer that fires meanwhile waits for it, and idle() settles after it', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let sends = 0;
+  const client = { registerChannels: async () => ({}), sendIncoming: async () => { sends++; await gate; } } as any;
+  const d: ChannelDescriptor = { id: 'zulip:general', type: 'zulip', label: '#general', direction: 'bidirectional' };
+  const { adapter, ids } = fakeAdapter('zulip', [d]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 20);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  const message = (id: string) => ({ messageId: id, author: { id: 'U1', name: 'a' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: 'hi' }] });
+  deliver(manager, 'zulip:general', message('7'));
+  let settled = false;
+  void manager.idle().then(() => { settled = true; });
+  const flushed = manager.flush();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(manager.isIdle(), false, "flush()'s batch is on the wire");
+  assert.equal(settled, false, 'idle() waits while the batch is on the wire');
+  deliver(manager, 'zulip:general', message('8'));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(sends, 1, 'the timer waits for the batch on the wire');
+  assert.equal(settled, false, 'idle() still waits');
+  release();
+  await flushed;
+  const deadline = performance.now() + 1000;
+  while (!settled && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(settled, true, 'idle() settles once both batches are sent');
+  assert.equal(sends, 2);
+  manager.destroy();
+});
+
+test('an idle() taken while the batch waits for its window settles when flush() sends that batch', async () => {
+  let sends = 0;
+  const client = { registerChannels: async () => ({}), sendIncoming: async () => { sends++; } } as any;
+  const d: ChannelDescriptor = { id: 'zulip:general', type: 'zulip', label: '#general', direction: 'bidirectional' };
+  const { adapter, ids } = fakeAdapter('zulip', [d]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 50);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  deliver(manager, 'zulip:general', { messageId: '7', author: { id: 'U1', name: 'a' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text', text: 'hi' }] });
+  let settled = false;
+  void manager.idle().then(() => { settled = true; });
+  await manager.flush();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(sends, 1);
+  assert.equal(settled, true, 'idle() settles once flush() has sent the batch');
+  manager.destroy();
 });

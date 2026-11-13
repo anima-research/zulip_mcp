@@ -11,11 +11,12 @@
  *   ZULIP_REALM / ZULIP_EMAIL / ZULIP_API_KEY   - bot credentials
  *   ZULIP_RC_PATH                               - alternative: a zuliprc file
  *   ZULIP_SESSION_ID                            - persistent monitoring state id
- *   ZULIP_SUBSCRIBE                             - comma-separated streams to join on startup
+ *   ZULIP_SUBSCRIBE                             - comma-separated streams to join once the stream list is first read,
+ *                                                 or a read without MCPL got no answer
  *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
  *                                                 (default ~/.zulip_mcp_state)
- *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
- *                                                 catch-up sweep and gap recovery (3000)
+ *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for each channel's
+ *                                                 catch-up and gap recovery (3000)
  *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
  *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
  *   ZULIP_FILTERS_FILE                          - the filters plane file (default
@@ -26,7 +27,7 @@
  *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
  *   ZULIP_ATTRIBUTE_DELIVERY                    - "false" delivers bare bodies; default renders
  *                                                 "[time id=N] [#stream > topic] Author: " into each
- *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split (10000)
+ *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split, longer edits refused (10000)
  *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
  *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
  *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
@@ -48,27 +49,32 @@ import { checkImageDecoder, fetchCapped, resolveInlineOptions } from './attachme
 import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
+import { StreamDirectory } from './stream-directory.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { LOCAL_FILES_SUPPORTED, createZulipUploader, resolveUploadPolicy } from './uploads.js';
 import { agentLineTimeFormatter } from './timezone.js';
-import { initializeZulipClient } from './zulip-client.js';
+import { initializeZulipClient, subscribeConfigured } from './zulip-client.js';
 
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
 
 const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
 
-function intEnv(name: string, fallback: number): number {
+function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
-  const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) {
-    console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not a non-negative integer); using ${fallback}`);
+  const n = /^\s*\d+\s*$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isFinite(n) || n < min) {
+    console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not ${min === 0 ? 'a non-negative integer' : `an integer of at least ${min}`}); using ${fallback}`);
     return fallback;
   }
   return n;
+}
+
+export function maxMessageLengthFromEnv(): number | undefined {
+  return process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000, 1) : undefined;
 }
 
 /** "general:50,dev:200" → Map { general → 50, dev → 200 }. Bad entries are reported and skipped. */
@@ -118,16 +124,20 @@ async function main(): Promise<void> {
   }
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
-  const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+  const maxMessageLength = maxMessageLengthFromEnv();
+  const directory = new StreamDirectory();
+  void subscribeConfigured(session.api, directory, process.env.ZULIP_SUBSCRIBE);
+  const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
+    directory,
     formatTime,
     uploader,
     uploadPolicy,
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
-    maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
+    maxMessageLength,
   });
-  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
@@ -143,14 +153,15 @@ async function main(): Promise<void> {
     attributeDelivery: process.env.ZULIP_ATTRIBUTE_DELIVERY !== 'false',
     formatTime,
     filters,
+    directory,
     attachments: {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm
       // host may ever see the bot's credentials.
       source: {
-        fetch: (path, maxBytes) => {
+        fetch: (path, maxBytes, signal) => {
           const url = parseZulipAttachmentUrl(path, session.realm);
           const headers: Record<string, string> = session.authHeader ? { Authorization: session.authHeader } : {};
-          return fetchCapped(url.toString(), headers, maxBytes);
+          return fetchCapped(url.toString(), headers, maxBytes, signal);
         },
       },
       inline,
