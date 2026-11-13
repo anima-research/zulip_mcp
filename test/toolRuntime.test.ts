@@ -839,6 +839,26 @@ test('get_stream_topics with MCPL reads a name as the send tools do: a former na
 
 const MOVE_STREAMS: Record<number, string> = { 7: 'general', 8: 'ops' };
 
+for (const [tool, args, asked] of [
+  ['move_messages', { message_id: 77, stream: 'ops', scope: 'one' }, ['GET /get_stream_id', 'PATCH /messages/77', 'GET /messages/77']],
+  ['get_stream_topics', { stream: 'deploys' }, ['GET /get_stream_id', 'GET /users/me/12/topics']],
+] as const) {
+  test(`${tool} with MCPL asks Zulip for a name the directory doesn't hold, with no read of the stream list, and refuses a former name it holds with nothing sent`, async () => {
+    const { tools, dir, calls } = tool === 'move_messages' ? moveRuntime({ known: false }) : topicsRuntime();
+    try {
+      const directory = new StreamDirectory();
+      directory.load({ streams: { 7: 'general' }, formerNames: { 'old-general': 7 } });
+      const listReads: string[] = [];
+      tools.channelIds = new ChannelIds(directory, async (why) => { listReads.push(why); });
+      await assert.rejects(tools.handleToolCall(tool, { ...args, stream: 'old-general' }), /^Error: Zulip stream #old-general was renamed #general\. Nothing went to Zulip\.$/);
+      assert.deepEqual(calls, [], 'a former name: nothing went to Zulip');
+      await tools.handleToolCall(tool, args);
+      assert.deepEqual(listReads, [], 'no read of the stream list');
+      assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), asked);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknown; readBack?: () => unknown; lookup?: () => unknown; known?: boolean; formerNames?: Record<string, number> } = {}) {
   const message = { id: 77, type: 'stream', stream_id: 7, display_recipient: 'general', subject: 'deploys' };
   const stand = standInApi({

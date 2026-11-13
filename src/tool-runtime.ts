@@ -263,13 +263,15 @@ export class ZulipToolRuntime {
 
   answerHints: AnswerHints | null = null;
 
-  private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
+  private async streamIdsByName(names: string[], opts: { readList?: boolean } = {}): Promise<Map<string, number>> {
     const out = new Map<string, number>();
     const ids = this.channelIds;
     if (!ids) return out;
     const renamed: string[] = [];
     for (const name of names) {
-      const answer = await ids.keyOf(`zulip:${name}`, { byName: true });
+      const answer = opts.readList === false
+        ? ids.resolve(`zulip:${name}`, { byName: true }) ?? { unknownName: name }
+        : await ids.keyOf(`zulip:${name}`, { byName: true });
       if ("key" in answer) {
         const parsed = parseKey(answer.key);
         if (parsed.kind === "stream") out.set(name, parsed.streamId);
@@ -283,7 +285,7 @@ export class ZulipToolRuntime {
   }
 
   private async streamIdForName(name: string): Promise<number> {
-    const known = (await this.streamIdsByName([name])).get(name);
+    const known = (await this.streamIdsByName([name], { readList: false })).get(name);
     if (known !== undefined) return known;
     let id: unknown;
     try {
