@@ -69,7 +69,7 @@ import type { AttachmentRef } from './content.js';
 import { agentLineTimeFormatter } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import { StateTracker } from './state.js';
-import type { IncomingEntry, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
@@ -213,6 +213,7 @@ export class ZulipMcplServer {
   private grantUpdatesOnChain = 0;
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private messagingHold: (() => void) | null = null;
+  private readonly changesOnTurn = new Map<number, ChangeEntry[]>();
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
@@ -361,6 +362,7 @@ export class ZulipMcplServer {
     this.readWaits.clear();
     this.toldReadWait = false;
     this.messagingHold = null;
+    this.changesOnTurn.clear();
     this.lanes = this.makeLanes();
   }
 
@@ -1094,7 +1096,9 @@ export class ZulipMcplServer {
     const place = this.placeOf(key);
     if (id !== null && place !== undefined && id <= place) return;
     lane.enter(async (ctx) => {
-      const ready = await entry.ready();
+      const changes = id !== null ? this.changesOnTurn.get(id) : undefined;
+      if (id !== null) this.changesOnTurn.delete(id);
+      const ready = await entry.ready(changes);
       if (ctx.ended) return;
       const placeNow = this.placeOf(key);
       if (id !== null && placeNow !== undefined && id <= placeNow) return;
@@ -1741,6 +1745,7 @@ export class ZulipMcplServer {
   private giveUp(w: DeliveryWriter, lane: Lane<DeliveryWriter>): void {
     const key = lane.key;
     const ids = lane.replaceMessages((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readGivenUp(r2, key))));
+    for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
       const first = Math.min(...held);
@@ -2395,21 +2400,22 @@ export class ZulipMcplServer {
           const placed = reaction.placed();
           if (placed.key === reaction.key) return this.onReaction(ctx.w, placed);
           this.lanes?.lane(placed.key).enter((c) => this.onReaction(c.w, placed));
-        });
+        }, { kind: 'reaction', about: [Number(reaction.messageId)] });
       },
       (entry) => {
         const lane = this.lanes?.lane(entry.key);
         if (!lane) return;
-        if (this.messagingHold !== null) {
-          const waiting = new Set(lane.waitingMessages());
-          if (!entry.messageIds.some((id) => waiting.has(id))) return;
+        const waiting = new Set(lane.waitingMessages());
+        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => waiting.has(id));
+        for (const id of applied) this.changesOnTurn.set(id, [...(this.changesOnTurn.get(id) ?? []), entry]);
+        if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
+        const rest = entry.messageIds.filter((id) => !applied.includes(id));
+        if (rest.length === 0) return;
+        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) {
+          lane.host((ctx) => this.runChange(ctx, entry, rest, true));
+          return;
         }
-        lane.enter(async (ctx) => {
-          const change = await entry.ready();
-          if (change === null || ctx.ended) return;
-          if (change.key === entry.key) return this.onMessageChange(ctx, change);
-          this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'other', about: entry.messageIds });
-        }, { kind: 'other', about: entry.messageIds });
+        lane.enter((ctx) => this.runChange(ctx, entry, rest, false), { kind: 'change', about: rest });
       },
     );
   }
@@ -2464,6 +2470,15 @@ export class ZulipMcplServer {
     return this.mcplActive && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
   }
 
+  private async runChange(ctx: Ctx, entry: ChangeEntry, ids: number[], silent: boolean): Promise<void> {
+    const change = await entry.ready(ids);
+    if (change === null || ctx.ended) return;
+    if (change.key === entry.key) return this.onMessageChange(ctx, change, true, silent);
+    const lane = this.lanes?.lane(change.key);
+    if (silent) lane?.host((c) => this.onMessageChange(c, change, true, true));
+    else lane?.enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
+  }
+
   /**
    * An edit, move or deletion is as visible as its message was. On an open
    * channel every message is delivered, so a change to one the host has
@@ -2475,12 +2490,12 @@ export class ZulipMcplServer {
    * already changed if it arrives at all. The synthetic id never advances a
    * watermark; the line carries the message's own id for fetch_around.
    */
-  private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true): Promise<void> {
+  private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true, silent = false): Promise<void> {
     if (ev.previousTopic !== null && !ev.leftChannel) ctx.w.channels.followMove(ev.key, ev.messageIds, ev.topic);
     if (ev.byBot) return;
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
-    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    if (silent || !this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a
     // stream the bot was added to after startup — a message edited into a
