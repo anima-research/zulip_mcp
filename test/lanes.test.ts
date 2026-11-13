@@ -1,10 +1,3 @@
-/**
- * The lanes: one job at a time on a channel, the host's queue first, and
- * what all lanes share.
- *
- * Run: node --import tsx --test test/lanes.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { streamKey } from '../src/channel-key.ts';

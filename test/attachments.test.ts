@@ -153,7 +153,6 @@ test("a message's attachments share one deadline: the fetch it cuts, and every o
   let started!: () => void;
   const firstStarted = new Promise<void>((resolve) => { started = resolve; });
   const source: AttachmentSource = {
-    // Never answers, and doesn't listen to its signal.
     fetch(path, _maxBytes, signal) {
       calls.push({ path, signal });
       started();

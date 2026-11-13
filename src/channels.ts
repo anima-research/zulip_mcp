@@ -759,12 +759,10 @@ export class ChannelManager {
     await flushing;
   }
 
-  /** No batch waits for its window and no flush is on the wire. */
   isIdle(): boolean {
     return this.batchTimer === null && this.flushing === null;
   }
 
-  /** Settles once the batch is idle. */
   idle(): Promise<void> {
     if (this.isIdle()) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));

@@ -80,7 +80,6 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   enterChange: OnMessageChange | null;
   systemEvent: OnSystemEvent | null;
   react: ((event: Omit<Parameters<OnReaction>[0], 'key' | 'placed'> & { channelId: string }) => void) | null;
-  /** The server's reaction handler as it is: for a key that `keyOf` would name, or a reaction placed elsewhere at its turn. */
   reactAt: OnReaction | null;
   change: ((event: Omit<MessageChangeEvent, 'key' | 'movedToKey'> & { channelId: string; movedToChannelId: string | null }) => void) | null;
   /** The stream's messages, oldest first; fetchHistory pages over them by id. */
@@ -1363,7 +1362,6 @@ test("a message whose attachment fetches never answer goes at its one deadline, 
   await h.close();
 });
 
-/** An attachment source whose fetches wait until the test lets them go, or for `ms` when given. */
 function heldFetches(ms?: number) {
   const started: string[] = [];
   let release!: () => void;
@@ -1454,7 +1452,6 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
   const open = async (history: { limit: number; sinceLastSeen?: boolean }) =>
     h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history }) as Promise<{ history?: { messageId: string }[] }>;
 
-  // The newest rows: the page is the two below the two that wait.
   h.adapter.emit!(withLog(streamMsg(3, { mentioned: true })));
   await until(() => fetches.started.length === 1, 'the fetch to start');
   h.adapter.emit!(streamMsg(4));
@@ -1466,7 +1463,6 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
   await h.server.quiet();
   assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5']);
 
-  // Since last seen: the page ends below the two that wait.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.history.push(...[6, 7, 8].map((n) => streamMsg(n)));
   h.adapter.emit!(withLog(streamMsg(6, { mentioned: true })));
@@ -1480,7 +1476,6 @@ test('an open\'s page holds no message that waits in its lane, and each waiting 
   await h.server.quiet();
   assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5', '7', '8']);
 
-  // A message that comes to wait while the page is read is left out of it.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   let letRead!: () => void;
   const gate = new Promise<void>((resolve) => { letRead = resolve; });
@@ -1808,7 +1803,6 @@ test('a message that arrives while zulip.messaging is disabled is offered once i
   await h.close();
 });
 
-/** Enters `m` with a job that waits until the returned release; then `zulip.messaging` goes off, and the release lets the job meet it. Resolves once `m` is held. */
 async function heldAcrossDisable(h: Harness, m: IncomingChannelMessage, disable: () => Promise<unknown>): Promise<void> {
   const key = h.adapter.keyOf(m.channelId);
   const { channelId, ...rest } = m;
@@ -2345,7 +2339,6 @@ test('a mention that enters a closed channel while its read after a break is at 
   await initialize(h, true);
   await settled(h);
   h.delivery.advance('zulip:general', 1);
-  // The read's answer is history as Zulip had it when the read was sent: nothing after 1.
   let letRead!: () => void;
   const gate = new Promise<void>((resolve) => { letRead = resolve; });
   let reading = false;
@@ -2457,7 +2450,6 @@ test('a push the host hasn\'t answered holds back no later message, reaction or 
     assert.deepEqual(h.pushed.map((p) => p.eventId.split('_')[1]), ['msg', 'reaction', 'edit', 'msg']);
 
     h.policy.holdPushes = false;
-    // The answers come a little later, so that a quiet() which didn't wait for them could show it.
     setTimeout(() => { for (const answer of h.policy.heldPushes.splice(0)) answer(); }, 30);
     await h.server.quiet();
     assert.equal(h.delivery.watermark('zulip:general'), 4, 'both messages accepted');
@@ -3325,7 +3317,6 @@ test("an edit and a deletion that arrive while their message's move to another c
     mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
     ...over,
   });
-  // Each enters general's lane, as the cache named it at arrival; the edit's and the deletion's ready() key them to aaa.
   h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'move', previousTopic: 'deploys', movedToKey: aaa }) });
   h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'edit', key: aaa, content: 'ship it @Bot', previousContent: 'ship it' }) });
   h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'delete', key: aaa, previousContent: 'ship it @Bot', actorId: null }) });
@@ -3656,7 +3647,6 @@ test('listen registers what it subscribed the bot to and reports how the host an
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
 
-  // A host that does not answer: the tool says so rather than logging it.
   h.policy.changedAnswer = 'error';
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM, { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } }];
   const stalled = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['infra'] } })) as { content: { text: string }[] }).content[0].text) as
@@ -3782,8 +3772,6 @@ test('an open and then a close for a channel id the directory does not hold yet 
   const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }).then(() => answered.push('open'));
   await until(() => h.policy.heldChanged.length === 1, "the open's re-discovery to announce the stream");
   const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' }).then(() => answered.push('close'));
-  // Time for the close to be read while the announcement is out. It changes
-  // only whether a server that served the close first could show it.
   await new Promise((r) => setTimeout(r, 50));
   h.policy.heldChanged.shift()!();
   await Promise.all([open, close]);
@@ -5405,7 +5393,6 @@ test('on a closed channel, a lane gives its messages up and history has nothing 
   await h.close();
 });
 
-/** The channel's reads from history after a message id fail with `errors`, one each, in order; then they pass. */
 function failReads(h: Harness, channelId: string, errors: unknown[]): void {
   const real = h.adapter.fetchHistory!.bind(h.adapter);
   h.adapter.fetchHistory = async (key, query) => {
@@ -5682,14 +5669,12 @@ test('a read after a give-up that gets no answer is tried again, and the given-u
 const readWaitLines = (h: Harness, kind: 'history-waiting' | 'history-answered') =>
   h.incoming.filter((m) => (m.metadata as { kind?: string }).kind === kind);
 
-/** A system line that goes to every open channel at once: once it has arrived, so has every line queued before it. */
 async function sentinelThrough(h: Harness, channels: number): Promise<void> {
   const text = `sentinel ${Math.random()}`;
   h.adapter.systemEvent!({ kind: 'degraded', text, metadata: { platform: 'zulip' } });
   await until(() => h.incoming.filter((m) => (m.content[0] as TextContent).text === text).length === channels, 'the sentinel line');
 }
 
-/** Each read of a channel after a message id fails, once for each entry, with the clock moved on by that entry's ms first. */
 function failReadsAt(h: Harness, clock: { t: number }, failures: Record<string, ({ ms: number; error?: unknown })[]>): void {
   const real = h.adapter.fetchHistory!.bind(h.adapter);
   h.adapter.fetchHistory = async (key, query) => {

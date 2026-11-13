@@ -37,7 +37,6 @@ interface Run {
   server: ZulipMcplServer;
   filters: FiltersPlane;
   host: McplConnection;
-  /** The server's side of the connection. */
   serverSide: McplConnection;
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
@@ -81,7 +80,6 @@ interface StartOptions {
   grantLater?: boolean;
   /** Record channels/register but never answer it. */
   holdRegister?: boolean;
-  /** Answer channels/register once this settles. */
   beforeRegisterAnswer?: () => Promise<void>;
   shutdownGraceMs?: number;
 }

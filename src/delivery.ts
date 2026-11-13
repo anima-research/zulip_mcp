@@ -261,7 +261,6 @@ export class DeliveryState {
     return this.advance(key, messageId);
   }
 
-  /** A connection begins: what an earlier connection's host accepted counts only as far as the watermark. */
   restartReached(): void {
     this.reached = new Map(this.watermarks);
   }
@@ -324,7 +323,6 @@ export class DeliveryState {
     return this.settle(key);
   }
 
-  /** The host refused a block of (afterId, messageId]: every hold in it is rejected. */
   refuse(key: ChannelKey, afterId: number, messageId: number): void {
     const held = this.held.get(key);
     if (!held) return;
@@ -332,7 +330,6 @@ export class DeliveryState {
     if (this.watermarkBelowHolds(key)) this.save();
   }
 
-  /** The connection ended: a hold that was on its way is not any more, so a replay may offer it. */
   failQueued(): void {
     for (const [key, held] of this.held) {
       let failed = false;
@@ -382,18 +379,15 @@ export class DeliveryState {
     }
   }
 
-  /** The event path verified this held message as a reply to the bot, for a read from history that can't verify it. The verdict goes with the hold. */
   verifiedReply(key: ChannelKey, messageId: number): boolean {
     return this.held.get(key)?.get(messageId)?.replyVerified === true;
   }
 
-  /** The event path verified this held message as a reply to the bot. A message no longer held stays unheld. */
   verifyReply(key: ChannelKey, messageId: number): void {
     const h = this.held.get(key)?.get(messageId);
     if (h) h.replyVerified = true;
   }
 
-  /** An edit took the quote out: the message is no longer a verified reply. */
   forgetReply(key: ChannelKey, messageId: number): void {
     const h = this.held.get(key)?.get(messageId);
     if (h) h.replyVerified = false;
@@ -456,10 +450,6 @@ export class DeliveryState {
   }
 }
 
-/**
- * Delivery state as the server holds it outside its lanes: what it reads,
- * whether a save persists, and the save, which changes no state.
- */
 export type DeliveryReader = Pick<
   DeliveryState,
   | 'writes'

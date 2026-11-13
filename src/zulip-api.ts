@@ -56,9 +56,7 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
 }
 
 export class ZulipRefused extends Error {
-  /** Zulip's error code, such as `RATE_LIMIT_HIT`, when its answer has one. */
   readonly code: string | undefined;
-  /** How many seconds a rate limit asks the client to wait (the answer's `retry-after`), when it says. */
   readonly retryAfterSeconds: number | undefined;
 
   constructor(what: string, answer: ZulipRefusal, readonly mayHaveBeenApplied = false) {

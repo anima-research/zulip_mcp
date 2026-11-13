@@ -109,11 +109,6 @@ export interface ReactionEvent {
   timestamp: Date;
 }
 
-/**
- * A reaction from the event stream, placed in its channel when it arrives.
- * The server calls `placed` in the channel's turn; it answers the reaction
- * placed where its message is then, which a move ahead of it may have changed.
- */
 export interface ReactionEntry extends ReactionEvent {
   placed(): ReactionEvent;
 }
@@ -173,14 +168,8 @@ export interface MessageChangeEvent {
   timestamp: Date;
 }
 
-/**
- * A change from the event stream, placed in its channel when it arrives.
- * The server runs `ready` in the channel's turn; it answers null for a
- * change that isn't for the host.
- */
 export interface ChangeEntry {
   key: ChannelKey;
-  /** The messages the change is about, as the event names them. */
   messageIds: number[];
   ready(): Promise<MessageChangeEvent | null>;
 }

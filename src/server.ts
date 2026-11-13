@@ -136,13 +136,9 @@ export interface ZulipMcplServerOptions {
   announceTimeoutMs?: number;
   /** Render `[time id=N] [#stream > topic] Author: ` into delivered bodies (live, push, recovered replays; default true). `false` for a host that renders the structured fields itself. */
   attributeDelivery?: boolean;
-  /** How long shutdown waits for a delivery still running, such as one fetching its attachments (default 5 s). */
   shutdownGraceMs?: number;
-  /** At most this many messages wait in all channels' lanes together; past it, the channel with the most gives them up to a read from history (default 5,000). */
   maxWaitingMessages?: number;
-  /** How a lane waits before it tries a read from history again that got no answer (default: a timer of `ms`). */
   readRetryWait?: (ms: number) => Promise<void>;
-  /** The clock for how long a lane has waited for a read from history (default: Date.now). */
   now?: () => number;
   directory?: StreamDirectory;
 }
@@ -174,7 +170,6 @@ interface HistoryRead {
   unverifiedMessageIds: number[];
 }
 
-/** One pass of a catch-up read, read from `after`; no `fetched` when the read failed. */
 interface CatchUpPass {
   after: number;
   bound: number | undefined;
@@ -444,12 +439,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /**
-   * Settles once nothing is under way: no delivery job runs or waits, no
-   * request waits to be served, no batch waits for its window or is on the
-   * wire, no request to the host waits for its answer, and no replay runs.
-   * For tests and diagnostics.
-   */
   async quiet(): Promise<void> {
     while (!this.isQuiet()) {
       await Promise.all([
@@ -1539,11 +1528,6 @@ export class ZulipMcplServer {
     }
   }
 
-  /**
-   * Hand one pass of a catch-up read on, up to the first message that waits
-   * in the lane now. A first pass that a row with an unverified quote ended
-   * hands the second pass on after it.
-   */
   private handCatchUp(ctx: Ctx, key: ChannelKey, read: CatchUpRead, pass: CatchUpPass, window?: { through: number; truncated: boolean }, second?: CatchUpPass): void {
     const { after, fetched } = pass;
     if (!fetched) {
@@ -1657,7 +1641,6 @@ export class ZulipMcplServer {
     if (blocked !== undefined) handSecond();
   }
 
-  /** Read the ambient that arrived on a tallied channel during downtime; what it hands on counts it. */
   private async readBackfill(r: Reading, key: ChannelKey): Promise<Hand | void> {
     if (!this.adapter.fetchHistory || this.isMuted(key) || !this.isAllowed(key)) return;
     const tally = this.delivery.tally(key);
@@ -1746,7 +1729,6 @@ export class ZulipMcplServer {
     return keys;
   }
 
-  /** The break's job sends both its reads before it hands a row on: the held ids' rows, then its own. */
   private async readGap(r: Reading, key: ChannelKey, gap: GapRead): Promise<Hand> {
     const held = await this.readHeld(r, key, gap);
     const fill = await this.fillRead(r, (r2) => this.readFill(r2, key, gap));
@@ -1842,7 +1824,6 @@ export class ZulipMcplServer {
     for (const key of open) this.channelManager.notifyChannel(key, text, metadata);
   }
 
-  /** With `ceiling`, the read is one of a give-up's passes, and `ceiling.reached` says whether it stopped at the catch-up ceiling. */
   private async readFill(r: Reading, key: ChannelKey, gap?: GapRead, ceiling?: { reached: boolean }): Promise<Hand | void> {
     if (r.ended || this.isMuted(key) || !this.isAllowed(key)) return;
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;

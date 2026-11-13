@@ -27,7 +27,6 @@ export interface Realm {
   /** `noStreamId`: its event carries the stream's name alone, as some Zulip versions send it. */
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
-  /** Someone moves a message to another stream, keeping its topic. */
   move(messageId: number, toStreamId: number): void;
 }
 
