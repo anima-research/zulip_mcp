@@ -138,8 +138,9 @@ test('R2: publish returns and posts as before, at one chunk, three chunks, with 
 
 
 const refuseSecond: Answer = (n) => (n === 2 ? { result: 'error', msg: 'nope', code: 'BAD_REQUEST' } : ok(n));
+let noAnswer: ZulipNoAnswer | undefined;
 const noAnswerSecond: Answer = (n) => {
-  if (n === 2) throw new ZulipNoAnswer('timeout', 'POST', '/messages', true, 'Zulip gave no answer to POST /messages within 15 s.');
+  if (n === 2) throw (noAnswer = new ZulipNoAnswer('timeout', 'POST', '/messages', true, 'Zulip gave no answer to POST /messages within 15 s.'));
   return ok(n);
 };
 const threeChunks = [big(1, 9000), big(2, 9000), big(3, 5000)].join('\n\n');
@@ -166,16 +167,16 @@ test('R3: a refusal at the second of three chunks keeps each caller\'s error tex
 
 test('R3b: no answer at the second of three chunks throws that error, and the first chunk is on record', async () => {
   const sm = tools(messagesApi(noAnswerSecond).api);
-  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), ZulipNoAnswer);
+  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), (e) => e === noAnswer);
   assert.deepEqual(sm.sent.map((s) => s.messageId), ['901']);
   sm.done();
 
   const dm = tools(messagesApi(noAnswerSecond).api);
-  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), ZulipNoAnswer);
+  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), (e) => e === noAnswer);
   assert.deepEqual(dm.sent.map((s) => s.messageId), ['901']);
   dm.done();
 
   const pub = adapter(messagesApi(noAnswerSecond).api);
-  await assert.rejects(pub.adapter.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), ZulipNoAnswer);
+  await assert.rejects(pub.adapter.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e === noAnswer);
   assert.deepEqual(pub.sent.map((s) => s.messageId), ['901']);
 });

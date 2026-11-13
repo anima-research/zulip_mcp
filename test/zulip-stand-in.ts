@@ -9,15 +9,6 @@ export interface StandInCall {
 
 type Route = unknown | ((params: Record<string, unknown>, call: StandInCall) => unknown);
 
-/**
- * A ZulipApi whose transport answers by "METHOD /path" (below /api/v1) with the
- * call site's own values, unencoded. A path's numeric segments may be written
- * `:id` in a route, as in "GET /messages/:id"; an exact route wins. A route's
- * answer is the JSON body, sent with 200, or 400 when it is a refusal. A
- * call with no route throws, naming it. A call that passes its own
- * `timeoutMs` and isn't answered within it throws ZulipNoAnswer, as the HTTP
- * transport does; the default bound isn't applied.
- */
 export function standInApi(routes: Record<string, Route>): { api: ZulipApi; calls: StandInCall[] } {
   const calls: StandInCall[] = [];
   const answerFor = async (call: StandInCall): Promise<TransportAnswer> => {

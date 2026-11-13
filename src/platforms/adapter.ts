@@ -21,7 +21,13 @@ import type {
   ContextInjection,
   IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
-import type { SentRecord } from '../outgoing.js';
+
+/** A message this server sent, as the rollback record keeps it. */
+export interface SentRecord {
+  messageId: string;
+  channelId: string;
+  content: string;
+}
 
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
@@ -159,6 +165,7 @@ export interface ChannelHistoryQuery {
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
   afterMessageId?: string;
+  timeoutMs?: number;
 }
 
 /**
