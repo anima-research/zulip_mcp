@@ -79,6 +79,7 @@ const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
   writes = true;
+  private unreadableFile = false;
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
@@ -165,6 +166,7 @@ export class DeliveryState {
         place(chan, (key) => this.lastOpen.add(key), (u) => { u.lastOpen = true; });
       }
     } catch (err) {
+      this.unreadableFile = true;
       console.error('[zulip-mcp] Failed to load delivery state:', (err as Error).message);
     }
   }
@@ -199,6 +201,19 @@ export class DeliveryState {
   save(): void {
     const path = this.file();
     if (!path || !this.writes) return;
+    if (this.unreadableFile) {
+      const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      try {
+        renameSync(path, aside);
+        console.error(`[zulip-mcp] The delivery state file that failed to load is moved aside to ${aside}.`);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.error(`[zulip-mcp] Failed to save delivery state: the file that failed to load could not be moved aside: ${(err as Error).message}`);
+          return;
+        }
+      }
+      this.unreadableFile = false;
+    }
     try {
       mkdirSync(this.stateDir!, { recursive: true });
       const entries = <T>(map: Map<ChannelKey, T>): [string, T][] => {

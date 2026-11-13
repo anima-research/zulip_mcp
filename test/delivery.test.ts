@@ -7,7 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
@@ -366,4 +366,67 @@ test('a state file as main writes it, saved before a stream list fills the direc
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+function withLogs(run: (logs: string[], dir: string, path: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-delivery-unreadable-'));
+  const original = console.error;
+  const logs: string[] = [];
+  console.error = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+  try {
+    run(logs, dir, join(dir, 's1.delivery.json'));
+  } finally {
+    console.error = original;
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const BROKEN = '{"watermarks": {"zulip:general": 42}, ';
+
+test('a delivery state file that fails to load stays in place until a save, which first moves it aside under the name its log line gives', () => {
+  withLogs((logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    assert.ok(logs.some((l) => l.includes('Failed to load delivery state')), 'the failure is logged');
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'a load alone moves nothing');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
+    state.advance(GENERAL, 7);
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f !== 's1.delivery.json');
+    assert.equal(aside.length, 1, 'one file set aside');
+    assert.ok(logs.some((l) => l.includes(join(dir, aside[0]))), 'a log line names where it went');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN, 'the unreadable bytes are kept as they were');
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7, 'the new state is under the old name');
+  });
+});
+
+test('a save that cannot move the unreadable file aside writes nothing, and the next save moves it first', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  withLogs((_logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    chmodSync(dir, 0o500);
+    state.advance(GENERAL, 7);
+    state.save();
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json'], 'nothing moved, nothing written');
+    assert.equal(readFileSync(path, 'utf-8'), BROKEN);
+    chmodSync(dir, 0o700);
+    state.save();
+    const aside = readdirSync(dir).filter((f) => f !== 's1.delivery.json');
+    assert.equal(aside.length, 1, 'the next save sets the file aside');
+    assert.equal(readFileSync(join(dir, aside[0]), 'utf-8'), BROKEN);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
+});
+
+test('a save after a failed load whose file is gone by then writes the state, with nothing to move', () => {
+  withLogs((_logs, dir, path) => {
+    writeFileSync(path, BROKEN);
+    const state = new DeliveryState(dir, 's1', directoryOf({ 1: 'general' }));
+    rmSync(path);
+    state.advance(GENERAL, 7);
+    state.save();
+    assert.deepEqual(readdirSync(dir), ['s1.delivery.json']);
+    assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
+  });
 });
