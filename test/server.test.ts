@@ -7409,6 +7409,34 @@ test('a refused mention behind more ambient messages than the catch-up limit is 
   await h.close();
 });
 
+for (const [where, filters] of [['that is muted', { mutedStreams: ['aaa'] }], ['outside the allowlist', { streams: ['general'] }]] as const) {
+  test(`a move to a stream ${where} says the message moved to another stream, without naming it`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-move-unheard-'));
+    try {
+      writeFileSync(join(dir, 'filters.json'), JSON.stringify(filters));
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const h = harness({ visible: [DESCRIPTOR, AAA], filters: plane });
+      await initialize(h, true);
+      await settled(h);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      h.adapter.emit!(streamMsg(2));
+      await until(() => h.delivery.watermark('zulip:general') === 2, 'delivered');
+      changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'elsewhere', movedToChannelId: 'zulip:aaa', leftChannel: true });
+      await h.server.quiet();
+      const line = h.incoming.find((m) => (m.content[0] as { text: string }).text.startsWith('[moved]'));
+      assert.ok(line, 'the move has its line');
+      assert.doesNotMatch((line.content[0] as { text: string }).text, /aaa/, `the line names no stream ${where}`);
+      assert.match((line.content[0] as { text: string }).text, /another stream/);
+      assert.equal((line.metadata as { movedToChannelId?: string }).movedToChannelId, undefined);
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('a change in a direct message is judged by its author, not by the conversation', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-dm-change-author-'));
   try {

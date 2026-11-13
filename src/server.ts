@@ -2596,8 +2596,10 @@ export class ZulipMcplServer {
     const others = ev.messageIds.length > 1 ? ` (${ev.messageIds.length} messages)` : '';
     const byOther = ev.actorId !== null && ev.actorId !== ev.authorId ? ` [by user ${ev.actorId}]` : '';
     const wasQuoted = ev.previousContent ? ` — was: "${ev.previousContent}"` : '';
-    const movedToChannelId = ev.movedToKey !== null ? this.ids.channelIdOf(ev.movedToKey) : null;
-    const movedTo = movedToChannelId ? ` (now in ${movedToChannelId})` : '';
+    const destinationId = ev.movedToKey !== null ? this.ids.channelIdOf(ev.movedToKey) : null;
+    const hearsDestination = ev.movedToKey !== null && !this.isMuted(ev.movedToKey) && this.isAllowed(ev.movedToKey);
+    const movedToChannelId = hearsDestination ? destinationId : null;
+    const movedTo = movedToChannelId ? ` (now in ${movedToChannelId})` : destinationId ? ' (now in another stream)' : '';
     const fromTopic = ev.previousTopic !== null ? ` [moved from topic "${ev.previousTopic}"${movedTo}]` : (movedTo ? ` [moved${movedTo}]` : '');
     let line: string;
     if (ev.kind === 'edit') {
