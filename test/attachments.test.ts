@@ -167,6 +167,7 @@ test("a message's attachments share one deadline: the fetch it cuts, and every o
   ];
   const built = buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 }, deadline.signal);
   await firstStarted;
+  assert.equal(calls[0].signal.aborted, false, 'the fetch starts with a live signal');
   deadline.abort();
   const blocks = await built;
   assert.deepEqual(blocks.map((b) => (b as { text: string }).text), [

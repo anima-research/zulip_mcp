@@ -1426,7 +1426,7 @@ scenario('56. one process: a host that leaves while a rename\'s push waits behin
 });
 
 scenario('57. a rename whose announcement gets no answer: the stream\'s message waits for the bound, then goes under the old id', async (dir) => {
-  const r = realm({ 17: 'general', 18: 'dev' });
+  const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 200 });
   const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
   try {
@@ -1434,11 +1434,14 @@ scenario('57. a rename whose announcement gets no answer: the stream\'s message 
     r.rename(17, 'lobby');
     await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
     const addressed = r.post(17, '@bot meanwhile', { mentioned: true });
-    const control = r.post(18, '@bot control', { mentioned: true });
-    await until(() => named(run, control), 'the control mention');
-    assert.equal(named(run, addressed), false, 'it waits while the announcement may still be answered');
+    let gaveUpBefore: boolean | null = null;
+    const push = run.incoming.push.bind(run.incoming);
+    run.incoming.push = (...messages) => {
+      if (gaveUpBefore === null && messages.some((m) => m.messageId === String(addressed))) gaveUpBefore = gaveUp();
+      return push(...messages);
+    };
     await until(() => arrivedOn(run, addressed) !== null, 'the message after the bound');
-    assert.equal(gaveUp(), true, 'it went once the announcement was given up');
+    assert.equal(gaveUpBefore, true, 'it arrived only once the announcement was given up');
     assert.equal(arrivedOn(run, addressed), 'zulip:general');
   } finally { run.releaseChanged(); await run.close(); }
 });
@@ -1521,8 +1524,10 @@ scenario('61. one process: a host that leaves while a request is still served, a
     leaving = second.end();
     await sawClose;
     await new Promise((resolve) => setImmediate(resolve));
+    const laneOf = (streamId: number) => (second.server as unknown as { lanes: { lane(key: ReturnType<typeof streamKey>): { isQuiet: boolean } } }).lanes.lane(streamKey(streamId));
+    assert.equal(laneOf(17).isQuiet, false, 'the open still runs on its lane, held at its page read');
     release();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await until(() => laneOf(17).isQuiet && laneOf(18).isQuiet, 'the open, resumed, and each job its lanes would run after it, done');
   } finally {
     release();
     releaseList();

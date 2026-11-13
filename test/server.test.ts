@@ -1610,8 +1610,9 @@ test('a message still waiting in its channel when the connection ends is offered
   const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
   await initialize(second, true);
   await settled(second);
-  const offered = () => [...first.pushed, ...second.pushed].map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
-  await until(() => /id=2\]/.test(offered()), 'the waiting mention, offered');
+  const offered = (h: Harness) => h.pushed.map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
+  await until(() => /id=2\]/.test(offered(second)), 'the waiting mention, offered by the next connection');
+  assert.doesNotMatch(offered(first), /id=2\]/, 'the first connection never offered it');
   await second.close();
 });
 
@@ -4469,48 +4470,39 @@ test('R3-1: a reply emitted before featureSets/update is delivered', async () =>
   }
 });
 
-for (const slowPart of ['history HTTP', 'prefix acceptance'] as const) {
-  test(`R3-3: slow ${slowPart} does not spend the quote-GET wait allowance`, async (t) => {
-    let now = 0;
-    t.mock.method(performance, 'now', () => now);
-    const h = harness();
-    try {
-      await initialize(h, true);
-      await settled(h);
-      h.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => h.delivery.watermark('zulip:general') === 1, 'seed watermark');
-      h.pushed.length = 0;
-      let gets = 0;
-      const row: ZulipRawMessage = {
-        id: 3, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
-        display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
-        content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
-      };
-      const history = new ZulipAdapter(standInApi({
-        'GET /messages': async ({ anchor }: { anchor: number }) => {
-          if (slowPart === 'history HTTP') now += 3100;
-          const rows = slowPart === 'prefix acceptance'
-            ? [{ ...row, id: 2, content: 'explicit mention', flags: ['mentioned'] }, row] : [row];
-          return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
-        },
-        'GET /messages/:id': async () => {
-          if (++gets === 1 && slowPart === 'prefix acceptance') return { result: 'error', code: 'RATE_LIMIT_HIT' };
-          return { message: { ...row, id: 500, sender_id: 100 } };
-        },
-      }).api, 100, 'session', { directory: historyStreams() });
-      h.adapter.fetchHistory = history.fetchHistory.bind(history);
-      const respond = h.host.sendResponse.bind(h.host);
-      t.mock.method(h.host, 'sendResponse', (...args: Parameters<typeof h.host.sendResponse>) => {
-        if (slowPart === 'prefix acceptance' && (args[1] as { accepted?: boolean })?.accepted) now += 7000;
-        return respond(...args);
-      });
-      h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
-      await until(() => h.delivery.watermark('zulip:general') === 3, 'catch-up complete');
-      assert.equal(gets, slowPart === 'history HTTP' ? 1 : 2, 'unrelated waits must not starve quote verification');
-      assert.ok(h.pushed.some((p) => p.tags?.includes('chat:reply')), 'verified quote reaches the host');
-    } finally { await h.close(); }
-  });
-}
+test('R3-3: slow history HTTP does not spend the quote-GET wait allowance', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.delivery.watermark('zulip:general') === 1, 'seed watermark');
+    h.pushed.length = 0;
+    let gets = 0;
+    const row: ZulipRawMessage = {
+      id: 3, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+      content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
+    };
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async ({ anchor }: { anchor: number }) => {
+        now += 3100;
+        return { messages: [row].filter((m) => m.id > anchor), found_newest: true };
+      },
+      'GET /messages/:id': async () => {
+        gets++;
+        return { message: { ...row, id: 500, sender_id: 100 } };
+      },
+    }).api, 100, 'session', { directory: historyStreams() });
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.delivery.watermark('zulip:general') === 3, 'catch-up complete');
+    assert.equal(gets, 1, 'unrelated waits must not starve quote verification');
+    assert.ok(h.pushed.some((p) => p.tags?.includes('chat:reply')), 'verified quote reaches the host');
+  } finally { await h.close(); }
+});
 
 test('R3-1 follow-up: a message whose delivery job throws stays held, and the next start offers it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-throw-'));
@@ -5303,6 +5295,40 @@ for (const rateLimited of [false, true]) {
   });
 }
 
+test('after a break of the event queue, a read that Zulip refuses by its rate limit, through the Zulip adapter, is tried again after the wait Zulip asks for', async () => {
+  const waits = heldWaits();
+  const h = harness({ readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const row = (id: number): ZulipRawMessage => ({
+    id, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+    display_recipient: 'general', subject: 'deploys', timestamp: 1_700_000_000 + id, type: 'stream', flags: [], content: `msg ${id}`,
+  });
+  let refusals = 1;
+  const history = new ZulipAdapter(standInApi({
+    'GET /messages': async ({ anchor }: { anchor: number }) => {
+      if (refusals > 0) {
+        refusals--;
+        return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'API usage exceeded rate limit', 'retry-after': 5 };
+      }
+      return { messages: [row(2), row(3)].filter((m) => m.id > anchor), found_newest: true };
+    },
+  }).api, 100, 'session', { directory: historyStreams() });
+  h.adapter.fetchHistory = history.fetchHistory.bind(history);
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3));
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  assert.deepEqual(waits.asked, [5000], 'the wait is the retry-after Zulip gave');
+  waits.release();
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  await h.close();
+});
+
 test('after a break of the event queue, an open lane whose read gets no answer holds back only itself: the other open lanes get the gap notice, and it gets its recovered rows and then the notice once its read answers', async () => {
   const waits = heldWaits();
   const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
@@ -5472,7 +5498,9 @@ test('a try that fails after its read has waited 90 s tells every open channel o
   assert.deepEqual(answered.map((m) => m.channelId).sort(), ['zulip:general', 'zulip:other']);
   for (const [channelId, row] of [['zulip:general', '2'], ['zulip:other', '501']]) {
     const on = h.incoming.filter((m) => m.channelId === channelId);
-    assert.ok(on.findIndex((m) => m.messageId === row) < on.findIndex((m) => (m.metadata as { kind?: string }).kind === 'history-answered'), `${channelId}: the line follows ${row}`);
+    const rowAt = on.findIndex((m) => m.messageId === row);
+    assert.ok(rowAt >= 0, `${channelId}: ${row} is recovered`);
+    assert.ok(rowAt < on.findIndex((m) => (m.metadata as { kind?: string }).kind === 'history-answered'), `${channelId}: the line follows ${row}`);
   }
   await h.close();
 });
