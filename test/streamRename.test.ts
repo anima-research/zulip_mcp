@@ -1749,7 +1749,7 @@ scenario('71. under a disabled zulip.messaging, an edit runs after an older edit
   } finally { release(); await run.close(); }
 });
 
-scenario('72. once the host has answered a rename, an acknowledge under the old id adds its reaction, and a publish under it is still refused', async (dir) => {
+scenario('72. once the host has answered a rename, an acknowledge under the old id, or under an id of no known format, adds its reaction, and a publish under the old id is still refused', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir);
   try {
@@ -1759,6 +1759,8 @@ scenario('72. once the host has answered a rename, an acknowledge under the old 
     const ack = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: String(posted), value: 'eyes' });
     assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
     assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [['POST', `/messages/${posted}/reactions`, 'eyes']]);
+    const unformed = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'nonsense-general', messageId: String(posted), value: 'tada' });
+    assert.deepEqual(unformed, { acknowledged: true, representation: ':tada:' }, 'an id of no known format adds the reaction too');
     await assert.rejects(publish(run, 'zulip:general', 'hello?'), /zulip:lobby/);
   } finally { await run.close(); }
 });
