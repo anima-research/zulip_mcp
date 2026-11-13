@@ -1,11 +1,9 @@
 export type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 export interface RequestOptions {
-  /** Ends the request after this long, in milliseconds. */
   timeoutMs?: number;
 }
 
-/** Zulip's answer when it refused the request. */
 export interface ZulipRefusal {
   result: 'error';
   msg: string;
@@ -13,40 +11,28 @@ export interface ZulipRefusal {
   [field: string]: unknown;
 }
 
-/** A successful answer, with the fields a call site reads. */
 export type ZulipSuccess<T extends object> = T & { result: 'success' };
 
 export interface ZulipApi {
-  /**
-   * Zulip's answer. Throws `Zulip refused <what>: <msg>` when its `result` is
-   * "error", and ZulipNoAnswer when Zulip gave no JSON answer.
-   */
   request<T extends object = Record<string, unknown>>(
     method: Method, path: string, what: string, params?: Record<string, unknown>, opts?: RequestOptions,
   ): Promise<ZulipSuccess<T>>;
-  /**
-   * Zulip's JSON answer whatever its `result`, for a site that reads a refusal
-   * itself. Throws ZulipNoAnswer when Zulip gave no JSON answer.
-   */
   requestAnswer<T extends object = Record<never, never>>(
     method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions,
   ): Promise<ZulipSuccess<T> | ZulipRefusal>;
 }
 
-/** What a transport hands back: the HTTP status and the parsed JSON body. */
 export interface TransportAnswer {
   status: number;
   body: unknown;
 }
 
-/** Sends one request and parses its JSON answer, or throws ZulipNoAnswer. */
 export type Transport = (
   method: Method, path: string, params: Record<string, unknown> | undefined, opts: RequestOptions | undefined,
 ) => Promise<TransportAnswer>;
 
 export type NoAnswerKind = 'timeout' | 'network' | 'not-json';
 
-/** Zulip gave no JSON answer: the request timed out, the connection failed, or the body wasn't JSON. */
 export class ZulipNoAnswer extends Error {
   constructor(
     readonly kind: NoAnswerKind,
@@ -69,29 +55,33 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
 }
 
-/** The error a checking site throws for a refusal: `Zulip refused <what>: <msg>`. */
-export function refusalError(what: string, answer: ZulipRefusal): Error {
-  return new Error(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
+export class ZulipRefused extends Error {
+  constructor(what: string, answer: ZulipRefusal, readonly mayHaveBeenApplied = false) {
+    super(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
+  }
 }
 
-/** Builds the two entry points on a transport. */
+export function mayHaveBeenApplied(err: unknown): boolean {
+  return (err instanceof ZulipNoAnswer || err instanceof ZulipRefused) && err.mayHaveBeenApplied;
+}
+
 export function zulipApi(transport: Transport): ZulipApi {
-  const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions): Promise<unknown> => {
+  const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) => {
     const { status, body } = await transport(method, path, params, opts);
     if (method !== 'GET' && status >= 500 && isRefusal(body)) {
-      const text = body.msg ?? body.code ?? 'unknown error';
-      return { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` };
+      const text = body.msg || body.code || 'unknown error';
+      return { body: { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` }, serverError: true };
     }
-    return body;
+    return { body, serverError: false };
   };
   return {
     async request<T extends object>(method: Method, path: string, what: string, params?: Record<string, unknown>, opts?: RequestOptions) {
-      const body = await answer(method, path, params, opts);
-      if (isRefusal(body)) throw refusalError(what, body);
+      const { body, serverError } = await answer(method, path, params, opts);
+      if (isRefusal(body)) throw new ZulipRefused(what, body, serverError);
       return body as ZulipSuccess<T>;
     },
     async requestAnswer<T extends object>(method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) {
-      return (await answer(method, path, params, opts)) as ZulipSuccess<T> | ZulipRefusal;
+      return (await answer(method, path, params, opts)).body as ZulipSuccess<T> | ZulipRefusal;
     },
   };
 }
@@ -105,19 +95,17 @@ function encodeParams(params: Record<string, unknown> | undefined): URLSearchPar
   return encoded;
 }
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+export const DEFAULT_TIMEOUT_MS = 15_000;
+export const LONG_TIMEOUT_MS = 90_000;
 
 export interface HttpTransportConfig {
-  /** The API's address, such as `https://chat.example.com/api/v1`. */
   apiUrl: string;
-  /** `Basic …`, or empty to send no Authorization header. */
   authHeader: string;
-  /** The bound for a call that passes none; 15 s by default. */
   timeoutMs?: number;
 }
 
-/** Error codes from Node's fetch that mean the request was never sent. */
-const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_INVALID_URL', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']);
+const notSent = (code: string) => NOT_SENT_CODES.has(code) || code.includes('CERT');
 
 function causeCode(err: unknown): string | undefined {
   let current: unknown = err;
@@ -133,7 +121,6 @@ function duration(ms: number): string {
   return ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
 }
 
-/** Sends each request over HTTP, ended at its bound. */
 export function httpTransport(config: HttpTransportConfig): Transport {
   return async (method, path, params, opts) => {
     const timeoutMs = opts?.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -161,9 +148,9 @@ export function httpTransport(config: HttpTransportConfig): Transport {
         throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`);
       }
       const code = causeCode(err);
-      const notSent = code !== undefined && NOT_SENT_CODES.has(code);
-      throw new ZulipNoAnswer('network', method, path, write && !notSent,
-        notSent
+      const unsent = code !== undefined && notSent(code);
+      throw new ZulipNoAnswer('network', method, path, write && !unsent,
+        unsent
           ? `Couldn't reach Zulip for ${method} ${path} (${code}).`
           : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`);
     } finally {

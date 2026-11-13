@@ -5,10 +5,9 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
-import { httpTransport, zulipApi, type ZulipApi } from './zulip-api.js';
+import { httpTransport, LONG_TIMEOUT_MS, zulipApi, type ZulipApi } from './zulip-api.js';
 
 export interface ZulipSession {
-  /** Zulip's API, with the session's credentials. */
   api: ZulipApi;
   /** Numeric bot user id when the profile fetch succeeded; null = no self-filter. */
   selfUserId: number | null;
@@ -23,7 +22,6 @@ export interface ZulipSession {
 }
 
 export interface ZulipClientOptions {
-  /** The bound for a call that passes none, in milliseconds; 15 s by default. */
   timeoutMs?: number;
 }
 
@@ -43,10 +41,11 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     const api = parseIni(readFileSync(zuliprc, "utf-8")).api as Record<string, unknown> | undefined;
     if (!api) throw new Error(`The zuliprc file at ${zuliprc} has no [api] section`);
     const text = (v: unknown) => (typeof v === "string" ? v : "");
-    realm = text(api.site);
+    const site = text(api.site);
+    realm = site || env.ZULIP_REALM || "";
     email = text(api.email) || env.ZULIP_EMAIL || env.ZULIP_USERNAME || "";
     apiKey = text(api.key) || env.ZULIP_API_KEY || "";
-    apiUrl = `${realm}/api/v1`;
+    apiUrl = !site && realm.endsWith("/api") ? `${realm}/v1` : `${realm}/api/v1`;
   } else {
     realm = env.ZULIP_REALM || "";
     email = env.ZULIP_USERNAME || env.ZULIP_EMAIL || "";
@@ -70,23 +69,6 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     apiUrl = realm.endsWith("/api") ? `${realm}/v1` : `${realm}/api/v1`;
   }
 
-  // Final fallback: parse the zuliprc file directly if any field is still missing.
-  if ((!realm || !email || !apiKey) && zuliprc) {
-    try {
-      const raw = readFileSync(zuliprc, "utf-8");
-      const parsed: Record<string, string> = {};
-      for (const line of raw.split(/\r?\n/)) {
-        const m = line.match(/^\s*(email|key|site)\s*=\s*(.+?)\s*$/);
-        if (m) parsed[m[1]] = m[2];
-      }
-      if (!realm && parsed.site) realm = parsed.site;
-      if (!email && parsed.email) email = parsed.email;
-      if (!apiKey && parsed.key) apiKey = parsed.key;
-    } catch (err) {
-      console.error("Failed to parse zuliprc for direct-HTTP credentials:", err);
-    }
-  }
-
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
     const answer = await exchange.requestAnswer<{ api_key?: unknown }>("POST", "/fetch_api_key", { username: email, password });
@@ -105,7 +87,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   // Fail-open: if profile fetch fails, leave selfUserId null (no self-filter).
   let selfUserId: number | null = null;
   try {
-    const profile = await api.requestAnswer<{ user_id?: unknown }>("GET", "/users/me");
+    const profile = await api.requestAnswer<{ user_id?: unknown }>("GET", "/users/me", {}, { timeoutMs: LONG_TIMEOUT_MS });
     if (profile.result === "success" && typeof profile.user_id === "number") {
       selfUserId = profile.user_id;
       console.error(`Zulip MCP bot user_id: ${selfUserId}`);
@@ -118,7 +100,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   // actually accept rather than a guess. Fail-open: unknown → null.
   let maxUploadBytes: number | null = null;
   try {
-    const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {});
+    const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS });
     const mib = settings.result === "success" ? settings.max_file_upload_size_mib : undefined;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
   } catch (err) {
