@@ -681,12 +681,14 @@ for (const [how, first] of [
     const handed: { key: string; messageId: string; selfUserId: number | null }[] = [];
     try {
       assert.equal(s.session.selfUserId, null, "the start's read failed");
-      await new Promise<void>((resolve) => {
+      const arrived = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 5_000);
         adapter.startEvents((entry) => {
           handed.push({ key: entry.key, messageId: entry.messageId, selfUserId: s.session.selfUserId });
-          if (entry.messageId === String(dmFromAnn.id)) resolve();
+          if (entry.messageId === String(dmFromAnn.id)) { clearTimeout(timer); resolve(true); }
         });
       });
+      assert.ok(arrived, 'the direct message reached the adapter within 5 s');
       assert.deepEqual(handed, [{ key: dmKey([7]), messageId: String(dmFromAnn.id), selfUserId: 790 }]);
     } finally { adapter.stopEvents(); s.done(); z.close(); }
   });
