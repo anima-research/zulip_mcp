@@ -4081,8 +4081,8 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal((h.incoming[3].content[0] as { text: string }).text, '[deleted] [T id=12] [#general > deploys] Ann: message deleted — was: "my own line"');
   assert.deepEqual(h.incoming[3].tags, ['chat:deleted', 'chat:ambient']);
 
-  // A message offered but not yet accepted (held) counts as seen: "post,
-  // then fix the typo" lands before the host's acceptance round trip.
+  // A message the host refused, and so holds, counts as seen: its edit
+  // comes through as an edit.
   h.policy.rejectIds.add('13');
   h.adapter.emit!({
     channelId: 'zulip:general', messageId: '13', author: { id: '9', name: 'Ann' }, timestamp: new Date(1_700_000_070_000).toISOString(),
