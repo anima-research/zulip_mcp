@@ -369,6 +369,7 @@ export class Lanes<W> {
         this.runningJobs.add(started);
         void started.finally(() => this.runningJobs.delete(started));
       }
+      this.offerTurn();
       this.wakeQuietWaiters();
     });
   }
@@ -413,11 +414,17 @@ export class Lanes<W> {
     return false;
   }
 
-  /** Every waiting lane that could start its read now is woken, and takeTurn gives the turn to the one that has waited longest. */
   giveTurnBack(lane: Lane<W>): void {
     if (this.turnHolder !== lane) return;
     this.turnHolder = null;
-    for (const other of this.turnWaiters) if (other.canStartRead) this.changed(other);
+    this.offerTurn();
+  }
+
+  /** While the turn is free, the lane that has waited longest among those that could start their read now is woken. */
+  private offerTurn(): void {
+    if (this.turnHolder !== null) return;
+    const next = this.turnWaiters.find((other) => other.canStartRead);
+    if (next) this.changed(next);
   }
 
   /** No job runs or waits in any lane that hasn't ended. */

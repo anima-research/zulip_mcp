@@ -220,6 +220,40 @@ test("a lane that a host's job reaches as the turn comes back to it doesn't keep
   assert.deepEqual(log, ['C', 'A host', 'B', 'A']);
 });
 
+test("a lane that a host's job reaches just as its hold ends doesn't keep the turn from the next lane that can read, at any timing", async () => {
+  for (let k = 0; k <= 6; k++) {
+    const l = lanes();
+    const log: string[] = [];
+    const readC = gate();
+    const hostA = gate();
+    const holdA = gate();
+    const holdB = gate();
+    l.lane(C).enterRead(async () => { log.push('C'); await readC.opened; });
+    await new Promise((r) => setImmediate(r));
+    l.lane(A).enterRead(() => { log.push('A'); });
+    await new Promise((r) => setImmediate(r));
+    l.lane(B).enterRead(() => { log.push('B'); });
+    await new Promise((r) => setImmediate(r));
+    l.lane(A).holdOtherUntil(holdA.opened);
+    l.lane(B).holdOtherUntil(holdB.opened);
+    await new Promise((r) => setImmediate(r));
+    readC.open();
+    await new Promise((r) => setImmediate(r));
+    const hostJobAfter = (hops: number): void => {
+      if (hops === 0) l.lane(A).host(async () => { log.push('A host'); await hostA.opened; });
+      else queueMicrotask(() => hostJobAfter(hops - 1));
+    };
+    holdB.open();
+    queueMicrotask(() => hostJobAfter(k));
+    holdA.open();
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+    assert.ok(log.includes('A') || log.includes('B'), `${k} hops: no lane read while A's host job ran: ${log.join(', ')}`);
+    hostA.open();
+    await l.quiet();
+    assert.deepEqual([...log].sort(), ['A', 'A host', 'B', 'C'], `${k} hops`);
+  }
+});
+
 test('ending the lanes drops what waits, tells a running job, waits for it within the grace, and takes nothing after', async () => {
   const l = lanes();
   const log: string[] = [];
