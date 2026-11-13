@@ -319,6 +319,10 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.tools.answerHints = {
+      followed: (key) => this.channelManager.hintsFrom(key),
+      follow: (key, from, topic) => this.followOwnMove(key, from, topic),
+    };
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -2003,6 +2007,15 @@ export class ZulipMcplServer {
         lane.holdOtherUntil(answered);
         line();
       }
+      ran();
+    }));
+  }
+
+  private followOwnMove(key: ChannelKey, from: number, topic: string): Promise<void> {
+    const lane = this.lanes?.lane(key);
+    if (!lane) return Promise.resolve();
+    return new Promise((ran) => lane.answer((ctx) => {
+      ctx.w.channels.followMove(key, [String(from)], topic);
       ran();
     }));
   }

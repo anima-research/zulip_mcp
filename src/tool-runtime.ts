@@ -22,7 +22,7 @@ import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
-import { parseKey, streamKey } from './channel-key.js';
+import { parseKey, streamKey, type ChannelKey } from './channel-key.js';
 import type { ChannelIds } from './channel-ids.js';
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
@@ -113,6 +113,18 @@ const STATE_DIR = join(homedir(), ".zulip_mcp_state");
 const MOVE_SCOPES: Record<string, string> = { one: "change_one", later: "change_later", all: "change_all" };
 
 const MOVE_NOTE = "To answer this message where it is now, use send_message with reply_to.";
+
+// The host ends a tool call at 60 s by default (agent-framework's DEFAULT_REQUEST_TIMEOUT_MS). A move makes up
+// to three requests of 15 s each before this wait, so the call's bounds add up to 50 s (anima-research/zulip_mcp#60).
+const FOLLOW_WAIT_MS = 5_000;
+
+/** What the MCPL server lends the tools about where a channel's plain answers go. */
+export interface AnswerHints {
+  /** The id of the message whose topic a channel's plain answers follow, if any. */
+  followed(key: ChannelKey): number | undefined;
+  /** Settles once a job in the channel's lane has run that gives the answers `topic` where they still follow message `from`. */
+  follow(key: ChannelKey, from: number, topic: string): Promise<void>;
+}
 
 // Helper function to parse date strings
 export function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
@@ -250,6 +262,9 @@ export class ZulipToolRuntime {
 
   channelIds: ChannelIds | null = null;
 
+  /** Set by the MCPL server, so that the agent's own move takes its channel's plain answers along before move_messages answers. */
+  answerHints: AnswerHints | null = null;
+
   private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
     const out = new Map<string, number>();
     const ids = this.channelIds;
@@ -282,6 +297,31 @@ export class ZulipToolRuntime {
     }
     if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error(`Zulip's answer to looking up stream ${JSON.stringify(name)} gave no stream id.`);
     return id;
+  }
+
+  private async followOwnMove(messageId: number, streamId: number, topic: string, scope: string): Promise<boolean> {
+    const hints = this.answerHints;
+    const key = streamKey(streamId);
+    const from = hints?.followed(key);
+    if (!hints || from === undefined || (from !== messageId && scope === "one")) return true;
+    const followedTopic = from === messageId ? topic : await this.topicIn(from, streamId);
+    if (followedTopic === undefined) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), FOLLOW_WAIT_MS); });
+    try {
+      return await Promise.race([hints.follow(key, from, followedTopic).then(() => true), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async topicIn(messageId: number, streamId: number): Promise<string | undefined> {
+    try {
+      const message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId}`)).message;
+      return message?.stream_id === streamId ? message.subject : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private readonly uploader: Uploader | null;
@@ -862,11 +902,12 @@ export class ZulipToolRuntime {
         if (message?.type !== "stream" || typeof name !== "string" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id)) {
           return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, ...note };
         }
+        const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
           channelId: this.channelIds?.channelIdOf(streamKey(message.stream_id)) ?? `zulip:${name}`,
           channel: name,
           topic: message.subject,
-          ...note,
+          ...(answersFollow ? {} : { note: MOVE_NOTE }),
         };
       }
 

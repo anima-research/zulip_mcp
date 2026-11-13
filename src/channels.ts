@@ -592,6 +592,10 @@ export class ChannelManager {
     this.lastIncoming.set(key, { hints: { threadId: topic || undefined, metadata: { ...last.hints.metadata, topic } }, from: last.from });
   }
 
+  hintsFrom(key: ChannelKey): number | undefined {
+    return this.lastIncoming.get(key)?.from;
+  }
+
   /**
    * Broadcast a platform system event (delivery gap, degraded polling) to
    * every open channel of that platform as a synthetic incoming message, so
