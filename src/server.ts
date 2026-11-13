@@ -552,14 +552,17 @@ export class ZulipMcplServer {
       else this.renamedUnannounced.delete(key);
     }
     const keys = new Set([...this.delivery.watermarkedChannels(), ...this.delivery.talliedChannels(), ...this.delivery.lastOpenChannels()]);
+    const renamePushes = new Map<ChannelKey, Promise<boolean>[]>([...renamed].map((key) => [key, []]));
     for (const key of keys) {
       const lane = lanes.lane(key);
       const answers: Promise<boolean>[] = [];
-      lane.enterReadFirst((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readStart(r2, key, renamed.has(key), answers))));
+      lane.enterReadFirst((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readStart(r2, key, renamePushes.get(key) ?? null, answers))));
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
-        if (!ctx.ended && !conn.isClosed) this.pushRenamed(key);
+        if (ctx.ended || conn.isClosed) return;
+        const pushed = this.pushRenamed(key);
+        if (pushed) renamePushes.get(key)?.push(pushed);
       });
     }
     openLanes();
@@ -1397,7 +1400,7 @@ export class ZulipMcplServer {
    * Deferred quote verification can split a channel into multiple
    * `<missed>` pushes. On a closed channel the tally's backfill follows.
    */
-  private async readStart(r: Reading, key: ChannelKey, renamed: boolean, answers: Promise<boolean>[]): Promise<Hand> {
+  private async readStart(r: Reading, key: ChannelKey, renamePushes: Promise<boolean>[] | null, answers: Promise<boolean>[]): Promise<Hand> {
     let catchUp: Hand | void;
     let backfill: Hand | void;
     if (this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
@@ -1418,14 +1421,15 @@ export class ZulipMcplServer {
           if (oks.includes(true)) console.error(`[zulip-mcp] Reconnect catch-up: delivered missed messages on ${this.label(key)}`);
         });
       }
-      if (renamed) {
+      if (renamePushes) {
         const closeUnlessOpen = (c: Ctx) => {
           if (c.ended || this.channelManager.isKeyOpen(key)) return;
           c.w.delivery.markClosed(key);
           this.delivery.save();
         };
-        if (answers.length === 0) closeUnlessOpen(ctx);
-        else void Promise.all(answers).then(() => ctx.lane.answer(closeUnlessOpen));
+        const waits = [...answers, ...renamePushes];
+        if (waits.length === 0) closeUnlessOpen(ctx);
+        else void Promise.all(waits).then(() => ctx.lane.answer(closeUnlessOpen));
       }
       this.delivery.save();
     };
@@ -2038,7 +2042,7 @@ export class ZulipMcplServer {
       : `zulip:${oldName} is gone`;
   }
 
-  private pushRenamed(key: ChannelKey): void {
+  private pushRenamed(key: ChannelKey): Promise<boolean> | undefined {
     const note = this.renamedUnannounced.get(key);
     const fresh = this.ids.channelIdOf(key);
     if (note === undefined || fresh === null) return;
@@ -2046,7 +2050,7 @@ export class ZulipMcplServer {
     const { from, to } = note;
     const text = `Zulip stream #${from} was renamed #${to} since its channel was last open. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
       `Open ${fresh} to keep hearing it. What you had read stays read.`;
-    void this.pushEvent({
+    return this.pushEvent({
       key,
       messageId: `system:stream-renamed:${Date.now()}`,
       author: { id: 'system', name: 'zulip connection' },
@@ -2055,6 +2059,7 @@ export class ZulipMcplServer {
       metadata: { system: true, kind: 'stream-renamed', from: `zulip:${from}`, to: fresh },
     }, `zulip_stream_renamed_${key}_${to}`, { kind: 'stream-renamed', from: `zulip:${from}`, to: fresh }).then((pushed) => {
       if (!pushed) console.error(`[zulip-mcp] ${fresh} (was zulip:${from}) was open at last sight; the push saying so did not land`);
+      return pushed;
     });
   }
 

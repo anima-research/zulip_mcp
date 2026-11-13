@@ -1763,6 +1763,27 @@ scenario('72. once the host has answered a rename, an acknowledge under the old 
   } finally { await run.close(); }
 });
 
+scenario('73. a host that leaves before it answers the push about a rename leaves the stream open at last sight: the next host gets its ambient messages in the backscroll', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const before = await start(r, dir);
+  let left: Run | undefined;
+  try {
+    await before.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => before.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+  } finally { await before.end(); }
+  r.rename(17, 'lobby');
+  try {
+    left = await start(r, dir, { reuse: before, noWait: true, beforePushAnswer: () => new Promise<void>(() => {}) });
+    await until(() => toldRename(left!).length > 0, 'the push');
+  } finally { await left?.end(); }
+  r.post(17, 'ambient after the rename');
+  const next = await start(r, dir, { reuse: left, noWait: true });
+  try {
+    await until(() => next.pushed.some((p) => payloadText(p).includes('ambient after the rename')), "the ambient message, in an open channel's backscroll");
+  } finally { await next.close(); }
+});
+
 scenario("74. a deletion of a new stream's first message that comes while the message waits for the stream's announcement follows the message as a line", async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
