@@ -350,7 +350,7 @@ export class FiltersPlane {
     if (this.broken) {
       return {
         ok: false,
-        reason: `the filters file ${this.path} is ${this.broken.desired} on disk; repair it (hot reload applies within seconds) and retry`,
+        reason: `the filters file ${this.path} is ${this.broken.desired} on disk. It is the operator's to repair, and hot reload applies a repair within seconds, after which an update can be made again.`,
       };
     }
     const next = normalizeFilters(edit(structuredClone(this.effective)));

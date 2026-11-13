@@ -238,6 +238,14 @@ export function toToolCallResult(result: unknown): ToolCallResult {
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }
 
+function postedBefore(ids: number[]): string {
+  if (ids.length === 0) return "";
+  const one = ids.length === 1;
+  const list = one ? String(ids[0]) : `${ids.slice(0, -1).join(", ")} and ${ids[ids.length - 1]}`;
+  return `Posted as message${one ? "" : "s"} ${list} (${one ? "part 1" : `parts 1 to ${ids.length}`}) before the next part failed; ` +
+    `sending the whole text again posts ${one ? "that part" : "those parts"} twice. `;
+}
+
 export class ZulipToolRuntime {
   private readonly api: ZulipApi;
   private readonly sessionId: string;
@@ -373,16 +381,22 @@ export class ZulipToolRuntime {
   }
 
   private async send(destination: Destination, content: string, args: Record<string, any>, channelId: string) {
+    const posted: number[] = [];
     try {
       return await sendMessage(this.api, destination, content, {
         limit: this.maxMessageLength,
         unlinkable: "refuse",
         upload: () => this.uploadFor(args),
-        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+        onChunk: (chunk) => {
+          posted.push(chunk.id);
+          this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content });
+        },
       });
     } catch (err) {
-      if (err instanceof SendRefused) throw new Error(err.answer.msg ?? "Zulip refused the message");
+      const before = postedBefore(posted);
+      if (err instanceof SendRefused) throw new Error(`${before}${before ? "Zulip: " : ""}${err.answer.msg ?? "Zulip refused the message"}`);
       if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
+      if (before && err instanceof Error) err.message = `${before}${err.message}`;
       throw err;
     }
   }

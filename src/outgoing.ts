@@ -32,8 +32,9 @@ export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
 
 /**
  * Split text into messages of at most `limit` characters, preferring
- * paragraph boundaries, then line boundaries, then a hard cut. Boundary
- * whitespace at the split is dropped; nothing else is.
+ * paragraph boundaries, then line boundaries, then a hard cut, which never
+ * splits a character. Boundary whitespace at the split is dropped; nothing
+ * else is.
  */
 export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
   const out: string[] = [];
@@ -46,11 +47,17 @@ export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LEN
     const window = rest.slice(0, limit + 1);
     let cut = window.lastIndexOf('\n\n');
     if (cut <= 0) cut = window.lastIndexOf('\n');
-    if (cut <= 0) cut = limit;
+    if (cut <= 0) cut = splitsPair(rest, limit) ? (limit > 1 ? limit - 1 : limit + 1) : limit;
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n+/, '');
   }
   return out.filter((c) => c.length > 0);
+}
+
+function splitsPair(text: string, at: number): boolean {
+  const before = text.charCodeAt(at - 1);
+  const after = text.charCodeAt(at);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
 /** A send with no text and nothing uploaded. */
