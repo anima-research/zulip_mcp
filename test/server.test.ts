@@ -924,6 +924,132 @@ test('an answer in a closed stream goes to the topic of the mention the host acc
   await g.close();
 });
 
+type ChangeOf = Parameters<NonNullable<FakeAdapter['change']>>[0];
+
+function changeTo(h: Harness, over: Partial<ChangeOf> & Pick<ChangeOf, 'messageIds'>): void {
+  h.adapter.change!({
+    kind: 'move', channelId: 'zulip:general', messageId: over.messageIds[0], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '12',
+    topic: 'deploys', previousTopic: null, movedToChannelId: null, leftChannel: false, byBot: false, content: null, previousContent: null,
+    mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_100_000),
+    ...over,
+  });
+}
+
+async function answerGoesTo(h: Harness): Promise<{ threadId?: string; topic?: string }> {
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'answer' }] });
+  const hints = h.adapter.published.at(-1)?.hints;
+  return { threadId: hints?.threadId, topic: (hints?.metadata as { topic?: string } | undefined)?.topic };
+}
+
+test('on a closed channel, a plain answer follows a rename, a resolve and a move of the message the host accepted as a push', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the rename');
+  changeTo(h, { messageIds: ['2'], previousTopic: 'releases', topic: '✔ releases', mentioned: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: '✔ releases', topic: '✔ releases' }, 'after the resolve');
+  changeTo(h, { messageIds: ['2'], previousTopic: '✔ releases', topic: 'archive', mentioned: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'archive', topic: 'archive' }, 'after a move of that one message');
+  await h.close();
+});
+
+test('on an open channel, a plain answer follows a move of the topic that holds its message, with no notice from Zulip', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'both delivered');
+
+  changeTo(h, { messageIds: ['1', '2'], previousTopic: 'deploys', topic: 'releases' });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the rename');
+  changeTo(h, { messageIds: ['1', '2'], previousTopic: 'releases', topic: '✔ releases' });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: '✔ releases', topic: '✔ releases' }, 'after the resolve');
+  changeTo(h, { messageIds: ['2'], previousTopic: '✔ releases', topic: 'archive' });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'archive', topic: 'archive' }, 'after a move of that one message');
+  await h.close();
+});
+
+test('a plain answer stays where it was after a move of an older message, a move of its message to another stream, known or not, and a later rename there', async () => {
+  const h = harness({ visible: [DESCRIPTOR, AAA] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'both delivered');
+
+  changeTo(h, { messageIds: ['1'], previousTopic: 'deploys', topic: 'old news' });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'after a move of an older message');
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'unseen', leftChannel: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, "after a move to a stream the bot doesn't know");
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'elsewhere', movedToChannelId: 'zulip:aaa', leftChannel: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'after a move to another stream');
+  changeTo(h, { channelId: 'zulip:aaa', messageIds: ['2'], previousTopic: 'elsewhere', topic: 'later' });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'after a later rename in the other stream');
+  await h.close();
+});
+
+test("the bot's own move takes a plain answer to the new topic, and nothing about it reaches the host", async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'delivered');
+  const before = { incoming: h.incoming.length, pushed: h.pushed.length };
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', actorId: '1', byBot: true });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' });
+  assert.deepEqual({ incoming: h.incoming.length, pushed: h.pushed.length }, before, 'no line about the move reached the host');
+  await h.close();
+});
+
+test('a plain answer stays where it was after a reaction, an edit and a deletion of its message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-hints-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.emit!(streamMsg(2));
+    await until(() => h.delivery.watermark('zulip:general') === 2, 'delivered');
+
+    h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '2', emoji: 'eyes',
+      reactorId: '12', reactorName: 'Bea', onOwnMessage: false, messageSnippet: 'msg 2', timestamp: new Date(1_700_000_101_000),
+    });
+    changeTo(h, { kind: 'edit', messageIds: ['2'], content: 'msg 2, fixed', previousContent: 'msg 2' });
+    changeTo(h, { kind: 'delete', messageIds: ['2'], previousContent: 'msg 2, fixed', actorId: null });
+    await until(() => h.incoming.length === 4, 'the message, the reaction, the edit and the deletion');
+    await h.server.quiet();
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' });
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('an answer after channels/open with history goes to the topic of its newest message, unless the history was fetched before a message', async () => {
   const answerTopic = async (h: Harness) => {
     await h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c1', channelId: 'zulip:general', content: [{ type: 'text', text: 'answer' }] });

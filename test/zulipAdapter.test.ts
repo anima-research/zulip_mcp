@@ -287,6 +287,52 @@ test('two moves of one cached message, the second arriving while the first waits
   ]);
 });
 
+test("the bot's own move reaches the server marked as the bot's, its own content edit doesn't, and a move says whether its message left the stream", async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(5) },
+    { id: 2, type: 'message', flags: [], message: raw(6) },
+    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_900, orig_subject: 'deploys', subject: 'releases', propagate_mode: 'change_one', stream_id: 7 },
+    { id: 4, type: 'update_message', message_id: 5, message_ids: [5], user_id: SELF, edit_timestamp: 1_700_000_901, orig_content: 'm5', content: 'm5, again', flags: [], stream_id: 7 },
+    { id: 5, type: 'update_message', message_id: 5, message_ids: [5], user_id: 12, edit_timestamp: 1_700_000_902, orig_subject: 'releases', stream_id: 7, new_stream_id: 8 },
+    { id: 6, type: 'update_message', message_id: 6, message_ids: [6], user_id: 12, edit_timestamp: 1_700_000_903, orig_subject: 'deploys', stream_id: 7, new_stream_id: 99 },
+  ];
+  let polls = 0;
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'other', stream_id: 8, subscriber_count: 2 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+  }).api;
+  const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const changes: MessageChangeEvent[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(inTurn(() => {}), undefined, undefined, inTurn((c) => { changes.push(c); }));
+    const deadline = Date.now() + 2000;
+    while (changes.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 20));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  const view = changes.map((c) => ({
+    kind: c.kind, messageId: c.messageId, topic: c.topic, previousTopic: c.previousTopic, movedTo: c.movedToKey, leftChannel: c.leftChannel, byBot: c.byBot,
+  }));
+  assert.deepEqual(view, [
+    { kind: 'move', messageId: '5', topic: 'releases', previousTopic: 'deploys', movedTo: null, leftChannel: false, byBot: true },
+    { kind: 'move', messageId: '5', topic: 'releases', previousTopic: null, movedTo: streamKey(8), leftChannel: true, byBot: false },
+    { kind: 'move', messageId: '6', topic: 'deploys', previousTopic: null, movedTo: null, leftChannel: true, byBot: false },
+  ]);
+});
+
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
   const events = [
     // Ann's message arrives live (cached), then she edits it to mention the bot.
