@@ -725,12 +725,11 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */
-  private describeDm(m: ZulipMessage): { descriptor: ChannelDescriptor; isNew: boolean } {
+  private describeDm(m: ZulipMessage): ChannelDescriptor {
     const counterparts = dmCounterparts(m.recipients, this.identity.selfUserId);
     const descriptor = dmDescriptor(counterparts, this.backscrollDefault);
-    const isNew = !this.knownDms.has(descriptor.id);
     this.knownDms.set(descriptor.id, descriptor);
-    return { descriptor, isNew };
+    return descriptor;
   }
 
   async publish(
@@ -1124,13 +1123,16 @@ export class ZulipAdapter implements PlatformAdapter {
         console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
         return;
       }
-      const { descriptor, isNew } = this.describeDm(m);
+      // Sent with every message, as a stream's descriptor is: the server's
+      // registry decides what is new, and a first message taken back while
+      // it waited never carries it.
+      const descriptor = this.describeDm(m);
       onMessage({
         key,
         messageId: String(m.id),
         ready: async (changes) => {
           const now = this.applyChanges(raw, m, changes);
-          return now === null ? null : { message: toIncoming(key, now, this.identity), ...(isNew ? { newChannel: descriptor } : {}) };
+          return now === null ? null : { message: toIncoming(key, now, this.identity), newChannel: descriptor };
         },
       });
       return;

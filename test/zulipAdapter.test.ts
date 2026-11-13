@@ -908,3 +908,30 @@ test("a DM's row is built at its turn: an edit that arrived while it waited give
   assert.equal(await messages[1].ready([changes[1]]), null);
   assert.deepEqual(changes.map((c) => c.kind), ['edit', 'delete']);
 });
+
+test("a new DM conversation whose first message is taken out while it waits still carries its descriptor with the next message, so the server can register it", async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: dm(50, 42) },
+    { id: 2, type: 'delete_message', message_ids: [50], message_type: 'private' },
+    { id: 3, type: 'message', flags: [], message: dm(51, 42) },
+  ];
+  let polls = 0;
+  const client = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      return new Promise(() => {});
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const messages: IncomingEntry[] = [];
+  const changes: ChangeEntry[] = [];
+  adapter.startEvents((entry) => { messages.push(entry); }, undefined, undefined, (entry) => { changes.push(entry); });
+  const deadline = Date.now() + 2000;
+  while (messages.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  adapter.stopEvents();
+  assert.equal(await messages[0].ready([changes[0]]), null);
+  const next = await messages[1].ready();
+  assert.equal(next?.newChannel?.id, 'zulip:dm:7+42', "the conversation with Ann and Bo, as the README names it");
+});
