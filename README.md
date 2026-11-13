@@ -33,7 +33,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
   (`channel_missed`). On live delivery, each channel's messages, reactions and
-  changes are offered to the host in the order the server received them. A
+  changes are offered to the host in the order the server received them. An
+  edit or a deletion that arrives while its message's move to another stream
+  still waits is offered in the new stream's channel, after what waits there,
+  so it can follow a message the server received after it. A
   message waiting for its quote lookup or its attachments holds back only its
   own channel. An event that only a lookup can place waits for it, such as a
   reaction to a message the server hasn't seen, and the reactions, changes and
