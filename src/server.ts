@@ -1845,7 +1845,6 @@ export class ZulipMcplServer {
 
   private async readFill(r: Reading, key: ChannelKey, gap?: GapRead, ceiling?: { reached: boolean }): Promise<Hand | void> {
     if (r.ended || this.isMuted(key) || !this.isAllowed(key)) return;
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const place = this.placeOf(key);
     const below = () => this.firstWaiting(key) - 1;
     if (place === undefined || below() <= place) return;

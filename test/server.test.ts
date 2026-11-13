@@ -1919,6 +1919,42 @@ test('a break of the event queue while zulip.messaging is disabled is recovered 
   await h.close();
 });
 
+test("a break whose read for held ids is still out when zulip.messaging is disabled reads the rest of the hole too, and the enable brings it before the message that waited", async () => {
+  const h = harness({ history: [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.policy.rejectOnce.add('2');
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(2), '2 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => {
+    h.adapter.fetchHistory = real;
+    reading = true;
+    await readHeld;
+    return real(key, query);
+  };
+  const lane = (h.server as unknown as { lanes: { lane(key: string): { running: boolean } } }).lanes.lane('zulip:general');
+  breakQueue(h);
+  await until(() => reading, "the break's read for 2");
+  await disableMessaging(h);
+  releaseRead();
+  await until(() => !lane.running, "the break's read to end while zulip.messaging is disabled");
+  h.adapter.emit!(streamMsg(7));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h).filter((id) => /^\d+$/.test(id)), ['1', '2', '2', '3', '4', '5', '6', '7']);
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 7);
+  await h.close();
+});
+
 test("a connection that starts with zulip.messaging disabled makes each channel's catch-up once it is enabled", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-start-disabled-'));
   try {
