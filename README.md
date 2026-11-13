@@ -284,8 +284,9 @@ watermark or held, when the change addresses the agent, or when the
 message is the bot's own. A change to any other message is dropped, unless
 it arrives while that message still waits for its turn: the delivery model
 above says what then happens to it. While `zulip.messaging` is disabled, a
-channel's first message can set the watermark just below it, so a change
-to an older message that the host never received then goes too.
+channel's first message can set the watermark just below it, so once it is
+enabled again, a change to an older message that the host never received
+goes too.
 Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits and deletions (rollback,
 `delete_message`) are its own doing and don't surface either. A deletion's
