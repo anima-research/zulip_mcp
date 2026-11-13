@@ -10,7 +10,7 @@
   waits up to 5 s for the channel to take the move in, so that a plain answer
   right after the result goes where the move put the message it answers. Where
   the tool can't say that a plain answer lands right, as after a move that
-  names a stream, a read that fails or gives no place, or that wait, the
-  result says to answer the message with `send_message`'s `reply_to`. The tool
-  belongs to `zulip.messaging` and is on by default; a realm limits it with
-  Zulip's permissions for moving messages.
+  names a stream, a read that fails or gives no place, or a wait that reaches
+  its 5 s, the result says to answer the message with `send_message`'s
+  `reply_to`. The tool belongs to `zulip.messaging` and is on by default; a
+  realm limits it with Zulip's permissions for moving messages.
