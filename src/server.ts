@@ -2556,13 +2556,14 @@ export class ZulipMcplServer {
     const open = this.channelManager.isKeyOpen(ev.key);
     if (!open && !addressed) return;
     if (open && !addressed && !ev.onOwnMessage) {
-      // Accepted (at or below the watermark) or offered and not yet accepted
+      // Accepted (at or below the highest id the host accepted, which a
+      // message held below it doesn't lower) or offered and not yet accepted
       // (held): "post, then fix the typo" lands before the host's acceptance
       // round trip and must not be lost.
-      const watermark = this.delivery.watermark(ev.key) ?? 0;
+      const accepted = this.delivery.acceptedThrough(ev.key) ?? 0;
       const held = new Set(this.delivery.heldIds(ev.key));
       const ids = ev.messageIds.map(Number).filter((n) => Number.isFinite(n));
-      if (!ids.some((n) => n <= watermark || held.has(n))) return;
+      if (!ids.some((n) => n <= accepted || held.has(n))) return;
     }
 
     const head = messageLineHead({

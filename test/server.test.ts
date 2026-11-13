@@ -7360,3 +7360,21 @@ test("a muted channel's read for held ids lets go of a give-up's hold, whose mes
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an accepted ambient message deleted on an open channel gives its line while an older message there is held as refused', async () => {
+  const h = harness({ history: [16, 17, 18, 19, 20].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  for (const id of ['16', '17', '18']) h.policy.rejectIds.add(id);
+  for (const id of [16, 17, 18, 19]) h.adapter.emit!(streamMsg(id));
+  await until(() => [16, 17, 18].every((id) => h.delivery.heldIds('zulip:general').includes(id)) && h.incoming.some((m) => m.messageId === '19'), '16 to 18 refused and held, 19 accepted');
+  h.adapter.emit!(streamMsg(20));
+  await until(() => h.incoming.some((m) => m.messageId === '20'), '20 accepted');
+  await h.server.quiet();
+  assert.equal(h.delivery.watermark('zulip:general'), 15, 'the refused holds keep the watermark below them');
+  changeTo(h, { kind: 'delete', messageId: '20', messageIds: ['20'], content: null, previousContent: 'msg 20', actorId: null });
+  await h.server.quiet();
+  assert.ok(h.incoming.some((m) => (m.content[0] as { text: string }).text.startsWith('[deleted] [T id=20]')), 'the deletion of 20 reaches the host');
+  await h.close();
+});

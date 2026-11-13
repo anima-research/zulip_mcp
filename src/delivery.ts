@@ -263,6 +263,10 @@ export class DeliveryState {
     return this.advance(key, messageId);
   }
 
+  acceptedThrough(key: ChannelKey): number | undefined {
+    return this.reached.get(key) ?? this.watermarks.get(key);
+  }
+
   restartReached(): void {
     this.reached = new Map(this.watermarks);
   }
@@ -461,6 +465,7 @@ export type DeliveryReader = Pick<
   | 'save'
   | 'directoryCopy'
   | 'watermark'
+  | 'acceptedThrough'
   | 'watermarkedChannels'
   | 'floor'
   | 'heldChannels'

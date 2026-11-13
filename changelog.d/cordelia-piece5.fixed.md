@@ -44,9 +44,7 @@
   read from history brings it first once it is enabled. The first message of
   a channel that the host has never been told of isn't brought by that read:
   it stays held until that channel is registered. Where that read
-  fails, later messages go first, and until it comes, an edit, a move or a
-  deletion of one of them sends no line, unless that message addresses the
-  agent or is the agent's own. A message that the batch withheld while
+  fails, later messages go first. A message that the batch withheld while
   `zulip.messaging` was disabled can come after its channel's later
   messages, where the enable comes while a message, change or read of that
   channel is still being handled.
@@ -129,9 +127,7 @@
   read that Zulip refuses for a reason other than its rate limit brings none
   of them either, and the log gives the refusal. They stay held, up to the
   50,000 holds a channel keeps, so on an open channel a later read of held
-  messages offers them, after messages that arrived after them. Until they
-  come, an edit, a move or a deletion of one of those later messages sends
-  no line, unless that message addresses the agent or is the agent's own. If
+  messages offers them, after messages that arrived after them. If
   that read is refused too, the next connection's catch-up brings them. A
   reaction, or a change about another message, that was waiting stays, and
   its turn comes after the read. On a closed channel, the given-up messages
