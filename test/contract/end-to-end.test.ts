@@ -160,3 +160,35 @@ test('end to end: on a closed channel, the host\'s plain answer to a pushed ment
     await stop();
   }
 });
+
+test('end to end: on a closed channel, after the bot\'s own move_messages rename, the host\'s plain answer lands in the new topic, and no moved line reaches the host', async () => {
+  const stream = await newStream(env, 'e2e-tool-moved');
+  const botName = (await bot.ok('GET', 'users/me')).full_name as string;
+  const { host, pushed, stop } = await serve();
+  try {
+    const channelId = `zulip:${stream}`;
+    await registered(host, channelId);
+
+    const question = await user.ok('POST', 'messages', { type: 'stream', to: stream, topic: 'before', content: `@**${botName}** is anyone there?` });
+    await until(() => pushed.find((p) => p.origin.messageId === String(question.id)), `the mention ${question.id} pushed to the host`);
+    const called = (await host.sendRequest('tools/call', { name: 'move_messages', arguments: { message_id: question.id, topic: 'after', scope: 'all' } })) as {
+      isError?: boolean;
+      content: { text: string }[];
+    };
+    assert.notEqual(called.isError, true, called.content[0]?.text);
+    assert.equal(JSON.parse(called.content[0].text).topic, 'after');
+    await user.ok('PATCH', `messages/${question.id}`, { content: `@**${botName}** is anyone there? (edited)` });
+    await until(() => pushed.find((p) => String(p.origin.messageId).startsWith(`edit:${question.id}:`)), 'the edit after the move pushed to the host');
+
+    const published = (await host.sendRequest(method.CHANNELS_PUBLISH, {
+      conversationId: 'contract',
+      channelId,
+      content: [{ type: 'text', text: 'here, after the bot moved it' }],
+    })) as { delivered: boolean; messageId?: string };
+    assert.equal(published.delivered, true);
+    assert.equal((await user.message(published.messageId!)).subject, 'after', 'the answer follows the bot\'s own rename');
+    assert.deepEqual(pushed.filter((p) => String(p.origin.messageId).startsWith('move:')).map((p) => p.origin.messageId), [], 'no moved line for the bot\'s own move');
+  } finally {
+    await stop();
+  }
+});
