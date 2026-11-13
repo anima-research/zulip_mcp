@@ -290,10 +290,10 @@ export const toolDefinitions: ToolDefinition[] = [
         scope: {
           type: "string",
           enum: ["one", "later", "all"],
-          description: "What moves: one (this message, the default), later (this message and those after it in its topic), or all (its whole topic)",
+          description: "What moves: one (this message), later (this message and those after it in its topic), or all (its whole topic)",
         },
       },
-      required: ["message_id"],
+      required: ["message_id", "scope"],
     },
   },
   {

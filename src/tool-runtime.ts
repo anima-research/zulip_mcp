@@ -839,7 +839,7 @@ export class ZulipToolRuntime {
         if (topic === undefined && stream === undefined) throw new Error("Give a topic, a stream, or both.");
         if (topic !== undefined && typeof topic !== "string") throw new Error("topic must be a string.");
         if (stream !== undefined && (typeof stream !== "string" || stream === "")) throw new Error("stream must be a stream's name.");
-        const scope = args.scope ?? "one";
+        const scope = args.scope;
         if (typeof scope !== "string" || !Object.hasOwn(MOVE_SCOPES, scope)) throw new Error("scope must be one, later or all.");
         const streamId = stream === undefined ? undefined : await this.streamIdForName(stream);
         await api.request("PATCH", `/messages/${messageId}`, `moving message ${messageId}`, {
