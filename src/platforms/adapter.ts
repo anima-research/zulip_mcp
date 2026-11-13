@@ -142,6 +142,10 @@ export interface MessageChangeEvent {
   previousTopic: string | null;
   /** The channel the message moved to, when it left this one. */
   movedToKey: ChannelKey | null;
+  /** The message moved to another stream, which `movedToKey` names when the adapter knows that stream. */
+  leftChannel: boolean;
+  /** The bot made the change. The adapter passes on only such a change that moves a message. */
+  byBot: boolean;
   /** The content after an edit, cleaned like a delivered message; null for a
    *  move or a delete. */
   content: string | null;

@@ -634,6 +634,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic,
         previousTopic: change.topic !== null ? change.origTopic : null,
         movedToKey,
+        leftChannel: crossStream,
+        byBot: self !== null && change.actorId === self,
         content,
         previousContent,
         mentioned,
@@ -677,6 +679,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic: change.topic ?? cached.topic,
         previousTopic: null,
         movedToKey: null,
+        leftChannel: false,
+        byBot: false,
         content: null,
         previousContent: cached.snippet,
         // A deleted mention is the one the agent was about to answer.
@@ -704,6 +708,8 @@ export class ZulipAdapter implements PlatformAdapter {
         topic: change.topic ?? '',
         previousTopic: null,
         movedToKey: null,
+        leftChannel: false,
+        byBot: false,
         content: null,
         previousContent: null,
         mentioned: false,
@@ -1044,7 +1050,8 @@ export class ZulipAdapter implements PlatformAdapter {
     const current = () => this.eventLoop === loop;
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {
-          if (change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId) return;
+          const byBot = change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId;
+          if (byBot && change.topic === null && change.newStreamId === null) return;
           const enter = (key: ChannelKey, located?: SeenMessage) => onMessageChange({ key, messageIds: change.messageIds, ready: () => this.onZulipChange(change, located) });
           const key = this.changeKeyNow(change);
           if (key !== null && (change.streamId !== null || this.placing === 0)) return enter(key);
