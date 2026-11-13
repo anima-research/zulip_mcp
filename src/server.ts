@@ -1209,10 +1209,7 @@ export class ZulipMcplServer {
         if (delivered) {
           // The agent's answer goes back through channels/publish, so it goes
           // to this message's topic, as an answer on an open channel does.
-          const place = isDmKey(key) ? null : this.adapter.whereSeen?.(message.messageId) ?? null;
-          w.channels.noteConversation(key, place === null || place.key !== key
-            ? message
-            : { ...message, threadId: place.topic || undefined, metadata: { ...(message.metadata as Record<string, unknown> | undefined), topic: place.topic } });
+          w.channels.noteConversation(key, this.asLastSeen(key, message));
           if (this.accepted(w, key, id)) this.delivery.save();
           this.enterHeldReads();
         } else {
@@ -1226,6 +1223,12 @@ export class ZulipMcplServer {
 
     this.letGo(ctx.w, key, id);
     if (ctx.w.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
+  }
+
+  private asLastSeen<M extends Pick<KeyedMessage, 'messageId' | 'threadId' | 'metadata'>>(key: ChannelKey, message: M): M {
+    const place = isDmKey(key) ? null : this.adapter.whereSeen?.(message.messageId) ?? null;
+    if (place === null || place.key !== key) return message;
+    return { ...message, threadId: place.topic || undefined, metadata: { ...(message.metadata as Record<string, unknown> | undefined), topic: place.topic } };
   }
 
   private messagingChanged(): void {
@@ -1630,7 +1633,7 @@ export class ZulipMcplServer {
         // channel's deliveries would have left it.
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
-          if (w.channels.noteConversation(key, msgs[i])) break;
+          if (w.channels.noteConversation(key, this.asLastSeen(key, msgs[i]))) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
         for (const id of w.delivery.heldIds(key)) if (id > after && id <= newestId) w.delivery.release(key, id);

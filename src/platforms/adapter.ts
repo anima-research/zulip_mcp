@@ -290,9 +290,9 @@ export interface PlatformAdapter {
   noteSelfDeleted?(messageId: number): void;
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
-  /** Where the adapter last saw a message: its channel and topic, or null for
-   *  one it hasn't seen, a direct message, or one that left for a stream it
-   *  doesn't know. */
+  /** Null for a message that left for a stream the adapter doesn't know:
+   *  Zulip's move event leaves its cached entry under the old stream with the
+   *  new topic. */
   whereSeen?(messageId: string): { key: ChannelKey; topic: string } | null;
 
   /**
