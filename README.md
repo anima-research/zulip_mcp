@@ -25,10 +25,12 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Every stream and DM conversation the bot can see is a channel the host can
   open and close. Opening a channel subscribes the bot to the stream first
-  (Zulip only delivers events to subscribers) — a stream the bot cannot
-  subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically. A stream whose
-  name reads as a DM channel id, such as `dm:42`, isn't served.
+  (without a subscription, a public stream sends the bot a message's edits
+  and reactions only when the message mentions it, and a private stream sends
+  at most the messages that mention it) — a stream the bot cannot subscribe
+  to fails the open rather than opening without it — and can return
+  backscroll atomically. A stream whose name reads as a DM channel id, such
+  as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
@@ -37,8 +39,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   edit that doesn't move its message, or a deletion, that arrives while the
   message still waits for its turn is applied to the message instead: the
   message comes once with its new text and "(edited)", or doesn't come, and
-  no line is offered for the change, nor for a reaction or a move that
-  waited about the deleted message alone. A change or a reaction to a
+  no line is offered about it, nor for a reaction or a move that waited
+  about the deleted message alone. A change or a reaction to a
   message that arrives while the message's move to another stream still
   waits is offered in the new stream's channel, after what waits there, so it
   can follow a message the server received after it. A message waiting for
@@ -223,9 +225,10 @@ Disabling `zulip.messaging` stops
 its delivery (incoming and push) and its tools at once. A message that
 arrives meanwhile waits in its channel until it is enabled again. An edit or
 a deletion of it that arrives meanwhile is applied to it, unless the change
-also moves it: then it is offered after it. Any other change, and any
-reaction, that arrives meanwhile isn't told. A catch-up, and a recovery after
-a break of Zulip's event queue, wait too, and are made once it is enabled.
+also moves it, and a change that moves it is offered after it. A change about
+no message that waits, and any reaction, that arrives meanwhile isn't told. A
+catch-up, and a recovery after a break of Zulip's event queue, wait too, and
+are made once it is enabled.
 
 **Wake policy.** Closed-channel mentions, quote replies and DMs, new-DM
 announcements and `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
@@ -294,8 +297,9 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
 `previouslyMentioned`, plus `replyToSelf` and `previouslyReplyToSelf` for
 quote addressing (previous verdicts are absent when only the post-change
-state could be read). A change line never sets `threadId` and never moves
-this server's reply routing: a moderator archiving an old message does not retarget the
+state could be read). A change line never sets `threadId`. Reply routing
+moves only when the message a plain answer follows moves to another topic in
+its stream: a moderator archiving an older message does not retarget the
 reply the agent is composing. A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
@@ -443,9 +447,11 @@ file, or remove it to re-seed from the environment.
 
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
-Omit `to` and `topic`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
-Supplied destinations, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
-Without `reply_to`, provide `type` and `to` (plus `topic` for streams). No additional permissions are needed.
+For a stream message, a `topic` beside `reply_to` sends to that message's stream in the given topic: `{"reply_to":12345,"topic":"follow-up","content":"Thanks!"}`.
+Omit `to`; `type` is inferred, and an explicit type must match (`channel`/`direct` normalize to `stream`/`private`).
+A supplied `to`, a `topic` for a direct message, conflicting types, or unreadable IDs fail before uploads or sends; lookup errors retain Zulip's API code.
+After a send with `reply_to`, the result says where the message went: `channelId` and `channel`, the stream's name, for a stream message, and `topic` when you gave none; `channelId` and `to_user_ids` for a direct message, where `to_user_ids` is the participants other than the bot, or the bot too where its own id isn't known or the conversation is its own.
+Without `reply_to`, provide `type` and `to`, plus `topic` for a stream message: a stream message with neither `topic` nor `reply_to` is refused before uploads or sends. No additional permissions are needed.
 
 Both send tools take an optional `attachments` array; each entry is a local
 file (`{ "file": "notes/report.pdf" }`) or inline bytes
@@ -571,8 +577,11 @@ environment). Under connectome-host, point it into the data volume, e.g.
 
 ## Notes for operators
 
-- **Subscription is not optional.** Zulip delivers stream events only to
-  subscribers, even with `all_public_streams` on the event queue. Opening a
+- **Subscription is not optional.** Even with `all_public_streams` on the
+  event queue, a public stream sends a bot that isn't subscribed its new
+  messages, with mentions of the bot flagged, but a message's edits and
+  reactions only when the message mentions the bot. A private stream sends
+  it at most the messages that mention it. Opening a
   channel subscribes the bot (and fails if it cannot — a private stream the
   bot was not invited to answers `success` with the stream under
   `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`

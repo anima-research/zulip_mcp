@@ -104,6 +104,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
   let server: ZulipMcplServer | null = null;
   let nextStreamId = 1000;
   const changeOf = new WeakMap<ChangeEntry, MessageChangeEvent>();
+  const places = new Map<string, { key: ChannelKey; topic: string }>();
   const applied = (message: KeyedMessage, changes: readonly ChangeEntry[] | undefined): KeyedMessage | null => {
     let now = message;
     for (const entry of changes ?? []) {
@@ -205,6 +206,8 @@ function fakeAdapter(withTyping = true): FakeAdapter {
           const { channelId, ...m } = message;
           keyed = { ...m, key: adapter.keyOf(channelId) } as KeyedMessage;
         }
+        const topic = (keyed.metadata as { topic?: unknown } | undefined)?.topic;
+        if (typeof topic === 'string') places.set(keyed.messageId, { key: keyed.key, topic });
         onMessage({ key: keyed.key, messageId: keyed.messageId, ready: async (changes) => {
           const now = applied(keyed, changes);
           return now === null ? null : { message: now, ...(newChannel ? { newChannel } : {}) };
@@ -228,7 +231,17 @@ function fakeAdapter(withTyping = true): FakeAdapter {
               key: change.key,
               messageIds: change.messageIds.map(Number),
               kind,
-              ready: async (only) => (only ? { ...change, messageIds: change.messageIds.filter((id) => only.includes(Number(id))) } : change),
+              ready: async (only) => {
+                if (change.previousTopic !== null || change.movedToKey !== null || change.leftChannel === true) {
+                  for (const id of change.messageIds) {
+                    const was = places.get(id);
+                    if (!was) continue;
+                    if (change.leftChannel === true && change.movedToKey === null) places.delete(id);
+                    else places.set(id, { key: change.movedToKey ?? was.key, topic: change.topic });
+                  }
+                }
+                return only ? { ...change, messageIds: change.messageIds.filter((id) => only.includes(Number(id))) } : change;
+              },
             };
             changeOf.set(entry, change);
             onMessageChange(entry);
@@ -236,6 +249,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
         : null;
     },
     stopEvents() { adapter.emit = null; adapter.enter = null; adapter.enterChange = null; },
+    placeOf(messageId: string) { return places.get(messageId) ?? null; },
   } as unknown as FakeAdapter;
   Object.defineProperty(adapter, 'discoverChannels', {
     get: () => async () => learn(await discover()),
@@ -328,6 +342,7 @@ interface HarnessOptions {
   announceTimeoutMs?: number;
   shutdownGraceMs?: number;
   maxWaitingMessages?: number;
+  catchupLimit?: number;
   readRetryWait?: (ms: number) => Promise<void>;
   now?: () => number;
   /** A second connection to a server that already served one (the TCP case). */
@@ -352,7 +367,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     contextHistorySize: 3,
     stateDir: opts.stateDir ?? null,
     sessionId: opts.sessionId ?? 'test',
-    catchupLimit: 100,
+    catchupLimit: opts.catchupLimit ?? 100,
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 100,
     shutdownGraceMs: opts.shutdownGraceMs,
@@ -1043,6 +1058,28 @@ test("the bot's own move takes a plain answer to the new topic, and nothing abou
   await h.close();
 });
 
+test('a rename while zulip.messaging is disabled waits behind an older rename of its message, so a plain answer goes to the newer topic after the enable', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let busyDone = false;
+  h.adapter.enterChange!({ key: h.adapter.keyOf('zulip:general'), messageIds: [1], kind: 'edit', ready: async () => { await gate; busyDone = true; return null; } });
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await disableMessaging(h);
+  changeTo(h, { messageIds: ['2'], previousTopic: 'releases', topic: 'archive', mentioned: true });
+  release();
+  await until(() => busyDone, 'the job ahead of the older rename ended');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'archive', topic: 'archive' }, 'after the enable');
+  await h.close();
+});
+
 const MOVING_STREAMS: Record<number, string> = { 7: 'general' };
 
 function movingRealm(topics: Record<number, string>, readAs: Record<number, unknown> = {}) {
@@ -1266,6 +1303,24 @@ test('a rename while the channel is muted moves where a plain answer goes after 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a rename while the mention's push waits for the host's answer moves where a plain answer goes once the host accepts it", async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.policy.holdPushes = true;
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.pushed.length === 1, 'the mention pushed');
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await until(() => h.pushed.length === 2, "the move's line pushed, so its job has run");
+  h.policy.holdPushes = false;
+  while (h.policy.heldPushes.length > 0) h.policy.heldPushes.shift()!();
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the acceptance');
+  await h.close();
 });
 
 test('a rename while zulip.messaging is disabled moves where a plain answer goes after the enable, and tells the host nothing', async () => {
@@ -2326,6 +2381,37 @@ test('a lane that gives up twice while zulip.messaging is disabled brings every 
     console.error = original;
   }
 });
+
+for (const form of ['with the catch-up limit at 0', 'on a closed channel that the host holds no id for', 'on a closed channel that the host holds an id for'] as const) {
+  test(`a give-up's log line says whether a read from history brings the given-up messages back: ${form}`, async () => {
+    const h = harness({ maxWaitingMessages: 2, ...(form === 'with the catch-up limit at 0' ? { catchupLimit: 0 } : {}) });
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+      await h.host.sendRequest('ping');
+      const late: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
+      for (const id of [1, 2, 3]) {
+        if (form === 'on a closed channel that the host holds no id for') h.adapter.emit!(streamMsg(id, { channelId: 'zulip:late-stream' }), late);
+        else h.adapter.emit!(streamMsg(id));
+      }
+      await until(() => lines.some((l) => l.includes('given up')), 'the give-up');
+      const line = lines.find((l) => l.includes('given up'))!;
+      const said = form === 'with the catch-up limit at 0'
+        ? 'with the catch-up limit at 0, no read from history brings them back'
+        : form === 'on a closed channel that the host holds no id for'
+          ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
+          : 'a read from history takes their place';
+      assert.ok(line.endsWith(`3 waiting message(s) given up; ${said}`), line);
+      await h.close();
+    } finally {
+      console.error = original;
+    }
+  });
+}
 
 test("while zulip.messaging is disabled, the edit of a message that waits is applied to it, so it comes once with its new text and no line, and the edit of any other message isn't told", async () => {
   const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };

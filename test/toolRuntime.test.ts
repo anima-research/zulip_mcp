@@ -331,7 +331,8 @@ test('send_message reply_to derives the current stream and topic', async () => {
   const sent: unknown[] = [];
   tools.onSent = (s) => sent.push(s);
   try {
-    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }), result);
+    assert.deepEqual(await tools.handleToolCall('send_message', { type: 'stream', reply_to: 123, content: 'reply' }),
+      { ...result, channelId: 'zulip:General', channel: 'General', topic: 'Deploy status' });
     assert.deepEqual(gets, [{ id: 123 }]);
     assert.deepEqual(sends, [{ type: 'stream', to: 12, topic: 'Deploy status', content: 'reply' }]);
     assert.deepEqual(sent[0], { messageId: '501', channelId: 'zulip:General', content: 'reply' });
@@ -345,7 +346,9 @@ for (const participants of [replyParticipants.slice(0, 2), replyParticipants]) {
     tools.onSent = (s) => sent.push(s);
     try {
       const ids = participants.map((p) => p.id);
-      await tools.handleToolCall('send_message', { type: 'private', reply_to: 123, content: 'reply' });
+      const others = ids.filter((id) => id !== 790).sort((a, b) => a - b);
+      assert.deepEqual(await tools.handleToolCall('send_message', { type: 'private', reply_to: 123, content: 'reply' }),
+        { result: 'success', id: 501, channelId: `zulip:dm:${others.join('+')}`, to_user_ids: others });
       assert.equal(gets.length, 1);
       assert.deepEqual(sends, [{ type: 'private', to: ids, topic: undefined, content: 'reply' }]);
       assert.deepEqual(sent.map((s) => s.channelId), [`zulip:dm:${ids.filter((id) => id !== 790).sort((a, b) => a - b).join('+')}`]);
@@ -358,12 +361,9 @@ for (const [label, message, destination] of [
   ['numeric-string stream ID', replyStream, { to: '12' }],
   ['matching stream name', replyStream, { to: 'general' }],
   ['different stream', replyStream, { to: 'Other' }],
-  ['matching topic', replyStream, { topic: 'Deploy status' }],
-  ['different topic', replyStream, { topic: 'Other' }],
   ['matching DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [790, 42, 7] }],
   ['partial DM recipients', { type: 'private', display_recipient: replyParticipants }, { to: [42] }],
   ['DM email', { type: 'private', display_recipient: replyParticipants }, { to: 'bo@example.com' }],
-  ['empty DM topic', { type: 'private', display_recipient: replyParticipants }, { topic: '' }],
   ['empty self-DM recipients', { type: 'private', display_recipient: [replyParticipants[0]] }, { to: [] }],
 ] as const) {
   test(`send_message reply_to refuses supplied ${label} before lookups, uploads or sends`, async () => {
@@ -371,7 +371,7 @@ for (const [label, message, destination] of [
     try {
       await assert.rejects(tools.handleToolCall('send_message', {
         ...destination, reply_to: 123, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
-      }), { message: 'reply_to sets the destination; omit to/topic' });
+      }), { message: 'reply_to sets the destination; omit to' });
       assert.deepEqual(gets, []);
       assert.deepEqual(userLookups, []);
       assert.deepEqual(sends, []);
@@ -379,6 +379,66 @@ for (const [label, message, destination] of [
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test('send_message reply_to with a topic sends to that message\'s stream in the given topic, and the result names no topic', async () => {
+  for (const topic of ['New thread', '']) {
+    const { tools, dir, gets, sends, result } = replyRuntime(replyStream);
+    try {
+      assert.deepEqual(await tools.handleToolCall('send_message', { reply_to: 123, topic, content: 'reply' }),
+        { ...result, channelId: 'zulip:General', channel: 'General' });
+      assert.deepEqual(gets, [{ id: 123 }]);
+      assert.deepEqual(sends, [{ type: 'stream', to: 12, topic, content: 'reply' }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message reply_to with a topic on a direct message is refused before uploads or sends', async () => {
+  for (const topic of ['New thread', '']) {
+    const { tools, dir, sends, uploaded } = replyRuntime({ type: 'private', display_recipient: replyParticipants });
+    try {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        reply_to: 123, topic, content: 'reply', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), /direct message.*no topic/);
+      assert.deepEqual(sends, []);
+      assert.deepEqual(uploaded, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message reply_to a direct message names the bot in to_user_ids where its id is unknown, or the conversation is its own', async () => {
+  for (const [participants, selfUserId, expected] of [
+    [replyParticipants.slice(0, 2), null, [42, 790]],
+    [replyParticipants.slice(0, 1), 790, [790]],
+  ] as const) {
+    const { tools, dir } = replyRuntime({ type: 'private', display_recipient: participants, subject: '' }, undefined, selfUserId);
+    try {
+      assert.deepEqual(await tools.handleToolCall('send_message', { reply_to: 123, content: 'reply' }),
+        { result: 'success', id: 501, channelId: `zulip:dm:${expected.join('+')}`, to_user_ids: [...expected] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message to a stream with neither a topic nor reply_to is refused before any read, upload or send, and says to name one', async () => {
+  for (const args of [{ type: 'stream' }, { type: 'channel' }, { type: 'stream', topic: null }]) {
+    const { tools, dir, gets, sends, uploaded } = replyRuntime(replyStream);
+    try {
+      await assert.rejects(tools.handleToolCall('send_message', {
+        ...args, to: 'general', content: 'hello', attachments: [{ data: 'aGk=', name: 'hi.txt' }],
+      }), { message: 'topic is required for a stream message: name one, or use reply_to to answer a message where it is' });
+      assert.deepEqual(gets, []);
+      assert.deepEqual(sends, []);
+      assert.deepEqual(uploaded, []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('send_message with an empty topic sends it to Zulip as given', async () => {
+  const { tools, dir, sends } = replyRuntime(replyStream);
+  try {
+    await tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: '', content: 'hello' });
+    assert.deepEqual(sends, [{ type: 'stream', to: 'general', topic: '', content: 'hello' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 for (const code of ['BAD_REQUEST', 'UNAUTHORIZED']) {
   test(`send_message reply_to preserves API error code ${code} for missing/deleted/inaccessible ids`, async () => {
@@ -481,7 +541,7 @@ test('send_message schema leaves destination requirements to the runtime', () =>
   for (const combinator of ['anyOf', 'oneOf', 'allOf']) assert.equal(combinator in schema, false);
   const properties = schema.properties as Record<string, any>;
   assert.equal(properties.reply_to.type, 'integer');
-  assert.match(properties.reply_to.description, /Omit to\/topic/);
+  assert.match(properties.reply_to.description, /Omit to;/);
 });
 
 test('send_message reply_to supports a canonical stream name fallback and an empty topic', async () => {
@@ -667,6 +727,101 @@ for (const field of ['to', 'type']) {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+function topicsRuntime() {
+  const topics = [{ name: 'four', max_id: 40 }, { name: 'three', max_id: 30 }, { name: 'two', max_id: 20 }, { name: 'one', max_id: 10 }];
+  const { api, calls } = standInApi({
+    'GET /get_stream_id': async ({ stream }: Record<string, unknown>) => {
+      if (stream === 'unreachable') throw new ZulipNoAnswer('network', 'GET', '/get_stream_id', false, "Couldn't reach Zulip for GET /get_stream_id (ECONNREFUSED).");
+      return stream === 'deploys'
+        ? { result: 'success', stream_id: 12 }
+        : { result: 'error', code: 'BAD_REQUEST', msg: `Invalid channel name '${String(stream)}'` };
+    },
+    'GET /users/me/12/topics': { result: 'success', topics },
+  });
+  return { ...runtime(api), calls, topics };
+}
+
+test('get_stream_topics takes the stream by name, and asks Zulip for its id once', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    const result = await tools.handleToolCall('get_stream_topics', { stream: 'deploys' }) as { topic_count: number; formatted_list: string };
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id', 'GET /users/me/12/topics']);
+    assert.deepEqual(calls[0].params, { stream: 'deploys' });
+    assert.equal(result.topic_count, 4);
+    assert.deepEqual([...result.formatted_list.matchAll(/\*\*(\w+)\*\* \(latest/g)].map((m) => m[1]), ['four', 'three', 'two', 'one']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics with a limit lists the newest topics in Zulip\'s order, and counts them all', async () => {
+  const { tools, dir, topics } = topicsRuntime();
+  try {
+    const result = await tools.handleToolCall('get_stream_topics', { stream_id: 12, limit: 2, verbose: true }) as { topic_count: number; formatted_list: string; raw_data: unknown };
+    assert.equal(result.topic_count, 4);
+    assert.equal(result.formatted_list, '📑 **4 Topics, the newest 2 shown**\n\n1. **four** (latest msg: 40)\n2. **three** (latest msg: 30)');
+    assert.deepEqual(result.raw_data, { result: 'success', topics });
+    for (const limit of [4, 5, 2 ** 53]) {
+      const uncut = await tools.handleToolCall('get_stream_topics', { stream_id: 12, limit }) as { formatted_list: string };
+      assert.match(uncut.formatted_list, /^📑 \*\*4 Topics\*\*\n/, `limit ${limit}`);
+      assert.equal([...uncut.formatted_list.matchAll(/\(latest/g)].length, 4, `limit ${limit}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics with stream_id and no limit returns what it returned before', async () => {
+  const { tools, dir, topics } = topicsRuntime();
+  try {
+    const verbose = await tools.handleToolCall('get_stream_topics', { stream_id: 12, verbose: true }) as { raw_data: unknown };
+    assert.deepEqual(verbose.raw_data, { result: 'success', topics });
+    const asDigits = await tools.handleToolCall('get_stream_topics', { stream_id: '12' }) as { topic_count: number };
+    assert.equal(asDigits.topic_count, 4);
+    assert.deepEqual(await tools.handleToolCall('get_stream_topics', { stream_id: 12 }), {
+      topic_count: 4,
+      formatted_list: '📑 **4 Topics**\n\n1. **four** (latest msg: 40)\n2. **three** (latest msg: 30)\n3. **two** (latest msg: 20)\n4. **one** (latest msg: 10)',
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics refuses neither or both of stream and stream_id, and a limit that is not a positive integer, before asking Zulip', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    for (const args of [{}, { stream: 'deploys', stream_id: 12 }]) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', args), (err: Error) => {
+        assert.match(err.message, /stream_id/);
+        assert.match(err.message.replaceAll('stream_id', ''), /\bstream\b/);
+        return true;
+      }, JSON.stringify(args));
+    }
+    for (const limit of [0, -1, 1.5, '2']) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream_id: 12, limit }), /limit/, `limit ${String(limit)}`);
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'deploys', limit }), /limit/, `by name, limit ${String(limit)}`);
+    }
+    for (const stream of [123, '', ['deploys']]) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream }), /stream/, `stream ${JSON.stringify(stream)}`);
+    }
+    for (const stream_id of [0, 1.5, 'abc', '12/../../messages', ' 12']) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream_id }), /stream_id/, `stream_id ${JSON.stringify(stream_id)}`);
+    }
+    assert.equal(calls.length, 0, 'Zulip was never asked');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics for a name no stream has gives Zulip\'s refusal, with the name', async () => {
+  const { tools, dir } = topicsRuntime();
+  try {
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'nowhere' }), (err: Error) => {
+      assert.match(err.message, /^Zulip refused/);
+      assert.match(err.message, /Invalid channel name 'nowhere'/);
+      assert.match(err.message, /list_streams/);
+      return true;
+    });
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'unreachable' }), (err: Error) => {
+      assert.ok(err instanceof ZulipNoAnswer, 'a lookup with no answer keeps its own error');
+      assert.doesNotMatch(err.message, /list_streams/);
+      return true;
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 const MOVE_STREAMS: Record<number, string> = { 7: 'general', 8: 'ops' };
 

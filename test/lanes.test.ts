@@ -395,6 +395,23 @@ test('at a give-up, a change about given-up messages alone leaves with them, and
   assert.deepEqual(log, ['running', 'read', 'about 10 and 5', 'reaction to 10', 'about none']);
 });
 
+test('a lane says whether a change about any of some messages waits in it: a running change, a reaction or a message about them is not one', async () => {
+  const running = gate();
+  const l = lanes();
+  l.lane(A).enter(async () => { await running.opened; }, { kind: 'change', about: [7] });
+  await new Promise((r) => setImmediate(r));
+  l.lane(A).enter(() => {}, { kind: 'reaction', about: [8] });
+  l.lane(A).enter(() => {}, { kind: 'message', id: 9 });
+  assert.equal(l.lane(A).changeWaitsAbout([7, 8, 9]), false);
+  l.lane(A).enter(() => {}, { kind: 'change', about: [9, 10] });
+  assert.equal(l.lane(A).changeWaitsAbout([10, 11]), true);
+  assert.equal(l.lane(A).changeWaitsAbout([11]), false);
+  assert.equal(l.lane(B).changeWaitsAbout([10]), false);
+  running.open();
+  await l.quiet();
+  assert.equal(l.lane(A).changeWaitsAbout([10]), false);
+});
+
 test('the place moves up to what a job decides, and never down', async () => {
   const lane = lanes().lane(A);
   assert.equal(lane.place, undefined);

@@ -846,12 +846,14 @@ export class ZulipMcplServer {
     this.channelManager.confirmAnnounced(descriptor.id);
     const result: ChannelsOpenResult = { channel: descriptor };
 
-    // Zulip only delivers stream events to subscribers; an open channel the
-    // bot is not subscribed to would be listening to silence. So the
+    // Without a subscription, Zulip sends a public stream's edits and
+    // reactions only for messages that mention the bot, and from a private
+    // stream at most the messages that mention it; an open channel the bot
+    // is not subscribed to would miss the rest. So the
     // subscription comes FIRST, and a refusal (private stream, permission,
     // rate limit) fails the open: the host records the operation as failed
     // and the agent's tool result says why, instead of an open channel that
-    // hears nothing.
+    // misses the rest.
     if (this.adapter.ensureSubscribed) {
       try {
         await this.adapter.ensureSubscribed(key);
@@ -1211,7 +1213,10 @@ export class ZulipMcplServer {
         if (delivered) {
           // The agent's answer goes back through channels/publish, so it goes
           // to this message's topic, as an answer on an open channel does.
-          w.channels.noteConversation(key, message);
+          const place = isDmKey(key) ? null : this.adapter.placeOf?.(message.messageId) ?? null;
+          w.channels.noteConversation(key, place === null || place.key !== key
+            ? message
+            : { ...message, threadId: place.topic || undefined, metadata: { ...(message.metadata as Record<string, unknown> | undefined), topic: place.topic } });
           if (this.accepted(w, key, id)) this.delivery.save();
           this.enterHeldReads();
         } else {
@@ -1757,7 +1762,12 @@ export class ZulipMcplServer {
       w.delivery.hold(key, first, 'failed');
       this.delivery.save();
     }
-    console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; a read from history takes their place`);
+    const read = this.catchupLimit === 0
+      ? 'with the catch-up limit at 0, no read from history brings them back'
+      : !this.channelManager.isKeyOpen(key) && this.ids.heldIdOf(key) === undefined
+        ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
+        : 'a read from history takes their place';
+    console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; ${read}`);
   }
 
   private async readGivenUp(r: Reading, key: ChannelKey): Promise<Hand> {
@@ -2424,11 +2434,12 @@ export class ZulipMcplServer {
         if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
         if (rest.length === 0) return;
-        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) {
+        const silent = this.messagingHold !== null && !rest.some((id) => waiting.has(id));
+        if (silent && !lane.changeWaitsAbout(rest)) {
           lane.host((ctx) => this.runChange(ctx, entry, rest, true));
           return;
         }
-        lane.enter((ctx) => this.runChange(ctx, entry, rest, false), { kind: 'change', about: rest });
+        lane.enter((ctx) => this.runChange(ctx, entry, rest, silent), { kind: 'change', about: rest });
       },
     );
   }
@@ -2488,8 +2499,9 @@ export class ZulipMcplServer {
     if (change === null || ctx.ended) return;
     if (change.key === entry.key) return this.onMessageChange(ctx, change, true, silent);
     const lane = this.lanes?.lane(change.key);
-    if (silent) lane?.host((c) => this.onMessageChange(c, change, true, true));
-    else lane?.enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
+    if (!lane) return;
+    if (silent && !lane.changeWaitsAbout(ids)) lane.host((c) => this.onMessageChange(c, change, true, true));
+    else lane.enter((c) => this.onMessageChange(c, change, true, silent), { kind: 'change', about: ids });
   }
 
   /**

@@ -37,7 +37,7 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
+import { NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -748,8 +748,9 @@ export class ZulipAdapter implements PlatformAdapter {
     // (Zulip's own attachment form). Uploads happen before the send, so a
     // failed upload fails the publish whole; a send that fails after them
     // leaves unreferenced uploads, which Zulip garbage-collects.
-    const uploaded = this.uploader && this.uploadPolicy ? await uploadBlocks(this.uploader, content, this.uploadPolicy) : [];
-    if (!textContent && uploaded.length === 0) return { delivered: false };
+    const uploader = this.uploader;
+    const uploadPolicy = this.uploadPolicy;
+    const upload = uploader && uploadPolicy ? () => uploadBlocks(uploader, content, uploadPolicy) : undefined;
 
     const parsed = typeof target === 'string' ? parseKey(target) : null;
     let destination: Destination;
@@ -776,12 +777,14 @@ export class ZulipAdapter implements PlatformAdapter {
     try {
       const { chunks } = await sendMessage(this.api, destination, textContent, {
         limit: this.maxMessageLength,
-        uploaded,
+        unlinkable: 'as-typed',
+        ...(upload ? { upload } : {}),
         onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
       });
       const messageIds = chunks.map((c) => String(c.id));
       return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
     } catch (err) {
+      if (err instanceof NothingToSend) return { delivered: false };
       if (err instanceof SendRefused) throw new ZulipRefused(what, err.answer);
       throw err;
     }
@@ -823,6 +826,13 @@ export class ZulipAdapter implements PlatformAdapter {
 
   forgetSelfDeleted(messageId: number): void {
     this.selfDeleted.delete(messageId);
+  }
+
+  placeOf(messageId: string): { key: ChannelKey; topic: string } | null {
+    const id = Number(messageId);
+    const seen = this.seen.get(id);
+    if (!seen || seen.isDm || this.movedAway.has(id)) return null;
+    return { key: seen.key, topic: seen.topic };
   }
 
   private wasSelfDeleted(messageId: number): boolean {
@@ -1010,14 +1020,16 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Zulip delivers stream events only to subscribers — even with
-   * `all_public_streams` on the queue — so opening a channel must also
-   * subscribe the bot, or the host would be listening to silence.
+   * Even with `all_public_streams` on the queue, a bot that isn't subscribed
+   * gets a public stream's edits and reactions only for messages that
+   * mention it, and from a private stream at most the messages that mention
+   * it. So opening a channel must also subscribe the bot, or the host would
+   * miss the rest.
    * Idempotent; subscription persists server-side. DMs need nothing.
    *
    * Asks Zulip every time rather than remembering: the `unlisten` tool
    * removes subscriptions behind this adapter's back, and a remembered
-   * "subscribed" would let a later open succeed onto silence. The add call
+   * "subscribed" would let a later open succeed without it. The add call
    * is cheap and answers `already_subscribed` when there is nothing to do.
    *
    * Throws when the subscription did not happen: an API error, a transport

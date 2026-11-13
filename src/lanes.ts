@@ -126,6 +126,10 @@ export class Lane<W> {
     return this.otherQueue.filter((e) => e.info.kind === 'message').map((e) => e.info.id ?? NaN);
   }
 
+  changeWaitsAbout(ids: readonly number[]): boolean {
+    return this.otherQueue.some((e) => e.info.kind === 'change' && (e.info.about ?? []).some((id) => ids.includes(id)));
+  }
+
   replaceMessages(read: ReadJob<W>): number[] {
     const first = this.otherQueue.findIndex((e) => e.info.kind === 'message');
     if (first < 0) return [];

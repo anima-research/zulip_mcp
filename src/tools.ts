@@ -45,7 +45,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "listen",
     description:
-      "Subscribe the bot to one or more Zulip streams. Required before the bot can receive real-time message events from a stream — event queues with all_public_streams only deliver events for streams the bot is subscribed to. Subscription persists server-side across session restarts.",
+      "Subscribe the bot to one or more Zulip streams. Without a subscription, a public stream still sends its new messages, with mentions of the bot flagged, but a message's edits and reactions only when the message mentions the bot. A private stream sends at most the messages that mention the bot. Subscription persists server-side across session restarts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -61,7 +61,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "unlisten",
     description:
-      "Unsubscribe the bot from one or more Zulip streams. After this, the bot stops receiving real-time events for those streams until listen is called again. Unsubscription persists server-side.",
+      "Unsubscribe the bot from one or more Zulip streams. After this, a public stream still sends its new messages, but edits and reactions only for messages that mention the bot. A private stream sends at most the messages that mention the bot. This lasts until the bot is subscribed again: by listen, by opening the stream's channel, or, for a stream that the operator named in ZULIP_SUBSCRIBE, after the server next starts. Unsubscription persists server-side.",
     inputSchema: {
       type: "object",
       properties: {
@@ -155,7 +155,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination; after 'reply_to' the result says where the message went. Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -170,11 +170,11 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         topic: {
           type: "string",
-          description: "Required for streams without reply_to. Omit with reply_to.",
+          description: "Required for a stream message without reply_to. With reply_to on a stream message, optional: it sends to that message's stream in this topic. To see a stream's recent topics first, call get_stream_topics.",
         },
         reply_to: {
           type: "integer",
-          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; a supplied to, a topic on a direct message, or an unreadable ID fails before uploads or sends. Does not quote the message.",
         },
         content: {
           type: "string",
@@ -336,13 +336,22 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "get_stream_topics",
-    description: "Get all topics in a specific stream",
+    description: "List a stream's topics, newest first.",
     inputSchema: {
       type: "object",
       properties: {
+        stream: {
+          type: "string",
+          description: "The stream's name. Give this or stream_id.",
+        },
         stream_id: {
           type: "number",
-          description: "ID of the stream",
+          description: "The stream's ID. Give this or stream.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Only the newest N topics.",
         },
         verbose: {
           type: "boolean",
@@ -350,7 +359,6 @@ export const toolDefinitions: ToolDefinition[] = [
           default: false,
         },
       },
-      required: ["stream_id"],
     },
   },
   {

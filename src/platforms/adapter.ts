@@ -118,8 +118,9 @@ export type OnReaction = (entry: ReactionEntry) => void;
 /**
  * A message the agent may have seen was edited, moved to another topic or
  * stream, or deleted — resolved to the channel the message lived in.
- * Adapters drop the bot's own edits before invoking the callback; a change
- * someone else made to the bot's message is news (`onOwnMessage`).
+ * Adapters drop the bot's own edits that move nothing before invoking the
+ * callback, and mark its moves `byBot`; a change someone else made to the
+ * bot's message is news (`onOwnMessage`).
  */
 export interface MessageChangeEvent {
   kind: 'edit' | 'move' | 'delete';
@@ -271,8 +272,10 @@ export interface PlatformAdapter {
   fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
-   * Make sure the platform delivers events for this channel — Zulip only
-   * sends stream events to subscribers. Optional; idempotent; best-effort.
+   * Make sure the platform delivers events for this channel. Without a
+   * subscription, a public stream's edits and reactions come only for
+   * messages that mention the bot, and a private stream sends at most the
+   * messages that mention it. Optional; idempotent.
    */
   ensureSubscribed?(key: ChannelKey): Promise<void>;
 
@@ -287,6 +290,7 @@ export interface PlatformAdapter {
   noteSelfDeleted?(messageId: number): void;
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
+  placeOf?(messageId: string): { key: ChannelKey; topic: string } | null;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
