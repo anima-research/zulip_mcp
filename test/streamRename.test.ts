@@ -1546,3 +1546,21 @@ scenario('62. quiet() waits while a rename\'s channels/changed is with the host,
     await until(() => settled, 'quiet() once the host answers');
   } finally { run.releaseChanged(); await run.close(); }
 });
+
+scenario('63. a read of the stream list held for one stream\'s message: a mention on another stream reaches the host meanwhile', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+  const before = lists();
+  const release = r.hold('GET /streams');
+  try {
+    r.streams.set(30, 'north');
+    const unlisted = r.post(30, '@bot north', { mentioned: true });
+    await until(() => lists() > before, 'the read of the stream list');
+    const mention = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, mention), 'the other stream\'s mention');
+    assert.equal(named(run, unlisted), false, 'the mention came while the read was still out');
+    release();
+    await until(() => named(run, unlisted), 'the mention on the stream the read found');
+  } finally { release(); await run.close(); }
+});
