@@ -1869,9 +1869,6 @@ export class ZulipMcplServer {
         const id = numericId(m);
         if (id === null) continue;
         if (ctx.ended || id > below()) break;
-        // Taken before it is handed: its live event, arriving while its
-        // attachments are fetched, is dropped as it enters.
-        ctx.decide(id);
         await this.route(ctx, recovered(m), undefined, gap);
       }
     };
