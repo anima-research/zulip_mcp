@@ -1836,8 +1836,8 @@ export class ZulipMcplServer {
 
   private tellOpen(text: string, metadata: Record<string, unknown>): boolean {
     const open = this.openKeys();
-    if (open.length === 0) {
-      console.error(`[zulip-mcp] ${text} (no open channel to tell)`);
+    if (open.length === 0 || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+      console.error(`[zulip-mcp] ${text} (${open.length === 0 ? 'no open channel to tell' : 'zulip.messaging is disabled'})`);
       return false;
     }
     for (const key of open) this.channelManager.notifyChannel(key, text, metadata);
