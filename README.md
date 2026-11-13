@@ -119,9 +119,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   is disabled, as that message comes in. It never advances past a message
   the host was offered but did not accept — a refusal, a batch lost to a
   transport failure — which is replayed from history once the host answers
-  again. The exception is a channel that is muted or outside the allowlist,
-  at the refusal or at a later read for held messages: there such a message
-  is let go, as it may never reach the agent.
+  again. The exception is a channel that is muted or outside the allowlist
+  when the offer is refused or fails, or at a later read for held messages:
+  there such a message is let go, as it may never reach the agent.
   On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
@@ -332,11 +332,11 @@ before the lifecycle commits.
 **Channels that appear after startup.** The bot does not have to be
 restarted to use a stream it was added to later. Four things register one,
 whichever happens first: the `listen` tool registers what it subscribes the
-bot to; every message from the stream carries its descriptor, the way a DM
-from a new conversation does, so the mention that wakes the agent also
-makes the channel openable; `refresh_channels` re-enumerates everything
-visible; and `channels/open` on an unknown exact `channelId` re-enumerates
-once before it fails. Only a channel none of these can find answers
+bot to; every message from the stream carries its descriptor, the way every
+DM does, so the mention that wakes the agent also makes the channel
+openable; `refresh_channels` re-enumerates everything visible; and
+`channels/open` on an unknown exact `channelId` re-enumerates once before it
+fails. Only a channel none of these can find answers
 `-32023 Unknown channel`.
 
 **A stream that is renamed or archived.** A stream's channel id holds its
