@@ -942,6 +942,27 @@ test('move_messages names the channel by the id the host holds for it', async ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("move_messages gives no channel id where the host holds the stream's name's id for another stream, or the directory can't name it yet, and without MCPL makes one from the name", async () => {
+  const taken = moveRuntime();
+  try {
+    taken.ids!.noteHeld(streamKey(99), 'zulip:ops');
+    const result = await taken.tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+    assert.equal(result.channelId, null, "the host holds zulip:ops for the stream that was renamed");
+    assert.equal(result.channel, 'ops');
+  } finally { rmSync(taken.dir, { recursive: true, force: true }); }
+  const unnamed = moveRuntime({ readBack: () => ({ result: 'success', message: { id: 77, type: 'stream', stream_id: 9, display_recipient: 'brand-new', subject: 'deploys' } }) });
+  try {
+    const result = await unnamed.tools.handleToolCall('move_messages', { message_id: 77, topic: 'deploys', scope: 'one' });
+    assert.equal(result.channelId, null, "the directory doesn't list stream 9 yet");
+    assert.equal(result.channel, 'brand-new');
+  } finally { rmSync(unnamed.dir, { recursive: true, force: true }); }
+  const plain = moveRuntime({ known: false });
+  try {
+    const result = await plain.tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+    assert.equal(result.channelId, 'zulip:ops');
+  } finally { rmSync(plain.dir, { recursive: true, force: true }); }
+});
+
 test('move_messages says the move was made when Zulip accepted it but the read back fails, and claims no place', async () => {
   const { tools, dir, calls } = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
   try {

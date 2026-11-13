@@ -932,7 +932,7 @@ export class ZulipToolRuntime {
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
-          channelId: this.channelIds?.channelIdOf(streamKey(message.stream_id)) ?? `zulip:${name}`,
+          channelId: this.channelIds ? this.channelIds.channelIdOf(streamKey(message.stream_id)) : `zulip:${name}`,
           channel: name,
           topic: message.subject,
           ...(answersFollow ? {} : { note: MOVE_NOTE }),
