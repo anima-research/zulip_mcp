@@ -237,11 +237,10 @@ export class ZulipAdapter implements PlatformAdapter {
 
   constructor(
     private api: ZulipApi,
-    selfUserId: number | null,
-    sessionId: string,
+    identity: ZulipIdentity,
     options: ZulipAdapterOptions = {},
   ) {
-    this.identity = { selfUserId, sessionId };
+    this.identity = identity;
     this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
     this.backscrollLimits = options.backscrollLimits ?? new Map();
     this.filters = options.filters ?? ALLOW_ALL;

@@ -158,7 +158,7 @@ test('send_message, send_dm and a plain answer each post the table with the blan
   await t2.runtime.handleToolCall('send_dm', { to: ['42'], content: underText });
   t2.done();
   const pub = standInApi({ 'POST /messages': { result: 'success', msg: '', id: 901 } });
-  await new ZulipAdapter(pub.api, 790, 's', {} as never).publish('zulip:general', undefined, [{ type: 'text', text: underText }], { threadId: 't' });
+  await new ZulipAdapter(pub.api, { selfUserId: 790, sessionId: 's' }, {} as never).publish('zulip:general', undefined, [{ type: 'text', text: underText }], { threadId: 't' });
   assert.deepEqual(posted(sm.calls, 'POST'), [repaired], 'send_message');
   assert.deepEqual(posted(dm.calls, 'POST'), [repaired], 'send_dm');
   assert.deepEqual(posted(pub.calls, 'POST'), [repaired], 'plain answer');

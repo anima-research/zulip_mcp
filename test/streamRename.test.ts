@@ -95,7 +95,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
   const directory = opts.reuse ? opts.reuse.directory : directoryModule ? new directoryModule.StreamDirectory() : undefined;
   const subscribing = opts.reuse ? Promise.resolve() : wireSubscribe(r, directory, opts.subscribe);
   const backscrollLimits = new Map(Object.entries(opts.backscroll ?? {}));
-  const adapter = new ZulipAdapter(r.api, SELF, 's', { directory, filters, backscrollLimits, dmDiscoveryLimit: 0, formatTime: () => 'T' } as ConstructorParameters<typeof ZulipAdapter>[3]);
+  const adapter = new ZulipAdapter(r.api, { selfUserId: SELF, sessionId: 's' }, { directory, filters, backscrollLimits, dmDiscoveryLimit: 0, formatTime: () => 'T' } as ConstructorParameters<typeof ZulipAdapter>[3]);
   const tools = new ZulipToolRuntime({ api: r.api, selfUserId: SELF, realm: '', authHeader: '', sessionId: 's' }, dir, { formatTime: () => 'T' });
   const server = opts.reuse?.server ?? new ZulipMcplServer(adapter, tools, {
     serverInfo: { name: 'zulip-mcp-test', version: '0.0.0' },
