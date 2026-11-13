@@ -5876,6 +5876,52 @@ test("a connection's catch-up read that gets no answer is tried again, and a men
   await h.close();
 });
 
+test('a give-up whose read Zulip refuses other than by its rate limit keeps every given-up message held, and the read for held ids that a later acceptance starts offers each of them, after the later message', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  failReads(h, 'zulip:general', [refusal('BAD_REQUEST')]);
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '6', '2', '3', '4', '5']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
+test("a give-up whose read and the later read for held ids Zulip both refuse leaves the given-up messages to the next connection's catch-up", async () => {
+  const fetches = heldFetches();
+  const first = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  first.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) first.adapter.emit!(streamMsg(id));
+  failReads(first, 'zulip:general', [refusal('BAD_REQUEST'), refusal('BAD_REQUEST')]);
+  fetches.release();
+  await first.server.quiet();
+  assert.deepEqual(first.incoming.map((m) => m.messageId), ['1', '6']);
+  assert.equal(first.delivery.watermark('zulip:general'), 1, 'the watermark stays below the first given-up message');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  const offered = (h: Harness) => h.pushed.map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
+  await until(() => [2, 3, 4, 5].every((id) => offered(second).includes(`id=${id}]`)), "the given-up messages, in the next connection's catch-up");
+  await second.close();
+});
+
 test('a read after a give-up that gets no answer is tried again, and the given-up messages still come by it, in order, before a later message', async () => {
   const waits = heldWaits();
   const fetches = heldFetches();
@@ -6524,7 +6570,7 @@ test("a muted channel's read for held ids lets go of a give-up's hold, whose mes
     h.adapter.emit!(withLog(streamMsg(2)));
     await until(() => fetches.started.length === 1, "2's attachment fetch");
     for (const id of [3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
-    await until(() => JSON.stringify(h.delivery.heldIds('zulip:general')) === '[2,3]', 'the give-up, holding 3 for 3 to 6');
+    await until(() => JSON.stringify(h.delivery.heldIds('zulip:general')) === '[2,3,4,5,6]', 'the give-up, holding 3 to 6');
     await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
     fetches.release();
     await h.server.quiet();

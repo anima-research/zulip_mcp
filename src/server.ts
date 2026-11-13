@@ -1755,9 +1755,7 @@ export class ZulipMcplServer {
     for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
-      const first = Math.min(...held);
-      for (const id of held) if (id !== first) w.delivery.release(key, id);
-      w.delivery.hold(key, first, 'failed');
+      for (const id of held) w.delivery.hold(key, id, 'failed');
       this.delivery.save();
     }
     const read = this.catchupLimit === 0

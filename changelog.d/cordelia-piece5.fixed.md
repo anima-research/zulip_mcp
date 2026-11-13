@@ -117,11 +117,11 @@
   channel that the host holds no id for when the read runs, that read brings
   none of them, and the log says so where the give-up already sees it. A
   read that Zulip refuses for a reason other than its rate limit brings none
-  of them either, and the log gives the refusal. A later read of held
-  messages then offers the first of them, and once the host accepts it, the
-  rest aren't offered again, after a restart either. A reaction, or a change
-  about another message, that was waiting stays, and its turn comes after
-  the read.
+  of them either, and the log gives the refusal. They stay held, so on an
+  open channel a later read of held messages offers them, after messages
+  that arrived after them. If that read is refused too, the next
+  connection's catch-up brings them. A reaction, or a change about another
+  message, that was waiting stays, and its turn comes after the read.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip
