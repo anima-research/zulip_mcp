@@ -5833,3 +5833,53 @@ test("a read for held ids that the connection's end cuts short partway marks off
   await h.close();
   assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1, 2]);
 });
+
+test("a muted channel's read for held ids lets go of the holds at or below its place only: a message whose job waits on its lookup keeps its hold", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-held-read-'));
+  try {
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({
+      filters: plane, visible: [DESCRIPTOR, OTHER],
+      history: [streamMsg(1), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+    });
+    await initialize(h, true);
+    await settled(h);
+    for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+    h.policy.rejectIds.add('1');
+    h.adapter.emit!(streamMsg(1));
+    h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+    await until(() => h.delivery.heldIds('zulip:general').includes(1) && h.delivery.watermark('zulip:other') === 500, '1 refused, 500 accepted');
+    const real = h.adapter.fetchHistory!.bind(h.adapter);
+    let otherReading = false;
+    let releaseOther!: () => void;
+    const otherRead = new Promise<void>((resolve) => { releaseOther = resolve; });
+    h.adapter.fetchHistory = async (key, query) => {
+      if (h.adapter.wireOf(key) === 'zulip:other' && query.afterMessageId !== undefined) { otherReading = true; await otherRead; }
+      return real(key, query);
+    };
+    let releaseLookup!: () => void;
+    const lookup = new Promise<void>((resolve) => { releaseLookup = resolve; });
+    try {
+      breakQueue(h);
+      await until(() => otherReading, "other's read, holding the turn");
+      await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+      const key = h.adapter.keyOf('zulip:general');
+      const { channelId: _c, ...rest } = streamMsg(2);
+      h.adapter.enter!({ key, messageId: '2', ready: async () => { await lookup; return { message: { ...rest, key } as KeyedMessage }; } });
+      await until(() => h.delivery.heldIds('zulip:general').includes(2), "2's hold");
+      releaseOther();
+      await until(() => !h.delivery.heldIds('zulip:general').includes(1), "the muted read's hand, letting 1 go");
+      assert.deepEqual(h.delivery.heldIds('zulip:general'), [2], 'the message whose job waits on its lookup keeps its hold');
+    } finally {
+      releaseOther();
+      releaseLookup();
+    }
+    await h.server.quiet();
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

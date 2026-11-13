@@ -1234,7 +1234,8 @@ export class ZulipMcplServer {
   private async readHeld(r: Reading, key: ChannelKey, gap?: GapRead): Promise<Hand | void> {
     if (this.isMuted(key) || !this.isAllowed(key)) {
       return (ctx) => {
-        ctx.w.delivery.releaseAll(key);
+        const place = this.placeOf(key);
+        for (const id of ctx.w.delivery.heldIds(key)) if (place !== undefined && id <= place) ctx.w.delivery.release(key, id);
         this.delivery.save();
       };
     }
