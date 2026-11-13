@@ -20,7 +20,8 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { mayHaveBeenApplied, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { chunkMessage, ZULIP_MAX_MESSAGE_LENGTH } from "./content.js";
+import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import type { SentRecord } from "./platforms/adapter.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -30,7 +31,7 @@ import {
   prepareAttachments,
   resolveUploadPolicy,
   uploadPrepared,
-  withAttachmentLinks,
+  type UploadedFile,
   type UploadPolicy,
   type Uploader,
 } from "./uploads.js";
@@ -41,13 +42,6 @@ export interface SubscriptionRegistration {
   local: string[];
   refused: string[];
   reason?: string;
-}
-
-/** A message this server sent through a tool — recorded for rollback. */
-export interface SentRecord {
-  messageId: string;
-  channelId: string;
-  content: string;
 }
 
 /** What of a message's reactions the model may see. */
@@ -284,6 +278,19 @@ export class ZulipToolRuntime {
   /** Reaction suppression for history rendering (the filters plane). */
   setReactionPolicy(policy: ReactionPolicy): void {
     this.reactionPolicy = policy;
+  }
+
+  private async send(destination: Destination, content: string, uploaded: UploadedFile[], channelId: string) {
+    try {
+      return await sendMessage(this.api, destination, content, {
+        limit: this.maxMessageLength,
+        uploaded,
+        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+      });
+    } catch (err) {
+      if (err instanceof SendRefused) throw new Error(err.answer.msg ?? "Zulip refused the message");
+      throw err;
+    }
   }
 
   /** Resolve and check a reply before uploading files or sending any chunks. */
@@ -691,21 +698,14 @@ export class ZulipToolRuntime {
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
         const uploaded = await this.uploadFor(args);
-        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
-        const ids: number[] = [];
-        let last: any = null;
         const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
-        for (const chunk of chunkMessage(content)) {
-          const isDm = args.type === "private" || args.type === "direct";
-          // A stream send with no topic keeps sending the topic text "undefined", as it did through zulip-js, until #44 decides what it should do.
-          const topic = args.topic === undefined && !isDm ? "undefined" : args.topic;
-          last = await api.requestAnswer<{ id: number }>("POST", "/messages", { type: args.type, to: args.to, topic, content: chunk });
-          if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
-          ids.push(last.id);
-          this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
-        }
+        const isDm = args.type === "private" || args.type === "direct";
+        // A stream send with no topic keeps sending the topic text "undefined", as it did through zulip-js, until #44 decides what it should do.
+        const topic = args.topic === undefined && !isDm ? "undefined" : args.topic;
+        const { chunks, last } = await this.send({ type: args.type, to: args.to, topic }, hasText ? args.content : "", uploaded, channelId);
+        const ids = chunks.map((c) => c.id);
         return {
           ...last,
           ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
@@ -721,16 +721,8 @@ export class ZulipToolRuntime {
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
         const uploaded = await this.uploadFor(args);
-        const content = withAttachmentLinks(hasText ? args.content : "", uploaded);
-        const channelId = dmChannelIdFor(ids);
-        const sent: number[] = [];
-        let result: any = null;
-        for (const chunk of chunkMessage(content)) {
-          result = await api.requestAnswer<{ id: number }>("POST", "/messages", { type: "private", to: ids, content: chunk });
-          if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
-          sent.push(result.id);
-          this.onSent?.({ messageId: String(result.id), channelId, content: chunk });
-        }
+        const { chunks, last: result } = await this.send({ type: "private", to: ids }, hasText ? args.content : "", uploaded, dmChannelIdFor(ids));
+        const sent = chunks.map((c) => c.id);
         return {
           ...result,
           to_user_ids: ids,

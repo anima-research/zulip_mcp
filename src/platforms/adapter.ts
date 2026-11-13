@@ -22,6 +22,13 @@ import type {
   IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
 
+/** A message this server sent, as the rollback record keeps it. */
+export interface SentRecord {
+  messageId: string;
+  channelId: string;
+  content: string;
+}
+
 /** `messageIds` lists every platform message a publish produced (a long
  *  text is chunked); `messageId` is the last of them. */
 export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
@@ -185,6 +192,10 @@ export interface PlatformAdapter {
 
   /** Discover all channels visible to this connection. */
   discoverChannels(): Promise<ChannelDescriptor[]>;
+
+  /** Set by the MCPL server: each message a publish posts is reported here
+   *  as it is posted, so a rollback checkpoint can undo it. */
+  onSent?: ((sent: SentRecord) => void) | null;
 
   /**
    * Deliver content to a channel. `descriptor` is the registered descriptor

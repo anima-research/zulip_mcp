@@ -32,12 +32,14 @@ import type {
   PlatformAdapter,
   PublishResult,
   RoutingHints,
+  SentRecord,
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
-import { chunkMessage, cleanMarkdown } from '../content.js';
+import { cleanMarkdown } from '../content.js';
+import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
-import { uploadBlocks, withAttachmentLinks, type UploadPolicy, type Uploader } from '../uploads.js';
+import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
 import { isRefusal, mayHaveBeenApplied, ZulipRefused, type ZulipApi } from '../zulip-api.js';
 import {
   channelIdOf,
@@ -195,6 +197,7 @@ const DEFAULT_DM_DISCOVERY_LIMIT = 300;
 
 export class ZulipAdapter implements PlatformAdapter {
   readonly type = 'zulip';
+  onSent: ((sent: SentRecord) => void) | null = null;
 
   private eventLoop: ZulipEventLoop | null = null;
   private readonly identity: ZulipIdentity;
@@ -202,7 +205,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly backscrollLimits: ReadonlyMap<string, number>;
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
-  private readonly maxMessageLength: number | undefined;
+  private readonly maxMessageLength: number;
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
   private readonly formatTime: (d: Date) => string;
@@ -253,7 +256,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.backscrollLimits = options.backscrollLimits ?? new Map();
     this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
-    this.maxMessageLength = options.maxMessageLength;
+    this.maxMessageLength = options.maxMessageLength ?? ZULIP_MAX_MESSAGE_LENGTH;
     this.uploader = options.uploader ?? null;
     this.uploadPolicy = options.uploadPolicy ?? null;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
@@ -677,7 +680,7 @@ export class ZulipAdapter implements PlatformAdapter {
     content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult> {
-    let textContent = content
+    const textContent = content
       .filter((c): c is TextContent => c.type === 'text')
       .map(c => c.text)
       .join('\n');
@@ -685,14 +688,11 @@ export class ZulipAdapter implements PlatformAdapter {
     // (Zulip's own attachment form). Uploads happen before the send, so a
     // failed upload fails the publish whole; a send that fails after them
     // leaves unreferenced uploads, which Zulip garbage-collects.
-    if (this.uploader && this.uploadPolicy) {
-      const uploaded = await uploadBlocks(this.uploader, content, this.uploadPolicy);
-      textContent = withAttachmentLinks(textContent, uploaded);
-    }
-    if (!textContent) return { delivered: false };
+    const uploaded = this.uploader && this.uploadPolicy ? await uploadBlocks(this.uploader, content, this.uploadPolicy) : [];
+    if (!textContent && uploaded.length === 0) return { delivered: false };
 
     const dmIds = parseDmChannelId(channelId);
-    let target: Record<string, unknown>;
+    let target: Destination;
     let what: string;
     if (dmIds) {
       target = { type: 'private', to: dmIds };
@@ -710,14 +710,18 @@ export class ZulipAdapter implements PlatformAdapter {
       what = `message to #${streamName}`;
     }
 
-    // Zulip rejects anything over the realm's max_message_length; a long
-    // reply goes out as several messages rather than failing whole.
-    const messageIds: string[] = [];
-    for (const chunk of chunkMessage(textContent, this.maxMessageLength)) {
-      const result = await this.api.request<{ id?: number }>('POST', '/messages', what, { ...target, content: chunk });
-      messageIds.push(String(result.id));
+    try {
+      const { chunks } = await sendMessage(this.api, target, textContent, {
+        limit: this.maxMessageLength,
+        uploaded,
+        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+      });
+      const messageIds = chunks.map((c) => String(c.id));
+      return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
+    } catch (err) {
+      if (err instanceof SendRefused) throw new ZulipRefused(what, err.answer);
+      throw err;
     }
-    return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
   }
 
   /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */

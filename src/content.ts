@@ -313,29 +313,3 @@ export function cleanContent(html: string): string {
 export function cleanMarkdown(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').trim();
 }
-
-/** Zulip's default `max_message_length` realm setting. */
-export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
-
-/**
- * Split text into messages of at most `limit` characters, preferring
- * paragraph boundaries, then line boundaries, then a hard cut. Boundary
- * whitespace at the split is dropped; nothing else is.
- */
-export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
-  const out: string[] = [];
-  let rest = text;
-  while (rest.length > 0) {
-    if (rest.length <= limit) {
-      out.push(rest);
-      break;
-    }
-    const window = rest.slice(0, limit + 1);
-    let cut = window.lastIndexOf('\n\n');
-    if (cut <= 0) cut = window.lastIndexOf('\n');
-    if (cut <= 0) cut = limit;
-    out.push(rest.slice(0, cut));
-    rest = rest.slice(cut).replace(/^\n+/, '');
-  }
-  return out.filter((c) => c.length > 0);
-}
