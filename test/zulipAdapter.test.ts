@@ -333,7 +333,7 @@ test("the bot's own move reaches the server marked as the bot's, its own content
   ]);
 });
 
-test("placeOf answers a seen message's place as its moves left it, and nothing for a message that moved to a stream the adapter doesn't know", async () => {
+test("whereSeen answers a seen message's place as its moves left it, and nothing for a message that moved to a stream the adapter doesn't know", async () => {
   const events = [
     { id: 1, type: 'message', flags: [], message: raw(5) },
     { id: 2, type: 'message', flags: [], message: raw(6) },
@@ -368,7 +368,7 @@ test("placeOf answers a seen message's place as its moves left it, and nothing f
   } finally {
     console.error = original;
   }
-  const place = (id: string) => adapter.placeOf?.(id) ?? 'none';
+  const place = (id: string) => adapter.whereSeen?.(id) ?? 'none';
   assert.deepEqual(
     { 5: place('5'), 6: place('6'), 7: place('7'), 8: place('8') },
     { 5: { key: streamKey(7), topic: 'releases' }, 6: { key: streamKey(7), topic: 'releases' }, 7: 'none', 8: 'none' },

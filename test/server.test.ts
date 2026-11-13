@@ -249,7 +249,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
         : null;
     },
     stopEvents() { adapter.emit = null; adapter.enter = null; adapter.enterChange = null; },
-    placeOf(messageId: string) { return places.get(messageId) ?? null; },
+    whereSeen(messageId: string) { return places.get(messageId) ?? null; },
   } as unknown as FakeAdapter;
   Object.defineProperty(adapter, 'discoverChannels', {
     get: () => async () => learn(await discover()),

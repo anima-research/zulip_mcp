@@ -290,7 +290,10 @@ export interface PlatformAdapter {
   noteSelfDeleted?(messageId: number): void;
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
-  placeOf?(messageId: string): { key: ChannelKey; topic: string } | null;
+  /** Where the adapter last saw a message: its channel and topic, or null for
+   *  one it hasn't seen, a direct message, or one that left for a stream it
+   *  doesn't know. */
+  whereSeen?(messageId: string): { key: ChannelKey; topic: string } | null;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
