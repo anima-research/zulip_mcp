@@ -75,7 +75,7 @@ function zulip(streams: Record<number, Stream>, messages: Record<number, Message
   } finally {
     console.error = original;
   }
-  const adapter = new ZulipAdapter(api, 790, 's', { uploader, uploadPolicy, ...(limit ? { maxMessageLength: limit } : {}) } as never);
+  const adapter = new ZulipAdapter(api, { selfUserId: 790, sessionId: 's' }, { uploader, uploadPolicy, ...(limit ? { maxMessageLength: limit } : {}) } as never);
   const posts = () => calls.filter((c) => c.method === 'POST' && c.path === '/messages').map((c) => c.params.content);
   const edits = () => calls.filter((c) => c.method === 'PATCH').map((c) => c.params.content);
   const reads = (prefix: string) => calls.filter((c) => c.method === 'GET' && c.path.startsWith(prefix));

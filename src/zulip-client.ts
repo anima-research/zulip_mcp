@@ -5,7 +5,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
-import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, zulipApi, type ZulipApi } from './zulip-api.js';
+import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, selfIdGate, zulipApi, type ZulipApi } from './zulip-api.js';
 import type { StreamDirectory } from './stream-directory.js';
 
 export interface ZulipSession {
@@ -24,10 +24,6 @@ export interface ZulipSession {
 
 export interface ZulipClientOptions {
   timeoutMs?: number;
-}
-
-function selfFilterOff(why: string): void {
-  console.error(`Failed to fetch bot profile for self-filter: ${why}. The self-filter is off for this run, so the bot's own messages come back to the agent.`);
 }
 
 function basic(email: string, apiKey: string): string {
@@ -86,32 +82,25 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
 
   realm = realm.replace(/\/+$/, "");
   const authHeader = email && apiKey ? basic(email, apiKey) : "";
-  const api = zulipApi(httpTransport({ apiUrl, authHeader: basic(email, apiKey), timeoutMs: options.timeoutMs }));
+  const transport = httpTransport({ apiUrl, authHeader: basic(email, apiKey), timeoutMs: options.timeoutMs });
+  const gate = selfIdGate(transport);
+  const api = zulipApi(gate.transport);
 
   // Keys the persistent state files. The bot's identity is the natural
   // default whichever way the credentials arrived (env or zuliprc); two
   // sessions of one bot sharing a state dir must set ZULIP_SESSION_ID.
   const sessionId = env.ZULIP_SESSION_ID || email || env.ZULIP_USERNAME || "default";
 
-  // Fail-open: if profile fetch fails, leave selfUserId null (no self-filter).
-  let selfUserId: number | null = null;
-  try {
-    const profile = await api.requestAnswer<{ user_id?: unknown }>("GET", "/users/me", {}, { timeoutMs: LONG_TIMEOUT_MS });
-    if (profile.result === "success" && typeof profile.user_id === "number") {
-      selfUserId = profile.user_id;
-      console.error(`Zulip MCP bot user_id: ${selfUserId}`);
-    } else {
-      selfFilterOff(isRefusal(profile) ? `Zulip refused GET /users/me: ${refusalText(profile)}` : "Zulip's answer to GET /users/me held no user id");
-    }
-  } catch (err) {
-    selfFilterOff((err instanceof Error ? err.message : String(err)).replace(/\.+$/, ""));
+  const failure = await gate.read({ timeoutMs: LONG_TIMEOUT_MS });
+  if (failure) {
+    console.error(`Failed to read the bot's own user id: ${failure.reason}. A later request reads it again, and fails if that read does.`);
   }
 
   // The realm's upload cap, so the outbound ceiling is what the server will
   // actually accept rather than a guess. Fail-open: unknown → null.
   let maxUploadBytes: number | null = null;
   try {
-    const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS });
+    const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS, needsSelfId: false });
     const mib = settings.result === "success" ? settings.max_file_upload_size_mib : undefined;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
     else if (isRefusal(settings)) {
@@ -122,7 +111,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   }
 
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
-  return { api, selfUserId, realm, authHeader, sessionId, maxUploadBytes };
+  return { api, get selfUserId() { return gate.selfUserId; }, realm, authHeader, sessionId, maxUploadBytes };
 }
 
 /**
@@ -151,7 +140,7 @@ export async function subscribeConfigured(api: ZulipApi, directory: StreamDirect
   try {
     const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
       subscriptions: streams.map((name) => ({ name })),
-    });
+    }, { needsSelfId: false });
     if (isRefusal(result)) {
       console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]: Zulip refused POST /users/me/subscriptions: ${refusalText(result)}`);
       return;

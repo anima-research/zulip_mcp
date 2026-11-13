@@ -70,7 +70,7 @@ const onlyDev: FilterView = { streamAllowed: (s) => s === 'dev', dmAllowed: (u) 
 
 test('fetchHistory withholds the bot\'s own messages and disallowed senders, and reports the newest id it scanned', async () => {
   const { client } = fakeClient([raw(1, { sender_id: SELF }), raw(2, { sender_id: SELF }), raw(3), dm(4, 7), dm(5, 42), dm(6, SELF)]);
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: onlyDev, directory: directoryOf() });
 
   // A stream outside the allowlist: nothing, without a fetch.
   const none = await adapter.fetchHistory(GENERAL, { limit: 10 });
@@ -86,7 +86,7 @@ test('fetchHistory withholds the bot\'s own messages and disallowed senders, and
 
   // A page of nothing but the bot's own messages is not the end of history.
   const allowAll: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const wide = new ZulipAdapter(client, SELF, 's', { filters: allowAll, directory: directoryOf() });
+  const wide = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: allowAll, directory: directoryOf() });
   const own = await wide.fetchHistory(GENERAL, { limit: 2, afterMessageId: '0' });
   assert.deepEqual(own.messages, []);
   assert.equal(own.scannedThrough, 2);
@@ -95,13 +95,13 @@ test('fetchHistory withholds the bot\'s own messages and disallowed senders, and
 
 test('fetchContext injects nothing for a stream outside the allowlist, and only allowed senders of a DM', async () => {
   const { client, calls } = fakeClient([raw(3), dm(4, 7), dm(5, 42), dm(6, SELF)]);
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: onlyDev, directory: directoryOf() });
   assert.equal(await adapter.fetchContext(GENERAL, undefined, 5), null);
   assert.equal(calls.retrieve.length, 0, 'not even fetched');
   const injection = await adapter.fetchContext(dmKey([7, 42]), undefined, 5);
   assert.ok(injection);
   assert.match(injection!.content, /Bo: m5/);
-  const timed = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, formatTime: () => 'T', directory: directoryOf() });
+  const timed = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: onlyDev, formatTime: () => 'T', directory: directoryOf() });
   const lines = (await timed.fetchContext(dmKey([7, 42]), undefined, 5))!.content.split('\n');
   assert.deepEqual(lines.slice(1), ['[T id=5] [DM] Bo: m5', '[T id=6] [DM] Bot: m6'], 'injected history uses the shared line shape, ids included');
   assert.match(injection!.content, /Bot: m6/, 'the bot\'s own turns stay in context');
@@ -110,7 +110,7 @@ test('fetchContext injects nothing for a stream outside the allowlist, and only 
 
 test('ensureSubscribed asks Zulip every time — a subscription dropped by unlisten is not remembered as live', async () => {
   const { client, calls } = fakeClient([]);
-  const adapter = new ZulipAdapter(client, SELF, 's', { directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { directory: directoryOf() });
   await adapter.ensureSubscribed(GENERAL);
   await adapter.ensureSubscribed(GENERAL);
   assert.equal(calls.subscribe.length, 2);
@@ -136,7 +136,7 @@ test('publish uploads image blocks and links them after the text; without an upl
   ];
 
   const uploadPolicy = { roots: new Map<string, string>(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
-  const withUploads = new ZulipAdapter(client, SELF, 's', { uploader, uploadPolicy });
+  const withUploads = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { uploader, uploadPolicy });
   const res = await withUploads.publish(GENERAL, undefined, blocks, { threadId: 'deploys' });
   assert.deepEqual(res, { delivered: true, messageId: '77', messageIds: ['77'] });
   assert.deepEqual(uploaded, ['image-2.png']);
@@ -147,11 +147,11 @@ test('publish uploads image blocks and links them after the text; without an upl
   assert.deepEqual(sends[1], { type: 'private', to: [42], content: '[image-1.png](/user_uploads/1/image-1.png)' });
 
   // A failed upload fails the publish before anything is sent.
-  const failing = new ZulipAdapter(client, SELF, 's', { uploader: { async upload() { throw new Error('quota'); } }, uploadPolicy });
+  const failing = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { uploader: { async upload() { throw new Error('quota'); } }, uploadPolicy });
   await assert.rejects(failing.publish(GENERAL, undefined, blocks), /quota/);
   assert.equal(sends.length, 2);
 
-  const plain = new ZulipAdapter(client, SELF, 's');
+  const plain = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' });
   await plain.publish(GENERAL, undefined, blocks);
   assert.equal(sends[2].content, 'chart attached');
   assert.equal((await plain.publish(GENERAL, undefined, [blocks[1]])).delivered, false);
@@ -190,7 +190,7 @@ function streamEvent(id: number, stream: string, streamId: number | undefined, o
 
 test('every stream message carries its stream descriptor, so a stream joined after startup can be registered (#20)', async () => {
   const client = eventingClient([], [streamEvent(900, 'ops', 12), streamEvent(901, 'ops', 12), streamEvent(902, 'general', 7)], [{ name: 'ops', stream_id: 12 }, { name: 'general', stream_id: 7 }]);
-  const adapter = new ZulipAdapter(client, SELF, 's');
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' });
   const seen: { key: string; descriptor?: string }[] = [];
   adapter.startEvents(inTurn(({ message: m, newChannel: descriptor }) => { seen.push({ key: m.key, descriptor: descriptor?.id }); }));
   await new Promise((r) => setTimeout(r, 50));
@@ -204,7 +204,7 @@ test('every stream message carries its stream descriptor, so a stream joined aft
 
 test('the descriptor a message carries matches the one discovery builds for the same stream (#20)', async () => {
   const client = eventingClient([], [streamEvent(900, 'general', 7)], [{ name: 'general', stream_id: 7 }]);
-  const adapter = new ZulipAdapter(client, SELF, 's');
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' });
   const discovered = (await adapter.discoverChannels()).find((c) => c.id === 'zulip:general')!;
   let fromEvent: ChannelDescriptor | undefined;
   adapter.startEvents(inTurn(({ newChannel: descriptor }) => { fromEvent = descriptor; }));
@@ -219,7 +219,7 @@ test('the descriptor a message carries matches the one discovery builds for the 
 
 test('a message without a stream_id is placed by its exact name, and its descriptor has the stream id (#20)', async () => {
   const client = eventingClient([], [streamEvent(900, 'ops', undefined)], [{ name: 'ops', stream_id: 12 }]);
-  const adapter = new ZulipAdapter(client, SELF, 's');
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' });
   const seen: { id: string; address: unknown }[] = [];
   adapter.startEvents(inTurn(({ newChannel: descriptor }) => { if (descriptor) seen.push({ id: descriptor.id, address: descriptor.address }); }));
   await new Promise((r) => setTimeout(r, 50));
@@ -242,7 +242,7 @@ test("an edit that also moves a later message, of a first message the cache does
     'GET /events': async () => { polls++; if (polls === 1) return { events }; return new Promise(() => {}); },
   }).api;
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const original = console.error;
   console.error = () => {};
@@ -286,7 +286,7 @@ test('two moves of one cached message, the second arriving while the first waits
     },
   }).api;
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   let openLane7!: () => void;
   const lanes = new Map<string, Promise<void>>([[String(streamKey(7)), new Promise<void>((r) => { openLane7 = r; })]]);
@@ -341,7 +341,7 @@ test("the bot's own move reaches the server marked as the bot's, its own content
     },
   }).api;
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -386,7 +386,7 @@ test("whereSeen answers a seen message's place as its moves left it, and nothing
     },
   }).api;
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -432,7 +432,7 @@ test("a message seen again loses its mark of a move to an unknown stream: by a m
     },
   });
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -462,7 +462,7 @@ test('a history read of a message the cache already holds evicts nothing, even w
   const rows = Array.from({ length: 2000 }, (_, i) => raw(i + 1));
   const { client } = fakeClient(rows);
   const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, directory: directoryOf() });
   await adapter.fetchHistory(GENERAL, { limit: 2000 });
   await adapter.fetchHistory(GENERAL, { limit: 1, afterMessageId: '1499' });
   assert.deepEqual(adapter.whereSeen?.('1') ?? 'none', { key: GENERAL, topic: 'deploys' }, 'the oldest entry stays');
@@ -513,7 +513,7 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
     },
   }).api;
   const filters: FilterView = { streamAllowed: (s) => s === 'general', dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const delivered: string[] = [];
   const changes: MessageChangeEvent[] = [];
@@ -587,7 +587,7 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
       return { events: [] };
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -627,7 +627,7 @@ test('a delete noted again becomes the newest mark, and noting it again removes 
       return { events: [] };
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -683,7 +683,7 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
       return { events: [] };
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const changes: MessageChangeEvent[] = [];
   const original = console.error;
@@ -723,7 +723,7 @@ test('a change to the bot\'s own DM message is judged by whom it was sent to', a
   }).api;
   const run = async (filters: FilterView) => {
     polls = 0;
-    const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, filters });
+    const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, filters });
     const changes: MessageChangeEvent[] = [];
     const original = console.error;
     console.error = () => {};
@@ -765,7 +765,7 @@ test('a message from a stream created after startup carries its descriptor, with
     },
   }).api;
   const filters: FilterView = { streamAllowed: (s) => s !== 'secret', dmAllowed: () => true };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const seen: { id: string; key: string; newChannel?: string; address?: unknown }[] = [];
   const original = console.error;
@@ -816,7 +816,7 @@ test('a stream the directory does not hold costs one list read for that stream, 
       return { events: [] };
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory: directoryOf() });
   const seen: string[] = [];
   const original = console.error;
   console.error = () => {};
@@ -851,7 +851,7 @@ test('a miss while a read of the stream list is in flight waits for that read', 
     },
   }).api;
   const directory = directoryOf();
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory });
   const first = adapter.refreshStreams('stream 11');
   let secondDone = false;
   const second = adapter.refreshStreams('#north').then(() => { secondDone = true; });
@@ -879,7 +879,7 @@ test('a miss that joined a read already in flight is read for again at its next 
     },
   }).api;
   const directory = directoryOf();
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory });
   const first = adapter.refreshStreams('stream 11');
   const joined = adapter.refreshStreams('stream 12');
   const deadline = Date.now() + 2000;
@@ -904,7 +904,7 @@ test('a miss within its hold-off still waits for a read already in flight, which
     },
   }).api;
   const directory = directoryOf();
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory });
   await adapter.refreshStreams('stream 12');
   assert.equal(directory.nameOf(12), undefined, 'the first read has no #south, so stream 12 is held off');
   const other = adapter.refreshStreams('stream 11');
@@ -932,7 +932,7 @@ test('a stream-list answer without a streams array is no list: the directory kee
   directory.restart({ streams: { '7': 'general', '11': 'north' } });
   const removed: number[] = [];
   directory.onChange((change) => removed.push(...change.removed.map((r) => r.id)));
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory });
   const original = console.error;
   console.error = () => {};
   try {
@@ -968,7 +968,7 @@ test('a stopped event loop\'s registration that answers late leaves the director
     'DELETE /events': { result: 'success' },
   }).api;
   const directory = directoryOf();
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory });
   const original = console.error;
   console.error = () => {};
   try {
@@ -1009,7 +1009,7 @@ test('while a change waits for the lookup that places it, later reactions and ch
       ] };
     },
   });
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory: directoryOf() });
   const placed: string[] = [];
   adapter.startEvents(() => {}, undefined,
     (r) => { placed.push(`reaction ${r.messageId}`); },
@@ -1046,7 +1046,7 @@ test("a stopped event loop's events that still wait for their placement are not 
       return { result: 'success', message: raw(call.id!) };
     },
   });
-  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { dmDiscoveryLimit: 0, directory: directoryOf() });
   const placed: string[] = [];
   const deadline = performance.now() + 2000;
   adapter.startEvents(() => {}, undefined, (r) => { placed.push(r.messageId); });
@@ -1080,7 +1080,7 @@ test("a DM's row is built at its turn: an edit that arrived while it waited give
       return { events: [] };
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0 });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
   const messages: IncomingEntry[] = [];
   const changes: ChangeEntry[] = [];
@@ -1109,7 +1109,7 @@ test("a new DM conversation whose first message is taken out while it waits stil
       return new Promise(() => {});
     },
   }).api;
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0, directory: directoryOf() });
   const messages: IncomingEntry[] = [];
   const changes: ChangeEntry[] = [];
   adapter.startEvents((entry) => { messages.push(entry); }, undefined, undefined, (entry) => { changes.push(entry); });
@@ -1138,7 +1138,7 @@ test("a reaction to a direct message is judged by that message's sender, not by 
       ] };
     },
   });
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: onlyDev, dmDiscoveryLimit: 0, directory: directoryOf() });
   const delivered: string[] = [];
   const reacted: { messageId: string; snippet: string | null }[] = [];
   adapter.startEvents(inTurn(({ message: m }) => { delivered.push(m.messageId); }), undefined, (r) => { reacted.push({ messageId: r.messageId, snippet: r.messageSnippet }); });
@@ -1166,7 +1166,7 @@ test("the adapter passes on a reaction to the bot's own direct message, for the 
     },
   });
   const annByEmail: FilterView = { streamAllowed: () => true, dmAllowed: (u) => u.email === 'ann@example.com' };
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: annByEmail, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: annByEmail, dmDiscoveryLimit: 0, directory: directoryOf() });
   const reacted: string[] = [];
   adapter.startEvents(inTurn(() => {}), undefined, (r) => { reacted.push(r.messageId); });
   try {

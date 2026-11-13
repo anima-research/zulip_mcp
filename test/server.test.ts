@@ -37,6 +37,8 @@ import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { realm as httpRealm } from './http-realm.ts';
+import { initializeZulipClient, type ZulipSession } from '../src/zulip-client.ts';
 import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
@@ -4880,7 +4882,7 @@ function quoteHistory(readableTarget = true): ZulipAdapter {
       if (!readableTarget) throw new Error('target unavailable');
       return { message: original };
     },
-  }).api, 100, 'session', { directory: historyStreams() });
+  }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
 }
 
 test('a refused quote-reply push is redelivered from classified history when another stream is accepted', async () => {
@@ -5066,7 +5068,7 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
           display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', content: 'original',
         } };
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     second = harness({ stateDir: dir, sessionId: 'budget' });
     second.adapter.visible.push(other);
     second.adapter.fetchHistory = (channelId, query) => {
@@ -5109,7 +5111,7 @@ test('the reconnect catch-up and the missed-tally backfill wait 90 s for each hi
         if (path === '/messages') bounds.push(opts?.timeoutMs);
         return api.request(verb, path, what, params, opts);
       }) as typeof api.request,
-    }, 100, 'session', { directory: historyStreams() });
+    }, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     second = harness({ stateDir: dir, sessionId: 'bound' });
     second.adapter.fetchHistory = (channelId, query) => history.fetchHistory(channelId, query);
     await initialize(second, true);
@@ -5251,7 +5253,7 @@ test('a budget-starved quote row is retried before catch-up advances past it', a
         gets++;
         return { message: { ...rows[0], id: message_id, sender_id: message_id === 508 ? 100 : 102 } };
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 10, 'immediate retry verifies and delivers row 10 without another gap');
@@ -5445,7 +5447,7 @@ test('R2-2: a timed-out quote target can answer on the single deferred pass', { 
         if (++gets === 1) return new Promise(() => {});
         return { message: { ...row, id: 500, sender_id: 100 } };
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 5, 'timeout retried', 7000);
@@ -5482,7 +5484,7 @@ test('R2-2: many hung quote targets use at most two walks and six seconds of wai
         if (cleaningUp) return { result: 'error' };
         return new Promise((resolve) => release.push(() => resolve({ result: 'error' })));
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     const started = performance.now();
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
@@ -5525,7 +5527,7 @@ test('R2-2: catch-up shares a total quote wait budget across history pages', asy
         now += 1500;
         return { message: { ...rows[0], id: message_id, sender_id: 102 } };
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 11, 'all pages scanned with bounded quote waiting');
@@ -5631,7 +5633,7 @@ test('R3-3: slow history HTTP does not spend the quote-GET wait allowance', asyn
         gets++;
         return { message: { ...row, id: 500, sender_id: 100 } };
       },
-    }).api, 100, 'session', { directory: historyStreams() });
+    }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 3, 'catch-up complete');
@@ -6457,7 +6459,7 @@ test('after a break of the event queue, a read that Zulip refuses by its rate li
       }
       return { messages: [row(2), row(3)].filter((m) => m.id > anchor), found_newest: true };
     },
-  }).api, 100, 'session', { directory: historyStreams() });
+  }).api, { selfUserId: 100, sessionId: 'session' }, { directory: historyStreams() });
   h.adapter.fetchHistory = history.fetchHistory.bind(history);
   breakQueue(h);
   h.adapter.emit!(streamMsg(3));
@@ -6550,6 +6552,50 @@ test("a connection that ends while a lane waits to try its read again makes no t
   assert.equal(second.pushed.length, 1, 'the catch-up block');
   assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=2\]/);
   await second.close();
+});
+
+test("after a break of the event queue, a read of history that meets the bot's own user id still unknown is tried again after the wait Zulip asked for in refusing the id's read", async () => {
+  let profileReads = 0;
+  const row = (id: number): ZulipRawMessage => ({
+    id, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+    display_recipient: 'general', subject: 'deploys', timestamp: 1_700_000_000 + id, type: 'stream', flags: [], content: `msg ${id}`,
+  });
+  const z = await httpRealm({
+    'GET /users/me': () => {
+      profileReads++;
+      if (profileReads === 1) return 'drop';
+      if (profileReads === 2) return { status: 429, json: { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'API usage exceeded rate limit', 'retry-after': 5 } };
+      return { json: { result: 'success', user_id: 100 } };
+    },
+    'GET /messages': (r) => ({ json: { result: 'success', messages: [row(2), row(3)].filter((m) => m.id > Number(r.query.get('anchor'))), found_newest: true, found_oldest: false } }),
+  });
+  const original = console.error;
+  console.error = () => {};
+  let session: ZulipSession;
+  try {
+    session = await initializeZulipClient({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+  } finally { console.error = original; }
+  const waits = heldWaits();
+  const h = harness({ readRetryWait: waits.wait });
+  try {
+    assert.equal(session.selfUserId, null, "the start's read failed");
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    const history = new ZulipAdapter(session.api, session, { directory: historyStreams() });
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    breakQueue(h);
+    h.adapter.emit!(streamMsg(3));
+    await until(() => waits.asked.length === 1, 'the wait before the second try');
+    assert.deepEqual(waits.asked, [5000], 'the wait is the retry-after Zulip gave');
+    assert.equal(z.requests.filter((r) => r.path === '/messages').length, 0, 'no read of history went out');
+    waits.release();
+    await until(() => gapNoticeIn(h), 'the gap notice');
+    await h.server.quiet();
+    assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  } finally { await h.close(); z.close(); }
 });
 
 test("a read that gets no answer is tried again after 2 s, doubling to at most 60 s, and after a refusal by the rate limit after the longer of that step and Zulip's retry-after", async () => {

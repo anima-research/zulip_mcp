@@ -3,102 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { once } from 'node:events';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { initializeZulipClient, subscribeConfigured } from '../src/zulip-client.ts';
 import type { StreamDirectory } from '../src/stream-directory.ts';
 import { standInApi } from './zulip-stand-in.ts';
 import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
-
-interface Recorded {
-  method: string;
-  rawPath: string;
-  path: string;
-  query: URLSearchParams;
-  body: string;
-  contentType: string | undefined;
-  authorization: string | undefined;
-  closed: Promise<void>;
-}
-
-type Answer =
-  | { json: unknown; status?: number; delayMs?: number }
-  | { html: string; status: number }
-  | 'hang'
-  | 'stall-body'
-  | { slow: string[]; everyMs: number };
-
-async function realm(answers: Record<string, Answer | ((r: Recorded) => Answer)>) {
-  const requests: Recorded[] = [];
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => {
-      const url = new URL(req.url ?? '/', 'http://realm.test');
-      const path = url.pathname.replace(/^\/api\/v1/, '');
-      const recorded: Recorded = {
-        method: req.method ?? '',
-        rawPath: url.pathname,
-        path,
-        query: url.searchParams,
-        body: Buffer.concat(chunks).toString(),
-        contentType: req.headers['content-type'],
-        authorization: req.headers.authorization,
-        closed: once(res, 'close').then(() => undefined),
-      };
-      requests.push(recorded);
-      const found = answers[`${recorded.method} ${path}`] ?? defaults[`${recorded.method} ${path}`];
-      const answer = typeof found === 'function' ? found(recorded) : found;
-      if (answer === undefined) {
-        res.statusCode = 404;
-        res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ result: 'error', msg: `no stand-in for ${recorded.method} ${path}` }));
-      } else if (answer === 'hang') {
-      } else if (answer === 'stall-body') {
-        res.statusCode = 200;
-        res.setHeader('content-type', 'application/json');
-        res.write('{"result":"success","streams":[');
-      } else if ('slow' in answer) {
-        res.statusCode = 200;
-        res.setHeader('content-type', 'text/plain');
-        const parts = [...answer.slow];
-        const next = () => {
-          const part = parts.shift();
-          if (part === undefined) { res.end(); return; }
-          res.write(part);
-          setTimeout(next, answer.everyMs);
-        };
-        next();
-      } else if ('html' in answer) {
-        res.statusCode = answer.status;
-        res.setHeader('content-type', 'text/html');
-        res.end(answer.html);
-      } else {
-        const send = () => {
-          res.statusCode = answer.status ?? 200;
-          res.setHeader('content-type', 'application/json');
-          res.end(JSON.stringify(answer.json));
-        };
-        if (answer.delayMs) setTimeout(send, answer.delayMs);
-        else send();
-      }
-    });
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = (server.address() as { port: number }).port;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    requests,
-    close: () => { server.closeAllConnections(); server.close(); },
-  };
-}
-
-const defaults: Record<string, Answer> = {
-  'GET /users/me': { json: { result: 'success', user_id: 790, email: 'bot@example.com' } },
-  'GET /server_settings': { json: { result: 'success', max_file_upload_size_mib: 25 } },
-};
+import { realm } from './http-realm.ts';
+import { ZulipAdapter } from '../src/platforms/zulip.ts';
+import { dmKey } from '../src/channel-key.ts';
+import { ZulipEventLoop } from '../src/platforms/zulip-events.ts';
 
 async function serverOn(realmUrl: string, env: Record<string, string> = {}, options: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
@@ -113,6 +26,12 @@ async function serverOn(realmUrl: string, env: Record<string, string> = {}, opti
   } finally {
     console.error = original;
   }
+}
+
+function toolsKnowingTheId(realmUrl: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
+  const session = { api: zulipApi(httpTransport({ apiUrl: `${realmUrl}/api/v1`, authHeader: '' })), selfUserId: 790, realm: realmUrl, authHeader: '', sessionId: 't' };
+  return { tools: new ZulipToolRuntime(session, dir), done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('a long edit_message sends its text in the body, and nothing in the URL', async () => {
@@ -233,7 +152,7 @@ test('delete_message keeps its note of the delete while the delete may have been
   } finally { s.done(); z.close(); }
   const gone = await realm({});
   gone.close();
-  const refused = await serverOn(gone.url);
+  const refused = toolsKnowingTheId(gone.url);
   refused.tools.onDeleteFailed = (id) => failed.push(id);
   try {
     await assert.rejects(refused.tools.handleToolCall('delete_message', { message_id: 58 }));
@@ -256,7 +175,7 @@ test('send_message to a person with no topic sends no topic parameter', async ()
 test('a refused connection says the request was not sent', async () => {
   const z = await realm({});
   z.close();
-  const s = await serverOn(z.url);
+  const s = toolsKnowingTheId(z.url);
   try {
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
@@ -342,7 +261,7 @@ test('a password exchange that Zulip refuses is logged with Zulip\'s words and t
   } finally { z.close(); }
 });
 
-test('a refused read of the bot\'s profile, or of the realm\'s settings, is logged with Zulip\'s words, and the profile\'s line says the self-filter is off', async () => {
+test('a refused read of the bot\'s profile, or of the realm\'s settings, is logged with Zulip\'s words, and the profile\'s line says that a later request reads it again', async () => {
   const z = await realm({
     'GET /users/me': { status: 429, json: { result: 'error', msg: 'API usage exceeded rate limit', code: 'RATE_LIMIT_HIT', 'retry-after': 0.2 } },
     'GET /server_settings': { status: 400, json: { result: 'error', msg: 'Invalid subdomain', code: 'BAD_REQUEST' } },
@@ -351,7 +270,7 @@ test('a refused read of the bot\'s profile, or of the realm\'s settings, is logg
     const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
     assert.equal(session.selfUserId, null);
     assert.equal(session.maxUploadBytes, null);
-    assert.ok(lines.includes('Failed to fetch bot profile for self-filter: Zulip refused GET /users/me: API usage exceeded rate limit (RATE_LIMIT_HIT). The self-filter is off for this run, so the bot\'s own messages come back to the agent.'), lines.join('\n'));
+    assert.ok(lines.includes('Failed to read the bot\'s own user id: Zulip answered GET /users/me with HTTP 429: API usage exceeded rate limit (RATE_LIMIT_HIT). A later request reads it again, and fails if that read does.'), lines.join('\n'));
     assert.ok(lines.includes('Failed to read realm server settings (upload cap): Zulip refused GET /server_settings: Invalid subdomain (BAD_REQUEST).'), lines.join('\n'));
   } finally { z.close(); }
 });
@@ -367,17 +286,17 @@ test('a password exchange whose answer holds no API key, or an empty one, gets t
   }
 });
 
-test('a profile answer with no user id, or a profile read with no answer, says that the self-filter is off', async () => {
+test('a profile answer with no user id, or a profile read with no answer, says that a later request reads it again', async () => {
   const noId = await realm({ 'GET /users/me': { json: { result: 'success', email: 'bot@example.com' } } });
   const unanswered = await realm({ 'GET /users/me': { html: '<html><body>502 Bad Gateway</body></html>', status: 502 } });
   try {
     for (const [z, why] of [
-      [noId, "Zulip's answer to GET /users/me held no user id"],
+      [noId, "Zulip's answer to GET /users/me (HTTP 200) held no user id"],
       [unanswered, "Zulip's answer to GET /users/me wasn't JSON (HTTP 502)"],
     ] as const) {
       const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
       assert.equal(session.selfUserId, null);
-      assert.ok(lines.includes(`Failed to fetch bot profile for self-filter: ${why}. The self-filter is off for this run, so the bot's own messages come back to the agent.`), lines.join('\n'));
+      assert.ok(lines.includes(`Failed to read the bot's own user id: ${why}. A later request reads it again, and fails if that read does.`), lines.join('\n'));
     }
   } finally { noId.close(); unanswered.close(); }
 });
@@ -729,4 +648,206 @@ test("a refusal carries Zulip's code, and a rate limit's retry-after in seconds"
       return true;
     });
   } finally { z.close(); }
+});
+
+const bot = { json: { result: 'success', user_id: 790, email: 'bot@example.com' } };
+const ownMessage = {
+  id: 1001, sender_id: 790, sender_full_name: 'Bot', sender_email: 'bot@example.com',
+  type: 'stream', stream_id: 7, display_recipient: 'general', subject: 'deploys', content: 'my own words', timestamp: 1_700_000_001,
+};
+const dmFromAnn = {
+  id: 1002, sender_id: 7, sender_full_name: 'Ann', sender_email: 'ann@example.com', type: 'private',
+  display_recipient: [{ id: 7, full_name: 'Ann', email: 'ann@example.com' }, { id: 790, full_name: 'Bot', email: 'bot@example.com' }],
+  subject: '', content: 'hello', timestamp: 1_700_000_002,
+};
+
+for (const [how, first] of [
+  ['gets no answer', 'drop'],
+  ['is refused by the rate limit', { status: 429, json: { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'API usage exceeded rate limit', 'retry-after': 0.5 } }],
+  ['gets a server error with a JSON body', { status: 500, json: { result: 'error', msg: 'Internal server error' } }],
+  ['gets a success that holds no user id', { json: { result: 'success', email: 'bot@example.com' } }],
+] as const) {
+  test(`a start whose read of the bot's profile ${how} hands the host nothing before Zulip gives the id, and then drops the bot's own message and keys a direct message as a normal run does`, { timeout: 10_000 }, async () => {
+    let profileReads = 0;
+    let polls = 0;
+    const z = await realm({
+      'GET /users/me': () => (++profileReads === 1 ? first : bot),
+      'POST /register': { json: { result: 'success', queue_id: 'q1', last_event_id: -1, streams: [{ stream_id: 7, name: 'general', invite_only: false }] } },
+      'GET /events': () => (++polls === 1
+        ? { json: { result: 'success', events: [{ id: 0, type: 'message', message: ownMessage, flags: [] }, { id: 1, type: 'message', message: dmFromAnn, flags: [] }] } }
+        : { json: { result: 'success', events: [] }, delayMs: 50 }),
+    });
+    const s = await serverOn(z.url);
+    const adapter = new ZulipAdapter(s.session.api, s.session);
+    const handed: { key: string; messageId: string; selfUserId: number | null }[] = [];
+    try {
+      assert.equal(s.session.selfUserId, null, "the start's read failed");
+      const arrived = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 5_000);
+        adapter.startEvents((entry) => {
+          handed.push({ key: entry.key, messageId: entry.messageId, selfUserId: s.session.selfUserId });
+          if (entry.messageId === String(dmFromAnn.id)) { clearTimeout(timer); resolve(true); }
+        });
+      });
+      assert.ok(arrived, 'the direct message reached the adapter within 5 s');
+      assert.deepEqual(handed, [{ key: dmKey([7]), messageId: String(dmFromAnn.id), selfUserId: 790 }]);
+    } finally { adapter.stopEvents(); s.done(); z.close(); }
+  });
+}
+
+test("while the bot's own user id is unknown and reading it fails, a tool call fails naming that read, sends nothing else to Zulip, and says that the request was not sent", async () => {
+  const z = await realm({ 'GET /users/me': { status: 503, json: { result: 'error', msg: 'Service unavailable' } } });
+  const s = await serverOn(z.url);
+  try {
+    const afterStart = z.requests.length;
+    await assert.rejects(
+      s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
+      (err: Error & { mayHaveBeenApplied?: boolean }) => {
+        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.ok(err.message.endsWith('The request was not sent.'), err.message);
+        assert.equal(err.mayHaveBeenApplied, false);
+        return true;
+      },
+    );
+    for (const [name, args] of [['list_streams', {}], ['send_message', { reply_to: 55, content: 'hi' }]] as const) {
+      await assert.rejects(s.tools.handleToolCall(name, args), (err: Error) => {
+        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.ok(err.message.endsWith('The request was not sent.'), err.message);
+        return true;
+      }, name);
+    }
+    assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /users/me', 'GET /users/me']);
+  } finally { s.done(); z.close(); }
+});
+
+test("two requests at once while the bot's own user id is unknown make one read of it, and both go out once it is known", async () => {
+  let profileReads = 0;
+  const z = await realm({
+    'GET /users/me': () => (++profileReads === 1 ? 'drop' : { ...bot, delayMs: 100 }),
+    'GET /streams': { json: { result: 'success', streams: [] } },
+  });
+  const s = await serverOn(z.url);
+  try {
+    assert.equal(s.session.selfUserId, null, "the start's read failed");
+    await Promise.all([1, 2].map(() => s.session.api.request('GET', '/streams', 'listing streams')));
+    assert.equal(profileReads, 2, "the start's read, and one for both requests");
+    assert.equal(z.requests.filter((r) => r.path === '/streams').length, 2);
+    assert.equal(s.session.selfUserId, 790);
+  } finally { s.done(); z.close(); }
+});
+
+test("where Zulip refuses the bot its profile with a client error, as it refuses an incoming-webhook bot, every request goes out as before, the profile isn't read again, and one line says so", async () => {
+  const z = await realm({
+    'GET /users/me': { status: 400, json: { result: 'error', code: 'BAD_REQUEST', msg: 'This API is not available to incoming webhook bots.' } },
+    'POST /messages': { json: { result: 'success', id: 501 } },
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    const session = await initializeZulipClient({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+    const tools = new ZulipToolRuntime(session, dir);
+    for (const content of ['one', 'two']) await tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
+    assert.deepEqual(z.requests.map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /server_settings', 'POST /messages', 'POST /messages']);
+    assert.equal(session.selfUserId, null);
+  } finally { console.error = original; rmSync(dir, { recursive: true, force: true }); z.close(); }
+  assert.deepEqual(lines.filter((line) => line.includes('/users/me')), [
+    "Zulip refused the read of the bot's own user id: Zulip answered GET /users/me with HTTP 400: This API is not available to incoming webhook bots. (BAD_REQUEST). The server goes on without it for this run.",
+  ]);
+});
+
+test("where the start's read of the bot's profile fails and a later read is refused with a client error, the requests go out and the profile isn't read again", async () => {
+  let profileReads = 0;
+  const z = await realm({
+    'GET /users/me': () => (++profileReads === 1 ? 'drop' : { status: 400, json: { result: 'error', code: 'BAD_REQUEST', msg: 'This API is not available to incoming webhook bots.' } }),
+    'POST /messages': { json: { result: 'success', id: 501 } },
+  });
+  const s = await serverOn(z.url);
+  try {
+    for (const content of ['one', 'two']) await s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
+    assert.deepEqual(z.requests.map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /server_settings', 'GET /users/me', 'POST /messages', 'POST /messages']);
+    assert.equal(s.session.selfUserId, null);
+  } finally { s.done(); z.close(); }
+});
+
+test("a start whose read of the bot's profile fails still reads the realm's upload cap", async () => {
+  const z = await realm({ 'GET /users/me': 'drop' });
+  const s = await serverOn(z.url);
+  try {
+    assert.equal(s.session.selfUserId, null, "the start's read failed");
+    assert.equal(s.session.maxUploadBytes, 25 * 1024 * 1024);
+  } finally { s.done(); z.close(); }
+});
+
+test("a direct message sent while the bot's own user id can't be read yet waits in the event queue, which registers at once, and reaches the host once Zulip gives the id", { timeout: 15_000 }, async () => {
+  const events: Record<string, unknown>[] = [];
+  let profileReads = 0;
+  const z = await realm({
+    'GET /users/me': () => {
+      profileReads++;
+      if (profileReads === 2) events.push({ id: events.length, type: 'message', message: dmFromAnn, flags: [] });
+      return profileReads <= 2 ? 'drop' : bot;
+    },
+    'POST /register': () => ({ json: { result: 'success', queue_id: 'q1', last_event_id: events.length - 1, streams: [{ stream_id: 7, name: 'general', invite_only: false }] } }),
+    'GET /events': (r) => {
+      const after = events.filter((e) => (e.id as number) > Number(r.query.get('last_event_id')));
+      return after.length > 0 ? { json: { result: 'success', events: after } } : { json: { result: 'success', events: [] }, delayMs: 50 };
+    },
+  });
+  const s = await serverOn(z.url);
+  const adapter = new ZulipAdapter(s.session.api, s.session);
+  const handed: { key: string; messageId: string }[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const arrived = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 8_000);
+      adapter.startEvents((entry) => {
+        handed.push({ key: entry.key, messageId: entry.messageId });
+        if (entry.messageId === String(dmFromAnn.id)) { clearTimeout(timer); resolve(true); }
+      });
+    });
+    assert.ok(arrived, 'the direct message reached the adapter within 8 s');
+    assert.deepEqual(handed, [{ key: dmKey([7]), messageId: String(dmFromAnn.id) }]);
+  } finally { console.error = original; adapter.stopEvents(); s.done(); z.close(); }
+});
+
+test("while the bot's own user id can't be read, the event loop's degraded notice says why", { timeout: 10_000 }, async () => {
+  const z = await realm({
+    'GET /users/me': { status: 503, json: { result: 'error', msg: 'Service unavailable' } },
+    'POST /register': { json: { result: 'success', queue_id: 'q1', last_event_id: -1, streams: [] } },
+  });
+  const s = await serverOn(z.url);
+  const loop = new ZulipEventLoop({ sleep: () => new Promise((resolve) => setTimeout(resolve, 5)) });
+  const notices: { kind: string; text: string }[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const running = loop.start(s.session.api, () => {}, (event) => notices.push(event));
+    const deadline = Date.now() + 3_000;
+    while (!notices.some((n) => n.kind === 'degraded') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    loop.stop();
+    await running;
+    const degraded = notices.find((n) => n.kind === 'degraded');
+    assert.ok(degraded, 'a degraded notice within 3 s');
+    assert.match(degraded.text, /GET \/users\/me with HTTP 503: Service unavailable/);
+  } finally { console.error = original; s.done(); z.close(); }
+});
+
+test("ZULIP_SUBSCRIBE's subscribe goes out while the bot's own user id can't be read", async () => {
+  const z = await realm({
+    'GET /users/me': 'drop',
+    'POST /users/me/subscriptions': { json: { result: 'success', subscribed: { 'bot@example.com': ['general'] }, already_subscribed: {} } },
+  });
+  const s = await serverOn(z.url);
+  const directory = { whenListed: async () => {}, formerOf: () => undefined } as unknown as StreamDirectory;
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const afterStart = z.requests.length;
+    await subscribeConfigured(s.session.api, directory, 'general');
+    assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['POST /users/me/subscriptions']);
+    assert.equal(s.session.selfUserId, null);
+  } finally { console.error = original; s.done(); z.close(); }
 });

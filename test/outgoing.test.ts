@@ -47,7 +47,7 @@ function tools(api: ZulipSession['api'], maxMessageLength?: number) {
 function adapter(api: ZulipSession['api'], options: Record<string, unknown> = {}) {
   const directory = new StreamDirectory();
   directory.registration([{ stream_id: 7, name: 'general' }]);
-  const a = new ZulipAdapter(api, 790, 's', { directory, ...options } as never);
+  const a = new ZulipAdapter(api, { selfUserId: 790, sessionId: 's' }, { directory, ...options } as never);
   const sent: Sent[] = [];
   (a as unknown as { onSent: (s: Sent) => void }).onSent = (s) => sent.push(s);
   const publish = (channelId: string, ...rest: Parameters<ZulipAdapter['publish']> extends [unknown, ...infer R] ? R : never) =>

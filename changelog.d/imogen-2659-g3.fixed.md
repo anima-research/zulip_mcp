@@ -5,10 +5,8 @@
   call that needs a key was refused with no line naming the failed exchange.
 - At start, a refused read of the bot's profile or of the realm's settings is
   logged with Zulip's words. A profile answer with no user id gets the
-  profile's line too, which says so. The profile's line says that the
-  self-filter is off for this run, so the bot's own messages come back to the
-  agent. That line now gives a failed read's error message in place of its
-  stack. A refused read used to log nothing.
+  profile's line too, which says so. That line now gives a failed read's error
+  message in place of its stack. A refused read used to log nothing.
 - A `ZULIP_SUBSCRIBE` that Zulip refuses logs the failure line with Zulip's
   words. It used to log the success line with empty lists.
 - An event poll that Zulip refuses for another reason than an expired queue

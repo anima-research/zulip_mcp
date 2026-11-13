@@ -128,7 +128,7 @@ async function main(): Promise<void> {
   const maxMessageLength = maxMessageLengthFromEnv();
   const directory = new StreamDirectory();
   void subscribeConfigured(session.api, directory, process.env.ZULIP_SUBSCRIBE);
-  const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
+  const adapter = new ZulipAdapter(session.api, session, {
     directory,
     formatTime,
     uploader,
