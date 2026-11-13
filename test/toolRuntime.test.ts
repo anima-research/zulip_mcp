@@ -9,7 +9,7 @@ import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.
 import { toolDefinitions } from '../src/tools.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
 import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
-import { httpTransport, zulipApi, type ZulipApi } from '../src/zulip-api.ts';
+import { httpTransport, zulipApi, ZulipNoAnswer, type ZulipApi } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
 import { ChannelIds } from '../src/channel-ids.ts';
 import { streamKey } from '../src/channel-key.ts';
@@ -670,7 +670,7 @@ for (const field of ['to', 'type']) {
 
 const MOVE_STREAMS: Record<number, string> = { 7: 'general', 8: 'ops' };
 
-function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknown; readBack?: () => unknown; known?: boolean; formerNames?: Record<string, number> } = {}) {
+function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknown; readBack?: () => unknown; lookup?: () => unknown; known?: boolean; formerNames?: Record<string, number> } = {}) {
   const message = { id: 77, type: 'stream', stream_id: 7, display_recipient: 'general', subject: 'deploys' };
   const stand = standInApi({
     'PATCH /messages/:id': (params: Record<string, unknown>) => {
@@ -685,6 +685,7 @@ function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknow
     },
     'GET /messages/:id': () => opts.readBack?.() ?? { result: 'success', message: { ...message } },
     'GET /get_stream_id': (params: Record<string, unknown>) => {
+      if (opts.lookup) return opts.lookup();
       const id = Object.entries(MOVE_STREAMS).find(([, name]) => name === params.stream)?.[0];
       return id === undefined ? { result: 'error', code: 'BAD_REQUEST', msg: `Invalid channel name '${params.stream}'` } : { result: 'success', stream_id: Number(id) };
     },
@@ -833,3 +834,15 @@ for (const known of [false, true]) {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test('move_messages keeps a stream lookup that got no answer as it is, with no pointer to list_streams, and moves nothing', async () => {
+  const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => { throw new ZulipNoAnswer('timeout', 'GET', '/get_stream_id', false, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.'); } });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops' }), (err: Error) => {
+      assert.ok(err instanceof ZulipNoAnswer, `${err.constructor.name}: ${err.message}`);
+      assert.doesNotMatch(err.message, /list_streams/);
+      return true;
+    });
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
