@@ -31,7 +31,7 @@
   "author": "Antra Tessera",
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.10.0"
   },
   "files": [
     "build",
@@ -42,7 +42,7 @@
   "dependencies": {
     "@animalabs/mcpl-core": "^0.3.0",
     "ini": "^5.0.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
     "@types/ini": "^4.1.1",

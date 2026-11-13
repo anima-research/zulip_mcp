@@ -10,7 +10,10 @@
  * image that was ever posted.
  */
 
-import sharp from 'sharp';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+import type sharpModule from 'sharp';
 import type { ContentBlock, TextContent } from '@animalabs/mcpl-core';
 import type { AttachmentRef } from './content.js';
 
@@ -79,8 +82,39 @@ export function normalizeImageForInference(buf: Buffer): Promise<NormalizedImage
   return withDecodeSlot(() => normalizeImageUnbounded(buf));
 }
 
+let sharpLoad: Promise<typeof sharpModule> | undefined;
+function loadSharp(): Promise<typeof sharpModule> {
+  sharpLoad ??= import('sharp').then((m) => m.default);
+  return sharpLoad;
+}
+
+function wasmInstall(): { command: string; dir?: string } {
+  const command = 'npm install --no-save @img/sharp-wasm32';
+  try {
+    const sharpDir = dirname(dirname(createRequire(import.meta.url).resolve('sharp')));
+    const { version } = JSON.parse(readFileSync(join(sharpDir, 'package.json'), 'utf8')) as { version: string };
+    return { command: `${command}@${version}`, dir: dirname(dirname(sharpDir)) };
+  } catch {
+    return { command };
+  }
+}
+
+export async function checkImageDecoder(options: InlineOptions): Promise<string | null> {
+  if (!options.inlineImages || options.maxImages <= 0) return null;
+  try {
+    await loadSharp();
+    return null;
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    const { command, dir } = wasmInstall();
+    const where = dir ? `in this directory:\n${dir}` : 'in the directory the server is installed in.';
+    return `${why}\n[zulip-mcp] Image inlining needs sharp, which couldn't load here. Loading it needs Node 20.10 or later. With that, either set ZULIP_INLINE_IMAGES=false to run without inlining images, or install sharp's WebAssembly build by running ${command} ${where}`;
+  }
+}
+
 async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | null> {
   try {
+    const sharp = await loadSharp();
     const meta = await sharp(buf, { ...sharpOpts, animated: true }).metadata();
     const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
     const isAnimated = (meta.pages ?? 1) > 1;

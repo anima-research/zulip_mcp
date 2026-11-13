@@ -45,7 +45,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { isMainModule } from './content.js';
-import { fetchCapped, resolveInlineOptions } from './attachments.js';
+import { checkImageDecoder, fetchCapped, resolveInlineOptions } from './attachments.js';
 import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
@@ -104,6 +104,12 @@ async function main(): Promise<void> {
     console.error('Usage: zulip-mcp-server [--stdio | --tcp <port>]');
     process.exit(1);
   }
+  const inline = resolveInlineOptions();
+  const decoderProblem = await checkImageDecoder(inline);
+  if (decoderProblem) {
+    console.error(decoderProblem);
+    process.exit(1);
+  }
 
   const session = await initializeZulipClient();
   const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
@@ -158,7 +164,7 @@ async function main(): Promise<void> {
           return fetchCapped(url.toString(), headers, maxBytes, signal);
         },
       },
-      inline: resolveInlineOptions(),
+      inline,
     },
   });
 
