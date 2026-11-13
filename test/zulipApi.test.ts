@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
-import { initializeZulipClient } from '../src/zulip-client.ts';
+import { initializeZulipClient, subscribeConfigured } from '../src/zulip-client.ts';
+import type { StreamDirectory } from '../src/stream-directory.ts';
+import { standInApi } from './zulip-stand-in.ts';
 import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
 
 interface Recorded {
@@ -313,6 +315,22 @@ test('a password exchange that gets no JSON answer fails the start, and its erro
     );
     assert.equal(z.requests.filter((r) => r.path === '/fetch_api_key').length, 1);
   } finally { z.close(); }
+});
+
+test('a ZULIP_SUBSCRIBE that Zulip refuses gets the failure line, with Zulip\'s words, and no success line', async () => {
+  const { api } = standInApi({
+    'POST /users/me/subscriptions': { result: 'error', msg: 'Not allowed for guest users', code: 'BAD_REQUEST' },
+  });
+  const directory = { whenListed: async () => {}, formerOf: () => undefined } as unknown as StreamDirectory;
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await subscribeConfigured(api, directory, 'general, dev');
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines, ['Zulip MCP auto-subscribe failed for [general, dev]: Zulip refused POST /users/me/subscriptions: Not allowed for guest users (BAD_REQUEST)']);
 });
 
 test('a call\'s own bound ends a real HTTP call at it, below the default', { timeout: 10_000 }, async () => {

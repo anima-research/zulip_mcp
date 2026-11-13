@@ -5,7 +5,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
-import { httpTransport, LONG_TIMEOUT_MS, zulipApi, type ZulipApi } from './zulip-api.js';
+import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, zulipApi, type ZulipApi } from './zulip-api.js';
 import type { StreamDirectory } from './stream-directory.js';
 
 export interface ZulipSession {
@@ -139,8 +139,12 @@ export async function subscribeConfigured(api: ZulipApi, directory: StreamDirect
     const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
       subscriptions: streams.map((name) => ({ name })),
     });
-    const subscribed = result.result === "success" ? result.subscribed ?? {} : {};
-    const already = result.result === "success" ? result.already_subscribed ?? {} : {};
+    if (isRefusal(result)) {
+      console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]: Zulip refused POST /users/me/subscriptions: ${refusalText(result)}`);
+      return;
+    }
+    const subscribed = result.subscribed ?? {};
+    const already = result.already_subscribed ?? {};
     console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
   } catch (err) {
     console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);
