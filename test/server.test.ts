@@ -6058,7 +6058,7 @@ test("a read for held ids that the connection's end cuts short partway marks off
   assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1, 2]);
 });
 
-test("a muted channel's read for held ids lets go of the holds at or below its place only: a message whose job waits on its lookup keeps its hold", async () => {
+test("a muted channel's read for held ids lets go of every hold but those of messages that wait in its lane: a message whose job waits on its lookup keeps its hold", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-held-read-'));
   try {
     const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
@@ -6101,6 +6101,33 @@ test("a muted channel's read for held ids lets go of the holds at or below its p
       releaseLookup();
     }
     await h.server.quiet();
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a muted channel's read for held ids lets go of a give-up's hold, whose messages no longer wait", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-give-up-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options, maxWaitingMessages: 3, history: [1, 2, 3, 4, 5, 6, 7].map((id) => (id === 2 ? withLog(streamMsg(2)) : streamMsg(id))) });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    h.adapter.emit!(withLog(streamMsg(2)));
+    await until(() => fetches.started.length === 1, "2's attachment fetch");
+    for (const id of [3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+    await until(() => JSON.stringify(h.delivery.heldIds('zulip:general')) === '[2,3]', 'the give-up, holding 3 for 3 to 6');
+    await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(h.delivery.heldIds('zulip:general'), [], 'every given-up message goes with the mute');
     plane.stop();
     await h.close();
   } finally {

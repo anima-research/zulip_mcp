@@ -1251,8 +1251,8 @@ export class ZulipMcplServer {
   private async readHeld(r: Reading, key: ChannelKey, gap?: GapRead): Promise<Hand | void> {
     if (this.isMuted(key) || !this.isAllowed(key)) {
       return (ctx) => {
-        const place = this.placeOf(key);
-        for (const id of ctx.w.delivery.heldIds(key)) if (place !== undefined && id <= place) ctx.w.delivery.release(key, id);
+        const waiting = new Set(ctx.lane.waitingMessages());
+        for (const id of ctx.w.delivery.heldIds(key)) if (!waiting.has(id)) ctx.w.delivery.release(key, id);
         this.delivery.save();
       };
     }
