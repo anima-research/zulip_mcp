@@ -5638,7 +5638,7 @@ test("a read for held ids that the connection's end cuts short marks none of the
   h.adapter.fetchHistory = async (key, query) => { reading = true; await readHeld; return real(key, query); };
   h.adapter.emit!(streamMsg(2));
   await until(() => reading, 'the read for the refused message');
-  h.serverSide.once('close', () => setTimeout(releaseRead, 50));
+  void h.served.then(releaseRead);
   await h.close();
   assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1]);
 });
@@ -5668,7 +5668,7 @@ test("a read for held ids of a closed channel that the connection's end cuts sho
     second.adapter.history.push(streamMsg(6, { mentioned: true }));
     second.adapter.emit!(streamMsg(6, { mentioned: true }));
     await until(() => reading, 'the read for the refused block');
-    second.serverSide.once('close', () => setTimeout(releaseRead, 50));
+    void second.served.then(releaseRead);
     await second.close();
     assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), [4]);
   } finally {
