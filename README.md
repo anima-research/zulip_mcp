@@ -46,8 +46,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   can follow a message the server received after it. A message waiting for
   its quote lookup or its attachments holds back only its own channel. An
   event that only a lookup can place waits for it, such as a
-  reaction to a message the server hasn't seen, and the reactions, changes and
-  messages after it that carry no stream id wait behind it. When delivery
+  reaction to a message the server hasn't seen, and the reactions and changes
+  after it, and the stream messages after it that carry no stream id, wait
+  behind it. A direct message doesn't wait. When delivery
   stops, a message the server already holds is offered by the next
   connection's catch-up, as any message above the watermark is, if Zulip's
   history still has it there; one still waiting for the lookup that places
@@ -138,7 +139,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
   follows it, as a message, so a live delivery can never jump the watermark
-  over the offline gap.
+  over the offline gap. Past 5,000 waiting messages, the channel with the
+  most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
   policy. Images are inlined on live delivery, downsampled to model-max.

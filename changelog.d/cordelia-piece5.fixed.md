@@ -41,10 +41,15 @@
   arrived meanwhile and didn't move it is applied to it, so it comes once
   with its new text, and one deleted meanwhile doesn't come. A message
   already being handled when `zulip.messaging` was disabled is held, and a
-  read from history brings it first once it is enabled. Where that read
+  read from history brings it first once it is enabled. The first message of
+  a channel that the host has never been told of isn't brought by that read:
+  it stays held until that channel is registered. Where that read
   fails, later messages go first, and until it comes, an edit, a move or a
   deletion of one of them sends no line, unless that message addresses the
-  agent or is the agent's own.
+  agent or is the agent's own. Where `zulip.messaging` is disabled and
+  enabled again while one message, change or read of a channel is being
+  handled, what that handling held, or what the batch withheld, can come
+  after that channel's later messages.
 - A catch-up at a connection's start, or a recovery after Zulip's event
   queue broke, that fell while `zulip.messaging` was disabled was skipped. It
   is now made once the host enables `zulip.messaging`.
@@ -66,7 +71,9 @@
 - A catch-up block the host refused was lost once the host accepted a later
   message of its channel: the watermark moved past the block. The block's
   first message is now held, so the watermark stays below it, and the block
-  is offered again when the host next accepts something.
+  is offered again when the host next accepts something. Where the channel
+  is open by then, only the block's first message is offered again, and the
+  others aren't, as before.
 - An offer that the host refused, or that was lost, after its stream was
   muted or left out of the allowlist was held again, so the channel's
   watermark stayed below it until the host accepted something else there.
@@ -88,8 +95,9 @@
   was done, and a message that arrived meanwhile could arrive inside its
   channel's catch-up block instead of as itself. Each channel's catch-up now
   reads only up to the first message waiting on that channel, that message
-  follows the block as itself, and each channel goes on as soon as its own
-  catch-up is done.
+  follows the block as itself (past 5,000 waiting messages, it can be given
+  up to a read from history in its place), and each channel goes on as soon
+  as its own catch-up is done.
 - A `sinceLastSeen` open at a connection's start, before its channel's
   catch-up, had its history repeated in the catch-up block. The catch-up now
   starts above what the open returned.
@@ -133,8 +141,9 @@
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip
-  sent them, and the reactions, changes and messages without a stream id
-  that arrive meanwhile wait behind them. On a queue that sends a stream's
+  sent them, and the reactions and changes, and the stream messages without
+  a stream id, that arrive meanwhile wait behind them. A direct message
+  doesn't wait. On a queue that sends a stream's
   id with one message and not with another, a message without the id can
   enter its channel behind a later message that has it. It then comes after
   that message, or doesn't come where that message was already dealt with.
