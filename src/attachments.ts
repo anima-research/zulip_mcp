@@ -99,7 +99,6 @@ function wasmInstall(): { command: string; dir?: string } {
   }
 }
 
-/** When images may be inlined, loads sharp: null when it loads, else what to tell the operator. */
 export async function checkImageDecoder(options: InlineOptions): Promise<string | null> {
   if (!options.inlineImages || options.maxImages <= 0) return null;
   try {
