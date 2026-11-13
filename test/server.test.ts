@@ -6283,6 +6283,37 @@ test("a deletion that arrives with the live event of a row that a break's read i
   await h.close();
 });
 
+// An adapter hands on at once a message whose event carries its stream's id, and makes one without the id wait for
+// its lookup. On a queue that sends the id with one message of a stream and not with another, the earlier message
+// can then enter its lane behind a later one.
+test("an earlier message that enters its lane behind a later one, while the later one's attachment is fetched, is offered after it", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(2)));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  h.adapter.emit!(streamMsg(1));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h), ['2', '1']);
+  await h.close();
+});
+
+test("an earlier message that enters its lane after a later one was dealt with isn't offered", async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(2));
+  await h.server.quiet();
+  h.adapter.emit!(streamMsg(1));
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h), ['2']);
+  await h.close();
+});
+
 test("a refused message that a held read brings while zulip.messaging is disabled is offered again once it is enabled", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);
