@@ -86,8 +86,9 @@ export function parseBackscrollLimits(raw: string | undefined): Map<string, numb
     if (!trimmed) continue;
     const sep = trimmed.lastIndexOf(':');
     const name = sep > 0 ? trimmed.slice(0, sep).trim() : '';
-    const n = sep > 0 ? parseInt(trimmed.slice(sep + 1), 10) : NaN;
-    if (!name || !Number.isFinite(n) || n < 0) {
+    const limit = sep > 0 ? trimmed.slice(sep + 1) : '';
+    const n = /^\s*\d+\s*$/.test(limit) ? Number(limit) : NaN;
+    if (!name || !Number.isFinite(n)) {
       console.error(`[zulip-mcp] ignoring ZULIP_BACKSCROLL_CHANNELS entry ${JSON.stringify(trimmed)} (want "stream:limit")`);
       continue;
     }
