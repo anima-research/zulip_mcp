@@ -1761,6 +1761,10 @@ scenario('72. once the host has answered a rename, an acknowledge under the old 
     assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [['POST', `/messages/${posted}/reactions`, 'eyes']]);
     const unformed = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'nonsense-general', messageId: String(posted), value: 'tada' });
     assert.deepEqual(unformed, { acknowledged: true, representation: ':tada:' }, 'an id of no known format adds the reaction too');
+    assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [
+      ['POST', `/messages/${posted}/reactions`, 'eyes'],
+      ['POST', `/messages/${posted}/reactions`, 'tada'],
+    ]);
     await assert.rejects(publish(run, 'zulip:general', 'hello?'), /zulip:lobby/);
   } finally { await run.close(); }
 });

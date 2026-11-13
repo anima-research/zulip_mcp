@@ -534,10 +534,10 @@ export class ZulipAdapter implements PlatformAdapter {
     return change.streamId !== null ? streamKey(change.streamId) : null;
   }
 
-  private inOrder(place: () => Promise<void>): void {
+  private inOrder(current: () => boolean, place: () => Promise<void>): void {
     this.placing++;
     this.placed = this.placed
-      .then(place)
+      .then(() => (current() ? place() : undefined))
       .catch((err) => { console.error('[zulip-mcp] placing an event failed:', (err as Error).message); })
       .finally(() => { this.placing--; });
   }
@@ -734,12 +734,11 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */
-  private describeDm(m: ZulipMessage): { descriptor: ChannelDescriptor; isNew: boolean } {
+  private describeDm(m: ZulipMessage): ChannelDescriptor {
     const counterparts = dmCounterparts(m.recipients, this.identity.selfUserId);
     const descriptor = dmDescriptor(counterparts, this.backscrollDefault);
-    const isNew = !this.knownDms.has(descriptor.id);
     this.knownDms.set(descriptor.id, descriptor);
-    return { descriptor, isNew };
+    return descriptor;
   }
 
   async publish(
@@ -1082,7 +1081,7 @@ export class ZulipAdapter implements PlatformAdapter {
           };
           const key = this.changeKeyNow(change);
           if (key !== null && (change.streamId !== null || this.placing === 0)) return enter(key);
-          this.inOrder(async () => {
+          this.inOrder(current, async () => {
             const cachedKey = this.changeKeyNow(change);
             const located = cachedKey === null && change.kind === 'edit' ? await this.locate(change.messageId, 'an edit') : null;
             const placedKey = cachedKey ?? located?.key ?? null;
@@ -1114,7 +1113,7 @@ export class ZulipAdapter implements PlatformAdapter {
           };
           const cached = this.seen.get(ev.message_id);
           if (cached && this.placing === 0) return emit(cached);
-          this.inOrder(async () => emit(await this.locate(ev.message_id)));
+          this.inOrder(current, async () => emit(await this.locate(ev.message_id)));
         }
       : undefined;
     loop.start(this.api, (_streamName, msg, flags) => {
@@ -1122,7 +1121,7 @@ export class ZulipAdapter implements PlatformAdapter {
       const m = normalizeMessage(raw);
       const key = this.keyNow(m, raw);
       if (key !== null && (m.isDm || m.streamId !== null || this.placing === 0)) return this.handOn(raw, m, key, onMessage);
-      this.inOrder(async () => {
+      this.inOrder(current, async () => {
         const placed = await this.keyFor(m, raw);
         if (placed !== null && current()) this.handOn(raw, m, placed, onMessage);
       });
@@ -1141,13 +1140,13 @@ export class ZulipAdapter implements PlatformAdapter {
         console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
         return;
       }
-      const { descriptor, isNew } = this.describeDm(m);
+      const descriptor = this.describeDm(m);
       onMessage({
         key,
         messageId: String(m.id),
         ready: async (changes) => {
           const now = this.applyChanges(raw, m, changes);
-          return now === null ? null : { message: toIncoming(key, now, this.identity), ...(isNew ? { newChannel: descriptor } : {}) };
+          return now === null ? null : { message: toIncoming(key, now, this.identity), newChannel: descriptor };
         },
       });
       return;

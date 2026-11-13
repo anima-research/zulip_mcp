@@ -841,13 +841,15 @@ test('a flush() batch on the wire counts for isIdle(), a timer that fires meanwh
   const flushed = manager.flush();
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(manager.isIdle(), false, "flush()'s batch is on the wire");
+  assert.equal(settled, false, 'idle() waits while the batch is on the wire');
   deliver(manager, 'zulip:general', message('8'));
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.equal(sends, 1, 'the timer waits for the batch on the wire');
+  assert.equal(settled, false, 'idle() still waits');
   release();
   await flushed;
-  const deadline = Date.now() + 1000;
-  while (!settled && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  const deadline = performance.now() + 1000;
+  while (!settled && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(settled, true, 'idle() settles once both batches are sent');
   assert.equal(sends, 2);
   manager.destroy();

@@ -4,10 +4,10 @@
  * a path it would have to fetch. Everything else stays a reference the
  * agent can pull with fetch_attachment.
  *
- * Applies to messages handed on one at a time (channels/incoming and
- * push/event), recovered ones included. History on channels/open, a
- * catch-up block, and the fetch tools keep the reference form: replaying
- * a backlog is not the moment to pull every image that was ever posted.
+ * Applies to live delivery only (channels/incoming and push/event). History
+ * on channels/open, the reconnect sweep, and the fetch tools keep the
+ * reference form: replaying a backlog is not the moment to pull every
+ * image that was ever posted.
  */
 
 import sharp from 'sharp';

@@ -250,8 +250,8 @@ test("an edit that also moves a later message, of a first message the cache does
     adapter.startEvents(inTurn(() => {}), undefined, undefined, (entry) => {
       void entry.ready().then((c) => { got.push(c && { kind: c.kind, messageId: c.messageId, content: c.content, topic: c.topic }); });
     });
-    const deadline = Date.now() + 2000;
-    while (!got.some((g) => typeof g !== 'string') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    const deadline = performance.now() + 2000;
+    while (!got.some((g) => typeof g !== 'string') && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
@@ -301,13 +301,13 @@ test('two moves of one cached message, the second arriving while the first waits
         lines.push(`${c?.kind} entered ${lane}, line ${c?.key}`);
       }));
     });
-    const deadline = Date.now() + 2000;
-    while (polls < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    const deadline = performance.now() + 2000;
+    while (polls < 2 && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     await new Promise((r) => setTimeout(r, 20));
     openLane7();
-    while (lines.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while (lines.length < 2 && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     laterSent();
-    while (lines.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while (lines.length < 3 && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
@@ -1018,11 +1018,47 @@ test('while a change waits for the lookup that places it, later reactions and ch
       void entry.ready().then((c) => { placed[at] = c ? `${c.kind} ${c.messageId}` : 'none'; });
     });
   try {
-    const deadline = Date.now() + 2000;
-    while (!calls.some((c) => c.path === '/messages/30') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    const deadline = performance.now() + 2000;
+    while (!calls.some((c) => c.path === '/messages/30') && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     release();
-    while ((placed.length < 4 || placed.includes('change')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while ((placed.length < 4 || placed.includes('change')) && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     assert.deepEqual(placed, ['edit 30', 'reaction 31', 'edit 31', 'delete 30']);
+  } finally { adapter.stopEvents(); }
+});
+
+test("a stopped event loop's events that still wait for their placement are not looked up, so the next loop's events don't wait behind them", async () => {
+  let releaseOld!: () => void;
+  const oldLookup = new Promise<void>((resolve) => { releaseOld = resolve; });
+  let registrations = 0;
+  const served = new Set<string>();
+  const reaction = (id: number, messageId: number) => ({ id, type: 'reaction', op: 'add', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: messageId, user_id: 42 });
+  const { api: client, calls } = standInApi({
+    'POST /register': async () => ({ queue_id: `q${++registrations}`, last_event_id: -1 }),
+    'GET /events': async (params) => {
+      const queue = String(params.queue_id);
+      if (served.has(queue)) return new Promise(() => {});
+      served.add(queue);
+      return { events: queue === 'q1' ? [reaction(1, 60), reaction(2, 61)] : [reaction(1, 62)] };
+    },
+    'GET /messages/:id': async (_params, call) => {
+      if (call.id === 60) await oldLookup;
+      if (call.id === 61) await new Promise(() => {}); // an answer that never comes
+      return { result: 'success', message: raw(call.id!) };
+    },
+  });
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const placed: string[] = [];
+  const deadline = performance.now() + 2000;
+  adapter.startEvents(() => {}, undefined, (r) => { placed.push(r.messageId); });
+  while (!calls.some((c) => c.path === '/messages/60') && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  adapter.stopEvents();
+  adapter.startEvents(() => {}, undefined, (r) => { placed.push(r.messageId); });
+  try {
+    while (!served.has('q2') && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    releaseOld();
+    while (!placed.includes('62') && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(placed, ['62']);
+    assert.equal(calls.some((c) => c.path === '/messages/61'), false);
   } finally { adapter.stopEvents(); }
 });
 
@@ -1049,11 +1085,38 @@ test("a DM's row is built at its turn: an edit that arrived while it waited give
   const messages: IncomingEntry[] = [];
   const changes: ChangeEntry[] = [];
   adapter.startEvents((entry) => { messages.push(entry); }, undefined, undefined, (entry) => { changes.push(entry); });
-  const deadline = Date.now() + 2000;
-  while (changes.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  const deadline = performance.now() + 2000;
+  while (changes.length < 2 && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
   adapter.stopEvents();
   const edited = await messages[0].ready([changes[0]]);
   assert.equal((edited!.message.content[0] as { text: string }).text, 'second words (edited)');
   assert.equal(await messages[1].ready([changes[1]]), null);
   assert.deepEqual(changes.map((c) => c.kind), ['edit', 'delete']);
+});
+
+test("a new DM conversation whose first message is taken out while it waits still carries its descriptor with the next message, so the server can register it", async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: dm(50, 42) },
+    { id: 2, type: 'delete_message', message_ids: [50], message_type: 'private' },
+    { id: 3, type: 'message', flags: [], message: dm(51, 42) },
+  ];
+  let polls = 0;
+  const client = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      return new Promise(() => {});
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: { streamAllowed: () => true, dmAllowed: () => true }, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const messages: IncomingEntry[] = [];
+  const changes: ChangeEntry[] = [];
+  adapter.startEvents((entry) => { messages.push(entry); }, undefined, undefined, (entry) => { changes.push(entry); });
+  const deadline = performance.now() + 2000;
+  while (messages.length < 2 && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  adapter.stopEvents();
+  assert.equal(await messages[0].ready([changes[0]]), null);
+  const next = await messages[1].ready();
+  assert.equal(next?.newChannel?.id, 'zulip:dm:7+42', "the conversation with Ann and Bo, as the README names it");
 });

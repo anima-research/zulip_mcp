@@ -227,7 +227,7 @@ export class ZulipMcplServer {
   private reconciling = false;
   private reconcileAgain = false;
   private readWaits = new Set<ChannelKey>();
-  private toldReadWait = false;
+  private toldReadWait: 'log' | 'open' | null = null;
 
   constructor(
     private readonly adapter: PlatformAdapter,
@@ -364,7 +364,7 @@ export class ZulipMcplServer {
     this.channelManager.reset();
     this.toldAgent.clear();
     this.readWaits.clear();
-    this.toldReadWait = false;
+    this.toldReadWait = null;
     this.messagingHold = null;
     this.changesOnTurn.clear();
     this.lanes = this.makeLanes();
@@ -1082,7 +1082,11 @@ export class ZulipMcplServer {
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
         moved = w.delivery.release(key, id) || moved;
-      } else w.delivery.hold(key, id, 'failed');
+      } else {
+        w.delivery.hold(key, id, 'failed');
+        // Never offered, so a held read that routed it hasn't tried it.
+        w.delivery.clearReplayed(key, [id]);
+      }
     }
     if (moved) this.delivery.save();
   }
@@ -1109,8 +1113,6 @@ export class ZulipMcplServer {
       if (id !== null) this.changesOnTurn.delete(id);
       const ready = await entry.ready(changes);
       if (ctx.ended) return;
-      const placeNow = this.placeOf(key);
-      if (id !== null && placeNow !== undefined && id <= placeNow) return this.letGo(ctx.w, key, id);
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);
@@ -1176,7 +1178,7 @@ export class ZulipMcplServer {
     // small text files inline. The reference note stays so anything not
     // inlined can still be fetched.
     const refs = Array.isArray(meta.attachments) ? (meta.attachments as AttachmentRef[]) : [];
-    if (refs.length > 0 && this.options.attachments && (addressed || this.channelManager.isKeyOpen(key))) {
+    if (refs.length > 0 && this.options.attachments && meta.recovered !== true && (addressed || this.channelManager.isKeyOpen(key))) {
       const conn = this.conn;
       const { source, inline, deadline = () => AbortSignal.timeout(ATTACHMENT_DEADLINE_MS) } = this.options.attachments;
       const blocks = await buildAttachmentBlocks(refs, source, inline, deadline());
@@ -1765,9 +1767,7 @@ export class ZulipMcplServer {
     for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
-      const first = Math.min(...held);
-      for (const id of held) if (id !== first) w.delivery.release(key, id);
-      w.delivery.hold(key, first, 'failed');
+      for (const id of held) w.delivery.hold(key, id, 'failed');
       this.delivery.save();
     }
     const read = this.catchupLimit === 0
@@ -1806,7 +1806,8 @@ export class ZulipMcplServer {
       console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
-      if (!this.toldReadWait && (ranOut || this.now() - since + ms >= READ_WAIT_LINE_MS)) this.tellReadWait();
+      const untold = this.toldReadWait === null || (this.toldReadWait === 'log' && this.openKeys().length > 0);
+      if (untold && (ranOut || this.now() - since + ms >= READ_WAIT_LINE_MS)) this.tellReadWait();
       lane.enterReadFirst((r2) => (r2.ended ? undefined : this.fillRead(r2, read, tries + 1, since)));
       lane.holdOtherUntil((this.options.readRetryWait ?? waitMs)(ms));
       return;
@@ -1828,34 +1829,33 @@ export class ZulipMcplServer {
   private tellReadWait(): void {
     const keys = [...this.readWaits].filter((key) => !this.isMuted(key) && this.isAllowed(key));
     if (keys.length === 0) return;
-    this.toldReadWait = true;
     const channels = keys.map((key) => this.ids.channelIdOf(key) ?? this.label(key));
-    this.tellOpen(
+    this.toldReadWait = this.tellOpen(
       `Zulip isn't serving reads of the history of ${channels.join(', ')}, and they are tried again. ` +
         'A channel whose read waits is silent until Zulip answers it; its messages then arrive in order.',
       { kind: 'history-waiting', channels },
-    );
+    ) ? 'open' : 'log';
   }
 
   private readWaitEnded(lane: Lane<DeliveryWriter>): void {
     if (lane.isEnded || !this.readWaits.delete(lane.key)) return;
-    if (!this.toldReadWait || this.readWaits.size > 0) return;
-    this.toldReadWait = false;
+    if (this.toldReadWait === null || this.readWaits.size > 0) return;
+    this.toldReadWait = null;
     this.tellOpen('No channel waits for a read of its history from Zulip any more.', { kind: 'history-answered' });
   }
 
-  private tellOpen(text: string, metadata: Record<string, unknown>): void {
+  private tellOpen(text: string, metadata: Record<string, unknown>): boolean {
     const open = this.openKeys();
-    if (open.length === 0) {
-      console.error(`[zulip-mcp] ${text} (no open channel to tell)`);
-      return;
+    if (open.length === 0 || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+      console.error(`[zulip-mcp] ${text} (${open.length === 0 ? 'no open channel to tell' : 'zulip.messaging is disabled'})`);
+      return false;
     }
     for (const key of open) this.channelManager.notifyChannel(key, text, metadata);
+    return true;
   }
 
   private async readFill(r: Reading, key: ChannelKey, gap?: GapRead, ceiling?: { reached: boolean }): Promise<Hand | void> {
     if (r.ended || this.isMuted(key) || !this.isAllowed(key)) return;
-    if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const place = this.placeOf(key);
     const below = () => this.firstWaiting(key) - 1;
     if (place === undefined || below() <= place) return;
