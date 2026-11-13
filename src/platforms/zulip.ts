@@ -570,40 +570,43 @@ export class ZulipAdapter implements PlatformAdapter {
   private async onZulipChange(change: ZulipMessageChange, located?: SeenMessage, only?: readonly number[]): Promise<MessageChangeEvent | null> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
-      const cached = located ? null : this.seen.get(change.messageId) ?? null;
+      const id = located || this.seen.has(change.messageId) ? change.messageId : change.messageIds.find((m) => this.seen.has(m)) ?? change.messageId;
+      const cached = located ? null : this.seen.get(id) ?? null;
       // A cache miss GETs the message as it reads NOW. For a content edit
       // that is the right place; for a cross-stream move it is the stream
       // the message went to, and the agent only ever saw it in the one it
       // came from — which the event names.
-      const where = located ?? cached ?? await this.locate(change.messageId, 'an edit');
+      const where = located ?? cached ?? await this.locate(id, 'an edit');
       if (!where) return null;
       const crossStream = change.newStreamId !== null && !where.isDm;
       // A cross-stream move of an uncached message whose origin the event
       // doesn't name has nowhere honest to go: the GET only knows the destination.
       if (crossStream && !cached && change.streamId === null) {
-        console.error(`[zulip-mcp] dropping a move of message ${change.messageId}: the event names no origin stream`);
+        console.error(`[zulip-mcp] dropping a move of message ${id}: the event names no origin stream`);
         return null;
       }
       const fromKey = crossStream && change.streamId !== null ? streamKey(change.streamId) : where.key;
       const placed: SeenMessage = { ...where, key: fromKey };
       if (!this.changeAllowed(placed)) return null;
-      const content = change.content !== null ? cleanMarkdown(change.content) : null;
-      const previousContent = change.origContent !== null ? cleanMarkdown(change.origContent) : null;
+      const raw = id === change.messageId ? change.content : null;
+      const flags = id === change.messageId ? change.flags : [];
+      const content = raw !== null ? cleanMarkdown(raw) : null;
+      const previousContent = raw !== null && change.origContent !== null ? cleanMarkdown(change.origContent) : null;
       const topic = change.topic ?? where.topic;
       const movedToKey = crossStream && (await this.knownStream(Number(change.newStreamId))) ? streamKey(Number(change.newStreamId)) : null;
       // Zulip's verdict on the new content replaces the cached one only when
       // the content changed; a move keeps the mention it had (the event's
       // flags are not relied on to be present for a move).
-      const mentioned = content !== null ? change.flags.includes('mentioned') : (where.mentioned || change.flags.includes('mentioned'));
-      const replyVerdict = change.content !== null
-        ? await this.classifyQuoteReply({ ...where, rawContent: change.content, mentioned })
+      const mentioned = content !== null ? flags.includes('mentioned') : (where.mentioned || flags.includes('mentioned'));
+      const replyVerdict = raw !== null
+        ? await this.classifyQuoteReply({ ...where, rawContent: raw, mentioned })
         : null;
-      const quoteTargets = change.content !== null ? quotedMessageIds(change.content) : where.quoteTargets;
+      const quoteTargets = raw !== null ? quotedMessageIds(raw) : where.quoteTargets;
       const replyToSelf = replyVerdict !== null ? this.replyToSelfForVerdict(replyVerdict, quoteTargets, where) : where.replyToSelf;
       // Keep the cache current: a later reaction or deletion reads the message
       // as it now is. A move re-seats every co-moved message, not only the one
       // acted on.
-      this.seen.set(change.messageId, {
+      this.seen.set(id, {
         ...where,
         topic,
         mentioned,
@@ -613,21 +616,21 @@ export class ZulipAdapter implements PlatformAdapter {
         ...(movedToKey !== null ? { key: movedToKey } : {}),
       });
       if (change.topic !== null || movedToKey !== null) {
-        for (const id of change.messageIds) {
-          if (id === change.messageId) continue;
-          const co = this.seen.get(id);
-          if (co) this.seen.set(id, { ...co, topic, ...(movedToKey !== null ? { key: movedToKey } : {}) });
+        for (const other of change.messageIds) {
+          if (other === id) continue;
+          const co = this.seen.get(other);
+          if (co) this.seen.set(other, { ...co, topic, ...(movedToKey !== null ? { key: movedToKey } : {}) });
         }
       }
       if (crossStream && movedToKey === null) {
         const now = Date.now();
-        for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
-        for (const id of change.messageIds) this.movedAway.set(id, now);
+        for (const [old, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(old);
+        for (const moved of change.messageIds) this.movedAway.set(moved, now);
       }
       return {
         kind: content !== null ? 'edit' : 'move',
         key: fromKey,
-        messageId: String(change.messageId),
+        messageId: String(id),
         messageIds: change.messageIds.map(String),
         authorId: String(where.authorId),
         authorName: where.authorName,

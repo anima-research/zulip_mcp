@@ -1802,6 +1802,26 @@ scenario("74. a deletion of a new stream's first message that comes while the me
   } finally { run.releaseChanged(); await run.close(); }
 });
 
+scenario('77. a move of a waiting message and a message the host has, whose waiting message is then deleted, reaches the host as a line about the other message', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const had = r.post(17, '@bot first', { mentioned: true });
+    await until(() => named(run, had), 'the first mention');
+    await busyGeneral(r);
+    const waiting = r.post(17, '@bot second', { mentioned: true });
+    r.moveTopic([waiting, had], 'elsewhere');
+    r.remove([waiting]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, waiting), false);
+    assert.equal(pushesAbout(run, 'move', had).length, 1);
+  } finally { release(); await run.close(); }
+});
+
 scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });

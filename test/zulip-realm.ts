@@ -28,6 +28,8 @@ export interface Realm {
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
   move(messageId: number, toStreamId: number): void;
+  /** One event that moves several messages of a stream to a topic, under the first id. */
+  moveTopic(messageIds: number[], topic: string): void;
   edit(messageId: number, content: string, opts?: { mentioned?: boolean; topic?: string }): void;
   remove(messageIds: number[]): void;
 }
@@ -230,6 +232,12 @@ export function realm(initial: Record<number, string>): Realm {
       const from = m.streamId;
       m.streamId = toStreamId;
       queue({ type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60, orig_subject: m.topic, stream_id: from, new_stream_id: toStreamId, flags: [] });
+    },
+    moveTopic(messageIds, topic) {
+      const moved = messages.filter((x) => messageIds.includes(x.id));
+      const from = moved[0].topic;
+      for (const m of moved) m.topic = topic;
+      queue({ type: 'update_message', message_id: messageIds[0], message_ids: messageIds, user_id: PERSON.id, edit_timestamp: moved[0].timestamp + 60, orig_subject: from, subject: topic, stream_id: moved[0].streamId, flags: [] });
     },
     edit(messageId, content, opts = {}) {
       const m = messages.find((x) => x.id === messageId)!;
