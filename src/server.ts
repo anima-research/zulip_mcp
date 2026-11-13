@@ -1244,6 +1244,7 @@ export class ZulipMcplServer {
       console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
     }
     return async (ctx) => {
+      if (ctx.ended) return;
       if (open) ctx.w.delivery.markReplayed(key, ids);
       try {
         await hand?.(ctx);

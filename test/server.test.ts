@@ -5572,3 +5572,56 @@ test("the lines belong to their connection: after a connection ended while the a
   await second.server.quiet();
   await second.close();
 });
+
+test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => { reading = true; await readHeld; return real(key, query); };
+  h.adapter.emit!(streamMsg(2));
+  await until(() => reading, 'the read for the refused message');
+  h.serverSide.once('close', () => setTimeout(releaseRead, 50));
+  await h.close();
+  assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1]);
+});
+
+test("a read for held ids of a closed channel that the connection's end cuts short, and whose fetch then fails, marks none of them offered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-held-read-ended-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'hre' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'hre', history: [streamMsg(4, { mentioned: true }), streamMsg(5)] });
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), [4], 'the refused block');
+    let reading = false;
+    let releaseRead!: () => void;
+    const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+    second.adapter.fetchHistory = async () => { reading = true; await readHeld; throw refusal('BAD_REQUEST'); };
+    second.adapter.history.push(streamMsg(6, { mentioned: true }));
+    second.adapter.emit!(streamMsg(6, { mentioned: true }));
+    await until(() => reading, 'the read for the refused block');
+    second.serverSide.once('close', () => setTimeout(releaseRead, 50));
+    await second.close();
+    assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), [4]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
