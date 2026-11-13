@@ -197,6 +197,29 @@ test("a lane that has waited longest but can't start its read when the turn come
   assert.deepEqual(log, ['C', 'B', 'A']);
 });
 
+test("a lane that a host's job reaches as the turn comes back to it doesn't keep the turn from the next lane that can read", async () => {
+  const l = lanes();
+  const log: string[] = [];
+  const readC = gate();
+  const hostA = gate();
+  l.lane(C).enterRead(async () => {
+    log.push('C');
+    await readC.opened;
+    return () => { l.lane(A).host(async () => { log.push('A host'); await hostA.opened; }); };
+  });
+  await new Promise((r) => setImmediate(r));
+  l.lane(A).enterRead(() => { log.push('A'); });
+  await new Promise((r) => setImmediate(r));
+  l.lane(B).enterRead(() => { log.push('B'); });
+  await new Promise((r) => setImmediate(r));
+  readC.open();
+  for (let i = 0; i < 10 && log.length < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(log, ['C', 'A host', 'B']);
+  hostA.open();
+  await l.quiet();
+  assert.deepEqual(log, ['C', 'A host', 'B', 'A']);
+});
+
 test('ending the lanes drops what waits, tells a running job, waits for it within the grace, and takes nothing after', async () => {
   const l = lanes();
   const log: string[] = [];

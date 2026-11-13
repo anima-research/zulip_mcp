@@ -413,11 +413,11 @@ export class Lanes<W> {
     return false;
   }
 
+  /** Every waiting lane that could start its read now is woken, and takeTurn gives the turn to the one that has waited longest. */
   giveTurnBack(lane: Lane<W>): void {
     if (this.turnHolder !== lane) return;
     this.turnHolder = null;
-    const next = this.turnWaiters.find((other) => other.canStartRead);
-    if (next) this.changed(next);
+    for (const other of this.turnWaiters) if (other.canStartRead) this.changed(other);
   }
 
   /** No job runs or waits in any lane that hasn't ended. */
