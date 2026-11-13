@@ -1,0 +1,7 @@
+---
+services:
+  zulip:
+    environment:
+      # docker-zulip writes a value in braces into settings.py as Python, and
+      # Zulip merges these rules over its defaults, so only api_by_user changes.
+      SETTING_RATE_LIMITING_RULES: '{"api_by_user": [(60, 100000)]}'

@@ -12,9 +12,10 @@ trap 'echo "scripts/contract-zulip.sh failed at line $LINENO" >&2' ERR
 # can't change the server a green run was against.
 image="ghcr.io/zulip/zulip-server@sha256:0a2b5760daaa69fc6fd425fed1cbd969be79c5842cd94443ce798243e7fb07af"
 
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "${1:?usage: scripts/contract-zulip.sh DOCKER_ZULIP_DIR}"
 export GITHUB_CI_IMAGE="$image"
-export COMPOSE_FILE=compose.yaml:ci/base.yaml:ci/basic/compose.yaml
+export COMPOSE_FILE="compose.yaml:ci/base.yaml:ci/basic/compose.yaml:$here/contract-zulip.compose.yaml"
 export COMPOSE_ENV_FILES=ci/base.env
 
 docker compose pull -q >&2

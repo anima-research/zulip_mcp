@@ -51,8 +51,7 @@ export class PlainApi {
       });
       const body = await res.json();
       if (res.status !== 429 || tries === RATE_LIMIT_TRIES) return body;
-      // The whole suite runs within one of Zulip's rate-limit windows, so a call
-      // can meet a 429. Wait the seconds it names, as any client must.
+      // Wait the seconds that Zulip's 429 names, as any client must.
       const seconds = Number(res.headers.get('retry-after') ?? body?.['retry-after']);
       await new Promise((r) => setTimeout(r, (Number.isFinite(seconds) && seconds > 0 ? seconds : 1) * 1000));
     }
