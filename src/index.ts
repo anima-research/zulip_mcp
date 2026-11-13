@@ -26,7 +26,7 @@
  *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
  *   ZULIP_ATTRIBUTE_DELIVERY                    - "false" delivers bare bodies; default renders
  *                                                 "[time id=N] [#stream > topic] Author: " into each
- *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split (10000)
+ *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split, longer edits refused (10000)
  *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
  *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
  *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
@@ -63,7 +63,7 @@ const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
 function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
-  const n = parseInt(raw, 10);
+  const n = /^\s*\d+\s*$/.test(raw) ? Number(raw) : NaN;
   if (!Number.isFinite(n) || n < min) {
     console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not ${min === 0 ? 'a non-negative integer' : `an integer of at least ${min}`}); using ${fallback}`);
     return fallback;

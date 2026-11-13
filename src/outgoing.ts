@@ -18,15 +18,8 @@ export interface SendResult {
   last: ZulipSuccess<{ id: number }>;
 }
 
-/** A message this server sent, as the rollback record keeps it. */
-export interface SentRecord {
-  messageId: string;
-  channelId: string;
-  content: string;
-}
-
 export class SendRefused extends Error {
-  constructor(readonly answer: ZulipRefusal, readonly sent: SentChunk[]) {
+  constructor(readonly answer: ZulipRefusal) {
     super(answer.msg ?? answer.code ?? 'Zulip refused the message');
     this.name = 'SendRefused';
   }
@@ -74,7 +67,7 @@ export async function sendMessage(
   let last: ZulipSuccess<{ id: number }> | undefined;
   for (const part of parts) {
     const answer = await api.requestAnswer<{ id: number }>('POST', '/messages', { ...destination, content: part });
-    if (isRefusal(answer)) throw new SendRefused(answer, chunks);
+    if (isRefusal(answer)) throw new SendRefused(answer);
     const chunk = { id: answer.id, content: part };
     chunks.push(chunk);
     last = answer;

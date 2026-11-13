@@ -6,29 +6,16 @@
  * each kind through its callback. Handles queue expiry recovery and
  * graceful shutdown.
  *
- * Failure semantics:
- *
- *   - Queue expiry (BAD_EVENT_QUEUE_ID) is an HTTP 400 with a JSON body
- *     `{ result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: ... }`, which the
- *     poll reads as an answer. We classify on its `code` field and re-register
- *     a fresh queue. Zulip offers no gap recovery for a dead queue, so any
- *     events between the last delivered message and re-registration are lost —
- *     we surface that as a 'gap' system event anchored on the last delivered
- *     *message* id/time (not the queue-local event id, which is meaningless to
- *     the new queue or the messages API) so the host/agent can consult history
- *     from there.
- *   - No JSON answer (a dropped connection, a poll unanswered past its bound,
- *     90 s by default, while Zulip sends a heartbeat at least every 45 s, or a
- *     non-JSON proxy or HTML error page)
- *     throws ZulipNoAnswer. These back off exponentially (base 2s, cap 60s);
- *     after several consecutive failures a 'degraded' system event fires, and
- *     a 'recovered' event fires when polling succeeds again.
- *   - A malformed but non-throwing response (missing `events` array and not an
- *     error object) also backs off rather than hot-spinning the poll.
+ * Zulip offers no gap recovery for a dead queue (code BAD_EVENT_QUEUE_ID):
+ * events between the last delivered message and re-registration are lost.
+ * An event id is local to its queue, and means nothing to the new queue or to
+ * the messages API, so a gap is anchored on the last delivered message's id
+ * and time.
+ * Zulip answers a long poll with a heartbeat at least every 45 s.
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
-import { isRefusal, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, LONG_TIMEOUT_MS, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 
 export interface ZulipEventMessage {
   id: number;
@@ -133,7 +120,6 @@ export type ZulipMessageChange =
 
 export type OnZulipMessageChange = (change: ZulipMessageChange) => void;
 
-/** The events in a successful answer to `GET /events`. */
 export interface ZulipRetrieveResponse {
   events?: ({ id: number; type: string; message?: ZulipEventMessage; flags?: string[] }
     & Partial<ZulipReactionEvent>
@@ -150,14 +136,12 @@ export interface ZulipEventLoopOptions {
   degradedThreshold?: number;
   /** Injectable sleep for tests. */
   sleep?: (ms: number) => Promise<void>;
-  /** The bound on one long poll. Default 90000ms. */
   pollTimeoutMs?: number;
 }
 
 const DEFAULT_BASE_BACKOFF_MS = 2000;
 const DEFAULT_MAX_BACKOFF_MS = 60_000;
 const DEFAULT_DEGRADED_THRESHOLD = 3;
-const DEFAULT_POLL_TIMEOUT_MS = 90_000;
 
 export class ZulipEventLoop {
   private stopped = false;
@@ -195,7 +179,7 @@ export class ZulipEventLoop {
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
     this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
-    this.pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+    this.pollTimeoutMs = options.pollTimeoutMs ?? LONG_TIMEOUT_MS;
   }
 
   /**
@@ -310,9 +294,6 @@ export class ZulipEventLoop {
           'GET', '/events', { queue_id: this.queueId, last_event_id: lastEventId }, { timeoutMs: this.pollTimeoutMs },
         );
 
-        // Queue died server-side: Zulip answers with a JSON refusal. Classify
-        // on the structured `code` before treating the missing `events` array
-        // as a malformed response.
         if (isRefusal(response) && response.code === 'BAD_EVENT_QUEUE_ID') {
           console.error('Zulip event queue expired, re-registering...');
           this.pendingGap = {
@@ -459,7 +440,7 @@ export class ZulipEventLoop {
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          nonJson ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : errMsg,
+          nonJson ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : errMsg.replace(/\.$/, ''),
         );
         await this.sleep(delay);
       }
