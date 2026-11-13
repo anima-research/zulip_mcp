@@ -118,8 +118,9 @@ export type OnReaction = (entry: ReactionEntry) => void;
 /**
  * A message the agent may have seen was edited, moved to another topic or
  * stream, or deleted — resolved to the channel the message lived in.
- * Adapters drop the bot's own edits before invoking the callback; a change
- * someone else made to the bot's message is news (`onOwnMessage`).
+ * Adapters drop the bot's own edits that move nothing before invoking the
+ * callback, and mark its moves `byBot`; a change someone else made to the
+ * bot's message is news (`onOwnMessage`).
  */
 export interface MessageChangeEvent {
   kind: 'edit' | 'move' | 'delete';

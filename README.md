@@ -293,8 +293,9 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
 `previouslyMentioned`, plus `replyToSelf` and `previouslyReplyToSelf` for
 quote addressing (previous verdicts are absent when only the post-change
-state could be read). A change line never sets `threadId` and never moves
-this server's reply routing: a moderator archiving an old message does not retarget the
+state could be read). A change line never sets `threadId`. Reply routing
+moves only when the message a plain answer follows moves to another topic in
+its stream: a moderator archiving an older message does not retarget the
 reply the agent is composing. A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
