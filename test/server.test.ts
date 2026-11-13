@@ -2046,6 +2046,77 @@ test('a message that waits with a reaction and a move behind it, and is deleted:
   }
 });
 
+test("while zulip.messaging is disabled, an edit that takes a held row's quote of the bot out forgets its reply verdict, and tells nothing", async () => {
+  const h = harness({ history: [streamMsg(5)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await heldAcrossDisable(h, streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }), () => disableMessaging(h));
+  h.adapter.change!({
+    ...deletion('zulip:general', '5', false), kind: 'edit', actorId: '9', content: 'no quote now', previousContent: 'msg 5', replyToSelf: false, replyToSelfVerified: true,
+  });
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.some((m) => m.messageId === '5'), '5, read again');
+  await h.server.quiet();
+  const five = h.incoming.find((m) => m.messageId === '5')!;
+  assert.equal(five.tags?.includes('chat:reply'), false);
+  assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('edit:')), []);
+  await h.close();
+});
+
+test('while zulip.messaging is disabled, a change to an accepted message whose lookup is still out when it is enabled tells nothing', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await disableMessaging(h);
+  const key = h.adapter.keyOf('zulip:general');
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let looking = false;
+  h.adapter.enterChange!({ key, messageIds: [1], kind: 'edit', ready: async () => {
+    looking = true;
+    await lookup;
+    return { ...deletion('zulip:general', '1', false), key, kind: 'edit', actorId: '9', content: 'msg 1, fixed', previousContent: 'msg 1' };
+  } });
+  await until(() => looking, "the edit's lookup");
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  answer();
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'a message after the enable');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('edit:')), []);
+  await h.close();
+});
+
+test('while zulip.messaging is disabled, a move of an accepted message that its turn places in another channel tells nothing on either channel', async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:aaa', label: '#aaa', address: { stream_name: 'aaa', stream_id: 6 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:aaa']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await disableMessaging(h);
+  const general = h.adapter.keyOf('zulip:general');
+  const aaa = h.adapter.keyOf('zulip:aaa');
+  h.adapter.enterChange!({ key: general, messageIds: [1], kind: 'move', ready: async () => ({
+    ...deletion('zulip:general', '1', true), key: aaa, kind: 'move', actorId: '9', previousContent: null, topic: 'elsewhere', previousTopic: 'deploys',
+  }) });
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'a message after the enable');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('move:')), []);
+  await h.close();
+});
+
 test("a reaction on a stream that the directory doesn't name yet, while zulip.messaging is disabled, waits in no lane", async () => {
   const h = harness();
   await initialize(h, true);

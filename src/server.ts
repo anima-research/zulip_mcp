@@ -2411,8 +2411,11 @@ export class ZulipMcplServer {
         if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
         if (rest.length === 0) return;
-        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) return;
-        lane.enter((ctx) => this.runChange(ctx, entry, rest), { kind: 'change', about: rest });
+        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) {
+          lane.host((ctx) => this.runChange(ctx, entry, rest, true));
+          return;
+        }
+        lane.enter((ctx) => this.runChange(ctx, entry, rest, false), { kind: 'change', about: rest });
       },
     );
   }
@@ -2467,11 +2470,13 @@ export class ZulipMcplServer {
     return this.mcplActive && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
   }
 
-  private async runChange(ctx: Ctx, entry: ChangeEntry, ids: number[]): Promise<void> {
+  private async runChange(ctx: Ctx, entry: ChangeEntry, ids: number[], silent: boolean): Promise<void> {
     const change = await entry.ready(ids);
     if (change === null || ctx.ended) return;
-    if (change.key === entry.key) return this.onMessageChange(ctx, change);
-    this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
+    if (change.key === entry.key) return this.onMessageChange(ctx, change, true, silent);
+    const lane = this.lanes?.lane(change.key);
+    if (silent) lane?.host((c) => this.onMessageChange(c, change, true, true));
+    else lane?.enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
   }
 
   /**
@@ -2485,10 +2490,10 @@ export class ZulipMcplServer {
    * already changed if it arrives at all. The synthetic id never advances a
    * watermark; the line carries the message's own id for fetch_around.
    */
-  private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true): Promise<void> {
+  private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true, silent = false): Promise<void> {
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
-    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    if (silent || !this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a
     // stream the bot was added to after startup — a message edited into a
