@@ -26,7 +26,8 @@
   when the host had accepted nothing on its channel before it, such as one
   the host refused, or one that was waiting or on its way when the
   connection ended. Such a channel had no watermark on disk. It now gets one
-  just below that message, so the next start offers it.
+  just below that message, so the next start offers it if Zulip's history
+  still has it there.
 - A message that arrived while the host had `zulip.messaging` disabled was
   dropped, unless it was already waiting in the batch. It is now held, and
   offered once the host enables `zulip.messaging` again.

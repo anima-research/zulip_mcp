@@ -2,7 +2,7 @@
   bound, where each fetch had 15 s of its own. An attachment not fetched by
   then gets the "could not fetch" note with its path for `fetch_attachment`,
   and an attachment after it isn't fetched. So a message waits at most 15 s
-  for its attachments, where it could wait 15 s for each.
+  for its attachments' fetches, where it could wait 15 s for each.
 - On a channel where the host has accepted nothing, a message that isn't
   accepted now gives the channel a watermark just below it, for example
   because the host refused it, the connection ended first, or
@@ -27,13 +27,13 @@
 - A read from history that fills a hole and gets no answer from Zulip, or
   that Zulip refuses by its rate limit, is now tried again: after 2 s, then
   at waits that double up to 60 s, or after Zulip's `retry-after` where that
-  is longer. These are the catch-up at a connection's start, the recovery
-  after Zulip's event queue broke, and the read after a channel gave up its
-  waiting messages. Meanwhile the channel's later messages wait behind the
+  is longer. These are the catch-up at a connection's start, the read of
+  the hole after Zulip's event queue broke, and the read after a channel
+  gave up its waiting messages. Meanwhile the channel's later messages wait behind the
   read, so the messages of the hole reach the host first, in order. Such a
   read used to be logged and skipped, and the messages of that stretch were
   never offered once the host accepted a later one. A read that Zulip
   refuses for another reason still ends the hole, as before. Once a read has
   waited 90 s, every open channel gets one line naming the channels whose
-  reads wait, and one more line when no read waits any more. With no
+  reads wait then, and one more line when no read waits any more. With no
   channel open, both lines go to the log.
