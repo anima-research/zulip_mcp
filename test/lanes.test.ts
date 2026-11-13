@@ -263,6 +263,7 @@ test("a lane that a host's job reaches before it reads, just as its hold ends, d
     if (!log.includes('A')) {
       reached++;
       assert.ok(log.includes('B'), `${k} hops: B didn't read while A's host job waited ahead of A's read: ${log.join(', ')}`);
+      assert.ok(log.indexOf('A host entered') < log.indexOf('B'), `${k} hops: B read before A's host job entered: ${log.join(', ')}`);
     }
     hostA.open();
     await l.quiet();
