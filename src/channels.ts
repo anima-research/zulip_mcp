@@ -1,11 +1,3 @@
-/**
- * Channel Manager — Maps platform channels to MCPL channels.
- *
- * Handles registration, open/close lifecycle, incoming message batching,
- * publish routing (with last-incoming thread tracking for in-thread replies),
- * and channel listing.
- */
-
 import { ERR_UNKNOWN_CHANNEL } from '@animalabs/mcpl-core';
 import type {
   ChannelDescriptor,
@@ -26,15 +18,8 @@ import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platf
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
-/**
- * The server→host calls the manager makes. Implemented over `McplConnection`
- * by the server; kept as an interface so the manager is testable without a
- * transport.
- */
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
-  /** `channels/changed`, Request form (§14.5) — itemized like register.
-   *  `timeoutMs` bounds the wait. */
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
@@ -42,12 +27,8 @@ export interface HostClient {
 /** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
 type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: string[] };
 
-/** Channels kept for re-announcement past a host that never answered. */
 const MAX_PENDING_ANNOUNCEMENTS = 100;
 
-/** A batch that failed as a whole is retried this many times before it is
- *  given up on (the watermark then stays put and a later read from history
- *  fetches what was lost again). */
 const MAX_BATCH_ATTEMPTS = 2;
 
 interface Queued {
@@ -55,39 +36,17 @@ interface Queued {
   attempts: number;
 }
 
-/** What `registerAdditional` did with each descriptor. */
 export interface RegisterAdditionalResult {
-  /** The host accepted these; they are registered on both sides. */
   announced: string[];
-  /** The announcement did not land; usable here and queued for re-announcement. */
   local: string[];
-  /** The host itemized a refusal; not registered. */
   refused: string[];
-  /** Why nothing was announced, when that is not obvious from the lists. */
   reason?: string;
 }
 
 export interface ChannelManagerHooks {
-  /**
-   * Called per channel after one `channels/incoming` round trip with what
-   * the host ACCEPTED and what it REJECTED. A batch that never got an answer
-   * reports nothing — this is the only signal on which a delivery watermark
-   * may advance.
-   */
   onDelivered?: (key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]) => void;
-  /**
-   * Decides at send time whether a queued message may still go out. A mute,
-   * an allowlist narrowing or a feature-set reduction that landed while the
-   * message sat in the batch window (or waited for its retry) is honoured
-   * here, not only at enqueue.
-   */
   deliverable?: (message: KeyedMessage) => boolean;
-  /** Messages removed from a batch by policy — `deliverable`, a channel no
-   *  longer open under the id the host holds, or a missing `channels.incoming`
-   *  grant — grouped per channel. Not sent, not answered. */
   onWithheld?: (key: ChannelKey, messages: KeyedMessage[]) => void;
-  /** Messages given up on after the transport retry, per channel: never
-   *  accepted, never rejected — the host simply did not answer. */
   onGivenUp?: (key: ChannelKey, messages: KeyedMessage[]) => void;
 }
 
@@ -99,19 +58,12 @@ export class ChannelManager {
   private batchWindowMs: number;
   private flushing: Promise<void> | null = null;
   private idleWaiters: (() => void)[] = [];
-  /** Per-channel routing hints from the newest message noteConversation
-   *  took, so publishes can land in the active thread/topic, with the id of
-   *  the message they came from, so an older message delivered late doesn't
-   *  move them back. */
   private lastIncoming = new Map<ChannelKey, { hints: RoutingHints; from?: number }>();
-  /** Per-channel topic the current typing run started in, so a refresh that
-   *  moves to a newer topic, and the final stop, cancel it there. */
   private typingTopic = new Map<ChannelKey, string | undefined>();
 
   /**
-   * @param grant the effective capability grant for this connection (§5.4).
-   *   Required: there is no ungated construction, because a default would be a
-   *   default-allow and absence of a capability is denial.
+   * There is no ungated construction: absence of a capability is denial
+   * (§5.4), so a default would be a default-allow.
    */
   constructor(
     private host: HostClient,
@@ -125,13 +77,9 @@ export class ChannelManager {
   }
 
   /**
-   * Discover all available channels across adapters and register them with the
-   * host (`channels/register`, §14.3).
-   *
-   * Descriptors are recorded locally only once the host has accepted them.
    * §14.5 authorizes each descriptor independently and the Request form
-   * answers itemwise, so a rejected descriptor must not sit in `allChannels`
-   * pretending to exist.
+   * answers itemwise, so a descriptor is recorded only once the host has
+   * accepted it.
    */
   async registerChannels(): Promise<void> {
     if (!this.grant.has('channels.register')) {
@@ -168,24 +116,16 @@ export class ChannelManager {
           (rejected > 0 ? ` (${rejected} rejected)` : ''),
       );
     } catch (error) {
-      // The registration never landed, so no descriptor is registered.
       console.error('Failed to register channels:', error);
     }
   }
 
   /**
-   * Register channels that appeared after startup (a DM from a new
-   * conversation, a stream the bot was just added to) via `channels/changed`
-   * (§14.5). Descriptors already known are refreshed locally and NOT
-   * re-announced, so repeat calls do not spam the host.
-   *
    * An announcement that never landed (transport error, timeout, a host that
    * treats `channels/changed` as a Notification and answers nothing) is not a
-   * refusal: the channel exists and the host may already know it from the
-   * message that arrived from it. Dropping it locally is what left a stream
-   * the bot joined after startup unopenable until a restart (#20), so it is
-   * recorded here and re-announced on the next call. Only an itemized
-   * `accepted: false` keeps a descriptor out — that IS the host's answer.
+   * refusal: the host may already know the channel from the message that
+   * arrived from it (#20). Only an itemized `accepted: false` keeps a
+   * descriptor out.
    */
   async registerAdditional(
     descriptors: ChannelDescriptor[],
@@ -193,15 +133,13 @@ export class ChannelManager {
   ): Promise<RegisterAdditionalResult> {
     const added: ChannelDescriptor[] = [];
     const refusedNow: string[] = [];
-    /** What each submitted descriptor was before this announcement, so the
-     *  verdict can be applied without inventing a state it never had. */
     const before = new Map<string, 'confirmed' | 'pending' | 'refused' | 'new'>();
     for (const d of descriptors) {
       const key = this.ids.keyOfDescriptor(d);
       const held = key === null ? undefined : this.ids.heldIdOf(key);
       const holder = this.ids.holderOf(d.id);
       if ((held !== undefined && held !== d.id) || (holder !== undefined && holder !== key)) continue;
-      if (this.announcing.has(d.id)) continue; // already going out
+      if (this.announcing.has(d.id)) continue;
       if (this.refused.has(d.id)) {
         if (!opts.retryRefused) {
           refusedNow.push(d.id);
@@ -212,15 +150,12 @@ export class ChannelManager {
         continue;
       }
       if (this.allChannels.has(d.id) && !this.unannounced.has(d.id)) {
-        this.record(d); // confirmed already; refresh the local copy
+        this.record(d);
         continue;
       }
       before.set(d.id, this.unannounced.has(d.id) ? 'pending' : 'new');
       added.push(d);
     }
-    // The backlog is retried only where a caller can afford to wait — an
-    // explicit refresh, a widened allowlist, `listen`. The message path must
-    // not carry it: that announcement sits in front of a delivery.
     if (opts.retryBacklog) {
       const queued = new Set(added.map((d) => d.id));
       for (const [id, d] of this.unannounced) {
@@ -237,10 +172,9 @@ export class ChannelManager {
       return { announced: [], local: [], refused: refusedNow, reason: 'channels.register is not in the grant' };
     }
 
-    // Recorded BEFORE the announcement goes out. A host that opens a channel
-    // from inside its own `channels/changed` handler (agent-framework
-    // reconciles before it answers) would otherwise be told `Unknown channel`
-    // for the very descriptor it is processing.
+    // Recorded before the announcement goes out: a host that opens a channel
+    // from inside its own `channels/changed` handler would otherwise be told
+    // `Unknown channel` for the very descriptor it is processing.
     for (const d of added) {
       this.record(d);
       this.announcing.add(d.id);
@@ -261,9 +195,6 @@ export class ChannelManager {
           case 'refused':
             this.unannounced.delete(d.id);
             if (was === 'confirmed') {
-              // The host accepted this one earlier and is now refusing it.
-              // Unregistering it here would leave delivery running against a
-              // channel the registry no longer has; keep it and say so.
               console.error(`host refused ${d.id}, which it had already accepted; keeping it registered`);
               announced.push(d.id);
               break;
@@ -350,14 +281,6 @@ export class ChannelManager {
     }
   }
 
-  /**
-   * The host proved it knows a channel by acting on it — it opened or closed
-   * one this server is still waiting to hear about. Against a host that
-   * reconciles inside its own `channels/changed` handler that action is the
-   * only confirmation this server can ever get, because the answer to the
-   * announcement cannot arrive until the request this server is serving
-   * returns. Without this the backlog would be retried forever (#20 review).
-   */
   confirmAnnounced(channelId: string): void {
     if (this.unannounced.delete(channelId)) {
       console.error(`[channels] ${channelId} confirmed by the host acting on it; dropping it from the announcement backlog`);
@@ -365,7 +288,6 @@ export class ChannelManager {
     this.refused.delete(channelId);
   }
 
-  /** Put a refused channel back the way a refusal leaves it. */
   private restoreRefusal(channelId: string): void {
     this.refused.add(channelId);
     this.unannounced.delete(channelId);
@@ -392,7 +314,6 @@ export class ChannelManager {
     return wasOpen;
   }
 
-  /** Queue a descriptor for re-announcement, oldest dropped past the cap. */
   private queueUnannounced(d: ChannelDescriptor): void {
     this.unannounced.delete(d.id);
     this.unannounced.set(d.id, d);
@@ -403,12 +324,7 @@ export class ChannelManager {
     }
   }
 
-  /**
-   * What the host said about each submitted descriptor (§14.5). An itemized
-   * `accepted: false` is a refusal; an id the itemization does not mention is
-   * unstated, NOT refused. A result with neither `results` nor `registered`
-   * itemizes nothing: the submitted set stands (pre-0.5 shape).
-   */
+  /** §14.5: an itemized `accepted: false` is a refusal. */
   private readVerdicts(
     result: RegisterResultCompat | undefined,
     submitted: ChannelDescriptor[],
@@ -430,25 +346,10 @@ export class ChannelManager {
     return verdicts;
   }
 
-  /** Recorded here but never confirmed by the host; re-announced on the next
-   *  explicit registration. Bounded: past the cap the oldest entry stops being
-   *  retried (it stays usable), so a host that never answers cannot grow this
-   *  without limit. */
   private readonly unannounced = new Map<string, ChannelDescriptor>();
-  /** Channels the host itemized as refused. Not re-announced until the agent
-   *  asks (`refresh_channels`) or the connection resets. */
   private readonly refused = new Set<string>();
-  /** Announcements in flight, so two callers cannot announce the same id twice. */
   private readonly announcing = new Set<string>();
 
-  /**
-   * Read an itemized `channels/register` / `channels/changed` result (§14.5).
-   *
-   * A host that answers with neither `results` nor `registered` has not
-   * itemized anything; the submitted set stands. That is the pre-0.5 shape,
-   * not a policy statement, and it is not read as approval of anything the
-   * host explicitly rejected.
-   */
   private acceptedIds(
     result: RegisterResultCompat | undefined,
     submitted: ChannelDescriptor[],
@@ -463,12 +364,8 @@ export class ChannelManager {
   }
 
   /**
-   * Handle channels/open from the host. Requires `channels.lifecycle` (§14.1);
-   * a denied capability behaves as if never advertised (§5.4), so this
-   * answers with an error rather than acting.
-   *
-   * An exact `channelId` is preferred; otherwise the first registered channel
-   * of the requested type whose address matches every key the host supplied.
+   * Requires `channels.lifecycle` (§14.1); a denied capability behaves as if
+   * never advertised (§5.4), so this answers with an error rather than acting.
    */
   openChannel(params: { channelId?: string; type: string; address?: unknown }): { channel: ChannelDescriptor } {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
@@ -477,10 +374,6 @@ export class ChannelManager {
     return { channel: descriptor };
   }
 
-  /**
-   * Find the descriptor channels/open names without opening it — for callers
-   * that must do work (fetch history) before committing the lifecycle.
-   */
   findChannel(params: { channelId?: string; type: string; address?: unknown }): ChannelDescriptor {
     if (params.channelId) {
       const descriptor = this.allChannels.get(params.channelId);
@@ -508,7 +401,6 @@ export class ChannelManager {
     });
   }
 
-  /** Commit the open half of the lifecycle. Requires `channels.lifecycle`. */
   markOpen(channelId: string): void {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     this.openChannels.add(channelId);
@@ -528,51 +420,24 @@ export class ChannelManager {
     return answer && 'key' in answer ? answer.key : null;
   }
 
-  /**
-   * Handle channels/close from the host. Requires `channels.lifecycle` (§14.1).
-   */
   closeChannel(params: ChannelsCloseParams): { closed: boolean } {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     const existed = this.openChannels.delete(params.channelId);
     return { closed: existed };
   }
 
-  /**
-   * Handle channels/list from the host. §14.1 keys `channels/list` in either
-   * direction on `channels.register`.
-   */
+  /** §14.1 keys `channels/list` in either direction on `channels.register`. */
   listChannels(): ChannelsListResult {
     if (!this.grant.has('channels.register')) throw capabilityDenied('channels.register');
     return { channels: Array.from(this.allChannels.values()) };
   }
 
-  /**
-   * Called when a new message arrives from a platform.
-   * Buffers messages and flushes in batches.
-   */
   onIncomingMessage(key: ChannelKey, message: KeyedMessage): void {
-    if (!this.isKeyOpen(key)) return; // channel not opened by host
+    if (!this.isKeyOpen(key)) return;
     this.noteConversation(key, message);
     this.enqueue(key, message);
   }
 
-  /**
-   * Remember where the conversation is, so publishes reply in-thread. The
-   * agent answers what reaches it through channels/publish, so the hints come
-   * from the newest of these on the channel: a message queued for the host
-   * while the channel is open, as it's queued (so one the batch then
-   * withholds, or the host refuses, moves them too); a mention or DM the host
-   * accepted as a push while the channel is closed; a catch-up block the host
-   * accepted, from its newest mention, or in a backscroll block its newest
-   * message; and the newest message of the history channels/open returned,
-   * unless it was fetched before a given message. The newest message wins:
-   * one older than the message the hints came from (a push accepted after a
-   * newer one's, a held message offered again) leaves them where they are. A
-   * marker about a message (a reaction, an edit, a move, a deletion) is not
-   * the conversation: a moderator moving a month-old message to `archive`
-   * must not retarget the reply the agent is composing in `support`. Returns
-   * whether the hints moved.
-   */
   noteConversation(key: ChannelKey, message: Pick<KeyedMessage, 'messageId' | 'threadId' | 'metadata'>): boolean {
     const meta = isRecord(message.metadata) ? message.metadata : undefined;
     if (meta?.reaction === true || typeof meta?.change === 'string') return false;
@@ -597,20 +462,11 @@ export class ChannelManager {
     return last && { from: last.from, topic: last.hints.threadId };
   }
 
-  /**
-   * Broadcast a platform system event (delivery gap, degraded polling) to
-   * every open channel of that platform as a synthetic incoming message, so
-   * the host/agent learns about it instead of it dying in stderr.
-   *
-   * Deliberately does NOT update lastIncoming: a system marker must not
-   * clobber the thread/topic routing hints of the real conversation.
-   */
   broadcastSystemEvent(platformType: string, event: PlatformSystemEvent): void {
     const prefix = `${platformType}:`;
     const targets = Array.from(this.openChannels).filter(id => id.startsWith(prefix));
 
     if (targets.length === 0) {
-      // No open channel to carry the marker — at least leave a trace.
       console.error(`[system:${platformType}] ${event.kind}: ${event.text} (no open channels to notify)`);
       return;
     }
@@ -630,8 +486,6 @@ export class ChannelManager {
       author: { id: 'system', name: `${platformType} connection` },
       timestamp,
       content: [{ type: 'text', text: event.text }],
-      // Spread adapter metadata FIRST so it can never clobber the
-      // discriminators consumers filter on (system / kind).
       metadata: { ...event.metadata, system: true, kind: event.kind },
     });
   }
@@ -648,9 +502,6 @@ export class ChannelManager {
     });
   }
 
-  /**
-   * Handle channels/publish from the host — route to the owning adapter.
-   */
   async publish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
     if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
 
@@ -675,10 +526,6 @@ export class ChannelManager {
     return 'key' in answer ? answer.key : { streamName: answer.unknownName };
   }
 
-  /**
-   * Handle channels/typing — best-effort typing indicator, routed to the
-   * owning adapter when it supports one.
-   */
   async sendTyping(
     channelId: string,
     metadata?: Record<string, unknown>,
@@ -693,12 +540,8 @@ export class ChannelManager {
       return;
     }
     const descriptor = this.allChannels.get(this.ids.channelIdOf(key) ?? channelId);
-    // A topic the host names wins. Like publish, a host that names none means
-    // the conversation's current one, the topic of the newest message
-    // noteConversation took.
-    // The host may send refreshes and the stop with the channel alone, so a run
-    // that a newer message moved must be stopped where it started, or it
-    // lingers there.
+    // The host may send typing refreshes and the stop with the channel alone,
+    // so a run is stopped in the topic it started in.
     const hostTopic = metadata?.topic;
     const named = typeof hostTopic === 'string';
     const at = (topic: string | undefined) => (topic === undefined ? metadata : { ...metadata, topic });
@@ -707,8 +550,6 @@ export class ChannelManager {
     const started = this.typingTopic.get(key);
     if (op === 'stop') {
       this.typingTopic.delete(key);
-      // A channel-only stop cancels the run where it is; a named stop cancels
-      // that topic too.
       if (running && (!named || started !== current)) await adapter.sendTyping(key, descriptor, at(started), 'stop');
       if (named || !running) await adapter.sendTyping(key, descriptor, at(current), 'stop');
       return;
@@ -718,44 +559,24 @@ export class ChannelManager {
     await adapter.sendTyping(key, descriptor, at(current), 'start');
   }
 
-  /**
-   * Get the set of currently open channel IDs.
-   */
   getOpenChannels(): Set<string> {
     return this.openChannels;
   }
 
-  /**
-   * Get a channel descriptor by ID.
-   */
   getChannel(id: string): ChannelDescriptor | undefined {
     return this.allChannels.get(id);
   }
 
-  /**
-   * Resolve the adapter owning a channel ID by its prefix.
-   */
   adapterFor(channelId: string): PlatformAdapter | undefined {
     const prefix = channelId.split(':', 1)[0];
     return this.adapters.get(prefix);
   }
 
-  /**
-   * Type of the first registered adapter — used as a fallback when an
-   * operation can't be attributed to a single platform.
-   */
   firstAdapterType(): string {
     const first = this.adapters.values().next().value as PlatformAdapter | undefined;
     return first?.type ?? 'unknown';
   }
 
-  /**
-   * Send whatever is buffered now, without waiting for the batch window.
-   * Awaits an in-flight flush first so batches never interleave. Used at
-   * shutdown so a message received in the last window is not stranded with
-   * its watermark unadvanced — and, if the connection is already gone, the
-   * failure leaves the watermark alone for the next start's catch-up.
-   */
   async flush(): Promise<void> {
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
@@ -779,17 +600,12 @@ export class ChannelManager {
     return new Promise((resolve) => this.idleWaiters.push(resolve));
   }
 
-  /** Buffered messages not yet delivered (for tests and diagnostics). */
   pendingCount(): number {
     let n = 0;
     for (const q of this.batchBuffer.values()) n += q.length;
     return n;
   }
 
-  /**
-   * Cleanup timers. Does not flush — call `flush()` first when the
-   * connection is still usable.
-   */
   destroy(): void {
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
@@ -798,12 +614,6 @@ export class ChannelManager {
     this.wakeIdleWaiters();
   }
 
-  /**
-   * Forget everything that belonged to a connection: the descriptors the
-   * peer accepted, what it had open, what was buffered for it. A new peer
-   * registers and opens afresh; whatever was buffered is re-offered by the
-   * new connection's catch-up, not sent to a host that never asked for it.
-   */
   reset(): void {
     this.destroy();
     this.allChannels.clear();
@@ -811,17 +621,11 @@ export class ChannelManager {
     this.batchBuffer.clear();
     this.lastIncoming.clear();
     this.typingTopic.clear();
-    // Announcement bookkeeping belongs to the peer that was there: a backlog
-    // carried across would announce to the NEXT host a channel this server
-    // may no longer even see, and a refusal was that host's policy, not this
-    // one's.
     this.unannounced.clear();
     this.refused.clear();
     this.announcing.clear();
     this.ids.reset();
   }
-
-  // -- Private --
 
   private enqueue(key: ChannelKey, message: KeyedMessage, attempts = 0): void {
     let buffer = this.batchBuffer.get(key);
@@ -835,11 +639,10 @@ export class ChannelManager {
   }
 
   private scheduleBatchFlush(): void {
-    if (this.batchTimer) return; // already scheduled
+    if (this.batchTimer) return;
     this.batchTimer = setTimeout(() => {
       this.batchTimer = null;
       if (this.flushing) {
-        // A flush is still on the wire; run after it rather than alongside.
         this.scheduleBatchFlush();
         return;
       }
@@ -857,16 +660,6 @@ export class ChannelManager {
     for (const resolve of waiters) resolve();
   }
 
-  /**
-   * One `channels/incoming` round trip for everything buffered.
-   *
-   * The buffer is taken, not cleared: on a failed request the batch goes
-   * back (front of the queue, attempts + 1) for one more try, and only
-   * messages the host itemizes as accepted reach `onDelivered`. A host that
-   * rejects a message has refused it (§14.5) — it is logged and reported
-   * rejected, and a batch that outlives the retry is reported given up; in
-   * neither case does a watermark move, so the message can be offered again.
-   */
   private async flushBatch(): Promise<void> {
     const taken = new Map(this.batchBuffer);
     this.batchBuffer.clear();
@@ -874,9 +667,6 @@ export class ChannelManager {
     for (const items of taken.values()) queued.push(...items);
     if (queued.length === 0) return;
 
-    // Policy is rechecked at send time, not only at enqueue: what changed
-    // during the batch window (a mute, a narrowed allowlist, a reduced
-    // grant) applies to what is still waiting.
     const wire = new Map<KeyedMessage, IncomingChannelMessage>();
     const withheld: KeyedMessage[] = [];
     queued = queued.filter((q) => {
@@ -892,10 +682,6 @@ export class ChannelManager {
     if (queued.length === 0) return;
     const allMessages = queued.map((q) => q.message);
 
-    // §14.1: `channels/incoming` is server→host content injection plus wake
-    // authority — a write. Without the grant the batch is dropped, not queued:
-    // a reduction must be respected immediately (§6.7), and holding messages
-    // for a grant that may never arrive would deliver them out of time.
     if (!this.grant.has('channels.incoming')) {
       console.error(
         `channels.incoming not granted; dropping ${allMessages.length} inbound message(s)`,
@@ -918,7 +704,6 @@ export class ChannelManager {
         (error as Error).message ?? error,
       );
       for (const [key, messages] of groupByKey(givenUp)) this.report(this.hooks.onGivenUp, key, messages);
-      // Put the retry set back ahead of anything buffered meanwhile.
       const requeued = new Map<ChannelKey, Queued[]>();
       for (const q of retry) {
         const list = requeued.get(q.message.key) ?? [];

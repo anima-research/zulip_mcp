@@ -1,41 +1,6 @@
 /**
- * The filters plane — which streams and people can reach the agent, which
- * streams are muted, and (for the reactions surface) which channels show
- * live reactions and which reaction emojis are withheld from the model.
- *
- * One JSON file is the desired state. It always exists once the server has
- * started: `ZULIP_FILTERS_FILE` when set, else `<state dir>/<session>.filters.json`,
- * seeded from the environment on first materialization. From then on edits
- * — by hand, by ops tooling, or by the agent through `filters_update` /
- * `mute_channel` — are hot-applied within seconds; nothing here needs a
- * restart, so an allowlist change can never require one (discord-mcpl #26).
- *
- * Semantics:
- *   streams unset/empty      → every stream the bot can see
- *   dmUsers unset/empty      → anyone may DM the bot
- *   mutedStreams             → nothing from these streams reaches the agent,
- *                              mentions included, and nothing is tallied
- *   reactionChannels         → channels opted into live reaction visibility
- *   suppressedReactionEmojis → reaction markers withheld from every
- *                              model-visible surface (operator-owned; the
- *                              agent's tools cannot carry this key)
- *
- * File schema:
- *   {
- *     "streams": ["general", "dev"],
- *     "dmUsers": ["42", "ann@example.com"],
- *     "mutedStreams": ["random"],
- *     "reactionChannels": ["zulip:general"],
- *     "suppressedReactionEmojis": ["biohazard"]
- *   }
- *
- * Failure posture: an unparseable or vanished file keeps the last-known-good
- * filters in force (never fail-open) and marks the plane stale. At startup
- * there is no last-known-good, so a file that exists but cannot be parsed
- * is a startup failure — the alternative would be running every
- * authorization list on the env seed, which for a deployment that never set
- * one means unrestricted. `filters_get` reports the plane's
- * desired-vs-effective state so disk ≠ process is always witnessed.
+ * Edits to the filters file are hot-applied: an allowlist change must never
+ * require a restart (discord-mcpl #26).
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
@@ -43,15 +8,10 @@ import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export interface ZulipFilters {
-  /** Allowed stream names. Unset = every visible stream. */
   streams?: string[];
-  /** Allowed DM senders, as user ids or (lower-cased) emails. Unset = anyone. */
   dmUsers?: string[];
-  /** Streams dropped entirely. */
   mutedStreams?: string[];
-  /** Channel ids opted into live reaction delivery. */
   reactionChannels?: string[];
-  /** Reaction emoji names withheld from the model. An explicit `[]` is preserved. */
   suppressedReactionEmojis?: string[];
 }
 
@@ -68,11 +28,10 @@ function stripHash(s: string): string {
 }
 
 /**
- * The matching key of a reaction marker. A name (`biohazard`, `:eyes:`) is
- * lower-cased without colons. A glyph (☣️, as the host's baseline carries
- * them) becomes its codepoints in hex joined by '-', VS-16 stripped — the
- * form Zulip reports as `emoji_code` for unicode emoji — so a glyph-shaped
- * entry and a name-shaped event meet on the code.
+ * A glyph (☣️, as the host's baseline carries them) becomes its codepoints in
+ * hex joined by '-', VS-16 stripped: the form Zulip reports as `emoji_code`
+ * for unicode emoji, so a glyph-shaped entry and a name-shaped event meet on
+ * the code.
  */
 export function normalizeReactionEmoji(emoji: string): string {
   const s = emoji.replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '');
@@ -80,9 +39,6 @@ export function normalizeReactionEmoji(emoji: string): string {
   return s.toLowerCase();
 }
 
-/** Drop empty lists so "unset" and "empty" stay one state (= unrestricted),
- *  except suppressedReactionEmojis, where an explicit empty list is a
- *  deliberate operator choice and must survive. */
 export function normalizeFilters(f: ZulipFilters): ZulipFilters {
   const out: ZulipFilters = {};
   const streams = uniqueStrings(f.streams, stripHash);
@@ -103,9 +59,6 @@ function splitList(raw: string | undefined): string[] {
   return (raw ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-/** The environment seed for the file: ZULIP_STREAMS, ZULIP_DM_USERS,
- *  ZULIP_MUTED_STREAMS. The reaction-suppression baseline is NOT part of it —
- *  see `parseBaselineFromEnv`. */
 export function parseFiltersFromEnv(env: NodeJS.ProcessEnv = process.env): ZulipFilters {
   return normalizeFilters({
     streams: splitList(env.ZULIP_STREAMS),
@@ -114,25 +67,11 @@ export function parseFiltersFromEnv(env: NodeJS.ProcessEnv = process.env): Zulip
   });
 }
 
-/**
- * The host-owned reaction-suppression baseline: the refusal-annotation
- * markers the host's framework stamps, which the model must never see.
- * `ZULIP_SUPPRESSED_REACTIONS_BASELINE` when set; else the name every host
- * injects into every MCPL child regardless of platform,
- * `DISCORD_SUPPRESSED_REACTIONS_BASELINE` (a naming wart of the host, not a
- * Discord-only value). Re-read on every start and never written to the
- * filters file: the host may change its markers between deployments, and a
- * persisted copy would freeze the set the file was first seeded with.
- */
 export function parseBaselineFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env.ZULIP_SUPPRESSED_REACTIONS_BASELINE ?? env.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
   return uniqueStrings(splitList(raw), normalizeReactionEmoji);
 }
 
-/** Load + validate the filters file. Returns null when the file is missing,
- *  unparseable, or carries a wrong-typed key — callers keep the previous
- *  filters (fail-safe, never fail-open). Every key here is an authorization
- *  list; a wrong-typed one must not degrade to "unrestricted" or "absent". */
 export function loadFiltersFile(path: string): ZulipFilters | null {
   try {
     const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
@@ -151,9 +90,6 @@ export function loadFiltersFile(path: string): ZulipFilters | null {
   }
 }
 
-/** Atomic write (tmp + rename) so the poller never reads a half-written
- *  file; the tmp name is per-process so two sessions on one file cannot
- *  clobber each other's staging. */
 export function saveFiltersFile(path: string, filters: ZulipFilters): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
@@ -169,11 +105,9 @@ export function filtersFileMtime(path: string): number | null {
   }
 }
 
-/** Poll-cycle interpreter for the file's presence/mtime, so the poller can
- *  tell an atomic-rename blink from a real deletion and force a reload when
- *  a vanished file reappears with a preserved mtime. One missing observation
- *  is grace (a non-atomic editor mid-replace); persistent absence is a real
- *  state the plane must witness. */
+/** One missing observation is grace: a non-atomic editor removes the file mid-replace. */
+const MISSING_POLLS_TOLERATED = 1;
+
 export class FiltersFilePollTracker {
   private lastMtime: number | null;
   private missedPolls = 0;
@@ -185,7 +119,7 @@ export class FiltersFilePollTracker {
   observe(mtime: number | null): 'none' | 'missing' | 'reload' {
     if (mtime === null) {
       this.missedPolls++;
-      return this.missedPolls >= 2 ? 'missing' : 'none';
+      return this.missedPolls > MISSING_POLLS_TOLERATED ? 'missing' : 'none';
     }
     const reappeared = this.missedPolls > 0;
     this.missedPolls = 0;
@@ -211,12 +145,9 @@ function sha256(s: string): string {
 }
 
 export interface FiltersPlaneStatus {
-  /** live: the file parsed and is applied. stale: the file is unreadable or
-   *  gone and the last-known-good filters are enforced (process-lifetime). */
   status: 'live' | 'stale';
   desiredState: 'ok' | 'invalid' | 'missing';
   path: string;
-  /** Digest of the normalized effective filters — the whole plane. */
   effectiveDigest: string | null;
   loadedAt?: string;
   staleSince?: string;
@@ -225,21 +156,12 @@ export interface FiltersPlaneStatus {
 export interface ReactionSuppressionStatus {
   status: 'not-configured' | 'configured-empty' | 'active' | 'stale';
   protectionActive: boolean;
-  /** File entries plus the host baseline, deduplicated. */
   effectiveCount: number;
-  /** Redacted by construction — a digest, never the entries. */
   effectiveDigest: string | null;
-  /** How many of the effective entries come from the host-injected baseline. */
   baselineCount: number;
   source: 'file' | 'baseline' | 'file+baseline' | 'none';
 }
 
-/**
- * The plane: desired state on disk, effective state in process, the
- * poller that keeps them aligned, and the status that says when they are
- * not. Consumers read `current()` (the effective filters) and subscribe to
- * `onChange` to react to reloads.
- */
 export class FiltersPlane {
   private effective: ZulipFilters;
   private digest: string | null = null;
@@ -248,7 +170,6 @@ export class FiltersPlane {
   private listeners: ((next: ZulipFilters, prev: ZulipFilters) => void)[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private tracker: FiltersFilePollTracker | null = null;
-  /** Host-owned, process-lifetime, never persisted. */
   private readonly baseline: string[];
 
   constructor(
@@ -260,17 +181,6 @@ export class FiltersPlane {
     this.baseline = parseBaselineFromEnv(env);
   }
 
-  /**
-   * Seed or load the file, then start watching it. Idempotent.
-   *
-   * Throws when the file does not exist and cannot be created: "the file
-   * always exists" is the contract every hot-reload guarantee rests on, and
-   * a server that cannot keep it is misconfigured (unwritable state dir),
-   * not degraded. Throws, too, when the file exists but cannot be parsed:
-   * every key in it is an authorization list, there is no last-known-good
-   * yet to fall back on, and the env seed behind it may well be "everything".
-   * The file is never overwritten — the operator repairs or removes it.
-   */
   start(): void {
     if (this.poll) return;
     if (existsSync(this.path)) {
@@ -305,7 +215,6 @@ export class FiltersPlane {
     this.poll = null;
   }
 
-  /** One poll cycle. Exposed for tests; the interval calls it. */
   tick(): void {
     if (!this.tracker) return;
     const action = this.tracker.observe(filtersFileMtime(this.path));
@@ -326,7 +235,6 @@ export class FiltersPlane {
     if (this.apply(next, false)) console.error(`[zulip-mcp] filters hot-reloaded from ${this.path}`);
   }
 
-  /** The effective filters (normalized). */
   current(): ZulipFilters {
     return this.effective;
   }
@@ -338,13 +246,6 @@ export class FiltersPlane {
     };
   }
 
-  /**
-   * Change the desired state: run one poll cycle, so an edit on disk that
-   * no poll has seen yet is applied first; then write the file atomically,
-   * apply, notify. Refused while the plane is broken — an operator repairs
-   * the file (hot reload applies it within seconds) and the update can be
-   * retried; the agent must never overwrite a file it could not read.
-   */
   update(edit: (current: ZulipFilters) => ZulipFilters): { ok: true; filters: ZulipFilters } | { ok: false; reason: string } {
     this.tick();
     if (this.broken) {
@@ -359,13 +260,10 @@ export class FiltersPlane {
     } catch (err) {
       return { ok: false, reason: `could not write ${this.path}: ${(err as Error).message}` };
     }
-    // Reset the tracker to our own write so the poller does not re-apply it.
     this.tracker = new FiltersFilePollTracker(filtersFileMtime(this.path));
     this.apply(next, false);
     return { ok: true, filters: this.effective };
   }
-
-  // ── queries ──
 
   streamAllowed(streamName: string): boolean {
     const allow = this.effective.streams;
@@ -385,17 +283,11 @@ export class FiltersPlane {
     return this.effective.reactionChannels?.includes(channelId) ?? false;
   }
 
-  /** The file's entries plus the host baseline, as matching keys. */
   private effectiveSuppressed(): string[] {
     return [...new Set([...(this.effective.suppressedReactionEmojis ?? []), ...this.baseline])];
   }
 
-  /**
-   * Is a reaction withheld? Matched on the emoji name and, for unicode
-   * emoji, on its codepoints — so the host's glyph-shaped baseline (☣️)
-   * meets Zulip's name-shaped event (`biohazard`, code `2623`). A realm
-   * emoji's code is its realm id and is never compared against a glyph.
-   */
+  /** A custom emoji's code is its id, never compared against a glyph. */
   reactionSuppressed(emojiName: string, emojiCode?: string, reactionType?: string): boolean {
     const list = this.effectiveSuppressed();
     if (list.length === 0) return false;
@@ -438,8 +330,6 @@ export class FiltersPlane {
     }
     return { status: n > 0 ? 'active' : 'configured-empty', protectionActive: n > 0, effectiveCount: n, effectiveDigest: digest, baselineCount, source };
   }
-
-  // ── internals ──
 
   private apply(filters: ZulipFilters, initial: boolean): boolean {
     const prev = this.effective;

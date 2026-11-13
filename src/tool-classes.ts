@@ -1,22 +1,13 @@
 /**
- * Tool classes — MCPL RFC-008
+ * Tool classes: MCPL RFC-008
  * (https://github.com/anima-research/mcpl/blob/main/RFC-008-tool-classes.md).
  *
- * Each classed tool in `tools/list` carries `_meta["mcpl/class"]`: what the
- * tool does, in a fixed vocabulary. It is a hint hosts use as a policy key,
- * for example to decide which tool calls a lifecycle observer may see. It
- * grants nothing and never changes the tool the model sees.
- *
- * The rule: a tool that carries or reads people's messages is classed
- * `comms`. Hosts never share `comms` arguments, so a messaging tool classed
- * without `comms` could expose a private conversation. A tool may have
- * several classes and hosts apply the strictest, so the send tools are also
- * `files` (their attachments may be local paths). A tool with no class is
- * handled most restrictively, so leaving one out (UNCLASSED) is always safe;
- * mislabelling one is not.
- *
- * Every tool the server can list must be in TOOL_CLASSES or UNCLASSED;
- * test/toolClasses.test.ts fails otherwise.
+ * Hosts use `_meta["mcpl/class"]` as a policy key. They never share `comms`
+ * arguments, so a messaging tool classed without `comms` could expose a
+ * private conversation. Hosts apply the strictest of a tool's classes, so the
+ * send tools are also `files` (their attachments may be local paths), and
+ * treat a tool with no class most restrictively, so leaving one out
+ * (UNCLASSED) is always safe; mislabelling one is not.
  */
 
 /** The RFC-008 vocabulary. */
@@ -36,11 +27,9 @@ export const TOOL_CLASS_VOCABULARY = [
 export type ToolClass = (typeof TOOL_CLASS_VOCABULARY)[number];
 
 export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
-  // Sends that can carry files.
   send_message: ['comms', 'files'],
   send_dm: ['comms', 'files'],
   upload_file: ['comms', 'files'],
-  // Messages, and the people, streams and emoji around them.
   edit_message: ['comms'],
   move_messages: ['comms'],
   delete_message: ['comms'],
@@ -56,7 +45,6 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   get_stream_topics: ['comms'],
   list_streams: ['comms'],
   list_emojis: ['comms'],
-  // This server's own delivery state and the bot's own profile.
   get_user_profile: ['control'],
   start_monitoring: ['control'],
   stop_monitoring: ['control'],
@@ -72,11 +60,8 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   channel_missed: ['control'],
 };
 
-/** Tools deliberately left without a class. None today. */
 export const UNCLASSED: ReadonlySet<string> = new Set<string>();
 
-/** The tools with their class added to `_meta`, keeping any other `_meta`
- *  keys. Unclassed tools are returned as they are. */
 export function withToolClasses<T extends { name: string; _meta?: Record<string, unknown> }>(
   tools: readonly T[],
 ): T[] {

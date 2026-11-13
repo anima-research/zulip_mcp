@@ -485,8 +485,8 @@ attaches them. `content` may be omitted when there are attachments.
 path, the URL, and the markdown link, for embedding in an `edit_message` or
 anywhere in a body. On the MCPL publish path, `image` and `audio` blocks
 with inline data are uploaded the same way. Uploads happen before the send;
-a send that then fails leaves them unreferenced, and Zulip garbage-collects
-unclaimed uploads after a week.
+a send that then fails leaves them unreferenced, and by default Zulip deletes
+unclaimed uploads after five weeks.
 
 **Local files are confined to upload roots.** Tool input is influenced by
 message content from untrusted senders, and this server runs with the
@@ -603,9 +603,8 @@ environment). Under connectome-host, point it into the data volume, e.g.
   messages, with mentions of the bot flagged, but a message's edits and
   reactions only when the message mentions the bot. A private stream sends
   it at most the messages that mention it. Opening a
-  channel subscribes the bot (and fails if it cannot — a private stream the
-  bot was not invited to answers `success` with the stream under
-  `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`
+  channel subscribes the bot (and fails if it cannot: for a stream the bot
+  can't read, Zulip answers with an error); `ZULIP_SUBSCRIBE`
   and `listen` do it explicitly. `listen` alone leaves the channel *closed*:
   ambient is tallied and addressed messages become push events — the host must open
   the channel to receive its traffic.

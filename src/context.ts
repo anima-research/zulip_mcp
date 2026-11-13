@@ -1,11 +1,3 @@
-/**
- * Context Provider — Handles context/beforeInference.
- *
- * Injects recent message history from open channels into the inference
- * context. History fetching/formatting is delegated to the owning
- * PlatformAdapter per channel.
- */
-
 import type {
   ContextBeforeInferenceParams,
   ContextBeforeInferenceResult,
@@ -25,7 +17,6 @@ const POSITION_CAPABILITY: Record<ContextInjection['position'], string> = {
 };
 
 export interface ContextProviderOptions {
-  /** Open channels for which nothing is injected (a muted stream). */
   excludeChannel?: (key: ChannelKey) => boolean;
 }
 
@@ -44,15 +35,9 @@ export class ContextProvider {
   }
 
   /**
-   * Handle context/beforeInference — return context injections for open channels.
-   *
-   * `params` is deliberately unread. This server injects history and never
-   * needs the user's text, so it does not declare
-   * `contextHooks.beforeInference.observe` and a conforming host sends
-   * `userMessage: null` regardless (§10.1). Injections are filtered by
-   * position against the grant before returning: the host authorizes each one
-   * independently at response-receipt (§5.4, §10.8), and a server that must
-   * respect a reduction immediately (§6.7) should not be offering them.
+   * `params` is deliberately unread: this server doesn't declare
+   * `contextHooks.beforeInference.observe`, so a conforming host sends
+   * `userMessage: null` regardless (§10.1).
    */
   async handleBeforeInference(_params: ContextBeforeInferenceParams): Promise<ContextBeforeInferenceResult> {
     const injections: ContextInjection[] = [];
@@ -64,11 +49,8 @@ export class ContextProvider {
       if (key === null || this.excludeChannel(key)) continue;
       const adapter = this.channelManager.adapterFor(channelId);
       if (!adapter) continue;
-      // §6.7: a server must immediately respect a reduction. The response
-      // claims `{type}.context` (§6.5); if the host disabled it, or the grant
-      // no longer covers what it declares, this server does not contribute
-      // under it. That is derivation, not authorization — the host authorizes
-      // each injection again at response-receipt (§5.4).
+      // §6.7: a server must respect a reduction immediately. The host still
+      // authorizes each injection again at response-receipt (§5.4).
       if (!this.grant.isFeatureSetActive(`${adapter.type}.context`)) continue;
       try {
         const fetched = await adapter.fetchContext(
@@ -93,8 +75,6 @@ export class ContextProvider {
       }
     }
 
-    // Tag with the contributing platform's context feature set. When multiple
-    // (or no) platforms contributed, fall back to the first registered one.
     const type = contributingTypes.size === 1
       ? contributingTypes.values().next().value
       : this.channelManager.firstAdapterType();

@@ -1,11 +1,3 @@
-/**
- * Tests for cleanContent + extractZulipAttachments — the two regex-heavy
- * parsers most likely to silently regress on a future Zulip render-format
- * change.
- *
- * Run: node --import tsx --test test/cleanContent.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cleanContent, cleanMarkdown, extractZulipAttachments } from '../src/index.ts';
@@ -85,15 +77,14 @@ test('extractZulipAttachments: returns empty list when no refs present', () => {
 });
 
 test('extractZulipAttachments: trailing punctuation in markdown links is not consumed', () => {
-  // `[name](/user_uploads/.../name.ext)` — the closing paren must not be in the path.
   const raw = '[a.png](/user_uploads/1/a.png)';
   const refs = extractZulipAttachments(raw);
   assert.equal(refs.length, 1);
   assert.equal(refs[0].path, '/user_uploads/1/a.png');
 });
 
-// Raw markdown path (apply_markdown:false): history, backscroll and wake text.
-// Nothing here is HTML, so angle brackets are the author's own text (#24).
+// Raw markdown (apply_markdown:false): nothing here is HTML, so angle
+// brackets are the author's own text (#24).
 test('cleanMarkdown: XML inside a fenced block survives untouched', () => {
   const raw = 'new mapping:\n```\n<tag_mapping>\n  <tag fix="6001" field="PERSIST_STR"/>\n</tag_mapping>\n```';
   assert.equal(cleanMarkdown(raw), raw);

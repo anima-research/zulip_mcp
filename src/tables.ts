@@ -41,10 +41,8 @@ const RE_CODE_PIPES = /(\\\\)|(\\`+)|(`+)|(\\\|)|(\|)/g;
 const RE_END_BORDER = /(?<!\\)(?:\\\\)*\|$/;
 
 /**
- * TableProcessor.test for the block of lines `from` to `to`, reading only
- * the lines it needs. It checks the delimiter row before a one-column
- * table's rows, which gives the same answer. `nextUnbordered` gives, for
- * each line, the next line at or after it with no pipe at either end.
+ * TableProcessor.test for the block of lines `from` to `to`. It checks the
+ * delimiter row before a one-column table's rows, which gives the same answer.
  */
 function isTable(lines: string[], from: number, to: number, nextUnbordered: number[]): boolean {
   if (to - from < 2) return false;
@@ -58,7 +56,6 @@ function isTable(lines: string[], from: number, to: number, nextUnbordered: numb
   return border && nextUnbordered[from + 1]! >= to;
 }
 
-/** TableProcessor.test for any block of `lines`, with the lookup it needs built once. */
 export function tableTest(lines: string[]): (from: number, to: number) => boolean {
   const nextUnbordered = new Array<number>(lines.length + 1).fill(lines.length);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -92,8 +89,6 @@ function split(row: string): string[] {
       pipes.push(at);
     }
   }
-  // Where each run length occurs, in order, so that the next run of a
-  // length is found without searching the runs between.
   const at = new Map<number, number[]>();
   tics.forEach((size, i) => {
     const runs = at.get(size);
@@ -139,8 +134,6 @@ const LIST_OR_QUOTE = /^[ ]*(?:>|(?:[-*+]|\d+[.)])(?:[ ]|$))/;
 export function blankLineAboveTables(text: string): string {
   const raw = text.split('\n');
   const lines = raw.map((line) => expandTabs(line.replace(/\r$/, '')));
-  // The next heading and the next rule at or after each line, so that no
-  // reading of a block searches its lines again.
   const nextHeading = nextMatching(lines, HEADING);
   const nextRule = nextMatching(lines, RULE);
   const table = tableTest(lines);
@@ -153,11 +146,7 @@ export function blankLineAboveTables(text: string): string {
   // lines after it as a block of their own; a heading, which splits the
   // block; a table, which takes the whole block; a rule, which splits what
   // no table took. What none of them takes is a paragraph, a list or a quote.
-  // Each reading below follows that order, with a list of the blocks still
-  // to read in place of recursion, since a block can hold thousands of
-  // headings or rules.
 
-  // How many tables Zulip shows for those lines.
   const tables = (from: number, to: number): number => {
     let count = 0;
     const todo: [number, number][] = [[from, to]];
@@ -172,8 +161,6 @@ export function blankLineAboveTables(text: string): string {
     }
     return count;
   };
-  // The runs of those lines, with no heading among them, that Zulip takes as
-  // paragraphs, lists or quotes, in order.
   const paragraphs = (from: number, to: number): [number, number][] => {
     const out: [number, number][] = [];
     const todo: [number, number][] = [[from, to]];
@@ -187,9 +174,6 @@ export function blankLineAboveTables(text: string): string {
     }
     return out;
   };
-  // Whether the line `at` opens a table in a block that runs to `to`: the
-  // block is one, or what comes before its first rule, which Zulip splits
-  // off when it isn't.
   const startsTable = (at: number, to: number): boolean => {
     const rule = nextRule[at]!;
     return table(at, to) || (rule > at && rule < to && table(at, rule));
@@ -203,11 +187,6 @@ export function blankLineAboveTables(text: string): string {
       todo.push([from, heading], [heading + 1, to]);
       continue;
     }
-    // The blank line goes inside a paragraph, above a line that then opens
-    // a table, and only where Zulip then shows more tables: that table
-    // takes the rest of the block as rows, a rule and any table after that
-    // included. The lines above it and the lines from it are then read as
-    // blocks of their own.
     const runs = paragraphs(from, to);
     if (runs.length === 0) continue;
     const shown = tables(from, to);

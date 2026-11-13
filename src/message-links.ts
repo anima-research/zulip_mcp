@@ -60,8 +60,6 @@ import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from '.
 import { tableTest } from './tables.js';
 import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
-// ── Where a token is ──
-
 const TOKEN = /\[\[msg:([0-9]+)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
 /** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
@@ -70,7 +68,6 @@ const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;
 interface MessageToken {
   start: number;
   end: number;
-  /** The id as written. */
   digits: string;
 }
 
@@ -79,7 +76,6 @@ interface MessageToken {
  * block processors take a block, in their order: an indented start (code,
  * whose backticks open no span), a heading, a table (each row apart), a
  * rule. What is left is a paragraph, a list (each item apart) or a quote.
- * Each run is the lines from its first to before its second number.
  */
 function inlineRuns(
   from: number,
@@ -152,8 +148,6 @@ function messageTokens(text: string): MessageToken[] {
       }
     }
   }
-  // Tokens come in order, and code spans don't overlap, so one pointer into
-  // each finds a token's line and the first span that doesn't end before it.
   code.sort((x, y) => x[0] - y[0]);
   const tokens: MessageToken[] = [];
   let line = 0;
@@ -169,8 +163,6 @@ function messageTokens(text: string): MessageToken[] {
   }
   return tokens;
 }
-
-// ── The link ──
 
 const HASH_REPLACEMENTS = new Map([
   ['%', '.'],
@@ -227,9 +219,6 @@ function messageLink(m: LinkedMessage): string {
   return `[${label}](${url})`;
 }
 
-// ── Who reads the message ──
-
-/** Where a text goes: a stream, by id or by name where known, or a direct conversation. */
 export type Audience = { kind: 'stream'; id?: number; name?: string } | { kind: 'direct' };
 
 /** The stream of a send's `to`, read as Zulip reads it: JSON first, an integer an id and a string a name. */
@@ -250,12 +239,8 @@ export function audienceOf(destination: { type: unknown; to: unknown }): Audienc
   return { kind: 'stream' };
 }
 
-// ── The preparation ──
-
-/** What happens to a token that can't become a link: a tool call refuses; a plain answer posts it as typed. */
 export type Unlinkable = 'refuse' | 'as-typed';
 
-/** One or more tokens can't become links; each reason names its token. */
 export class MessageLinkRefused extends Error {
   constructor(readonly reasons: string[]) {
     super(reasons.join(' '));
@@ -265,14 +250,6 @@ export class MessageLinkRefused extends Error {
 
 type Outcome = { link: string } | { reason: string };
 
-/**
- * Puts a link in place of each `[[msg:ID]]` that Zulip reads as Markdown.
- * Each message is read once, and each stream's privacy once, at this call.
- * A token for a message the bot can't read, for a direct message, or for a
- * message in a private stream toward any other conversation can't become a
- * link: `refuse` throws MessageLinkRefused naming each, before anything is
- * sent, and `as-typed` leaves it. A text with no token reads nothing.
- */
 export async function linkMessages(
   api: ZulipApi,
   text: string,
@@ -344,9 +321,6 @@ export async function linkMessages(
     try {
       outcomes.set(key, { digits: token.digits, outcome: await decide(token.digits) });
     } catch (err) {
-      // A tool call says what failed, and its caller adds that nothing was
-      // sent: the preparation only reads. A plain answer reads no further
-      // once Zulip doesn't answer, and posts the rest of its tokens as typed.
       if (unlinkable === 'refuse') throw new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? err.message : err).replace(/\.$/, '')}.`]);
       if (!(err instanceof ZulipNoAnswer)) throw err;
       outcomes.set(key, { digits: token.digits, outcome: null });

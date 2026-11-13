@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Boots one Zulip server from docker-zulip and makes a realm, a bot and a
-# second user for the contract suite (test/contract/). Prints the suite's
-# environment as KEY=value lines on stdout.
-#
-# Usage: scripts/contract-zulip.sh DOCKER_ZULIP_DIR
-#   DOCKER_ZULIP_DIR: a checkout of zulip/docker-zulip at the commit CI pins.
 set -euo pipefail
 trap 'echo "scripts/contract-zulip.sh failed at line $LINENO" >&2' ERR
 
@@ -36,8 +30,7 @@ password="contract-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 docker compose exec -T -u zulip zulip /home/zulip/deployments/current/manage.py \
   create_realm 'Contract Realm' "$human" 'Contract Human' --password "$password" >&2
 
-# Calls Zulip's API; the image's certificate is self-signed. Each call's
-# stdout is captured, so a failed call's answer goes to stderr.
+# The image's certificate is self-signed.
 api() {
   local answer
   if answer=$(curl -sS --fail-with-body --insecure "$@"); then

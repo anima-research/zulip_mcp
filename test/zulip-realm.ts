@@ -28,7 +28,6 @@ export interface Realm {
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
   move(messageId: number, toStreamId: number): void;
-  /** One event that moves several messages of a stream to a topic, under the first id. */
   moveTopic(messageIds: number[], topic: string): void;
   edit(messageId: number, content: string, opts?: { mentioned?: boolean; topic?: string }): void;
   remove(messageIds: number[]): void;
@@ -89,7 +88,6 @@ export function realm(initial: Record<number, string>): Realm {
     queue({ type: 'message', message: noStreamId ? named : raw(m), flags: raw(m).flags });
     return m;
   };
-  /** The narrow's stream, by either of Zulip's forms; a name no stream has refuses the read. */
   const narrowed = (narrow: unknown[]): { streamId?: number; topic?: string; refused?: string } => {
     const out: { streamId?: number; topic?: string; refused?: string } = {};
     for (const n of narrow) {

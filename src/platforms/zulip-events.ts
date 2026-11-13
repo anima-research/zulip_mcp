@@ -1,17 +1,11 @@
 /**
- * Zulip Event Loop — Real-time message delivery via long-polling.
- *
- * Registers an event queue for message, reaction, edit and delete events,
- * polls for them (stream messages and direct messages alike), and routes
- * each kind through its callback. Handles queue expiry recovery and
- * graceful shutdown.
- *
  * Zulip offers no gap recovery for a dead queue (code BAD_EVENT_QUEUE_ID):
  * events between the last delivered message and re-registration are lost.
  * An event id is local to its queue, and means nothing to the new queue or to
  * the messages API, so a gap is anchored on the last delivered message's id
  * and time.
- * Zulip answers a long poll with a heartbeat at least every 45 s.
+ * Zulip answers a long poll that has no event with a heartbeat after 45 to
+ * 55 s.
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
@@ -33,11 +27,9 @@ export interface ZulipEventMessage {
 }
 
 /** `flags` are the receiving user's message flags from the event envelope
- * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
- * `streamName` is null for direct messages. */
+ * (e.g. 'mentioned', 'wildcard_mentioned'), computed server-side by Zulip. */
 export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
 
-/** A `reaction` event as the queue delivers it. */
 export interface ZulipReactionEvent {
   op: 'add' | 'remove';
   emoji_name: string;
@@ -51,12 +43,11 @@ export interface ZulipReactionEvent {
 export type OnZulipReaction = (event: ZulipReactionEvent) => void;
 
 /**
- * An `update_message` event as the queue delivers it — the fields this loop
- * reads. Zulip sends `orig_content`/`content` only when the content changed,
- * `orig_subject`/`subject` only when the topic changed, and `new_stream_id`
- * only when the message moved to another stream. `rendering_only` marks a
- * re-render (a link preview arriving, an inline image resolving) that
- * changed nothing the author wrote.
+ * Zulip sends `orig_content` only when the content changed, and `content`
+ * then and on a re-render that changed nothing the author wrote, such as a
+ * link preview arriving (`rendering_only`). It sends `subject` only when the
+ * topic changed, `orig_subject` with every move, and `new_stream_id` only
+ * when the message moved to another stream.
  */
 export interface ZulipUpdateMessageEvent {
   message_id: number;
@@ -80,7 +71,6 @@ export interface ZulipUpdateMessageEvent {
   flags?: string[];
 }
 
-/** A `delete_message` event as the queue delivers it. */
 export interface ZulipDeleteMessageEvent {
   message_id?: number;
   message_ids?: number[];
@@ -89,25 +79,21 @@ export interface ZulipDeleteMessageEvent {
   topic?: string;
 }
 
-/** A change to an existing message, as the loop forwards it. */
+type UnixSeconds = number;
+
 export type ZulipMessageChange =
   | {
       kind: 'edit';
       messageId: number;
       messageIds: number[];
       actorId: number | null;
-      /** Unix seconds. */
-      editedAt: number;
-      /** New raw content; null when only the topic or stream changed. */
+      editedAt: UnixSeconds;
       content: string | null;
       origContent: string | null;
-          /** New topic; null when the topic name did not change (Zulip omits
-       *  `subject` for a stream-only move but still sends `orig_subject`). */
+      /** Zulip omits `subject` for a stream-only move but still sends `orig_subject`. */
       topic: string | null;
-      /** The topic before any move (topic or stream); null for a content edit. */
       origTopic: string | null;
       streamId: number | null;
-      /** Set when the message moved to another stream. */
       newStreamId: number | null;
       flags: string[];
     }
@@ -129,13 +115,9 @@ export interface ZulipRetrieveResponse {
 }
 
 export interface ZulipEventLoopOptions {
-  /** First retry delay after a poll failure. Default 2000ms. */
   baseBackoffMs?: number;
-  /** Upper bound for the exponential backoff. Default 60000ms. */
   maxBackoffMs?: number;
-  /** Consecutive failures before a 'degraded' system event is emitted. Default 3. */
   degradedThreshold?: number;
-  /** Injectable sleep for tests. */
   sleep?: (ms: number) => Promise<void>;
   pollTimeoutMs?: number;
   directory?: StreamDirectory;
@@ -148,26 +130,16 @@ const DEFAULT_DEGRADED_THRESHOLD = 3;
 export class ZulipEventLoop {
   private stopped = false;
   private queueId: string | null = null;
-  /** Set when a queue dies so the gap can be reported once the replacement
-   *  queue is registered (even if registration itself takes retries). The
-   *  anchor is the last delivered *message* (id + unix timestamp), which is
-   *  the only value usable as a "since" against the messages API. */
   private pendingGap: {
     queueId: string;
     lastMessageId: number | null;
     lastMessageTimestamp: number | null;
   } | null = null;
 
-  /** Last delivered message anchor — the only "since" value usable against
-   *  the messages API once a queue is replaced (see pendingGap). */
   private lastMessageId: number | null = null;
   private lastMessageTimestamp: number | null = null;
 
-  /** Consecutive poll failures. Instance-scoped so it survives an outer-loop
-   *  restart and cannot be reset by re-entering pollLoop — no path bypasses
-   *  backoff. Reset only on a successful, well-formed poll. */
   private consecutiveFailures = 0;
-  /** True while a 'degraded' event is outstanding, so 'recovered' fires once. */
   private degradedActive = false;
 
   private readonly baseBackoffMs: number;
@@ -186,17 +158,6 @@ export class ZulipEventLoop {
     this.pollTimeoutMs = options.pollTimeoutMs ?? LONG_TIMEOUT_MS;
   }
 
-  /**
-   * Start the long-polling event loop.
-   * This method runs indefinitely until stop() is called.
-   *
-   * `onSystemEvent` (optional) receives out-of-band conditions the agent
-   * should know about: 'gap' (messages may have been missed across a queue
-   * re-register), 'degraded' (polling is failing repeatedly), and 'recovered'
-   * (polling is healthy again). `onChange` (optional) receives edits, topic
-   * moves and deletions of existing messages; without it those event types
-   * are still registered but dropped.
-   */
   async start(
     api: ZulipApi,
     onMessage: OnZulipMessage,
@@ -215,9 +176,6 @@ export class ZulipEventLoop {
     }
   }
 
-  /**
-   * Stop the event loop gracefully.
-   */
   stop(): void {
     this.stopped = true;
   }
@@ -229,7 +187,6 @@ export class ZulipEventLoop {
     onReaction?: OnZulipReaction,
     onChange?: OnZulipMessageChange,
   ): Promise<void> {
-    // Register event queue.
     // Zulip delivers exactly the registered types: without 'update_message'
     // and 'delete_message' an edit to a message the agent was mentioned in
     // never arrived at all (#22).
@@ -248,11 +205,7 @@ export class ZulipEventLoop {
       client_capabilities: { notification_settings_null: false, bulk_message_deletion: true },
     }, { needsSelfId: false });
 
-    // A refused registration comes back as a value, not a throw. Without
-    // this check the loop went on polling queue "undefined" and logged only
-    // "returned no events array" — every event lost, the cause invisible.
-    // Throwing hands it to the outer loop: logged with Zulip's reason and
-    // retried after its pause.
+    // A refused registration comes back as a value, not a throw.
     if (isRefusal(registration) || typeof registration.queue_id !== 'string') {
       const refusal = isRefusal(registration) ? registration : undefined;
       throw new Error(
@@ -269,10 +222,6 @@ export class ZulipEventLoop {
 
     console.error(`Zulip event queue registered: ${this.queueId}`);
 
-    // A previous queue died and the replacement starts from *now* — Zulip
-    // has no gap recovery for dead queues, so events between the old
-    // queue's last delivered message and this registration are gone. Tell the
-    // host instead of dropping them silently.
     if (this.pendingGap) {
       const gap = this.pendingGap;
       this.pendingGap = null;
@@ -311,12 +260,10 @@ export class ZulipEventLoop {
             lastMessageId: this.lastMessageId,
             lastMessageTimestamp: this.lastMessageTimestamp,
           };
-          return; // Exit inner loop to re-register in the outer loop.
+          return;
         }
 
         if (isRefusal(response) || !Array.isArray(response.events)) {
-          // A refused or malformed but non-throwing response — without a delay this
-          // would hot-spin the poll and peg a CPU core.
           this.consecutiveFailures++;
           const delay = this.backoffDelay(this.consecutiveFailures);
           const refused = isRefusal(response) ? refusalText(response) : null;
@@ -360,7 +307,6 @@ export class ZulipEventLoop {
           }
 
           if (event.type === 'update_message') {
-            // A re-render is not an edit: nothing the author wrote changed.
             if (onChange && typeof event.message_id === 'number' && event.rendering_only !== true) {
               const contentChanged = typeof event.orig_content === 'string';
               // `orig_subject` accompanies every move; `subject` only a topic rename.
@@ -428,11 +374,8 @@ export class ZulipEventLoop {
             const isStream = msg.type === 'stream' && streamName !== null;
             const isDm = msg.type === 'private';
             if (isStream || isDm) {
-              // A throwing onMessage is a handler bug, not a poll failure —
-              // isolate it so it neither aborts the rest of the batch nor
-              // inflates consecutiveFailures toward a bogus 'degraded' marker.
-              // The event is already acked (lastEventId advanced); Zulip won't
-              // redeliver it, so we log and move on (at-most-once).
+              // Zulip won't redeliver an event once the next poll acknowledges
+              // it, so a handler failure is logged, not retried (at-most-once).
               try {
                 onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {
@@ -465,13 +408,11 @@ export class ZulipEventLoop {
     }
   }
 
-  /** Exponential backoff: base * 2^(n-1), capped. */
   private backoffDelay(consecutiveFailures: number): number {
-    const exp = Math.min(consecutiveFailures - 1, 31); // avoid 2**huge
+    const exp = Math.min(consecutiveFailures - 1, 31);
     return Math.min(this.baseBackoffMs * 2 ** exp, this.maxBackoffMs);
   }
 
-  /** Emit a 'degraded' event exactly once per outage (when crossing the threshold). */
   private maybeEmitDegraded(onSystemEvent: OnSystemEvent | undefined, reason: string): void {
     if (this.consecutiveFailures !== this.degradedThreshold) return;
     this.degradedActive = true;
@@ -484,11 +425,6 @@ export class ZulipEventLoop {
     });
   }
 
-  /**
-   * Emit a 'recovered' event once, when a poll succeeds after a 'degraded'
-   * marker was raised — so the agent is told delivery is healthy again rather
-   * than left holding the "degraded" belief forever.
-   */
   private maybeEmitRecovered(onSystemEvent: OnSystemEvent | undefined): void {
     if (!this.degradedActive) return;
     const failures = this.consecutiveFailures;
@@ -508,7 +444,6 @@ export class ZulipEventLoop {
     try {
       onSystemEvent(event);
     } catch (error) {
-      // System-event delivery must never take down the poll loop.
       console.error('Zulip event loop: onSystemEvent callback threw:', error);
     }
   }

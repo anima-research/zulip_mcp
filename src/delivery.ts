@@ -1,35 +1,3 @@
-/**
- * Delivery bookkeeping — what has already been forwarded, what the agent is
- * missing, and which channels it had open. Persisted so a restart can catch
- * up instead of starting from "now".
- *
- *   watermarks   channelId → highest message id forwarded to the host. A
- *                channel the host has accepted nothing on gets one just
- *                below its lowest held message once a hold there is no
- *                longer on its way (`hold`, `refuse`, `failQueued`), and,
- *                while `zulip.messaging` is disabled, as a message comes in
- *                (`watermarkBelowHolds`). The
- *                "since when" anchor for a channel's catch-up at a
- *                connection's start, for gap
- *                recovery after a Zulip event-queue expiry, and for
- *                `sinceLastSeen` history on channels/open. It never passes
- *                an id the host was offered but has not accepted (the
- *                undelivered floor, below), so a later acceptance cannot
- *                bury an earlier loss.
- *   missed       channelId → tally of ambient messages dropped because the
- *                host had the channel closed. Reported by `channel_missed`
- *                and carried on closed-channel push events so "reply without
- *                opening" is an informed choice.
- *   lastOpen     channels the host had open at last sight. A channel's
- *                catch-up at a connection's start delivers their full
- *                missed backscroll (the host will
- *                reopen them); every other watermarked channel gets only its
- *                addressed messages, with vicinity.
- *
- * File: `<stateDir>/<session>.delivery.json`, alongside the tool layer's
- * monitoring state. Best-effort: a failed save is logged, never fatal.
- */
-
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TextContent } from '@animalabs/mcpl-core';
@@ -39,9 +7,7 @@ import type { DirectorySnapshot, StreamDirectory } from './stream-directory.js';
 import { messageLineHead } from './message-line.js';
 
 export interface MissedTally {
-  /** Watermark at the moment the channel was closed (0 = none known). */
   anchorId: number;
-  /** Highest id counted so far; the reconnect backfill resumes from here. */
   talliedThrough: number;
   messages: number;
   characters: number;
@@ -61,20 +27,14 @@ interface Unresolved {
   lastOpen?: boolean;
 }
 
-/** Why an offered message is not (yet) accepted. `queued` is on its way;
- *  `failed` outlived the transport retry; `rejected` the host refused. */
 export type HeldStatus = 'queued' | 'failed' | 'rejected';
 
 interface Held {
   status: HeldStatus;
-  /** A live replay from history has been attempted once already. */
   replayed: boolean;
   replyVerified: boolean;
 }
 
-/** Ids held per channel before the newest ones stop being tracked. Far
- *  beyond any real outage; the floor (the lowest id) is what matters and
- *  the lowest ids are the ones kept. */
 const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
@@ -85,23 +45,7 @@ export class DeliveryState {
   private missed = new Map<ChannelKey, MissedTally>();
   private lastOpen = new Set<ChannelKey>();
   private unresolved = new Map<string, Unresolved>();
-  /**
-   * The undelivered floor (in-memory). Every live message id is held here
-   * from when it enters its channel's lane, and every id offered to the host
-   * on a channel — queued for `channels/incoming`, or sent as `push/event` —
-   * until the host accepts it or the server decides it is not for the host.
-   * The watermark never advances
-   * past the lowest held id, whatever is accepted after it: a message the
-   * host refused or a batch lost to a transport failure stays below the
-   * watermark, so the next start's catch-up, a gap recovery, or a live replay can offer
-   * it again instead of a later acceptance burying it. Not persisted: a
-   * hold that is not on its way has a watermark below it, and a connection's
-   * end ends every hold's way, so the persisted watermark is below every held
-   * id, which is all a restart needs.
-   */
   private held = new Map<ChannelKey, Map<number, Held>>();
-  /** The highest id acceptance has reached per channel; the watermark is
-   *  this, capped by the floor. Recomputed when a hold is released. */
   private reached = new Map<ChannelKey, number>();
 
   constructor(
@@ -224,8 +168,6 @@ export class DeliveryState {
         lastOpen: lastOpen.sort(),
         ...(copy ?? {}),
       };
-      // tmp + rename: a crash mid-write must not leave a truncated file that
-      // the next start reads as "no watermarks", catching no channel up.
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
       if (this.unreadableFile) {
@@ -249,27 +191,16 @@ export class DeliveryState {
     }
   }
 
-  // ── watermarks ──
-
   watermark(key: ChannelKey): number | undefined {
     return this.watermarks.get(key);
   }
 
-  /**
-   * Advance (never retreat) the forwarded watermark towards `messageId`,
-   * stopping below the undelivered floor. Returns true if it moved.
-   */
   advance(key: ChannelKey, messageId: number): boolean {
     const reached = Math.max(this.reached.get(key) ?? 0, this.watermarks.get(key) ?? 0, messageId);
     this.reached.set(key, reached);
     return this.settle(key);
   }
 
-  /**
-   * The range (afterId, messageId] has been delivered (a catch-up block
-   * scanned and pushed that range): release only the holds in it and
-   * advance. Returns true if the watermark moved.
-   */
   advanceThrough(key: ChannelKey, messageId: number, afterId = 0): boolean {
     const held = this.held.get(key);
     if (held) {
@@ -287,7 +218,6 @@ export class DeliveryState {
     this.reached = new Map(this.watermarks);
   }
 
-  /** Apply the floor: watermark = highest reached, capped below the lowest held id. */
   private settle(key: ChannelKey): boolean {
     const reached = this.reached.get(key);
     if (reached === undefined) return false;
@@ -303,10 +233,6 @@ export class DeliveryState {
     return [...this.watermarks.keys()];
   }
 
-  // ── undelivered floor ──
-
-  /** The message is on its way to the host, or was offered and is not accepted
-   *  yet. An id at or below the watermark is already forwarded and is not held. */
   hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
@@ -319,7 +245,6 @@ export class DeliveryState {
     if (existing) {
       existing.status = status;
     } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
-      // Keep the lowest ids: the floor protects everything above it anyway.
       console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
       return;
     } else {
@@ -337,7 +262,6 @@ export class DeliveryState {
     return true;
   }
 
-  /** The host accepted the message. Returns true if the watermark moved. */
   release(key: ChannelKey, messageId: number): boolean {
     const held = this.held.get(key);
     if (!held?.delete(messageId)) return false;
@@ -364,13 +288,11 @@ export class DeliveryState {
     }
   }
 
-  /** Drop every hold on a channel (nothing from it may reach the agent any more). */
   releaseAll(key: ChannelKey): boolean {
     if (!this.held.delete(key)) return false;
     return this.settle(key);
   }
 
-  /** The lowest id offered but not accepted, if any. */
   floor(key: ChannelKey): number | undefined {
     const held = this.held.get(key);
     if (!held || held.size === 0) return undefined;
@@ -381,7 +303,6 @@ export class DeliveryState {
     return [...this.held.keys()];
   }
 
-  /** Held ids on a channel, ascending; optionally only those a live replay may still try. */
   heldIds(key: ChannelKey, opts: { replayable?: boolean } = {}): number[] {
     const held = this.held.get(key);
     if (!held) return [];
@@ -391,7 +312,6 @@ export class DeliveryState {
       .sort((a, b) => a - b);
   }
 
-  /** A held read has tried these ids again: no later held read asks for them until `clearReplayed`. */
   markReplayed(key: ChannelKey, ids: number[]): void {
     const held = this.held.get(key);
     if (!held) return;
@@ -415,14 +335,11 @@ export class DeliveryState {
     if (h) h.replyVerified = false;
   }
 
-  /** These ids (every one when none is named) may be asked for again by a later held read. */
   clearReplayed(key: ChannelKey, ids?: number[]): void {
     const held = this.held.get(key);
     if (!held) return;
     for (const h of ids ? ids.map((id) => held.get(id)) : held.values()) if (h) h.replayed = false;
   }
-
-  // ── open mirror ──
 
   wasOpen(key: ChannelKey): boolean {
     return this.lastOpen.has(key);
@@ -432,20 +349,16 @@ export class DeliveryState {
     return [...this.lastOpen];
   }
 
-  /** Host opened the channel: it receives everything, so no tally applies. */
   markOpen(key: ChannelKey): void {
     this.lastOpen.add(key);
     this.missed.delete(key);
   }
 
-  /** Host closed the channel: start counting what it no longer sees. */
   markClosed(key: ChannelKey): void {
     if (!this.lastOpen.delete(key)) return;
     const anchor = this.watermarks.get(key) ?? 0;
     this.missed.set(key, { anchorId: anchor, talliedThrough: anchor, messages: 0, characters: 0 });
   }
-
-  // ── missed tallies ──
 
   tally(key: ChannelKey): MissedTally | undefined {
     return this.missed.get(key);
@@ -455,7 +368,6 @@ export class DeliveryState {
     return [...this.missed.keys()];
   }
 
-  /** Count one dropped ambient message. No-op unless the channel is tracked and the message is above what the tally has counted through. */
   countMissed(key: ChannelKey, m: { id: number; text: string }): boolean {
     const t = this.missed.get(key);
     if (!t || m.id <= t.talliedThrough) return false;
@@ -465,7 +377,6 @@ export class DeliveryState {
     return true;
   }
 
-  /** Fold a batch of fetched messages into the tally (reconnect backfill). */
   backfillMissed(key: ChannelKey, ambient: { id: number; text: string }[], scannedThrough: number): void {
     const t = this.missed.get(key);
     if (!t) return;
@@ -497,9 +408,6 @@ function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
-// ── Pure selection/rendering helpers for catch-up blocks ──
-
-/** The fields of an incoming-shaped message a catch-up reads. */
 export interface MissedView {
   id: number;
   mentioned: boolean;
@@ -534,17 +442,11 @@ export function viewOf(m: KeyedMessage): MissedView {
 }
 
 /**
- * Render the who/where/when of a message into its body in the shared line
- * shape (see message-line.ts), so the model sees
- * `[<time> id=N] [#stream > topic] Author (mention): text` and not a bare
- * body. The structured fields (author, threadId, metadata) travel too;
- * agent-framework's context strategies render the content blocks only, and
- * an agent that reads "ship it?" with no author cannot tell who asked.
- *
- * Stamps `metadata.attributed: true` and `metadata.attributionHeader` (the
- * exact prefix added), so a host strategy that renders its own provenance
+ * A host that renders only the content blocks shows the model only the body,
+ * so the who/where/when goes into it. `metadata.attributionHeader` is the
+ * exact prefix added, so a host strategy that renders its own provenance
  * header can skip it, and one that scans message text can strip the prefix
- * first. Idempotent on the flag, so a replay cannot double the header.
+ * first.
  */
 export function attributeMessage(m: KeyedMessage, stream: string | null, formatTime: (d: Date) => string): KeyedMessage {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
@@ -561,19 +463,16 @@ export function attributeMessage(m: KeyedMessage, stream: string | null, formatT
   });
   const index = m.content.findIndex((c) => c.type === 'text');
   const content = [...m.content];
-  // `prefix` is exactly what was added, so a consumer can strip it verbatim.
   const prefix = index < 0 ? header.trimEnd() : header;
   if (index < 0) content.unshift({ type: 'text', text: prefix });
   else content[index] = { type: 'text', text: prefix + (content[index] as TextContent).text };
   return { ...m, content, metadata: { ...meta, attributed: true, attributionHeader: prefix } };
 }
 
-/** Addressing includes explicit mentions, verified replies, and DMs. */
 export function isAddressed(m: { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }): boolean {
   return m.mentioned || m.replyToSelf === true || m.isDM === true;
 }
 
-/** Messages around each addressed message, ±`vicinity` by count. */
 export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boolean; isDM?: boolean }>(
   msgs: T[],
   opts: { keepAll: boolean; vicinity: number },
@@ -587,41 +486,23 @@ export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boole
   return [...keep].sort((a, b) => a - b).map((i) => msgs[i]);
 }
 
-/** Default size cap on one `<missed>` block, in characters (~10k tokens). */
 export const DEFAULT_MISSED_BLOCK_MAX_CHARS = 40_000;
 
 export interface MissedBlockOptions {
   streamName: string;
   channelId: string;
   reason: 'backscroll' | 'mention' | 'addressed';
-  /** Selected addressed-message count for mention/addressed; total lines for backscroll. */
   count: number;
   formatTime: (d: Date) => string;
-  /** Character budget for the block; the OLDEST lines are elided first. */
   maxChars?: number;
-  /** The fetch hit its ceiling: there is more beyond the newest line shown. */
   moreBeyond?: boolean;
-  /** Newest id the fetch scanned (may be past the newest line kept). */
   newestScannedId?: number;
 }
 
-/** The channel a `<missed>` note points the agent at — `fetch_history`
- *  reads DM conversations by their channel id, so the id is quoted as is. */
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined): string {
   return `fetch_history(channel="${channelId}", ${cursor}=${id})`;
 }
 
-/**
- * The `<missed>` transcript block delivered after downtime. Each line leads
- * with the message id so the agent can fetch_around(id) for more context,
- * and mention lines are flagged so they stand out from vicinity.
- *
- * `maxChars` is a hard cap on the whole serialized block, header and notes
- * included: the oldest lines go first, replaced by one line naming the
- * elided id range so fetch_history can page into it; when the single
- * newest line is itself over budget it is cut and says so. `elided` is how
- * many of the oldest lines the text left out.
- */
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): { text: string; elided: number } {
   const dm = parseDmChannelId(opts.channelId) !== null;
   const render = (m: MissedView): string => {
@@ -661,7 +542,6 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     return [`<missed ${attrs.join(' ')}>`, ...head, ...body, ...tail, '</missed>'].join('\n');
   };
 
-  // Elide the oldest lines until the whole block fits; always keep the newest.
   let elided = 0;
   let block = assemble(elided, null);
   while (block.length > budget && elided < lines.length - 1) {
@@ -669,7 +549,6 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     block = assemble(elided, null);
   }
   if (block.length > budget && lines.length > 0) {
-    // One line is over budget by itself: cut it to what fits, and say so.
     const last = msgs[msgs.length - 1];
     const marker = ` … [line cut to fit the catch-up budget — fetch_around(${last.id}) has the whole message]`;
     const room = budget - (assemble(elided, '').length + marker.length);

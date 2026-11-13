@@ -13,7 +13,6 @@ function econnresetError(): Error {
   return new ZulipNoAnswer('network', 'GET', '/events', false, 'The connection to Zulip failed during GET /events (ECONNRESET).');
 }
 
-/** Sleep recorder that resolves instantly and can stop the loop after N sleeps. */
 function makeSleepRecorder(loop: () => ZulipEventLoop, stopAfter: number) {
   const delays: number[] = [];
   const sleep = async (ms: number) => {
@@ -37,14 +36,11 @@ test('an HTML/proxy 502 backs off exponentially', async () => {
 
   await loop.start(api, () => {}, (e) => systemEvents.push(e));
 
-  // Six failures → six growing delays: 2s, 4s, 8s, 16s, 32s, 60s (capped).
   assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000]);
   for (let i = 1; i < delays.length - 1; i++) {
     assert.ok(delays[i] > delays[i - 1], `delay ${i} should grow`);
   }
 
-  // Degraded condition surfaced exactly once (at the threshold), naming the
-  // non-JSON cause.
   const degraded = systemEvents.filter(e => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
   assert.match(degraded[0].text, /non-JSON/);
@@ -67,11 +63,8 @@ test('a dropped connection is NOT treated as expiry', async () => {
 
   await loop.start(api, () => {}, (e) => systemEvents.push(e));
 
-  // Healthy queue never abandoned: registered exactly once, no re-register.
   assert.equal(registerCalls, 1, 'must not re-register the live queue on a transient error');
-  // No false gap markers.
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
-  // Backoff engaged (the expiry path used to bypass it entirely).
   assert.deepEqual(delays, [2000, 4000, 8000, 16000]);
 });
 
@@ -146,8 +139,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
     'GET /events': async () => {
       retrieveCalls++;
       if (retrieveCalls === 1) {
-        // Deliver a real message so the gap anchor (message id + timestamp)
-        // is populated.
         return {
           events: [{
             id: 42,
@@ -170,7 +161,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
       if (retrieveCalls === 2) {
         return { result: 'error', code: 'BAD_EVENT_QUEUE_ID', msg: 'Bad event queue ID: q1' };
       }
-      // First poll on the fresh queue — end the test.
       loop.stop();
       return { events: [] };
     },
@@ -189,7 +179,6 @@ test('queue expiry is a RETURNED error object; re-registers and emits a message-
   assert.equal(gaps[0].metadata?.lastMessageId, 9001);
   assert.equal(gaps[0].metadata?.lastMessageTimestamp, 1_710_000_000);
   assert.equal(gaps[0].metadata?.newQueueId, 'q2');
-  // The gap text carries the usable since-anchor (message id), not event id 42.
   assert.match(gaps[0].text, /message id 9001/);
 });
 
@@ -204,14 +193,12 @@ test('malformed non-throwing response (no events, no error code) sleeps instead 
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       retrieveCalls++;
-      return {}; // no `events` array, not an error object — previously hot-spun
+      return {};
     },
   }).api;
 
   await loop.start(api, () => {});
 
-  // Every malformed poll must be followed by a sleep — poll count tracks
-  // sleep count instead of running away.
   assert.equal(retrieveCalls, 3);
   assert.deepEqual(delays, [2000, 4000, 8000]);
 });
@@ -252,7 +239,6 @@ test('well-formed response resets the backoff counter', async () => {
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       retrieveCalls++;
-      // fail, fail, succeed, then fail again — backoff must restart at base.
       if (retrieveCalls === 3) return { events: [] };
       throw econnresetError();
     },
@@ -276,8 +262,6 @@ test('degraded is followed by a recovered event once polling succeeds again', as
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
       retrieveCalls++;
-      // Three failures cross the degraded threshold; the fourth poll succeeds
-      // and must emit 'recovered', then we stop.
       if (retrieveCalls <= 3) throw econnresetError();
       loop.stop();
       return { events: [] };
@@ -324,7 +308,6 @@ test('a throwing onMessage does not abort the batch or inflate the failure count
     'GET /events': async () => {
       retrieveCalls++;
       if (retrieveCalls === 1) {
-        // Batch of two: the first handler throws, the second must still run.
         return { events: [makeMessageEvent(1, 100), makeMessageEvent(2, 101)] };
       }
       loop.stop();
@@ -339,9 +322,7 @@ test('a throwing onMessage does not abort the batch or inflate the failure count
 
   await loop.start(api, onMessage, (e) => systemEvents.push(e));
 
-  // The second event was still delivered despite the first handler throwing.
   assert.deepEqual(delivered, [101], 'rest of the batch survives a throwing handler');
-  // A handler bug is not a poll failure — no spurious degraded marker.
   assert.equal(systemEvents.filter(e => e.kind === 'degraded').length, 0);
 });
 
@@ -395,16 +376,12 @@ test('edits, topic moves and deletions reach onChange; re-renders and unchanged 
       if (polls > 1) { loop.stop(); return { events: [] }; }
       return {
         events: [
-          // A content edit by the author, mentioning the bot as it now reads.
           { id: 1, type: 'update_message', message_id: 77, message_ids: [77], user_id: 9, edit_timestamp: 1_710_000_100, rendering_only: false, orig_content: 'old', content: 'new @**bot**', flags: ['mentioned'], stream_id: 7 },
-          // A link preview arriving: nothing the author wrote changed.
           { id: 2, type: 'update_message', message_id: 78, message_ids: [78], user_id: null, edit_timestamp: 1_710_000_101, rendering_only: true, content: 'with preview', stream_id: 7 },
-          // A topic move of three messages, by a moderator.
           { id: 3, type: 'update_message', message_id: 79, message_ids: [79, 80, 81], user_id: 12, edit_timestamp: 1_710_000_102, orig_subject: 'old topic', subject: 'new topic', propagate_mode: 'change_all', stream_id: 7 },
           // A move to another stream under the same topic name: Zulip sends
           // orig_subject for every move but subject only for a rename.
           { id: 4, type: 'update_message', message_id: 82, message_ids: [82], user_id: 12, edit_timestamp: 1_710_000_103, stream_id: 7, new_stream_id: 8, orig_subject: 'same' },
-          // An update that names no change at all.
           { id: 5, type: 'update_message', message_id: 83, message_ids: [83], user_id: 9, edit_timestamp: 1_710_000_104, stream_id: 7 },
           { id: 6, type: 'delete_message', message_ids: [84, 85], message_type: 'stream', stream_id: 7, topic: 'deploys' },
           { id: 7, type: 'delete_message', message_id: 86, message_type: 'private' },

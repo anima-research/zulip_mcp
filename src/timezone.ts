@@ -1,7 +1,3 @@
-/** Format agent-visible wall-clock times without changing UTC protocol data. */
-
-/** True iff `zone` names an IANA time zone this runtime can format in.
- *  Exported for hosts that want to pre-validate AGENT_TIMEZONE strictly. */
 export function isValidTimeZone(zone: string): boolean {
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: zone }).format(new Date(0));
@@ -11,11 +7,9 @@ export function isValidTimeZone(zone: string): boolean {
   }
 }
 
-/** Resolve the zone used for agent-visible timestamps. NEVER throws: a
- *  typo'd AGENT_TIMEZONE must not kill the stdio child before the MCPL
- *  handshake — a dead subprocess is never respawned by reconnect. Instead,
- *  warn loudly on stderr and fall back to the same default used when the
- *  variable is unset (system zone → UTC). */
+/** Never throws: a typo'd AGENT_TIMEZONE must not kill the stdio child before
+ *  the MCPL handshake, since a host respawns a dead child only when it is
+ *  configured to reconnect. */
 export function resolveAgentTimeZone(configured = process.env.AGENT_TIMEZONE): string {
   const fallback = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   const zone = configured?.trim();
@@ -27,22 +21,11 @@ export function resolveAgentTimeZone(configured = process.env.AGENT_TIMEZONE): s
   return zone;
 }
 
-/** Rendering style for agent-visible timestamps on message lines.
- *    full    2026-01-15T04:34:56-08:00 [America/Los_Angeles]   (default)
- *    compact 2026-01-15 04:34
- *    time    04:34
- *    none    (empty — callers omit the timestamp entirely)
- *  The zone still governs conversion for every style; only the rendered
- *  verbosity changes. Full costs ~45 chars per line, which adds up across a
- *  long backscroll — compact/time exist for context-budget-conscious
- *  deployments. */
 export type TimestampStyle = 'full' | 'compact' | 'time' | 'none';
 
 const TIMESTAMP_STYLES: ReadonlySet<string> = new Set(['full', 'compact', 'time', 'none']);
 
-/** Resolve the style for agent-visible timestamps (AGENT_TIMESTAMP_STYLE).
- *  Same never-throw contract as resolveAgentTimeZone, for the same reason.
- *  Unknown values warn on stderr and fall back to 'full'. */
+/** Never throws, for the reason resolveAgentTimeZone gives. */
 export function resolveTimestampStyle(configured = process.env.AGENT_TIMESTAMP_STYLE): TimestampStyle {
   const style = configured?.trim().toLowerCase();
   if (!style) return 'full';
@@ -77,14 +60,6 @@ export function formatAgentDateTime(
   return options.zoneName === false ? stamp : `${stamp} [${timeZone}]`;
 }
 
-/**
- * The time on a message line (`[<time> id=N] ...`), resolved once from
- * AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE. `full` drops its ` [Zone]` suffix
- * here: the offset already fixes the instant, the zone is constant for the
- * session, and a bracket inside the line's own bracket makes the line
- * harder to read and to parse. An invalid date renders empty (the line
- * keeps its id) rather than throwing inside delivery.
- */
 export function agentLineTimeFormatter(env: NodeJS.ProcessEnv = process.env): (d: Date) => string {
   const zone = resolveAgentTimeZone(env.AGENT_TIMEZONE);
   const style = resolveTimestampStyle(env.AGENT_TIMESTAMP_STYLE);
