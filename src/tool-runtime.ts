@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { mayHaveBeenApplied, type ZulipApi } from "./zulip-api.js";
+import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
@@ -795,17 +795,39 @@ export class ZulipToolRuntime {
       }
 
       case "get_stream_topics": {
-        const streamId = positiveIdArg("stream_id", args.stream_id);
-        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${args.stream_id}`);
+        const byName = args.stream !== undefined && args.stream !== null;
+        const byId = args.stream_id !== undefined && args.stream_id !== null;
+        if (byName === byId) throw new Error("Give exactly one of stream and stream_id.");
+        if (byName && (typeof args.stream !== "string" || args.stream === "")) throw new Error("stream must be a stream's name.");
+        const givenId = byId ? positiveIdArg("stream_id", args.stream_id) : undefined;
+        const limit = args.limit ?? undefined;
+        if (limit !== undefined && !(typeof limit === "number" && Number.isInteger(limit) && limit > 0)) {
+          throw new Error("limit must be a positive integer.");
+        }
+        let streamId = givenId;
+        if (byName) {
+          try {
+            streamId = (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id;
+          } catch (err) {
+            if (err instanceof ZulipNoAnswer) throw err;
+            const text = (err as Error).message;
+            throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
+          }
+        }
+        const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];
-        const formatted = topics
+        const shown = limit === undefined ? topics : topics.slice(0, limit);
+        const formatted = shown
           .map((t: any, idx: number) => `${idx + 1}. **${t.name}** (latest msg: ${t.max_id})`)
           .join("\n");
+        const heading = shown.length < topics.length
+          ? `${topics.length} Topics, the newest ${shown.length} shown`
+          : `${topics.length} Topics`;
 
         return {
           topic_count: topics.length,
-          formatted_list: `📑 **${topics.length} Topics**\n\n${formatted}`,
+          formatted_list: `📑 **${heading}**\n\n${formatted}`,
           ...(args.verbose && { raw_data: result }),
         };
       }
