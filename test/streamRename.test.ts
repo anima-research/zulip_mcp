@@ -1382,3 +1382,47 @@ scenario('55. one process: a backfill of missed tallies whose host leaves during
     assert.equal(await missedOn(third, 'zulip:dev'), 2, 'one ambient message counted live and one backfilled, each once');
   } finally { await third.close(); }
 });
+
+scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    const reused = r.create('general');
+    const intruder = r.post(reused, 'from the new #general');
+    await run.tool('refresh_channels', {});
+    const history = JSON.parse((await run.tool('fetch_history', { channel: 'general' })).text) as { channel: string; channelId: string | null };
+    assert.equal(history.channel, 'general');
+    assert.equal(history.channelId, null, 'fetch_history names the new #general by no id while the host holds zulip:general for stream 17');
+    const around = JSON.parse((await run.tool('fetch_around', { message_id: intruder })).text) as { channelId: string | null };
+    assert.equal(around.channelId, null, 'fetch_around names it by no id either');
+    const renamed = JSON.parse((await run.tool('fetch_history', { channel: 'lobby' })).text) as { channelId: string | null };
+    assert.equal(renamed.channelId, 'zulip:general', 'the renamed stream keeps the id the host holds');
+    run.answerChanged();
+  } finally { await run.close(); }
+});
+
+scenario('76. while the host holds a renamed stream\'s old id, a reply to a message in a new stream under the old name gives a receipt with no channel id', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    const reused = r.create('general');
+    const intruder = r.post(reused, 'from the new #general');
+    const inRenamed = r.post(17, 'in the renamed stream');
+    await run.tool('refresh_channels', {});
+    const reply = await run.tool('send_message', { reply_to: intruder, content: 'answer in the new #general' });
+    assert.equal(reply.isError, false, reply.text);
+    const receipt = JSON.parse(reply.text) as { channelId: string | null; channel: string };
+    assert.equal(receipt.channel, 'general');
+    assert.equal(receipt.channelId, null, 'the receipt names the new #general by no id while the host holds zulip:general for stream 17');
+    const control = JSON.parse((await run.tool('send_message', { reply_to: inRenamed, content: 'answer in lobby' })).text) as { channelId: string | null; channel: string };
+    assert.equal(control.channel, 'lobby');
+    assert.equal(control.channelId, 'zulip:general', 'a reply in the renamed stream names the id the host holds for it');
+    run.answerChanged();
+  } finally { await run.close(); }
+});

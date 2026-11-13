@@ -339,10 +339,13 @@ export class ZulipToolRuntime {
     if (message.type === "stream") {
       const name = message.display_recipient;
       if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
-      const channelId = `zulip:${name}`;
+      const named = `zulip:${name}`;
+      // The receipt names the stream by the id the host holds for it, or by none
+      // while the host holds its name's id for another stream.
+      const channelId = this.channelIds != null && Number.isSafeInteger(message.stream_id) ? this.channelIds.channelIdOf(streamKey(message.stream_id)) : named;
       return args.topic === undefined
-        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId, receipt: { channelId, channel: name, topic: message.subject } }
-        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId, receipt: { channelId, channel: name } };
+        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: channelId ?? named, receipt: { channelId, channel: name, topic: message.subject } }
+        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId: channelId ?? named, receipt: { channelId, channel: name } };
     }
     if (args.topic !== undefined) throw new Error(`reply_to ${id} is a direct message, which has no topic; omit topic`);
 
@@ -356,7 +359,7 @@ export class ZulipToolRuntime {
     return { type: message.type, to: ids, topic: undefined, channelId, receipt: { channelId, to_user_ids: others } };
   }
 
-  private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string; isDm: boolean }> {
+  private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string | null; isDm: boolean }> {
     const asId = channel.startsWith("zulip:") ? channel : `zulip:${channel}`;
     const dmIds = parseDmChannelId(asId);
     if (dmIds) return { query: { dmUserIds: dmIds }, channel: dmChannelIdFor(dmIds), channelId: dmChannelIdFor(dmIds), isDm: true };
@@ -367,7 +370,7 @@ export class ZulipToolRuntime {
       const parsed = parseKey(answer.key);
       if (parsed.kind === "stream") {
         const name = ids.directory.nameOf(parsed.streamId) ?? "";
-        return { query: { streamId: parsed.streamId }, channel: name, channelId: ids.channelIdOf(answer.key) ?? `zulip:${name}`, isDm: false };
+        return { query: { streamId: parsed.streamId }, channel: name, channelId: ids.channelIdOf(answer.key), isDm: false };
       }
     }
     const name = asId.slice("zulip:".length);
@@ -1025,11 +1028,12 @@ export class ZulipToolRuntime {
         const page = await fetchAround(api, messageId, limit);
         const anchor = page.messages.find((m) => m.id === messageId);
         const shown = anchor?.streamNameShown ?? null;
-        const held = this.channelIds && anchor?.streamId != null ? this.channelIds.channelIdOf(streamKey(anchor.streamId)) : null;
+        const known = this.channelIds != null && anchor?.streamId != null;
+        const held = known ? this.channelIds!.channelIdOf(streamKey(anchor!.streamId!)) : null;
         return {
           message_id: messageId,
           channel: shown,
-          channelId: held ?? (shown ? `zulip:${shown}` : null),
+          channelId: known ? held : shown ? `zulip:${shown}` : null,
           topic: anchor?.topic ?? null,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
