@@ -42,6 +42,7 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   upload_file: ['comms', 'files'],
   // Messages, and the people, streams and emoji around them.
   edit_message: ['comms'],
+  move_messages: ['comms'],
   delete_message: ['comms'],
   add_reaction: ['comms'],
   remove_reaction: ['comms'],

@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { mayHaveBeenApplied, type ZulipApi } from "./zulip-api.js";
+import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
@@ -109,6 +109,10 @@ export interface ToolCallResult {
 }
 
 const STATE_DIR = join(homedir(), ".zulip_mcp_state");
+
+const MOVE_SCOPES: Record<string, string> = { one: "change_one", later: "change_later", all: "change_all" };
+
+const MOVE_NOTE = "To answer this message where it is now, use send_message with reply_to.";
 
 // Helper function to parse date strings
 export function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
@@ -263,6 +267,18 @@ export class ZulipToolRuntime {
     }
     if (renamed.length > 0) throw new Error(`${renamed.join(" ")} Nothing went to Zulip.`);
     return out;
+  }
+
+  private async streamIdForName(name: string): Promise<number> {
+    const known = (await this.streamIdsByName([name])).get(name);
+    if (known !== undefined) return known;
+    try {
+      return (await this.api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(name)}`, { stream: name })).stream_id;
+    } catch (err) {
+      if (err instanceof ZulipNoAnswer) throw err;
+      const text = (err as Error).message;
+      throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
+    }
   }
 
   private readonly uploader: Uploader | null;
@@ -814,6 +830,40 @@ export class ZulipToolRuntime {
           if (!mayHaveBeenApplied(err)) this.onDeleteFailed?.(String(args.message_id));
           throw err;
         }
+      }
+
+      case "move_messages": {
+        const messageId = positiveIdArg("message_id", args.message_id);
+        const topic = args.topic ?? undefined;
+        const stream = args.stream ?? undefined;
+        if (topic === undefined && stream === undefined) throw new Error("Give a topic, a stream, or both.");
+        if (topic !== undefined && typeof topic !== "string") throw new Error("topic must be a string.");
+        if (stream !== undefined && (typeof stream !== "string" || stream === "")) throw new Error("stream must be a stream's name.");
+        const scope = args.scope ?? "one";
+        if (typeof scope !== "string" || !Object.hasOwn(MOVE_SCOPES, scope)) throw new Error("scope must be one, later or all.");
+        const streamId = stream === undefined ? undefined : await this.streamIdForName(stream);
+        await api.request("PATCH", `/messages/${messageId}`, `moving message ${messageId}`, {
+          propagate_mode: MOVE_SCOPES[scope],
+          ...(topic !== undefined ? { topic } : {}),
+          ...(streamId !== undefined ? { stream_id: streamId } : {}),
+        });
+        const asked = { ...(topic !== undefined ? { topic } : {}), ...(stream !== undefined ? { stream } : {}), scope };
+        let message: any;
+        try {
+          message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId} back`)).message;
+        } catch (err) {
+          return { moved: true, asked, readBackError: (err as Error).message };
+        }
+        const name = message?.display_recipient;
+        if (message?.type !== "stream" || typeof name !== "string" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id)) {
+          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.` };
+        }
+        return {
+          channelId: this.channelIds?.channelIdOf(streamKey(message.stream_id)) ?? `zulip:${name}`,
+          channel: name,
+          topic: message.subject,
+          ...(stream !== undefined ? { note: MOVE_NOTE } : {}),
+        };
       }
 
       case "list_streams": {

@@ -268,8 +268,8 @@ On a closed channel only an addressed change is pushed — the mention the
 agent is about to answer was rewritten or deleted, a quote reply changed,
 or a DM it is reading changed — the same rule as for messages. A change to a message the host was
 never offered is dropped. Zulip re-renders (a link preview arriving) are
-not edits and never surface; the bot's own edits and deletions (rollback,
-`delete_message`) are its own doing and don't surface either. A deletion's
+not edits and never surface; the bot's own edits, moves and deletions (rollback,
+`move_messages`, `delete_message`) are its own doing and don't surface either. A deletion's
 mark lasts 10 minutes and holds the bot's latest 500 deletes, so one whose
 event comes later can surface. A moved
 message is reported on the channel it left, naming where it went.
@@ -430,7 +430,8 @@ file, or remove it to re-seed from the environment.
 
 **Writing**
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
-`edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+`edit_message`, `move_messages`, `delete_message`, `add_reaction`,
+`remove_reaction`.
 
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.
