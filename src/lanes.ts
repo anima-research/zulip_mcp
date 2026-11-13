@@ -4,6 +4,7 @@ export interface JobInfo {
   kind: 'message' | 'change' | 'reaction' | 'other';
   id?: number;
   about?: number[];
+  started?: boolean;
 }
 
 export interface JobContext<W> {
@@ -122,8 +123,8 @@ export class Lane<W> {
     this.lanes.changed(this);
   }
 
-  waitingMessages(): number[] {
-    return this.otherQueue.filter((e) => e.info.kind === 'message').map((e) => e.info.id ?? NaN);
+  waitingMessages(opts: { unstarted?: boolean } = {}): number[] {
+    return this.otherQueue.filter((e) => e.info.kind === 'message' && !(opts.unstarted && e.info.started)).map((e) => e.info.id ?? NaN);
   }
 
   changeWaitsAbout(ids: readonly number[]): boolean {

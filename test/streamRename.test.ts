@@ -1763,6 +1763,24 @@ scenario('72. once the host has answered a rename, an acknowledge under the old 
   } finally { await run.close(); }
 });
 
+scenario("74. a deletion of a new stream's first message that comes while the message waits for the stream's announcement follows the message as a line", async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  const polls = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/events').length;
+  try {
+    const fresh = r.create('fresh');
+    const first = r.post(fresh, '@bot hello', { mentioned: true });
+    await until(() => run.changed.some((c) => c.added?.some((d) => d.id === 'zulip:fresh')), 'the held announcement');
+    const read = polls();
+    r.remove([first]);
+    await until(() => polls() > read, 'the deletion read');
+    run.releaseChanged();
+    await until(() => named(run, first), 'the message');
+    await run.server.quiet();
+    assert.equal(pushesAbout(run, 'delete', first).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
 scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });

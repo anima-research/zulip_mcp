@@ -1159,7 +1159,7 @@ export class ZulipMcplServer {
     if (newChannel && this.ids.heldIdOf(key) === undefined) {
       void this.channelManager.registerAdditional([newChannel]);
       const entryId = numericId(message);
-      ctx.lane.enterFirst((c) => this.route(c, message), { kind: 'message', ...(entryId !== null ? { id: entryId } : {}) });
+      ctx.lane.enterFirst((c) => this.route(c, message), { kind: 'message', started: true, ...(entryId !== null ? { id: entryId } : {}) });
       return;
     }
 
@@ -2412,7 +2412,8 @@ export class ZulipMcplServer {
         const lane = this.lanes?.lane(entry.key);
         if (!lane) return;
         const waiting = new Set(lane.waitingMessages());
-        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => waiting.has(id));
+        const unstarted = new Set(lane.waitingMessages({ unstarted: true }));
+        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => unstarted.has(id));
         for (const id of applied) this.changesOnTurn.set(id, [...(this.changesOnTurn.get(id) ?? []), entry]);
         if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
