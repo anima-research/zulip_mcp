@@ -1,8 +1,9 @@
 - On live delivery, the fetches of one message's attachments share one 15 s
-  bound, where each fetch had 15 s of its own. An attachment not fetched by
-  then gets the "could not fetch" note with its path for `fetch_attachment`,
-  and an attachment after it isn't fetched. So a message waits at most 15 s
-  for its attachments' fetches, where it could wait 15 s for each.
+  bound, where each fetch had 15 s of its own. An attachment whose fetch
+  that bound cuts gets the "could not fetch" note with its path for
+  `fetch_attachment`, and so does each later attachment the server would
+  fetch, which it doesn't fetch then. So a message waits at most 15 s for
+  its attachments' fetches, where it could wait 15 s for each.
 - On a channel where the host has accepted nothing, a message that isn't
   accepted now gives the channel a watermark just below it, for example
   because the host refused it, the connection ended first, or
@@ -22,11 +23,11 @@
 - A message waiting for its quote lookup, or for a read of the stream list
   for its stream id, now holds back only its own channel. It held back every
   later event: up to 3 s for a quote lookup, and up to 15 s for the read.
-- While the host hasn't answered a stream's rename, nothing of that stream
-  goes to the host: agent-framework drops the old id as it reads the
-  announcement, before it answers. A host that doesn't answer delays the
-  stream's messages by the announcement's 5 s bound, after which they go
-  under the old id.
+- While the host hasn't answered a stream's rename, none of that stream's
+  messages, or the lines about them, go to the host: agent-framework drops
+  the old id as it reads the announcement, before it answers. A host that
+  doesn't answer delays the stream's messages by the announcement's 5 s
+  bound, after which they go under the old id.
 - A read from history that fills a hole and gets no answer from Zulip, or
   that Zulip refuses by its rate limit, is now tried again: after 2 s, then
   at waits that double up to 60 s, or after Zulip's `retry-after` where that
@@ -41,7 +42,10 @@
   gets one line naming the channels whose reads wait then, and one more line
   when no read waits any more. The first line names no channel that is muted
   or outside the allowlist, and goes only if it names one. With no channel
-  open, both lines go to the log. A channel whose stream's rename is with
+  open, or while `zulip.messaging` is disabled, both lines go to the log,
+  and the first line goes to the open channels at the read's next failed
+  try once a channel is open and `zulip.messaging` is enabled. A channel
+  whose stream's rename is with
   the host at that moment may not get them: they go there under the old id,
   and the host may drop them. After a break, each open channel's notice
   of the break counts what had come when the notice reached that channel,

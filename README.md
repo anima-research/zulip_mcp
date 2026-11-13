@@ -46,8 +46,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   can follow a message the server received after it. A message waiting for
   its quote lookup or its attachments holds back only its own channel. An
   event that only a lookup can place waits for it, such as a
-  reaction to a message the server hasn't seen, and the reactions, changes and
-  messages after it that carry no stream id wait behind it. When delivery
+  reaction to a message the server hasn't seen, and the reactions after it,
+  and the changes and stream messages after it that carry no stream id, wait
+  behind it. A direct message doesn't wait. When delivery
   stops, a message the server already holds is offered by the next
   connection's catch-up, as any message above the watermark is, if Zulip's
   history still has it there; one still waiting for the lookup that places
@@ -119,9 +120,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   is disabled, as that message comes in. It never advances past a message
   the host was offered but did not accept — a refusal, a batch lost to a
   transport failure — which is replayed from history once the host answers
-  again. The exception is a channel that is muted or outside the allowlist,
-  at the refusal or at a later read for held messages: there such a message
-  is let go, as it may never reach the agent.
+  again. The exception is a channel that is muted or outside the allowlist
+  when the offer is refused or fails, or at a later read for held messages:
+  there such a message is let go, as it may never reach the agent.
   On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
@@ -138,11 +139,11 @@ Discord and Slack adapters that once lived here moved to those servers.
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
   follows it, as a message, so a live delivery can never jump the watermark
-  over the offline gap.
+  over the offline gap. Past 5,000 waiting messages, the channel with the
+  most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
-  policy. Images are inlined on live delivery and on messages recovered onto
-  an open channel, downsampled to model-max.
+  policy. Images are inlined on live delivery, downsampled to model-max.
 - Reactions, opt-in per channel, carry only reaction tags so a tag-keyed
   wake policy ignores them; operator-owned suppression of reaction markers
   plus the host-injected baseline; rollback checkpoints minted by every
@@ -190,7 +191,7 @@ are likely to touch:
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
-| `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery and on messages recovered onto an open channel |
+| `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
 | `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
 | `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
@@ -333,11 +334,11 @@ before the lifecycle commits.
 **Channels that appear after startup.** The bot does not have to be
 restarted to use a stream it was added to later. Four things register one,
 whichever happens first: the `listen` tool registers what it subscribes the
-bot to; every message from the stream carries its descriptor, the way a DM
-from a new conversation does, so the mention that wakes the agent also
-makes the channel openable; `refresh_channels` re-enumerates everything
-visible; and `channels/open` on an unknown exact `channelId` re-enumerates
-once before it fails. Only a channel none of these can find answers
+bot to; every message from the stream carries its descriptor, the way every
+DM does, so the mention that wakes the agent also makes the channel
+openable; `refresh_channels` re-enumerates everything visible; and
+`channels/open` on an unknown exact `channelId` re-enumerates once before it
+fails. Only a channel none of these can find answers
 `-32023 Unknown channel`.
 
 **A stream that is renamed or archived.** A stream's channel id holds its

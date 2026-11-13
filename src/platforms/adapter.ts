@@ -53,9 +53,9 @@ export interface RoutingHints {
  * A message from the event stream, placed in its channel when it arrives.
  * The server runs `ready` in the channel's turn: it does what may wait on
  * the platform, and answers null for a message that isn't for the host.
- * `newChannel` is set when the message belongs to a channel the adapter has
- * not described before (a DM from a new conversation) — the server
- * registers it with the host before routing.
+ * `newChannel` describes the message's channel wherever the adapter can
+ * describe it, on every message; the server registers it with the host
+ * when it routes the message, if the host holds no id for that channel.
  */
 export interface IncomingEntry {
   key: ChannelKey;
