@@ -33,7 +33,7 @@ import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import { FiltersPlane } from '../src/filters.ts';
-import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
@@ -333,6 +333,7 @@ interface HarnessOptions {
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
   visible?: ChannelDescriptor[];
+  tools?: ZulipToolRuntime;
 }
 
 function harness(opts: HarnessOptions = {}): Harness {
@@ -344,7 +345,7 @@ function harness(opts: HarnessOptions = {}): Harness {
   const adapter = opts.reuse?.adapter ?? fakeAdapter(opts.typing ?? true);
   if (opts.history) adapter.history = opts.history;
   if (opts.visible) adapter.visible = opts.visible;
-  const server = opts.reuse?.server ?? new ZulipMcplServer(adapter as unknown as PlatformAdapter, fakeTools as unknown as ZulipToolRuntime, {
+  const server = opts.reuse?.server ?? new ZulipMcplServer(adapter as unknown as PlatformAdapter, opts.tools ?? (fakeTools as unknown as ZulipToolRuntime), {
     serverInfo: { name: 'zulip-mcp-test', version: '0.0.0' },
     mcplEnabled: opts.mcpl ?? true,
     batchWindowMs: opts.batchWindowMs ?? 5,
@@ -1040,6 +1041,206 @@ test("the bot's own move takes a plain answer to the new topic, and nothing abou
   assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' });
   assert.deepEqual({ incoming: h.incoming.length, pushed: h.pushed.length }, before, 'no line about the move reached the host');
   await h.close();
+});
+
+const MOVING_STREAMS: Record<number, string> = { 7: 'general' };
+
+function movingRealm(topics: Record<number, string>, readAs: Record<number, unknown> = {}) {
+  const table = new Map(Object.entries(topics).map(([id, topic]) => [Number(id), { stream_id: 7, topic }]));
+  const stand = standInApi({
+    'PATCH /messages/:id': (params: Record<string, unknown>, call: { id?: number }) => {
+      const at = { ...table.get(call.id!)! };
+      for (const [id, m] of table) {
+        const inTopic = m.stream_id === at.stream_id && m.topic === at.topic;
+        const mode = params.propagate_mode;
+        if (!(id === call.id || (inTopic && (mode === 'change_all' || (mode === 'change_later' && id > call.id!))))) continue;
+        if (typeof params.topic === 'string') m.topic = params.topic;
+        if (typeof params.stream_id === 'number') m.stream_id = params.stream_id;
+      }
+      return { result: 'success' };
+    },
+    'GET /messages/:id': (_params: Record<string, unknown>, call: { id?: number }) => {
+      const m = table.get(call.id!);
+      if (call.id! in readAs) return readAs[call.id!];
+      if (!m) return { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
+      return { result: 'success', message: { id: call.id, type: 'stream', stream_id: m.stream_id, display_recipient: MOVING_STREAMS[m.stream_id], subject: m.topic } };
+    },
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-move-'));
+  const tools = new ZulipToolRuntime({ api: stand.api, selfUserId: 790, realm: 'https://z.example.com', authHeader: '', sessionId: 't' }, dir);
+  return { tools, calls: stand.calls, dir };
+}
+
+async function moveBy(h: Harness, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const answer = (await h.host.sendRequest('tools/call', { name: 'move_messages', arguments: args })) as { content: { text: string }[]; isError?: boolean };
+  assert.ok(!answer.isError, answer.content[0].text);
+  return JSON.parse(answer.content[0].text);
+}
+
+async function mentionedOn(h: Harness, id: number): Promise<void> {
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(id, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.delivery.watermark('zulip:general') === id, 'the mention accepted');
+}
+
+for (const [label, move] of [
+  ['it moves the message that the answers follow', { message_id: 3, scope: 'one' }],
+  ['later from an older message of its topic', { message_id: 1, scope: 'later' }],
+  ['all from another message of its topic', { message_id: 5, scope: 'all' }],
+] as const) {
+  test(`right after move_messages answers, with its event still to come, a plain answer goes to the new topic: ${label}`, async () => {
+    const realm = movingRealm({ 1: 'deploys', 3: 'deploys', 5: 'deploys' });
+    const h = harness({ tools: realm.tools });
+    try {
+      await mentionedOn(h, 3);
+      await moveBy(h, { ...move, topic: 'releases' });
+      assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' });
+    } finally {
+      await h.close();
+      rmSync(realm.dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("move_messages with one on another message reads nothing more and leaves a plain answer where it was, and so does a call that names the message's own stream", async () => {
+  const realm = movingRealm({ 1: 'deploys', 3: 'deploys' });
+  const h = harness({ tools: realm.tools });
+  try {
+    await mentionedOn(h, 3);
+    const before = realm.calls.length;
+    await moveBy(h, { message_id: 1, topic: 'elsewhere', scope: 'one' });
+    assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/1', 'GET /messages/1']);
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'after one on another message');
+    await moveBy(h, { message_id: 3, topic: 'releases', stream: 'general', scope: 'one' });
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'after a call that names a stream');
+  } finally {
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
+test("where reading the message that the answers follow fails, move_messages answers as without it, and the move's event moves a plain answer when it comes", async () => {
+  const realm = movingRealm({ 1: 'deploys', 3: 'deploys' }, { 3: { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' } });
+  const h = harness({ tools: realm.tools });
+  try {
+    await mentionedOn(h, 3);
+    const before = realm.calls.length;
+    const result = await moveBy(h, { message_id: 1, topic: 'releases', scope: 'later' });
+    assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases' });
+    assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/1', 'GET /messages/1', 'GET /messages/3']);
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'before the event');
+    changeTo(h, { messageIds: ['1', '3'], previousTopic: 'deploys', topic: 'releases', actorId: '1', byBot: true, mentioned: true });
+    await h.server.quiet();
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the event');
+  } finally {
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
+for (const [label, answer] of [
+  ['is in another stream by then', { result: 'success', message: { id: 3, type: 'stream', stream_id: 8, display_recipient: 'other', subject: 'elsewhere' } }],
+  ['comes back with no topic', { result: 'success', message: { id: 3, type: 'stream', stream_id: 7, display_recipient: 'general' } }],
+] as const) {
+  test(`where the message that the answers follow ${label}, move_messages leaves a plain answer where it was`, async () => {
+    const realm = movingRealm({ 1: 'deploys', 3: 'deploys' }, { 3: answer });
+    const h = harness({ tools: realm.tools });
+    try {
+      await mentionedOn(h, 3);
+      const before = realm.calls.length;
+      await moveBy(h, { message_id: 1, topic: 'releases', scope: 'all' });
+      assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/1', 'GET /messages/1', 'GET /messages/3']);
+      assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' });
+    } finally {
+      await h.close();
+      rmSync(realm.dir, { recursive: true, force: true });
+    }
+  });
+}
+
+async function movedWhileLaneBusy(h: Harness, realm: ReturnType<typeof movingRealm>, fetches: ReturnType<typeof heldFetches>, open: boolean) {
+  await initialize(h, true);
+  await settled(h);
+  if (open) {
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(3));
+  } else {
+    h.adapter.emit!(streamMsg(3, { mentioned: true, text: '@bot ship it?' }));
+  }
+  await until(() => h.delivery.watermark('zulip:general') === 3, 'message 3 accepted');
+  if (!open) h.policy.rejectPushes.add('4');
+  h.adapter.emit!(withLog(streamMsg(4, { mentioned: !open })));
+  await until(() => fetches.started.length === 1, "message 4's attachment holds the lane");
+  let done = false;
+  const call = realm.tools.handleToolCall('move_messages', { message_id: 3, topic: 'releases', scope: 'one' }).finally(() => { done = true; });
+  await until(() => realm.calls.some((c) => c.method === 'GET' && c.path === '/messages/3'), 'the read back');
+  await new Promise((resolve) => setImmediate(resolve));
+  return { call, done: () => done };
+}
+
+test("move_messages still answers where the channel's lane ends while its job waits", async () => {
+  const fetches = heldFetches();
+  const realm = movingRealm({ 3: 'deploys', 4: 'deploys' });
+  const h = harness({ tools: realm.tools, attachments: fetches.options, shutdownGraceMs: 50 });
+  let closed = false;
+  try {
+    const moving = await movedWhileLaneBusy(h, realm, fetches, false);
+    assert.equal(moving.done(), false, 'the tool waits for its job');
+    closed = true;
+    await h.close();
+    assert.deepEqual(await moving.call, { channelId: 'zulip:general', channel: 'general', topic: 'releases' });
+  } finally {
+    fetches.release();
+    if (!closed) {
+      await h.server.quiet();
+      await h.close();
+    }
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
+test("move_messages answers once its job has run, and the job leaves a plain answer where it is when a newer message is what the answers follow by then", async () => {
+  const fetches = heldFetches();
+  const realm = movingRealm({ 3: 'deploys', 4: 'deploys' });
+  const h = harness({ tools: realm.tools, attachments: fetches.options });
+  try {
+    const moving = await movedWhileLaneBusy(h, realm, fetches, true);
+    assert.equal(moving.done(), false, 'the tool waits for its job');
+    fetches.release();
+    assert.deepEqual(await moving.call, { channelId: 'zulip:general', channel: 'general', topic: 'releases' });
+    await h.server.quiet();
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' });
+  } finally {
+    fetches.release();
+    await h.server.quiet();
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
+test('move_messages waits for its job up to 5 s, then answers with the note, and the job still moves a plain answer at its turn', { timeout: 10_000 }, async () => {
+  const fetches = heldFetches();
+  const realm = movingRealm({ 3: 'deploys', 4: 'deploys' });
+  const h = harness({ tools: realm.tools, attachments: fetches.options });
+  const original = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 5_000 ? 50 : ms, ...rest)) as typeof setTimeout;
+    const moving = await movedWhileLaneBusy(h, realm, fetches, false);
+    const result = await moving.call;
+    globalThis.setTimeout = original;
+    assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases', note: 'To answer this message where it is now, use send_message with reply_to.' });
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, "before the job's turn");
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, "after the job's turn");
+  } finally {
+    globalThis.setTimeout = original;
+    fetches.release();
+    await h.server.quiet();
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
 });
 
 test('a rename while the channel is muted moves where a plain answer goes after the unmute, and tells the host nothing', async () => {
