@@ -172,6 +172,10 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       const limit = Math.min(query.limit, adapter.pageCap);
       const page = query.afterMessageId !== undefined ? rows.slice(0, limit) : rows.slice(-limit);
       const newest = page[page.length - 1];
+      for (const m of page) {
+        const topic = (m.metadata as { topic?: unknown } | undefined)?.topic;
+        if (typeof topic === 'string' && !places.has(m.messageId)) places.set(m.messageId, { key, topic });
+      }
       return {
         messages: page.map(({ channelId: _c, ...m }) => ({ ...m, key, metadata: { ...(m.metadata as object), backscroll: true } })),
         scannedThrough: newest ? Number(newest.messageId) : null,
@@ -2433,6 +2437,24 @@ test('a stream muted while an addressed message of its closed channel waits for 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a rename while a catch-up block waits for the host's answer moves where a plain answer goes once the host accepts the block", async () => {
+  const h = harness({ history: [streamMsg(2), streamMsg(3, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  h.policy.holdPushes = true;
+  h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+  await until(() => h.pushed.length === 1, 'the catch-up block pushed');
+
+  changeTo(h, { messageIds: ['3'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await until(() => h.pushed.length === 2, "the move's line pushed, so its job has run");
+  h.policy.holdPushes = false;
+  while (h.policy.heldPushes.length > 0) h.policy.heldPushes.shift()!();
+  await until(() => h.delivery.watermark('zulip:general') === 3, 'the block accepted');
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the acceptance');
+  await h.close();
 });
 
 test('a catch-up block the host refuses keeps the watermark below it, and is offered again once the host accepts a later message', async () => {
