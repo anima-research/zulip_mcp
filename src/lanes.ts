@@ -176,7 +176,8 @@ export class Lane<W> {
     const given = new Set(ids);
     const aboutGiven = (e: Entry<W>) => e.info.about !== undefined && e.info.about.length > 0 && e.info.about.every((id) => given.has(id));
     const kept = this.otherQueue.filter((e, i) => (i < first || e.info.kind !== 'message') && !aboutGiven(e));
-    kept.splice(first, 0, { read, info: { kind: 'other' } });
+    const at = this.otherQueue.slice(0, first).filter((e) => !aboutGiven(e)).length;
+    kept.splice(at, 0, { read, info: { kind: 'other' } });
     this.otherQueue.length = 0;
     this.otherQueue.push(...kept);
     this.lanes.messagesLeft(ids.length);

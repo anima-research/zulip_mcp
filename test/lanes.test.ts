@@ -395,6 +395,20 @@ test('the place moves up to what a job decides, and never down', async () => {
   assert.equal(lane.place, 8);
 });
 
+test("at a give-up, the read takes the first given-up message's place, also when a job ahead of that message leaves with it", async () => {
+  const log: string[] = [];
+  const running = gate();
+  const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }); }, 1);
+  l.lane(A).enter(async () => { await running.opened; log.push('running'); });
+  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'other', about: [10] });
+  l.lane(A).enter(() => { log.push('10'); }, { kind: 'message', id: 10 });
+  l.lane(A).enter(() => { log.push('after 10'); });
+  l.lane(A).enter(() => { log.push('11'); }, { kind: 'message', id: 11 });
+  running.open();
+  await l.quiet();
+  assert.deepEqual(log, ['running', 'read', 'after 10']);
+});
+
 test('an answer that fails is logged with its channel, also when it runs after its lane ended and fails later', async (t) => {
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
