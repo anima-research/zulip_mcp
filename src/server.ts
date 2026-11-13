@@ -1101,7 +1101,7 @@ export class ZulipMcplServer {
       const ready = await entry.ready(changes);
       if (ctx.ended) return;
       const placeNow = this.placeOf(key);
-      if (id !== null && placeNow !== undefined && id <= placeNow) return;
+      if (id !== null && placeNow !== undefined && id <= placeNow) return this.letGo(ctx.w, key, id);
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);

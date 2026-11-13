@@ -6080,6 +6080,25 @@ test("a live event for a row that a break's read is handing, which enters while 
   await h.close();
 });
 
+test("a live message that a break's read decides past before its turn holds nothing back: the watermark reaches what the host accepted", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [withLog(streamMsg(20))] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(18));
+  await until(() => h.delivery.watermark('zulip:general') === 18, '18 accepted');
+  breakQueue(h);
+  await until(() => fetches.started.length === 1, "the recovered row's attachment fetch");
+  h.adapter.emit!(streamMsg(19));
+  await new Promise((r) => setImmediate(r));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 20);
+  await h.close();
+});
+
 test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);
