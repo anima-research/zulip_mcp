@@ -748,10 +748,10 @@ test('move_messages refuses a call with neither topic nor stream, with no scope 
       await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic: 'x', scope }), /scope/, `scope ${JSON.stringify(scope)}`);
     }
     for (const stream of ['', 8, ['ops']]) {
-      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream, scope: 'one' }), /stream/, `stream ${JSON.stringify(stream)}`);
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream, scope: 'one' }), /stream must be a stream's name/, `stream ${JSON.stringify(stream)}`);
     }
     for (const topic of [5, ['x']]) {
-      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic, scope: 'one' }), /topic/, `topic ${JSON.stringify(topic)}`);
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic, scope: 'one' }), /topic must be a string/, `topic ${JSON.stringify(topic)}`);
     }
     for (const message_id of [0, '0x4d', '77/../users/me']) {
       await assert.rejects(tools.handleToolCall('move_messages', { message_id, topic: 'x', scope: 'one' }), /message_id/, `message_id ${JSON.stringify(message_id)}`);
@@ -791,16 +791,21 @@ test('move_messages says the move was made when Zulip accepted it but the read b
   const { tools, dir, calls } = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
   try {
     const result = await tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', stream: 'ops', scope: 'later' });
-    assert.deepEqual(Object.keys(result).sort(), ['asked', 'moved', 'readBackError']);
+    assert.deepEqual(Object.keys(result).sort(), ['asked', 'moved', 'note', 'readBackError'], 'a call that names a stream keeps its note');
     assert.equal(result.moved, true);
     assert.deepEqual(result.asked, { topic: 'renamed', stream: 'ops', scope: 'later' });
     assert.match(result.readBackError, /Invalid message\(s\)/);
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.');
     assert.deepEqual(calls.map((c) => c.method), ['PATCH', 'GET']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
   const placeless = moveRuntime({ readBack: () => ({ result: 'success' }) });
   try {
     const result = await placeless.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
-    assert.deepEqual(Object.keys(result).sort(), ['asked', 'moved', 'readBackError'], 'an answer with no stream and topic claims no place');
+    assert.deepEqual(result, {
+      moved: true,
+      asked: { topic: 'renamed', scope: 'one' },
+      readBackError: "Zulip's answer gave no stream and topic for message 77.",
+    }, 'an answer with no stream and topic claims no place');
   } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
 });
 
@@ -838,9 +843,17 @@ test('move_messages keeps a stream lookup that got no answer as it is, with no p
   try {
     await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' }), (err: Error) => {
       assert.ok(err instanceof ZulipNoAnswer, `${err.constructor.name}: ${err.message}`);
-      assert.doesNotMatch(err.message, /list_streams/);
+      assert.equal(err.message, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.');
       return true;
     });
     assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('move_messages refuses a stream lookup whose answer gives no stream id, and moves nothing', async () => {
+  const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => ({ result: 'success' }) });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', topic: 'there', scope: 'one' }), /Zulip's answer to looking up stream "ops" gave no stream id\./);
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id'], 'nothing is moved');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
