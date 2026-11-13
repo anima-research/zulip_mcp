@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
-import { ZulipNoAnswer } from '../src/zulip-api.ts';
+import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey } from '../src/channel-key.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
@@ -163,11 +163,11 @@ test('R3: a refusal at the second of three chunks keeps each caller\'s error tex
   dm.done();
 
   const pub = adapter(messagesApi(refuseSecond).api);
-  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message === 'Zulip refused message to #general: nope');
+  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message.endsWith('Zulip refused message to #general: nope'));
   assert.deepEqual(pub.sent, [{ messageId: '901', channelId: 'zulip:general', content: big(1, 9000) }]);
 
   const pubDm = adapter(messagesApi(refuseSecond).api);
-  await assert.rejects(pubDm.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => e.message === 'Zulip refused direct message to zulip:dm:42: nope');
+  await assert.rejects(pubDm.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => e.message.endsWith('Zulip refused direct message to zulip:dm:42: nope'));
   assert.deepEqual(pubDm.sent.map((s) => s.messageId), ['901']);
 });
 
@@ -187,20 +187,23 @@ test('R3b: no answer at the second of three chunks throws that error, and the fi
   assert.deepEqual(pub.sent.map((s) => s.messageId), ['901']);
 });
 
+const ONE_POSTED = 'Posted as message 901 (part 1) before the send stopped; sending the whole text again posts that part twice.';
+const fourChunks = [big(1, 9000), big(2, 9000), big(3, 9000), big(4, 5000)].join('\n\n');
+const refuseAt = (at: number): Answer => (n) => (n === at ? { result: 'error', msg: 'nope', code: 'BAD_REQUEST' } : ok(n));
+
 test('R2 (109): a send that fails after a part was posted names that part by id, then Zulip\'s words or the error; a first part refused gives Zulip\'s words alone', async () => {
   for (const tool of ['send_message', 'send_dm'] as const) {
     const args = tool === 'send_message' ? { type: 'stream', to: 'general', topic: 't', content: threeChunks } : { to: ['42'], content: threeChunks };
     const refused = tools(messagesApi(refuseSecond).api);
     await assert.rejects(refused.runtime.handleToolCall(tool, args), (e: Error) => {
-      assert.match(e.message, /\b901\b/, `${tool}: the posted part's id`);
-      assert.ok(e.message.endsWith('nope'), `${tool}: Zulip's words last`);
+      assert.equal(e.message, `${ONE_POSTED} Zulip: nope`, `${tool}: the posted part, then Zulip's words`);
       return true;
     });
     refused.done();
     const silent = tools(messagesApi(noAnswerSecond).api);
     await assert.rejects(silent.runtime.handleToolCall(tool, args), (e: Error) => {
       assert.equal(e, noAnswer, `${tool}: the same error`);
-      assert.match(e.message, /\b901\b/, `${tool}: the posted part's id`);
+      assert.ok(e.message.startsWith(`${ONE_POSTED} Zulip gave no answer`), `${tool}: the posted part, then the error's own words`);
       assert.match(e.message, /within 15 s/, `${tool}: the error's own words`);
       return true;
     });
@@ -209,4 +212,33 @@ test('R2 (109): a send that fails after a part was posted names that part by id,
     await assert.rejects(first.runtime.handleToolCall(tool, args), (e: Error) => e.message === 'nope');
     first.done();
   }
+});
+
+test('R2b (109): two posted parts are named as parts 1 and 2, and three or more as parts 1 to N', async () => {
+  const two = tools(messagesApi(refuseAt(3)).api);
+  await assert.rejects(two.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }),
+    (e: Error) => e.message === 'Posted as messages 901 and 902 (parts 1 and 2) before the send stopped; sending the whole text again posts those parts twice. Zulip: nope');
+  two.done();
+  const three = tools(messagesApi(refuseAt(4)).api);
+  await assert.rejects(three.runtime.handleToolCall('send_dm', { to: ['42'], content: fourChunks }),
+    (e: Error) => e.message === 'Posted as messages 901, 902 and 903 (parts 1 to 3) before the send stopped; sending the whole text again posts those parts twice. Zulip: nope');
+  three.done();
+});
+
+test('R4 (109, publish): a plain answer that fails after a part was posted names that part, keeps its error\'s kind, and a first part refused is as before', async () => {
+  const refused = adapter(messagesApi(refuseSecond).api);
+  await assert.rejects(refused.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error & { code?: string }) => {
+    assert.equal(e.message, `${ONE_POSTED} Zulip refused message to #general: nope`);
+    assert.ok(e instanceof ZulipRefused, 'still a refusal');
+    assert.equal(e.code, 'BAD_REQUEST', 'with its code');
+    return true;
+  });
+  const silent = adapter(messagesApi(noAnswerSecond).api);
+  await assert.rejects(silent.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => {
+    assert.equal(e, noAnswer, 'the same error');
+    assert.ok(e.message.startsWith(`${ONE_POSTED} Zulip gave no answer`));
+    return true;
+  });
+  const first = adapter(messagesApi(refuseAt(1)).api);
+  await assert.rejects(first.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message === 'Zulip refused message to #general: nope');
 });

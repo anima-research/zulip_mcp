@@ -262,7 +262,9 @@ test('R1 (113): while the file is broken, the refusal says that its repair is th
     assert.match(reason, /invalid on disk/);
     assert.match(reason, /operator's to repair/);
     assert.match(reason, /an update can be made again/);
+    assert.match(reason, /once a write repairs it/);
     assert.doesNotMatch(reason, /repair it/);
+    assert.doesNotMatch(reason, /\.(\s|$)/, 'one clause, so it reads inside the log line\'s parentheses');
     plane.stop();
   } finally {
     rmSync(dir, { recursive: true, force: true });
