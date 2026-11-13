@@ -1749,6 +1749,20 @@ scenario('71. under a disabled zulip.messaging, an edit runs after an older edit
   } finally { release(); await run.close(); }
 });
 
+scenario('72. once the host has answered a rename, an acknowledge under the old id adds its reaction, and a publish under it is still refused', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  try {
+    const posted = r.post(17, 'to acknowledge');
+    await renameWhileOpen(r, run);
+    await tookRename(run);
+    const ack = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: String(posted), value: 'eyes' });
+    assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
+    assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [['POST', `/messages/${posted}/reactions`, 'eyes']]);
+    await assert.rejects(publish(run, 'zulip:general', 'hello?'), /zulip:lobby/);
+  } finally { await run.close(); }
+});
+
 scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });

@@ -736,10 +736,8 @@ export class ZulipMcplServer {
             conn.sendResponse(req.id, { acknowledged: false, reason: 'this surface has no acknowledgment representation' });
             break;
           }
-          const ackKey = await this.ids.keyOf(ack.channelId);
-          if ('refusal' in ackKey) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, ackKey.refusal, { channelId: ack.channelId });
           try {
-            const representation = await this.adapter.acknowledge('key' in ackKey ? ackKey.key : null, ack.messageId, ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), ack.messageId, ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
             conn.sendResponse(req.id, { acknowledged: false, reason: (error as Error).message });

@@ -177,6 +177,7 @@ export function realm(initial: Record<number, string>): Realm {
       return { result: 'success', subscribed: {}, already_subscribed: {} };
     },
     'POST /typing': { result: 'success' },
+    'POST /messages/:id/reactions': { result: 'success' },
   });
 
   const self: Realm = {
