@@ -11,6 +11,7 @@ import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
 import { realm } from './http-realm.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import { dmKey } from '../src/channel-key.ts';
+import { ZulipEventLoop } from '../src/platforms/zulip-events.ts';
 
 async function serverOn(realmUrl: string, env: Record<string, string> = {}, options: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
@@ -694,7 +695,7 @@ for (const [how, first] of [
   });
 }
 
-test("while the bot's own user id is unknown and reading it fails, a tool call fails naming that read and sends nothing else to Zulip, and a write says that it was not sent", async () => {
+test("while the bot's own user id is unknown and reading it fails, a tool call fails naming that read, sends nothing else to Zulip, and says that the request was not sent", async () => {
   const z = await realm({ 'GET /users/me': { status: 503, json: { result: 'error', msg: 'Service unavailable' } } });
   const s = await serverOn(z.url);
   try {
@@ -708,11 +709,14 @@ test("while the bot's own user id is unknown and reading it fails, a tool call f
         return true;
       },
     );
-    await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error) => {
-      assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
-      return true;
-    });
-    assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /users/me']);
+    for (const [name, args] of [['list_streams', {}], ['send_message', { reply_to: 55, content: 'hi' }]] as const) {
+      await assert.rejects(s.tools.handleToolCall(name, args), (err: Error) => {
+        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.ok(err.message.endsWith('The request was not sent.'), err.message);
+        return true;
+      }, name);
+    }
+    assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /users/me', 'GET /users/me']);
   } finally { s.done(); z.close(); }
 });
 
@@ -774,4 +778,76 @@ test("a start whose read of the bot's profile fails still reads the realm's uplo
     assert.equal(s.session.selfUserId, null, "the start's read failed");
     assert.equal(s.session.maxUploadBytes, 25 * 1024 * 1024);
   } finally { s.done(); z.close(); }
+});
+
+test("a direct message sent while the bot's own user id can't be read yet waits in the event queue, which registers at once, and reaches the host once Zulip gives the id", { timeout: 15_000 }, async () => {
+  const events: Record<string, unknown>[] = [];
+  let profileReads = 0;
+  const z = await realm({
+    'GET /users/me': () => {
+      profileReads++;
+      if (profileReads === 2) events.push({ id: events.length, type: 'message', message: dmFromAnn, flags: [] });
+      return profileReads <= 2 ? 'drop' : bot;
+    },
+    'POST /register': () => ({ json: { result: 'success', queue_id: 'q1', last_event_id: events.length - 1, streams: [{ stream_id: 7, name: 'general', invite_only: false }] } }),
+    'GET /events': (r) => {
+      const after = events.filter((e) => (e.id as number) > Number(r.query.get('last_event_id')));
+      return after.length > 0 ? { json: { result: 'success', events: after } } : { json: { result: 'success', events: [] }, delayMs: 50 };
+    },
+  });
+  const s = await serverOn(z.url);
+  const adapter = new ZulipAdapter(s.session.api, s.session);
+  const handed: { key: string; messageId: string }[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const arrived = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 8_000);
+      adapter.startEvents((entry) => {
+        handed.push({ key: entry.key, messageId: entry.messageId });
+        if (entry.messageId === String(dmFromAnn.id)) { clearTimeout(timer); resolve(true); }
+      });
+    });
+    assert.ok(arrived, 'the direct message reached the adapter within 8 s');
+    assert.deepEqual(handed, [{ key: dmKey([7]), messageId: String(dmFromAnn.id) }]);
+  } finally { console.error = original; adapter.stopEvents(); s.done(); z.close(); }
+});
+
+test("while the bot's own user id can't be read, the event loop's degraded notice says why", { timeout: 10_000 }, async () => {
+  const z = await realm({
+    'GET /users/me': { status: 503, json: { result: 'error', msg: 'Service unavailable' } },
+    'POST /register': { json: { result: 'success', queue_id: 'q1', last_event_id: -1, streams: [] } },
+  });
+  const s = await serverOn(z.url);
+  const loop = new ZulipEventLoop({ sleep: () => new Promise((resolve) => setTimeout(resolve, 5)) });
+  const notices: { kind: string; text: string }[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const running = loop.start(s.session.api, () => {}, (event) => notices.push(event));
+    const deadline = Date.now() + 3_000;
+    while (!notices.some((n) => n.kind === 'degraded') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    loop.stop();
+    await running;
+    const degraded = notices.find((n) => n.kind === 'degraded');
+    assert.ok(degraded, 'a degraded notice within 3 s');
+    assert.match(degraded.text, /GET \/users\/me with HTTP 503: Service unavailable/);
+  } finally { console.error = original; s.done(); z.close(); }
+});
+
+test("ZULIP_SUBSCRIBE's subscribe goes out while the bot's own user id can't be read", async () => {
+  const z = await realm({
+    'GET /users/me': 'drop',
+    'POST /users/me/subscriptions': { json: { result: 'success', subscribed: { 'bot@example.com': ['general'] }, already_subscribed: {} } },
+  });
+  const s = await serverOn(z.url);
+  const directory = { whenListed: async () => {}, formerOf: () => undefined } as unknown as StreamDirectory;
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const afterStart = z.requests.length;
+    await subscribeConfigured(s.session.api, directory, 'general');
+    assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['POST /users/me/subscriptions']);
+    assert.equal(s.session.selfUserId, null);
+  } finally { console.error = original; s.done(); z.close(); }
 });
