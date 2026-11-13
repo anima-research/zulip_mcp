@@ -1161,14 +1161,14 @@ test("move_messages with one on another message reads nothing more and leaves a 
   }
 });
 
-test("where reading the message that the answers follow fails, move_messages answers as without it, and the move's event moves a plain answer when it comes", async () => {
+test("where reading the message that the answers follow fails, move_messages answers with the note, and the move's event moves a plain answer when it comes", async () => {
   const realm = movingRealm({ 1: 'deploys', 3: 'deploys' }, { 3: { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' } });
   const h = harness({ tools: realm.tools });
   try {
     await mentionedOn(h, 3);
     const before = realm.calls.length;
     const result = await moveBy(h, { message_id: 1, topic: 'releases', scope: 'later' });
-    assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases' });
+    assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases', note: 'To answer this message where it is now, use send_message with reply_to.' });
     assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/1', 'GET /messages/1', 'GET /messages/3']);
     assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, 'before the event');
     changeTo(h, { messageIds: ['1', '3'], previousTopic: 'deploys', topic: 'releases', actorId: '1', byBot: true, mentioned: true });
@@ -1180,9 +1180,10 @@ test("where reading the message that the answers follow fails, move_messages ans
   }
 });
 
-for (const [label, answer] of [
-  ['is in another stream by then', { result: 'success', message: { id: 3, type: 'stream', stream_id: 8, display_recipient: 'other', subject: 'elsewhere' } }],
-  ['comes back with no topic', { result: 'success', message: { id: 3, type: 'stream', stream_id: 7, display_recipient: 'general' } }],
+for (const [label, answer, noted] of [
+  ['is in another stream by then, with no note', { result: 'success', message: { id: 3, type: 'stream', stream_id: 8, display_recipient: 'other', subject: 'elsewhere' } }, false],
+  ['comes back with no topic, with the note', { result: 'success', message: { id: 3, type: 'stream', stream_id: 7, display_recipient: 'general' } }, true],
+  ['comes back with no stream, with the note', { result: 'success', message: { id: 3, subject: 'deploys' } }, true],
 ] as const) {
   test(`where the message that the answers follow ${label}, move_messages leaves a plain answer where it was`, async () => {
     const realm = movingRealm({ 1: 'deploys', 3: 'deploys' }, { 3: answer });
@@ -1190,7 +1191,8 @@ for (const [label, answer] of [
     try {
       await mentionedOn(h, 3);
       const before = realm.calls.length;
-      await moveBy(h, { message_id: 1, topic: 'releases', scope: 'all' });
+      const result = await moveBy(h, { message_id: 1, topic: 'releases', scope: 'all' });
+      assert.equal('note' in result, noted);
       assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/1', 'GET /messages/1', 'GET /messages/3']);
       assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' });
     } finally {

@@ -977,7 +977,7 @@ test("move_messages gives no channel id where the host holds the stream's name's
   } finally { rmSync(plain.dir, { recursive: true, force: true }); }
 });
 
-test('move_messages says the move was made when Zulip accepted it but the read back fails, and claims no place', async () => {
+test('move_messages says the move was made when Zulip accepted it but the read back fails, claims no place, and gives the note whatever the call names', async () => {
   const { tools, dir, calls } = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
   try {
     const result = await tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', stream: 'ops', scope: 'later' });
@@ -988,6 +988,11 @@ test('move_messages says the move was made when Zulip accepted it but the read b
     assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.');
     assert.deepEqual(calls.map((c) => c.method), ['PATCH', 'GET']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+  const unread = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
+  try {
+    const result = await unread.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.', 'a topic alone has the note too');
+  } finally { rmSync(unread.dir, { recursive: true, force: true }); }
   const placeless = moveRuntime({ readBack: () => ({ result: 'success' }) });
   try {
     const result = await placeless.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
@@ -995,7 +1000,8 @@ test('move_messages says the move was made when Zulip accepted it but the read b
       moved: true,
       asked: { topic: 'renamed', scope: 'one' },
       readBackError: "Zulip's answer gave no stream and topic for message 77.",
-    }, 'an answer with no stream and topic claims no place');
+      note: 'To answer this message where it is now, use send_message with reply_to.',
+    }, 'an answer with no stream and topic claims no place, and has the note');
   } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
 });
 

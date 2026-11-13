@@ -300,8 +300,13 @@ export class ZulipToolRuntime {
     const key = streamKey(streamId);
     const from = hints?.followed(key);
     if (!hints || from === undefined || (from !== messageId && scope === "one")) return true;
-    const followedTopic = from === messageId ? topic : await this.topicIn(from, streamId);
-    if (followedTopic === undefined) return true;
+    let followedTopic = topic;
+    if (from !== messageId) {
+      const followed = await this.followedTopic(from, streamId);
+      if (followed === "elsewhere") return true;
+      if (followed === undefined) return false;
+      followedTopic = followed.topic;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), FOLLOW_WAIT_MS); });
     try {
@@ -311,13 +316,16 @@ export class ZulipToolRuntime {
     }
   }
 
-  private async topicIn(messageId: number, streamId: number): Promise<string | undefined> {
+  private async followedTopic(messageId: number, streamId: number): Promise<{ topic: string } | "elsewhere" | undefined> {
+    let message: any;
     try {
-      const message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId}`)).message;
-      return message?.stream_id === streamId ? message.subject : undefined;
+      message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId}`)).message;
     } catch {
       return undefined;
     }
+    if (!Number.isSafeInteger(message?.stream_id)) return undefined;
+    if (message.stream_id !== streamId) return "elsewhere";
+    return typeof message.subject === "string" ? { topic: message.subject } : undefined;
   }
 
   private readonly uploader: Uploader | null;
@@ -915,16 +923,15 @@ export class ZulipToolRuntime {
           ...(streamId !== undefined ? { stream_id: streamId } : {}),
         });
         const asked = { ...(topic !== undefined ? { topic } : {}), ...(stream !== undefined ? { stream } : {}), scope };
-        const note = stream !== undefined ? { note: MOVE_NOTE } : {};
         let message: any;
         try {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId} back`)).message;
         } catch (err) {
-          return { moved: true, asked, readBackError: (err as Error).message, ...note };
+          return { moved: true, asked, readBackError: (err as Error).message, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id)) {
-          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, ...note };
+          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
