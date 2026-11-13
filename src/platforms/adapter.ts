@@ -247,8 +247,10 @@ export interface PlatformAdapter {
   fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
-   * Make sure the platform delivers events for this channel — Zulip only
-   * sends stream events to subscribers. Optional; idempotent; best-effort.
+   * Make sure the platform delivers events for this channel. Without a
+   * subscription, a public stream's edits and reactions come only for
+   * messages that mention the bot, and a private stream sends at most the
+   * messages that mention it. Optional; idempotent.
    */
   ensureSubscribed?(key: ChannelKey): Promise<void>;
 
