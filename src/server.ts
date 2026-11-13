@@ -1109,8 +1109,6 @@ export class ZulipMcplServer {
       if (id !== null) this.changesOnTurn.delete(id);
       const ready = await entry.ready(changes);
       if (ctx.ended) return;
-      const placeNow = this.placeOf(key);
-      if (id !== null && placeNow !== undefined && id <= placeNow) return this.letGo(ctx.w, key, id);
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);
@@ -1871,6 +1869,9 @@ export class ZulipMcplServer {
         const id = numericId(m);
         if (id === null) continue;
         if (ctx.ended || id > below()) break;
+        // Taken before it is handed: its live event, arriving while its
+        // attachments are fetched, is dropped as it enters.
+        ctx.decide(id);
         await this.route(ctx, recovered(m), undefined, gap);
       }
     };

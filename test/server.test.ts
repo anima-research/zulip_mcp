@@ -6260,6 +6260,29 @@ test("a live message that a break's read decides past before its turn holds noth
   await h.close();
 });
 
+test("a deletion that arrives with the live event of a row that a break's read is handing reaches the host as a line after that row", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [streamMsg(19), withLog(streamMsg(20))] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(19));
+  await until(() => h.delivery.watermark('zulip:general') === 19, '19 accepted');
+  breakQueue(h);
+  await until(() => fetches.started.length === 1, "the recovered row's attachment fetch");
+  h.adapter.emit!(streamMsg(20));
+  h.adapter.change!(deletion('zulip:general', '20', false));
+  await new Promise((r) => setImmediate(r));
+  fetches.release();
+  await h.server.quiet();
+  const texts = h.incoming.map((m) => (m.content[0] as { text: string }).text);
+  assert.deepEqual(h.incoming.map((m) => m.messageId).filter((id) => /^\d+$/.test(id)), ['19', '20']);
+  const row = texts.findIndex((t) => t.includes('id=20') && !t.startsWith('[deleted]'));
+  const line = texts.findIndex((t) => t.startsWith('[deleted] [T id=20]'));
+  assert.ok(line > row && row >= 0, `the deletion's line after the row: ${JSON.stringify(texts)}`);
+  await h.close();
+});
+
 test("a refused message that a held read brings while zulip.messaging is disabled is offered again once it is enabled", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);
