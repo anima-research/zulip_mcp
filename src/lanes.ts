@@ -204,10 +204,13 @@ export class Lane<W> {
   }
 
   #runAnswer(job: Job<W>): void {
-    try {
-      void job(this.#context());
-    } catch (err) {
+    const failed = (err: unknown): void => {
       console.error(`[zulip-mcp] an answer on ${this.key} failed:`, (err as Error).message ?? err);
+    };
+    try {
+      void Promise.resolve(job(this.#context())).catch(failed);
+    } catch (err) {
+      failed(err);
     }
   }
 

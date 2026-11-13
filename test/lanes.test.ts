@@ -394,3 +394,31 @@ test('the place moves up to what a job decides, and never down', async () => {
   await new Promise((r) => setImmediate(r));
   assert.equal(lane.place, 8);
 });
+
+test('an answer that fails is logged with its channel, also when it runs after its lane ended and fails later', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  const running = gate();
+  try {
+    const l = lanes();
+    l.lane(A).enter(async () => { await running.opened; });
+    await new Promise((r) => setImmediate(r));
+    l.lane(A).answer(async () => { await Promise.resolve(); throw new Error('waiting at the end'); });
+    await l.finish(0, settled);
+    l.lane(A).answer(async () => { await Promise.resolve(); throw new Error('after the end'); });
+    l.lane(A).answer(() => { throw new Error('thrown after the end'); });
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(logged.sort(), [
+      `[zulip-mcp] an answer on ${A} failed: after the end`,
+      `[zulip-mcp] an answer on ${A} failed: thrown after the end`,
+      `[zulip-mcp] an answer on ${A} failed: waiting at the end`,
+    ]);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    running.open();
+  }
+});
