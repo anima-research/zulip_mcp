@@ -355,13 +355,15 @@ test('a refused read of the bot\'s profile, or of the realm\'s settings, is logg
   } finally { z.close(); }
 });
 
-test('a password exchange whose answer holds no API key gets the same line', async () => {
-  const z = await realm({ 'POST /fetch_api_key': { json: { result: 'success' } } });
-  try {
-    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: 'pw' });
-    assert.equal(session.authHeader, '');
-    assert.ok(lines.includes("Failed to get an API key with ZULIP_PASSWORD: Zulip's answer to POST /fetch_api_key held no API key. The server has no API key for this run, so Zulip refuses each call that needs one."), lines.join('\n'));
-  } finally { z.close(); }
+test('a password exchange whose answer holds no API key, or an empty one, gets the same line', async () => {
+  for (const answer of [{ result: 'success' }, { result: 'success', api_key: '' }]) {
+    const z = await realm({ 'POST /fetch_api_key': { json: answer } });
+    try {
+      const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: 'pw' });
+      assert.equal(session.authHeader, '');
+      assert.ok(lines.includes("Failed to get an API key with ZULIP_PASSWORD: Zulip's answer to POST /fetch_api_key held no API key. The server has no API key for this run, so Zulip refuses each call that needs one."), lines.join('\n'));
+    } finally { z.close(); }
+  }
 });
 
 test('a profile answer with no user id, or a profile read with no answer, says that the self-filter is off', async () => {
