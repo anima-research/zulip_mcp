@@ -2368,7 +2368,9 @@ export class ZulipMcplServer {
       (entry) => {
         this.lanes?.lane(entry.key).enter(async (ctx) => {
           const change = await entry.ready();
-          if (change !== null && !ctx.ended) return this.onMessageChange(ctx, change);
+          if (change === null || ctx.ended) return;
+          if (change.key === entry.key) return this.onMessageChange(ctx, change);
+          this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'other', about: entry.messageIds });
         }, { kind: 'other', about: entry.messageIds });
       },
     );

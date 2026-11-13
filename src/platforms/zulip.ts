@@ -520,7 +520,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private changeKeyNow(change: ZulipMessageChange): ChannelKey | null {
     if (change.kind === 'edit') {
       const cached = this.seen.get(change.messageId);
-      if (cached) return change.newStreamId !== null && !cached.isDm && change.streamId !== null ? streamKey(change.streamId) : cached.key;
+      if (cached) return cached.key;
     } else {
       for (const id of change.messageIds) {
         const cached = this.seen.get(id);

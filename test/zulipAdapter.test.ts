@@ -227,6 +227,66 @@ test('a message without a stream_id is placed by its exact name, and its descrip
   assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: 12 } }]);
 });
 
+test('two moves of one cached message, the second arriving while the first waits, leave the cache at the second\'s stream', async () => {
+  const first = [
+    { id: 1, type: 'message', flags: [], message: raw(5) },
+    { id: 2, type: 'update_message', message_id: 5, message_ids: [5], user_id: 12, edit_timestamp: 1_700_000_903, orig_subject: 'deploys', stream_id: 7, new_stream_id: 8 },
+    { id: 3, type: 'update_message', message_id: 5, message_ids: [5], user_id: 12, edit_timestamp: 1_700_000_904, orig_subject: 'deploys', stream_id: 8, new_stream_id: 9 },
+  ];
+  const later = [
+    { id: 4, type: 'update_message', message_id: 5, message_ids: [5], user_id: 7, edit_timestamp: 1_700_000_905, orig_content: 'm5', content: 'm5 fixed', flags: [], stream_id: 9 },
+  ];
+  let polls = 0;
+  let laterSent!: () => void;
+  const laterDue = new Promise<void>((r) => { laterSent = r; });
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'random', stream_id: 8, subscriber_count: 2 }, { name: 'ops', stream_id: 9, subscriber_count: 2 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events: first };
+      if (polls === 2) {
+        await laterDue;
+        return { events: later };
+      }
+      return new Promise(() => {});
+    },
+  }).api;
+  const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  let openLane7!: () => void;
+  const lanes = new Map<string, Promise<void>>([[String(streamKey(7)), new Promise<void>((r) => { openLane7 = r; })]]);
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(inTurn(() => {}), undefined, undefined, (entry) => {
+      const lane = String(entry.key);
+      lanes.set(lane, (lanes.get(lane) ?? Promise.resolve()).then(async () => {
+        const c = await entry.ready();
+        lines.push(`${c?.kind} entered ${lane}, line ${c?.key}`);
+      }));
+    });
+    const deadline = Date.now() + 2000;
+    while (polls < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 20));
+    openLane7();
+    while (lines.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    laterSent();
+    while (lines.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines, [
+    `move entered ${streamKey(7)}, line ${streamKey(7)}`,
+    `move entered ${streamKey(7)}, line ${streamKey(8)}`,
+    `edit entered ${streamKey(9)}, line ${streamKey(9)}`,
+  ]);
+});
+
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
   const events = [
     // Ann's message arrives live (cached), then she edits it to mention the bot.

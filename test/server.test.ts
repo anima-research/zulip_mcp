@@ -3100,6 +3100,35 @@ test("a break's job sends both its reads before it hands a row on, and its held 
   await h.close();
 });
 
+test("an edit and a deletion that arrive while their message's move to another channel waits are handed in that channel's lane, after what waits there", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, visible: [DESCRIPTOR, AAA] });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(5, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 5, '5 accepted');
+  h.adapter.emit!(withLog(streamMsg(20, { channelId: 'zulip:aaa', mentioned: true })));
+  await until(() => fetches.started.length === 1, "aaa's 20 fetching its attachment");
+  const general = h.adapter.keyOf('zulip:general');
+  const aaa = h.adapter.keyOf('zulip:aaa');
+  const about5 = (over: Partial<MessageChangeEvent>): MessageChangeEvent => ({
+    kind: 'edit', key: general, messageId: '5', messageIds: ['5'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '12',
+    topic: 'deploys', previousTopic: null, movedToKey: null, content: null, previousContent: null,
+    mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    ...over,
+  });
+  // Each enters general's lane, as the cache named it at arrival; the edit's and the deletion's ready() key them to aaa.
+  h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'move', previousTopic: 'deploys', movedToKey: aaa }) });
+  h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'edit', key: aaa, content: 'ship it @Bot', previousContent: 'ship it' }) });
+  h.adapter.enterChange!({ key: general, messageIds: [5], ready: async () => about5({ kind: 'delete', key: aaa, previousContent: 'ship it @Bot', actorId: null }) });
+  await until(() => h.pushed.some((p) => String((p.origin as { messageId?: unknown }).messageId).startsWith('move:')), 'the move line');
+  fetches.release();
+  await h.server.quiet();
+  const kinds = h.pushed.map((p) => String((p.origin as { messageId?: unknown }).messageId).split(':')[0]);
+  assert.deepEqual(kinds.filter((k) => k !== '5'), ['move', '20', 'edit', 'delete']);
+  await h.close();
+});
+
 test("after a reconnect within one process, the watermark follows what the new connection's host accepts", async () => {
   const first = harness({ visible: [AAA, DESCRIPTOR], history: [1, 2, 3, 4, 5].map((id) => streamMsg(id)) });
   await initialize(first, true);
