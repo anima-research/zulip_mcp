@@ -1174,7 +1174,7 @@ export class ZulipMcplServer {
     // small text files inline. The reference note stays so anything not
     // inlined can still be fetched.
     const refs = Array.isArray(meta.attachments) ? (meta.attachments as AttachmentRef[]) : [];
-    if (refs.length > 0 && this.options.attachments && (addressed || this.channelManager.isKeyOpen(key))) {
+    if (refs.length > 0 && this.options.attachments && meta.recovered !== true && (addressed || this.channelManager.isKeyOpen(key))) {
       const conn = this.conn;
       const { source, inline, deadline = () => AbortSignal.timeout(ATTACHMENT_DEADLINE_MS) } = this.options.attachments;
       const blocks = await buildAttachmentBlocks(refs, source, inline, deadline());

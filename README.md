@@ -141,8 +141,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   over the offline gap.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
-  policy. Images are inlined on live delivery and on messages recovered onto
-  an open channel, downsampled to model-max.
+  policy. Images are inlined on live delivery, downsampled to model-max.
 - Reactions, opt-in per channel, carry only reaction tags so a tag-keyed
   wake policy ignores them; operator-owned suppression of reaction markers
   plus the host-injected baseline; rollback checkpoints minted by every
@@ -190,7 +189,7 @@ are likely to touch:
 | `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
-| `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery and on messages recovered onto an open channel |
+| `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
 | `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
 | `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
