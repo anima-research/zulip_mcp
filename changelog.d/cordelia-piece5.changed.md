@@ -37,4 +37,6 @@
   channel's wait for its history is set to reach 90 s, every open channel
   gets one line naming the channels whose reads wait then, and one more line
   when no read waits any more. With no channel open, both lines go to the
-  log.
+  log. After a break, each open channel's notice of the break counts what
+  had come when the notice reached that channel, and says how many channels
+  still wait for a read of their history.

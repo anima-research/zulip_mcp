@@ -1723,12 +1723,11 @@ export class ZulipMcplServer {
       })));
     }
     void Promise.all(reads).then(() => {
-      const notice = gapNotice(event, tally);
       const open = this.openKeys();
-      if (open.length === 0) return this.channelManager.broadcastSystemEvent(this.adapter.type, notice);
+      if (open.length === 0) return this.channelManager.broadcastSystemEvent(this.adapter.type, gapNotice(event, tally, this.readWaits.size));
       const timestamp = new Date().toISOString();
       for (const key of open) {
-        lanes.lane(key).enter(() => this.channelManager.systemEventTo(key, this.adapter.type, notice, timestamp));
+        lanes.lane(key).enter(() => this.channelManager.systemEventTo(key, this.adapter.type, gapNotice(event, tally, this.readWaits.size), timestamp));
       }
     });
   }
@@ -2651,15 +2650,16 @@ function lifecycleChannelId(req: JsonRpcRequest): string | null {
   return typeof channelId === 'string' ? channelId : null;
 }
 
-function gapNotice(event: PlatformSystemEvent, tally: GapTally): PlatformSystemEvent {
+function gapNotice(event: PlatformSystemEvent, tally: GapTally, waiting = 0): PlatformSystemEvent {
   const notes = [
     tally.recovered > 0 ? `${tally.recovered} message(s) on open channels were recovered from history and delivered above.` : null,
     tally.caughtUp.size > 0 ? `Addressed messages on ${tally.caughtUp.size} closed channel(s) were delivered as catch-up events.` : null,
+    waiting > 0 ? `${waiting} channel(s) still wait for a read of their history from Zulip, and what those reads bring isn't counted in this notice.` : null,
   ].filter(Boolean);
   return {
     ...event,
     text: notes.length > 0 ? `${event.text} ${notes.join(' ')}` : event.text,
-    metadata: { ...event.metadata, recoveredMessages: tally.recovered, closedChannelsCaughtUp: tally.caughtUp.size },
+    metadata: { ...event.metadata, recoveredMessages: tally.recovered, closedChannelsCaughtUp: tally.caughtUp.size, channelsWaitingForHistory: waiting },
   };
 }
 

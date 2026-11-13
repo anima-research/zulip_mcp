@@ -5563,6 +5563,37 @@ test('after a break of the event queue, an open lane whose read gets no answer h
   await h.close();
 });
 
+test("after a break of the event queue, each lane's notice is built at its turn: on the other open lanes it says that one channel still waits, and on the retried lane it counts that read's rows", async () => {
+  const waits = heldWaits();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({
+    visible: [DESCRIPTOR, OTHER],
+    readRetryWait: waits.wait,
+    history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  const noticeOn = (channelId: string) => h.incoming.find((m) => m.channelId === channelId && m.messageId.startsWith('system:'));
+  breakQueue(h);
+  await until(() => noticeOn('zulip:other') !== undefined, "other's notice");
+  const other = noticeOn('zulip:other')!;
+  assert.equal((other.metadata as { channelsWaitingForHistory?: number }).channelsWaitingForHistory, 1);
+  assert.match((other.content[0] as { text: string }).text, /1 channel\(s\) still wait for a read of their history/);
+  assert.equal((other.metadata as { recoveredMessages?: number }).recoveredMessages, 1, '501 only');
+  waits.release();
+  await until(() => noticeOn('zulip:general') !== undefined, "general's notice");
+  await h.server.quiet();
+  const general = noticeOn('zulip:general')!;
+  assert.equal((general.metadata as { recoveredMessages?: number }).recoveredMessages, 2, '501 and the retried read\'s 2');
+  assert.equal((general.metadata as { channelsWaitingForHistory?: number }).channelsWaitingForHistory, 0);
+  await h.close();
+});
+
 test("a connection that ends while a lane waits to try its read again makes no try, and the next connection's catch-up covers the hole", async () => {
   const waits = heldWaits();
   const first = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait });
