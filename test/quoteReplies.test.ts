@@ -1,10 +1,12 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
+import type { KeyedMessage } from '../src/channel-key.ts';
 import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
+import { dmKey, streamKey, type ChannelKey } from '../src/channel-key.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
@@ -16,12 +18,32 @@ beforeEach(() => {
 });
 
 const SELF = 100;
+const STREAMS = [{ stream_id: 1, name: 'general' }];
+
+const KNOWN = [
+  ...STREAMS,
+  { stream_id: 2, name: 'other' },
+  ...Array.from({ length: 16 }, (_, ch) => ({ stream_id: 100 + ch, name: String(ch) })),
+  ...Array.from({ length: 30 }, (_, i) => ({ stream_id: 1500 + i, name: `channel-${500 + i}` })),
+];
+
+function knownStreams(): StreamDirectory {
+  const directory = new StreamDirectory();
+  directory.registration(KNOWN);
+  return directory;
+}
+
+function key(channelId: string): ChannelKey {
+  const name = channelId.slice('zulip:'.length);
+  if (name.startsWith('dm:')) return dmKey(name.slice(3).split('+').map(Number));
+  return streamKey(KNOWN.find((s) => s.name === name)!.stream_id);
+}
 const QUOTED = 200;
 
 function raw(id: number, content: string, over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
   return {
     id, content, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
-    display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000,
+    display_recipient: 'general', stream_id: 1, subject: 'topic', timestamp: 1_700_000_000,
     type: 'stream', flags: [], ...over,
   };
 }
@@ -35,15 +57,15 @@ async function receive(
   rows: ZulipRawMessage[],
   getById: (params: Record<string, unknown>) => Promise<unknown>,
   selfUserId: number | null = SELF,
-): Promise<IncomingChannelMessage[]> {
-  const received: IncomingChannelMessage[] = [];
+): Promise<KeyedMessage[]> {
+  const received: KeyedMessage[] = [];
   const sentinel = 999;
   let finish!: () => void;
   const finished = new Promise<void>((resolve) => { finish = resolve; });
   let served = false;
   const client = standInApi({
     'GET /messages/:id': getById,
-    'POST /register': async () => ({ queue_id: 'q', last_event_id: -1 }),
+    'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
     'GET /events': async () => {
       if (served) return new Promise(() => {});
       served = true;
@@ -247,8 +269,8 @@ test('history quote replies resolve page authors before the seen cache or GETs',
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: rows, found_newest: true }),
     'GET /messages/:id': async () => { throw new Error('page target must not need a GET'); },
-  }).api, SELF, 'session');
-  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 500 });
   assert.deepEqual(page.messages.map((m) => m.messageId), ['300']);
   assert.equal(page.messages[0].metadata?.replyToSelf, true);
   assert.equal(page.messages[0].metadata?.mentioned, false);
@@ -265,11 +287,11 @@ test('history quote lookups share a page cap and still use cached authors after 
       gets.push(message_id);
       return { message: raw(message_id, 'another author') };
     },
-  }).api, SELF, 'session');
-  await adapter.fetchHistory('zulip:general', { limit: 500 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  await adapter.fetchHistory(key('zulip:general'), { limit: 500 });
   rows = Array.from({ length: 20 }, (_, i) => raw(300 + i, quote(500 + i)));
   rows.push(raw(400, quote()));
-  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 500 });
   assert.equal(gets.length, 8);
   assert.deepEqual(page.unverifiedMessageIds, Array.from({ length: 12 }, (_, i) => String(308 + i)));
   assert.ok(page.messages.slice(0, -1).every((m) => m.metadata?.replyToSelf === false));
@@ -284,8 +306,8 @@ test('history verifies an off-page own-message quote with a raw-message GET', as
       gets.push({ id, ...params });
       return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
     },
-  }).api, SELF, 'session');
-  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 500 });
   assert.equal(page.messages[0].metadata?.replyToSelf, true);
   assert.deepEqual(gets, [{ id: QUOTED, apply_markdown: false }]);
 });
@@ -297,12 +319,12 @@ for (const [label, before, after, wasReply, isReply] of [
 ] as const) {
   test(`an edit that ${label} a quote recomputes reply addressing independently of mentions`, { timeout: 2000 }, async () => {
     const changes: MessageChangeEvent[] = [];
-    const incoming: IncomingChannelMessage[] = [];
+    const incoming: KeyedMessage[] = [];
     let finish!: () => void;
     const finished = new Promise<void>((resolve) => { finish = resolve; });
     let served = false;
     const adapter = new ZulipAdapter(standInApi({
-      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1 }),
+      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
       'GET /events': async () => {
         if (served) return new Promise(() => {});
         served = true;
@@ -313,7 +335,7 @@ for (const [label, before, after, wasReply, isReply] of [
           { id: 4, type: 'delete_message', message_ids: [300], message_type: 'stream', stream_id: 1 },
         ] };
       },
-    }).api, SELF, 'session');
+    }).api, SELF, 'session', { directory: knownStreams() });
     adapter.startEvents((m) => incoming.push(m), undefined, undefined, (c) => {
       changes.push(c);
       if (changes.length === 2) finish();
@@ -389,8 +411,8 @@ test('history also withholds inferred addressing for bot-authored quotes', async
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: [raw(300, quote(), { sender_email: 'another-bot@example.invalid' })], found_newest: true }),
     'GET /messages/:id': async () => { gets++; return { message: raw(QUOTED, 'original', { sender_id: SELF }) }; },
-  }).api, SELF, 'session');
-  const page = await adapter.fetchHistory('zulip:general', { limit: 500 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 500 });
   assert.equal(page.messages[0].metadata?.replyToSelf, false);
   assert.equal(gets, 0);
 });
@@ -404,14 +426,14 @@ for (const restart of [false, true]) {
     const served = new Set<string>();
     const adapter = new ZulipAdapter(standInApi({
       'GET /messages/:id': () => new Promise((resolve) => { release = resolve; lookupStarted(); }),
-      'POST /register': async () => ({ queue_id: `q${++registrations}`, last_event_id: -1 }),
+      'POST /register': async () => ({ queue_id: `q${++registrations}`, last_event_id: -1, streams: STREAMS }),
       'GET /events': async ({ queue_id }: { queue_id: string }) => {
         if (served.has(queue_id)) return new Promise(() => {});
         served.add(queue_id);
         const rows = queue_id === 'q1' ? [raw(300, quote()), raw(301, 'later in old batch')] : [raw(400, 'new connection')];
         return { events: rows.map((message, i) => ({ id: i + 1, type: 'message', message, flags: [] })) };
       },
-    }).api, SELF, 'session');
+    }).api, SELF, 'session', { directory: knownStreams() });
     const oldMessages: string[] = [];
     const newMessages: string[] = [];
     try {
@@ -448,8 +470,8 @@ for (const failure of ['deleted'] as const) {
         if (succeed) return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
         return failure === 'deleted' ? { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' } : { result: 'success' };
       },
-    }).api, SELF, 'session');
-    const page = () => adapter.fetchHistory('zulip:general', { limit: 100 });
+    }).api, SELF, 'session', { directory: knownStreams() });
+    const page = () => adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.equal((await page()).messages[0].metadata?.replyToSelf, false);
     now += 2 * 60_000;
     assert.equal((await page()).messages[0].metadata?.replyToSelf, false);
@@ -474,11 +496,11 @@ test('negative-cache hits do not consume the history page GET allowance', async 
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
         : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
     },
-  }).api, SELF, 'session');
-  await adapter.fetchHistory('zulip:general', { limit: 100 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
   assert.equal(gets, 8);
   rows = [...rows, raw(400, quote())];
-  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
   assert.equal(gets, 9, 'only the new target costs a GET');
   assert.equal(page.messages.at(-1)?.metadata?.replyToSelf, true);
 });
@@ -499,7 +521,7 @@ for (const kind of ['reaction', 'edit'] as const) {
         if (gets === 1) throw new Error('503 transient');
         return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
       },
-      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1 }),
+      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
       'GET /events': async () => {
         if (served) return new Promise(() => {});
         served = true;
@@ -509,7 +531,7 @@ for (const kind of ['reaction', 'edit'] as const) {
           { id: 3, type: 'message', message: raw(999, 'done'), flags: [] },
         ] };
       },
-    }).api, SELF, 'session');
+    }).api, SELF, 'session', { directory: knownStreams() });
     adapter.startEvents(
       (m) => { if (m.messageId === '999') finish(); }, undefined,
       (ev) => { placed.push(ev.messageId); }, (ev) => { placed.push(ev.messageId); },
@@ -535,10 +557,10 @@ test('each history page gets a fresh lookup wait budget, even on another channel
       now += 3_001;
       return { message: raw(message_id, 'original', { sender_id: message_id === 501 ? SELF : 101 }) };
     },
-  }).api, SELF, 'session');
-  await adapter.fetchHistory('zulip:general', { limit: 100 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
   target = 501;
-  const page = await adapter.fetchHistory('zulip:other', { limit: 100 });
+  const page = await adapter.fetchHistory(key('zulip:other'), { limit: 100 });
   assert.equal(gets, 2, 'the next page is not starved by the previous deadline');
   assert.equal(page.messages[0].metadata?.replyToSelf, true);
 });
@@ -548,15 +570,15 @@ test('sixteen history channels all verify off-page quote targets', async (t) => 
   t.mock.method(performance, 'now', () => now);
   let gets = 0;
   const adapter = new ZulipAdapter(standInApi({
-    'GET /messages': async ({ narrow }: { narrow: [string, string][] }) => {
+    'GET /messages': async ({ narrow }: { narrow: { operand: number }[] }) => {
       now += 300; // one ordinary history page round trip; no quote lookup waited
-      return { messages: [raw(300, quote(500 + Number(narrow[0][1])))], found_newest: true };
+      return { messages: [raw(300, quote(500 + narrow[0].operand - 100))], found_newest: true };
     },
     'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => { gets++; return { message: raw(message_id, 'original', { sender_id: SELF }) }; },
-  }).api, SELF, 'session');
+  }).api, SELF, 'session', { directory: knownStreams() });
   const verdicts: boolean[] = [];
   for (let ch = 0; ch < 16; ch++) {
-    const page = await adapter.fetchHistory(`zulip:${ch}`, { limit: 100 });
+    const page = await adapter.fetchHistory(key(`zulip:${ch}`), { limit: 100 });
     verdicts.push(page.messages[0].metadata?.replyToSelf === true);
   }
   assert.equal(gets, 16);
@@ -574,8 +596,8 @@ test('history reports a quote skipped after the page wait deadline as unverified
       now += 3_001;
       return { message: raw(500, 'another author') };
     },
-  }).api, SELF, 'session');
-  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
   assert.equal(gets, 1);
   assert.deepEqual(page.unverifiedMessageIds, ['301']);
   assert.equal(page.messages[1].metadata?.replyToSelf, false);
@@ -597,7 +619,7 @@ for (const resolvedOther of [false, true]) {
       }
       return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
     },
-    'POST /register': async () => ({ queue_id: 'q', last_event_id: -1 }),
+    'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
     'GET /events': async () => {
       if (served) return new Promise(() => {});
       served = true;
@@ -607,7 +629,7 @@ for (const resolvedOther of [false, true]) {
         { id: 3000, type: 'update_message', message_id: 300, user_id: 102, orig_content: before, content: before + ' corrected', flags: [] },
       ] };
     },
-  }).api, SELF, 'session');
+  }).api, SELF, 'session', { directory: knownStreams() });
   adapter.startEvents((m) => { assert.equal(m.metadata?.replyToSelf, true); }, undefined, undefined, finish);
   try {
     const edit = await changed;
@@ -631,14 +653,14 @@ test('R2-5: quote GETs share one process-wide bucket across pages, adapters and 
     'GET /messages': async () => ({ messages: [raw(2000 + target, quote(target))], found_newest: true }),
     'GET /messages/:id': getById,
   }).api;
-  const adapters = [new ZulipAdapter(client, SELF, 'one'), new ZulipAdapter(client, SELF, 'two')];
+  const adapters = [new ZulipAdapter(client, SELF, 'one', { directory: knownStreams() }), new ZulipAdapter(client, SELF, 'two', { directory: knownStreams() })];
   for (; target < 530; target++) {
-    const page = await adapters[target % 2].fetchHistory(`zulip:channel-${target}`, { limit: 100 });
+    const page = await adapters[target % 2].fetchHistory(key(`zulip:channel-${target}`), { limit: 100 });
     assert.equal(page.messages[0].metadata?.replyToSelf, true);
   }
   assert.equal(gets, 30);
   target = 999;
-  const blocked = () => adapters[0].fetchHistory('zulip:other', { limit: 100 });
+  const blocked = () => adapters[0].fetchHistory(key('zulip:other'), { limit: 100 });
   assert.deepEqual((await blocked()).unverifiedMessageIds, ['2999']);
   assert.equal(gets, 30, 'a fresh page or adapter cannot reset the process allowance');
   const live = await receive([raw(1800, quote(1801))], getById);
@@ -673,10 +695,10 @@ for (const failure of ['rejecting promise', 'RATE_LIMIT_HIT', 'non-JSON response
         }
         return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
       },
-    }).api, SELF, 'session');
-    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    }).api, SELF, 'session', { directory: knownStreams() });
+    const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.deepEqual(first.unverifiedMessageIds, ['300'], 'transient failures participate in the retry pass');
-    const second = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    const second = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.equal(second.messages[0].metadata?.replyToSelf, true);
     assert.equal(gets, 2, 'the retry must issue a fresh GET');
   });
@@ -693,8 +715,8 @@ test('R3-4: channel messages expose umbrella and specific addressing metadata', 
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: rows, found_newest: true }),
     'GET /messages/:id': async () => ({ message: raw(QUOTED, 'original', { sender_id: SELF }) }),
-  }).api, SELF, 'session');
-  const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const page = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
   assert.equal(page.messages[0].metadata?.isMention, true);
   assert.equal(page.messages[0].metadata?.isReplyToBot, true);
   assert.equal(page.messages[1].metadata?.isExplicitMention, true);
@@ -711,12 +733,12 @@ for (const malformed of ['wrong id', 'missing sender'] as const) {
           { sender_id: malformed === 'missing sender' ? undefined : SELF }) };
         return { message: raw(QUOTED, 'original', { sender_id: SELF }) };
       },
-    }).api, SELF, 'session');
-    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    }).api, SELF, 'session', { directory: knownStreams() });
+    const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.deepEqual(first.unverifiedMessageIds, ['300']);
     // Invalid target objects must not enter either cache, including the wrong id.
     assert.equal((adapter as unknown as { seen: Map<number, unknown> }).seen.has(9999), false);
-    const second = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    const second = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.equal(second.messages[0].metadata?.replyToSelf, true);
     assert.equal(gets, 2, 'retry performs a fresh target GET');
   });
@@ -727,9 +749,9 @@ test('R4-4: translated BAD_REQUEST is a cached definite miss', async () => {
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async () => ({ messages: [raw(300, quote())], found_newest: true }),
     'GET /messages/:id': async () => { gets++; return { result: 'error', code: 'BAD_REQUEST', msg: 'Ungültige Nachricht(en)' }; },
-  }).api, SELF, 'session');
+  }).api, SELF, 'session', { directory: knownStreams() });
   for (let i = 0; i < 2; i++) {
-    const page = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    const page = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.deepEqual(page.unverifiedMessageIds ?? [], []);
     assert.equal(page.messages[0].metadata?.replyToSelf, false);
   }
@@ -745,8 +767,8 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
       'GET /messages/:id': async (_params: unknown, { id }: { id: number }) => initial && id === QUOTED
         ? { message: raw(QUOTED, 'original', { sender_id: SELF }) }
         : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' },
-    }).api, SELF, 'session');
-    const first = await adapter.fetchHistory('zulip:general', { limit: 100 });
+    }).api, SELF, 'session', { directory: knownStreams() });
+    const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.equal(first.messages[0].metadata?.replyToSelf, true);
     initial = false;
     const internal = adapter as unknown as { seen: Map<number, { replyToSelf?: boolean }> };
@@ -754,10 +776,10 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     content = quote().replace('reply', 'corrected reply');
     // A typo edit missed during a gap keeps the same quote target.
     const query = { limit: 100, ...(outcome === 'budget-skipped' ? { quoteLookupBudget: { remainingMs: 0 } } : {}) };
-    const unchanged = await adapter.fetchHistory('zulip:general', query);
+    const unchanged = await adapter.fetchHistory(key('zulip:general'), query);
     assert.equal(unchanged.messages[0].metadata?.replyToSelf, true, 'unchanged targets retain the confident verdict');
     content = quote(201); // A different, unresolved target is not a verified reply.
-    const page = await adapter.fetchHistory('zulip:general', query);
+    const page = await adapter.fetchHistory(key('zulip:general'), query);
     assert.equal(internal.seen.get(300)?.replyToSelf, false, 'changed targets invalidate the cached verdict');
     assert.equal(page.messages[0].metadata?.replyToSelf, false);
   });
@@ -770,14 +792,14 @@ for (const kind of ['explicit mention', 'DM', 'self author', 'bot author'] as co
     const adapter = new ZulipAdapter(standInApi({
       'GET /messages': async () => ({ messages: [row], found_newest: true }),
       'GET /messages/:id': async () => { gets++; return { message: raw(QUOTED, 'original', { sender_id: SELF }) }; },
-    }).api, SELF, 'session');
-    assert.equal((await adapter.fetchHistory('zulip:general', { limit: 100 })).messages[0].metadata?.replyToSelf, true);
+    }).api, SELF, 'session', { directory: knownStreams() });
+    assert.equal((await adapter.fetchHistory(key('zulip:general'), { limit: 100 })).messages[0].metadata?.replyToSelf, true);
     const overrides: Partial<ZulipRawMessage> = kind === 'explicit mention' ? { flags: ['mentioned'] }
       : kind === 'DM' ? { type: 'private', display_recipient: [SELF, 101].map((id) => ({ id, full_name: 'User', email: `${id}@example.invalid` })) }
       : kind === 'self author' ? { sender_id: SELF }
       : { sender_email: 'other-bot@example.invalid' };
     row = raw(300, quote(), overrides);
-    const page = await adapter.fetchHistory(kind === 'DM' ? 'zulip:dm:101' : 'zulip:general', { limit: 100 });
+    const page = await adapter.fetchHistory(key(kind === 'DM' ? 'zulip:dm:101' : 'zulip:general'), { limit: 100 });
     assert.equal((adapter as unknown as { seen: Map<number, { replyToSelf: boolean }> }).seen.get(300)?.replyToSelf, false);
     if (kind === 'self author') assert.equal(page.messages.length, 0);
     else {
@@ -798,7 +820,7 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     let gets = 0;
     const adapter = new ZulipAdapter(standInApi({
       'GET /messages/:id': async () => { gets++; return { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }; },
-      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1 }),
+      'POST /register': async () => ({ queue_id: 'q', last_event_id: -1, streams: STREAMS }),
       'GET /events': async () => {
         if (served) return new Promise(() => {});
         served = true;
@@ -809,7 +831,7 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
           { id: 4, type: 'delete_message', message_ids: [300], message_type: 'stream', stream_id: 1 },
         ] };
       },
-    }).api, SELF, 'session');
+    }).api, SELF, 'session', { directory: knownStreams() });
     adapter.startEvents((message) => {
       assert.equal(message.metadata?.replyToSelf, true);
       (adapter as unknown as { seen: Map<number, unknown> }).seen.delete(QUOTED);
@@ -830,3 +852,25 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     } finally { adapter.stopEvents(); }
   });
 }
+
+test('a quote target in a stream the stream list doesn\'t show yet is not remembered as unreachable', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let gets = 0;
+  let listed = false;
+  const adapter = new ZulipAdapter(standInApi({
+    'GET /messages': async () => ({ messages: [raw(300, quote())], found_newest: true }),
+    'GET /messages/:id': async () => {
+      gets++;
+      return { message: raw(QUOTED, 'original', { sender_id: SELF, stream_id: 900, display_recipient: 'late' }) };
+    },
+    'GET /streams': async () => ({ result: 'success', streams: listed ? [...KNOWN, { stream_id: 900, name: 'late' }] : KNOWN }),
+  }).api, SELF, 'session', { directory: knownStreams() });
+  const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
+  assert.deepEqual(first.unverifiedMessageIds, ['300'], 'unverified, not a definite miss');
+  listed = true;
+  now += 61_000;
+  const second = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
+  assert.equal(second.messages[0].metadata?.replyToSelf, true);
+  assert.equal(gets, 2, 'the retry reads the target again');
+});

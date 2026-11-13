@@ -24,6 +24,8 @@ export interface ZulipMessage {
   content: string;
 }
 
+const RATE_LIMIT_TRIES = 5;
+
 export class PlainApi {
   constructor(
     private readonly realm: string,
@@ -38,15 +40,21 @@ export class PlainApi {
     }
     const url = new URL(`${this.realm}/api/v1/${path}`);
     if (method === 'GET') url.search = form.toString();
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${this.email}:${this.apiKey}`).toString('base64')}`,
-        ...(method === 'GET' ? {} : { 'Content-Type': 'application/x-www-form-urlencoded' }),
-      },
-      ...(method === 'GET' ? {} : { body: form.toString() }),
-    });
-    return res.json();
+    for (let tries = 1; ; tries++) {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${this.email}:${this.apiKey}`).toString('base64')}`,
+          ...(method === 'GET' ? {} : { 'Content-Type': 'application/x-www-form-urlencoded' }),
+        },
+        ...(method === 'GET' ? {} : { body: form.toString() }),
+      });
+      const body = await res.json();
+      if (res.status !== 429 || tries === RATE_LIMIT_TRIES) return body;
+      // Wait the seconds that Zulip's 429 names, as any client must.
+      const seconds = Number(res.headers.get('retry-after') ?? body?.['retry-after']);
+      await new Promise((r) => setTimeout(r, (Number.isFinite(seconds) && seconds > 0 ? seconds : 1) * 1000));
+    }
   }
 
   async ok(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, params: Record<string, unknown> = {}): Promise<any> {

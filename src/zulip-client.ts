@@ -6,6 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
 import { httpTransport, LONG_TIMEOUT_MS, zulipApi, type ZulipApi } from './zulip-api.js';
+import type { StreamDirectory } from './stream-directory.js';
 
 export interface ZulipSession {
   api: ZulipApi;
@@ -107,27 +108,41 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     console.error("Failed to read realm server settings (upload cap):", err);
   }
 
-  // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
-  // Needed because, even with all_public_streams: true on the queue, a bot
-  // that isn't subscribed gets a public stream's edits and reactions only for
-  // messages that mention it, and from a private stream at most the messages
-  // that mention it.
-  if (env.ZULIP_SUBSCRIBE) {
-    const streams = env.ZULIP_SUBSCRIBE.split(",").map(s => s.trim()).filter(Boolean);
-    if (streams.length > 0) {
-      try {
-        const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
-          subscriptions: streams.map(name => ({ name })),
-        });
-        const subscribed = result.result === "success" ? result.subscribed ?? {} : {};
-        const already = result.result === "success" ? result.already_subscribed ?? {} : {};
-        console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
-      } catch (err) {
-        console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);
-      }
-    }
-  }
-
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
   return { api, selfUserId, realm, authHeader, sessionId, maxUploadBytes };
+}
+
+/**
+ * Subscribe to the streams named in ZULIP_SUBSCRIBE. Needed because, even
+ * with all_public_streams: true on the queue, a bot that isn't subscribed gets
+ * a public stream's edits and reactions only for messages that mention it, and
+ * from a private stream at most the messages that mention it.
+ *
+ * Zulip's subscribe call takes names, and where the bot may create streams
+ * it creates one for a name that no stream has.
+ */
+export async function subscribeConfigured(api: ZulipApi, directory: StreamDirectory, setting: string | undefined): Promise<void> {
+  const named = (setting ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (named.length === 0) return;
+  await directory.whenListed();
+  const streams: string[] = [];
+  for (const name of named) {
+    const former = directory.formerOf(name);
+    if (former) {
+      console.error(`[zulip-mcp] ZULIP_SUBSCRIBE names #${name}, which Zulip stream ${former.id} had before it was renamed #${former.current}; nothing is subscribed or created for it`);
+      continue;
+    }
+    streams.push(name);
+  }
+  if (streams.length === 0) return;
+  try {
+    const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
+      subscriptions: streams.map((name) => ({ name })),
+    });
+    const subscribed = result.result === "success" ? result.subscribed ?? {} : {};
+    const already = result.result === "success" ? result.already_subscribed ?? {} : {};
+    console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
+  } catch (err) {
+    console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);
+  }
 }

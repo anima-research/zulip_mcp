@@ -29,7 +29,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   and reactions only when the message mentions it, and a private stream sends
   at most the messages that mention it) — a stream the bot cannot subscribe
   to fails the open rather than opening without it — and can return
-  backscroll atomically.
+  backscroll atomically. A stream whose name reads as a DM channel id, such
+  as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
@@ -163,7 +164,7 @@ are likely to touch:
 |---|---|---|
 | `ZULIP_SESSION_ID` | bot email (from env or zuliprc) | Keys the persistent state files (monitoring, delivery, filters); set it when two sessions of one bot share a state dir |
 | `ZULIP_STATE_DIR` | `~/.zulip_mcp_state` | Where those files live |
-| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to on startup |
+| `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read, or, for a client without MCPL, once its read of the list got no answer |
 | `ZULIP_FILTERS_FILE` | `<state dir>/<session>.filters.json` | The filters plane file (hot-reloaded) |
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
@@ -305,6 +306,29 @@ makes the channel openable; `refresh_channels` re-enumerates everything
 visible; and `channels/open` on an unknown exact `channelId` re-enumerates
 once before it fails. Only a channel none of these can find answers
 `-32023 Unknown channel`.
+
+**A stream that is renamed or archived.** A stream's channel id holds its
+current name, so a rename changes it. When Zulip renames a stream, the host
+gets one `channels/changed` that removes `zulip:<old name>` and adds
+`zulip:<new name>`, and an agent that has the channel open gets one line
+naming both. Renames and removals waiting together go in one
+`channels/changed`, so two streams can swap names. Until the host answers,
+the old id is still the stream's id. A rename the host doesn't answer is
+offered again, and the server can't tell whether the host applied it, so
+the next `channels/changed` also removes each id the unanswered one added,
+unless a stream holds that id now. The watermark, the missed tally and
+the filters entries carry to the new name. Where the filters file can't be
+read or written at the rename, the old name stays in it, and the log says
+so. Once the host answers, a request
+for the old id is refused, and the refusal names the new id, unless another
+stream has taken the old name, as in a swap. With MCPL, `send_message`,
+`listen` and `unlisten` given the old name are refused the same way, and
+send nothing to Zulip. A stream that was open at last sight and was renamed
+while the server was down, or while no host was connected, gets one push
+from its new channel when a host next connects, if the allowlist holds the
+stream then, and then its backlog, as any stream open at last sight does.
+An archived stream, or one the bot lost access to, is removed at the host
+the same way, with nothing added.
 
 A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit
@@ -516,7 +540,8 @@ head (`\] [^:]*: pattern`), or match on channel, scope or tags instead.
 Under `ZULIP_STATE_DIR`, keyed by session:
 
 - `<session>.json` — the plain-MCP monitor (streams, last-read ids)
-- `<session>.delivery.json` — watermarks, missed tallies, last-open channels
+- `<session>.delivery.json` — watermarks, missed tallies, last-open channels,
+  and the stream names they were saved under (written only with MCPL)
 - `<session>.filters.json` — the filters plane (unless `ZULIP_FILTERS_FILE`)
 
 Put `ZULIP_STATE_DIR` on storage that survives a redeploy. In a container

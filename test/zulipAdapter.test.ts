@@ -5,14 +5,23 @@ import type { MessageChangeEvent } from '../src/platforms/adapter.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import { standInApi } from './zulip-stand-in.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
+import { dmKey, streamKey } from '../src/channel-key.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 const SELF = 790;
+const GENERAL = streamKey(7);
+
+function directoryOf(streams: Record<number, string> = { 7: 'general' }): StreamDirectory {
+  const directory = new StreamDirectory();
+  directory.registration(Object.entries(streams).map(([id, name]) => ({ stream_id: Number(id), name })));
+  return directory;
+}
 
 function raw(id: number, over: Partial<ZulipRawMessage> = {}): ZulipRawMessage {
   return {
     id, sender_id: 7, sender_full_name: 'Ann', sender_email: 'ann@example.com',
-    display_recipient: 'general', subject: 'deploys', content: `m${id}`, timestamp: 1_700_000_000 + id, type: 'stream', flags: [],
+    display_recipient: 'general', stream_id: 7, subject: 'deploys', content: `m${id}`, timestamp: 1_700_000_000 + id, type: 'stream', flags: [],
     ...over,
   };
 }
@@ -36,9 +45,13 @@ function fakeClient(rows: ZulipRawMessage[], routes: Parameters<typeof standInAp
       const matching = rows
         .filter((m) => after === null || m.id > after)
         .filter((m) => {
-          const narrow = params.narrow as unknown[][];
-          const stream = narrow.find((n) => n[0] === 'stream')?.[1];
-          const dmIds = narrow.find((n) => n[0] === 'dm')?.[1] as number[] | undefined;
+          // Both of Zulip's narrow forms: [operator, operand] and {operator, operand}.
+          const operand = (op: string) => (params.narrow as unknown[])
+            .map((n) => (Array.isArray(n) ? (n[0] === op ? n[1] : undefined) : (n as { operator: string; operand: unknown }).operator === op ? (n as { operand: unknown }).operand : undefined))
+            .find((v) => v !== undefined);
+          const stream = operand('stream');
+          const dmIds = operand('dm') as number[] | undefined;
+          if (typeof stream === 'number') return m.type === 'stream' && m.stream_id === stream;
           if (stream) return m.type === 'stream' && m.display_recipient === stream;
           if (dmIds) return m.type === 'private';
           return true;
@@ -57,15 +70,15 @@ const onlyDev: FilterView = { streamAllowed: (s) => s === 'dev', dmAllowed: (u) 
 
 test('fetchHistory withholds the bot\'s own messages and disallowed senders, and reports the newest id it scanned', async () => {
   const { client } = fakeClient([raw(1, { sender_id: SELF }), raw(2, { sender_id: SELF }), raw(3), dm(4, 7), dm(5, 42), dm(6, SELF)]);
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev });
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, directory: directoryOf() });
 
   // A stream outside the allowlist: nothing, without a fetch.
-  const none = await adapter.fetchHistory('zulip:general', { limit: 10 });
+  const none = await adapter.fetchHistory(GENERAL, { limit: 10 });
   assert.deepEqual(none, { messages: [], scannedThrough: null, reachedNewest: true });
 
   // A DM conversation: the bot's own and the excluded sender's messages are
   // withheld, but the page scanned through all of them.
-  const page = await adapter.fetchHistory('zulip:dm:7+42', { limit: 10, afterMessageId: '3' });
+  const page = await adapter.fetchHistory(dmKey([7, 42]), { limit: 10, afterMessageId: '3' });
   assert.deepEqual(page.messages.map((m) => m.messageId), ['5']);
   assert.equal(page.scannedThrough, 6, 'the cursor covers the withheld rows');
   assert.equal(page.reachedNewest, true);
@@ -73,8 +86,8 @@ test('fetchHistory withholds the bot\'s own messages and disallowed senders, and
 
   // A page of nothing but the bot's own messages is not the end of history.
   const allowAll: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
-  const wide = new ZulipAdapter(client, SELF, 's', { filters: allowAll });
-  const own = await wide.fetchHistory('zulip:general', { limit: 2, afterMessageId: '0' });
+  const wide = new ZulipAdapter(client, SELF, 's', { filters: allowAll, directory: directoryOf() });
+  const own = await wide.fetchHistory(GENERAL, { limit: 2, afterMessageId: '0' });
   assert.deepEqual(own.messages, []);
   assert.equal(own.scannedThrough, 2);
   assert.equal(own.reachedNewest, false);
@@ -82,14 +95,14 @@ test('fetchHistory withholds the bot\'s own messages and disallowed senders, and
 
 test('fetchContext injects nothing for a stream outside the allowlist, and only allowed senders of a DM', async () => {
   const { client, calls } = fakeClient([raw(3), dm(4, 7), dm(5, 42), dm(6, SELF)]);
-  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev });
-  assert.equal(await adapter.fetchContext('zulip:general', undefined, 5), null);
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, directory: directoryOf() });
+  assert.equal(await adapter.fetchContext(GENERAL, undefined, 5), null);
   assert.equal(calls.retrieve.length, 0, 'not even fetched');
-  const injection = await adapter.fetchContext('zulip:dm:7+42', undefined, 5);
+  const injection = await adapter.fetchContext(dmKey([7, 42]), undefined, 5);
   assert.ok(injection);
   assert.match(injection!.content, /Bo: m5/);
-  const timed = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, formatTime: () => 'T' });
-  const lines = (await timed.fetchContext('zulip:dm:7+42', undefined, 5))!.content.split('\n');
+  const timed = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, formatTime: () => 'T', directory: directoryOf() });
+  const lines = (await timed.fetchContext(dmKey([7, 42]), undefined, 5))!.content.split('\n');
   assert.deepEqual(lines.slice(1), ['[T id=5] [DM] Bo: m5', '[T id=6] [DM] Bot: m6'], 'injected history uses the shared line shape, ids included');
   assert.match(injection!.content, /Bot: m6/, 'the bot\'s own turns stay in context');
   assert.doesNotMatch(injection!.content, /Ann: m4/);
@@ -97,11 +110,11 @@ test('fetchContext injects nothing for a stream outside the allowlist, and only 
 
 test('ensureSubscribed asks Zulip every time — a subscription dropped by unlisten is not remembered as live', async () => {
   const { client, calls } = fakeClient([]);
-  const adapter = new ZulipAdapter(client, SELF, 's');
-  await adapter.ensureSubscribed('zulip:general');
-  await adapter.ensureSubscribed('zulip:general');
+  const adapter = new ZulipAdapter(client, SELF, 's', { directory: directoryOf() });
+  await adapter.ensureSubscribed(GENERAL);
+  await adapter.ensureSubscribed(GENERAL);
   assert.equal(calls.subscribe.length, 2);
-  await adapter.ensureSubscribed('zulip:dm:42');
+  await adapter.ensureSubscribed(dmKey([42]));
   assert.equal(calls.subscribe.length, 2, 'DMs need nothing');
 });
 
@@ -124,24 +137,27 @@ test('publish uploads image blocks and links them after the text; without an upl
 
   const uploadPolicy = { roots: new Map<string, string>(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
   const withUploads = new ZulipAdapter(client, SELF, 's', { uploader, uploadPolicy });
-  const res = await withUploads.publish('zulip:general', undefined, blocks, { threadId: 'deploys' });
+  const res = await withUploads.publish(GENERAL, undefined, blocks, { threadId: 'deploys' });
   assert.deepEqual(res, { delivered: true, messageId: '77', messageIds: ['77'] });
   assert.deepEqual(uploaded, ['image-2.png']);
-  assert.deepEqual(sends[0], { type: 'stream', to: 'general', topic: 'deploys', content: 'chart attached\n\n[image-2.png](/user_uploads/1/image-2.png)' });
+  assert.deepEqual(sends[0], { type: 'stream', to: 7, topic: 'deploys', content: 'chart attached\n\n[image-2.png](/user_uploads/1/image-2.png)' });
 
   // Only an image: the links are the body.
-  await withUploads.publish('zulip:dm:42', undefined, [blocks[1]]);
+  await withUploads.publish(dmKey([42]), undefined, [blocks[1]]);
   assert.deepEqual(sends[1], { type: 'private', to: [42], content: '[image-1.png](/user_uploads/1/image-1.png)' });
 
   // A failed upload fails the publish before anything is sent.
   const failing = new ZulipAdapter(client, SELF, 's', { uploader: { async upload() { throw new Error('quota'); } }, uploadPolicy });
-  await assert.rejects(failing.publish('zulip:general', undefined, blocks), /quota/);
+  await assert.rejects(failing.publish(GENERAL, undefined, blocks), /quota/);
   assert.equal(sends.length, 2);
 
   const plain = new ZulipAdapter(client, SELF, 's');
-  await plain.publish('zulip:general', undefined, blocks);
+  await plain.publish(GENERAL, undefined, blocks);
   assert.equal(sends[2].content, 'chart attached');
-  assert.equal((await plain.publish('zulip:general', undefined, [blocks[1]])).delivered, false);
+  assert.equal((await plain.publish(GENERAL, undefined, [blocks[1]])).delivered, false);
+
+  await plain.publish({ streamName: 'elsewhere' }, undefined, [blocks[0]]);
+  assert.deepEqual(sends[3], { type: 'stream', to: 'elsewhere', topic: 'mcpl', content: 'chart attached' });
 });
 
 // ── Streams joined after startup (#20) ──
@@ -173,14 +189,14 @@ function streamEvent(id: number, stream: string, streamId: number | undefined, o
 }
 
 test('every stream message carries its stream descriptor, so a stream joined after startup can be registered (#20)', async () => {
-  const client = eventingClient([], [streamEvent(900, 'ops', 12), streamEvent(901, 'ops', 12), streamEvent(902, 'general', 7)]);
+  const client = eventingClient([], [streamEvent(900, 'ops', 12), streamEvent(901, 'ops', 12), streamEvent(902, 'general', 7)], [{ name: 'ops', stream_id: 12 }, { name: 'general', stream_id: 7 }]);
   const adapter = new ZulipAdapter(client, SELF, 's');
-  const seen: { channelId: string; descriptor?: string }[] = [];
-  adapter.startEvents((m, descriptor) => seen.push({ channelId: m.channelId, descriptor: descriptor?.id }));
+  const seen: { key: string; descriptor?: string }[] = [];
+  adapter.startEvents((m, descriptor) => seen.push({ key: m.key, descriptor: descriptor?.id }));
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
 
-  assert.deepEqual(seen.map((s) => s.channelId), ['zulip:ops', 'zulip:ops', 'zulip:general']);
+  assert.deepEqual(seen.map((s) => s.key), [streamKey(12), streamKey(12), GENERAL]);
   // Every message, not just the first: what is already registered is the
   // server's decision, and its registry is cleared on every reconnect.
   assert.deepEqual(seen.map((s) => s.descriptor), ['zulip:ops', 'zulip:ops', 'zulip:general']);
@@ -201,14 +217,14 @@ test('the descriptor a message carries matches the one discovery builds for the 
   assert.deepEqual(fromEvent!.capabilities, discovered.capabilities);
 });
 
-test('a descriptor built from an event without a stream_id still addresses the stream (#20)', async () => {
-  const client = eventingClient([], [streamEvent(900, 'ops', undefined)]);
+test('a message without a stream_id is placed by its exact name, and its descriptor has the stream id (#20)', async () => {
+  const client = eventingClient([], [streamEvent(900, 'ops', undefined)], [{ name: 'ops', stream_id: 12 }]);
   const adapter = new ZulipAdapter(client, SELF, 's');
   const seen: { id: string; address: unknown }[] = [];
   adapter.startEvents((_m, descriptor) => { if (descriptor) seen.push({ id: descriptor.id, address: descriptor.address }); });
   await new Promise((r) => setTimeout(r, 50));
   adapter.stopEvents();
-  assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: undefined } }]);
+  assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: 12 } }]);
 });
 
 test('edits, moves and deletions are placed, cleaned and filtered before reaching the server (#22)', async () => {
@@ -273,23 +289,23 @@ test('edits, moves and deletions are placed, cleaned and filtered before reachin
   assert.deepEqual(delivered, ['5'], 'the live message still reaches onMessage');
   assert.deepEqual(getById, [6, 700], 'only the uncached messages cost a GET');
   const view = changes.map((c) => ({
-    kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
-    topic: c.topic, previousTopic: c.previousTopic, movedTo: c.movedToChannelId, content: c.content, previousContent: c.previousContent,
+    kind: c.kind, key: c.key, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, actorId: c.actorId,
+    topic: c.topic, previousTopic: c.previousTopic, movedTo: c.movedToKey, content: c.content, previousContent: c.previousContent,
     mentioned: c.mentioned, wasMentioned: c.previouslyMentioned, onOwnMessage: c.onOwnMessage,
   }));
   assert.deepEqual(view, [
-    { kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'second draft @**Bot**', previousContent: 'first draft', mentioned: true, wasMentioned: false, onOwnMessage: false },
+    { kind: 'edit', key: GENERAL, messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'second draft @**Bot**', previousContent: 'first draft', mentioned: true, wasMentioned: false, onOwnMessage: false },
     // Placed by GET: only the post-edit state is known, so no previous verdict.
-    { kind: 'edit', channelId: 'zulip:general', messageId: '6', messageIds: ['6'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'm6 fixed', previousContent: 'm6', mentioned: false, wasMentioned: null, onOwnMessage: false },
+    { kind: 'edit', key: GENERAL, messageId: '6', messageIds: ['6'], authorName: 'Ann', actorId: '7', topic: 'deploys', previousTopic: null, movedTo: null, content: 'm6 fixed', previousContent: 'm6', mentioned: false, wasMentioned: null, onOwnMessage: false },
     // A move quotes nothing (the content did not change) and keeps the
     // mention it had: the mention the agent is answering moved topics.
-    { kind: 'move', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', movedTo: null, content: null, previousContent: null, mentioned: true, wasMentioned: true, onOwnMessage: false },
+    { kind: 'move', key: GENERAL, messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: '12', topic: 'deploys-2', previousTopic: 'deploys', movedTo: null, content: null, previousContent: null, mentioned: true, wasMentioned: true, onOwnMessage: false },
     // Placed on the stream it left, pointing at the one it went to; the
     // topic name did not change, so there is no previous topic.
-    { kind: 'move', channelId: 'zulip:general', messageId: '700', messageIds: ['700'], authorName: 'Ann', actorId: '12', topic: 'deploys', previousTopic: null, movedTo: 'zulip:secret', content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
+    { kind: 'move', key: GENERAL, messageId: '700', messageIds: ['700'], authorName: 'Ann', actorId: '12', topic: 'deploys', previousTopic: null, movedTo: streamKey(8), content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
     // The deleted message kept its last mention verdict: it is the one the agent was about to answer.
-    { kind: 'delete', channelId: 'zulip:general', messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, movedTo: null, content: null, previousContent: 'second draft @**Bot**', mentioned: true, wasMentioned: true, onOwnMessage: false },
-    { kind: 'delete', channelId: 'zulip:general', messageId: '900', messageIds: ['900', '901'], authorName: null, actorId: null, topic: 'old', previousTopic: null, movedTo: null, content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
+    { kind: 'delete', key: GENERAL, messageId: '5', messageIds: ['5'], authorName: 'Ann', actorId: null, topic: 'deploys-2', previousTopic: null, movedTo: null, content: null, previousContent: 'second draft @**Bot**', mentioned: true, wasMentioned: true, onOwnMessage: false },
+    { kind: 'delete', key: GENERAL, messageId: '900', messageIds: ['900', '901'], authorName: null, actorId: null, topic: 'old', previousTopic: null, movedTo: null, content: null, previousContent: null, mentioned: false, wasMentioned: null, onOwnMessage: false },
   ]);
   assert.deepEqual(changes[0].timestamp, new Date(1_700_000_900_000), 'an edit is stamped with Zulip\'s edit time');
   assert.equal(changes[0].authorEmail, 'ann@example.com', 'the sender travels with the change for the DM allowlist');
@@ -339,10 +355,10 @@ test('the bot\'s own deletions (rollback, the delete tool) do not echo back as c
     adapter.startEvents(() => {}, undefined, undefined, (c) => { changes.push(c); });
     const deadline = Date.now() + 2000;
     while (!released && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
-    await adapter.deleteMessage('zulip:general', '5');
+    await adapter.deleteMessage(GENERAL, '5');
     adapter.noteSelfDeleted(6);
-    await assert.rejects(adapter.deleteMessage('zulip:general', '7'));
-    await assert.rejects(adapter.deleteMessage('zulip:general', '8'));
+    await assert.rejects(adapter.deleteMessage(GENERAL, '7'));
+    await assert.rejects(adapter.deleteMessage(GENERAL, '8'));
     released!();
     while (!changes.some((c) => c.messageId === '9') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
@@ -440,13 +456,13 @@ test('bulk deletion, co-moved ids, unresolvable origins and vanishing moves (#22
   } finally {
     console.error = original;
   }
-  const view = changes.map((c) => ({ kind: c.kind, channelId: c.channelId, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, topic: c.topic, movedTo: c.movedToChannelId, previousContent: c.previousContent, vanished: c.vanished }));
+  const view = changes.map((c) => ({ kind: c.kind, key: c.key, messageId: c.messageId, messageIds: c.messageIds, authorName: c.authorName, topic: c.topic, movedTo: c.movedToKey, previousContent: c.previousContent, vanished: c.vanished }));
   assert.deepEqual(view, [
-    { kind: 'move', channelId: 'zulip:general', messageId: '20', messageIds: ['20', '21', '22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
+    { kind: 'move', key: GENERAL, messageId: '20', messageIds: ['20', '21', '22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
     // Reported under 21 (cached, now in `archive`), with 19 still listed; never Ann's name on Bob's id.
-    { kind: 'delete', channelId: 'zulip:general', messageId: '21', messageIds: ['19', '21'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm21', vanished: false },
-    { kind: 'move', channelId: 'zulip:general', messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
-    { kind: 'delete', channelId: 'zulip:general', messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm22', vanished: true },
+    { kind: 'delete', key: GENERAL, messageId: '21', messageIds: ['19', '21'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm21', vanished: false },
+    { kind: 'move', key: GENERAL, messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: null, vanished: false },
+    { kind: 'delete', key: GENERAL, messageId: '22', messageIds: ['22'], authorName: 'Ann', topic: 'archive', movedTo: null, previousContent: 'm22', vanished: true },
   ]);
   assert.equal(listCalls, 2, 'unknown stream ids cost one list refresh, then a hold-off — not one per event');
 });
@@ -488,14 +504,16 @@ test('a message from a stream created after startup carries its descriptor, with
   // first message (a mention of the bot) arrives live.
   const events = [
     { id: 1, type: 'message', flags: [], message: raw(10) },
-    { id: 2, type: 'message', flags: ['mentioned'], message: raw(11, { display_recipient: 'late-stream', stream_id: 9, content: '@**Bot** hi' }) },
-    { id: 3, type: 'message', flags: [], message: raw(12, { display_recipient: 'late-stream', stream_id: 9 }) },
+    { id: 2, type: 'stream', op: 'create', streams: [{ stream_id: 9, name: 'late-stream' }] },
+    { id: 3, type: 'message', flags: ['mentioned'], message: raw(11, { display_recipient: 'late-stream', stream_id: 9, content: '@**Bot** hi' }) },
+    { id: 4, type: 'message', flags: [], message: raw(12, { display_recipient: 'late-stream', stream_id: 9 }) },
     // Outside the allowlist: filtered before any descriptor is made.
-    { id: 4, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
+    { id: 5, type: 'message', flags: [], message: raw(13, { display_recipient: 'secret', stream_id: 8 }) },
+    { id: 6, type: 'message', flags: [], message: raw(14) },
   ];
   let polls = 0;
   const client = standInApi({
-    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }),
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }, { name: 'secret', stream_id: 8, subscriber_count: 2 }] }),
     'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
     'GET /events': async () => {
@@ -508,13 +526,13 @@ test('a message from a stream created after startup carries its descriptor, with
   const filters: FilterView = { streamAllowed: (s) => s !== 'secret', dmAllowed: () => true };
   const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
   await adapter.discoverChannels();
-  const seen: { id: string; channelId: string; newChannel?: string; address?: unknown }[] = [];
+  const seen: { id: string; key: string; newChannel?: string; address?: unknown }[] = [];
   const original = console.error;
   console.error = () => {};
   try {
-    adapter.startEvents((m, d) => { seen.push({ id: m.messageId, channelId: m.channelId, newChannel: d?.id, address: d?.address }); });
+    adapter.startEvents((m, d) => { seen.push({ id: m.messageId, key: m.key, newChannel: d?.id, address: d?.address }); });
     const deadline = Date.now() + 2000;
-    while (seen.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    while (!seen.some((s) => s.id === '14') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
     adapter.stopEvents();
   } finally {
     console.error = original;
@@ -522,9 +540,212 @@ test('a message from a stream created after startup carries its descriptor, with
   // Every allowed stream message carries its descriptor — whether it is new
   // is the server's registry's call, not the adapter's.
   assert.deepEqual(seen, [
-    { id: '10', channelId: 'zulip:general', newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: undefined } },
-    // Described from the message, with the stream id publishing needs.
-    { id: '11', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
-    { id: '12', channelId: 'zulip:late-stream', newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
+    { id: '10', key: GENERAL, newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: 7 } },
+    // Its create event put it in the directory before its first message.
+    { id: '11', key: streamKey(9), newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
+    { id: '12', key: streamKey(9), newChannel: 'zulip:late-stream', address: { stream_name: 'late-stream', stream_id: 9 } },
+    { id: '14', key: GENERAL, newChannel: 'zulip:general', address: { stream_name: 'general', stream_id: 7 } },
   ]);
 });
+
+test('a stream the directory does not hold costs one list read for that stream, so another unknown stream within the minute is read for too, and a failed read holds nothing off', async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(30, { display_recipient: 'north', stream_id: 11 }) },
+    { id: 2, type: 'message', flags: [], message: raw(31, { display_recipient: 'north', stream_id: 11 }) },
+    { id: 3, type: 'message', flags: [], message: raw(32, { display_recipient: 'south', stream_id: 12 }) },
+    { id: 4, type: 'message', flags: [], message: raw(33, { display_recipient: 'east', stream_id: 13 }) },
+    { id: 5, type: 'message', flags: [], message: raw(34, { display_recipient: 'east', stream_id: 13 }) },
+    { id: 6, type: 'message', flags: [], message: raw(35) },
+  ];
+  let polls = 0;
+  let listCalls = 0;
+  const streams = [{ name: 'general', stream_id: 7 }];
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) return { result: 'error', code: 'BAD_REQUEST', msg: 'try again' };
+      return { result: 'success', streams: [...streams] };
+    },
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls === 1) return { events };
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+  }).api;
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const seen: string[] = [];
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents((m) => {
+      seen.push(`${m.messageId}@${m.key}`);
+      if (m.messageId === '31') streams.push({ name: 'south', stream_id: 12 });
+    });
+    streams.push({ name: 'north', stream_id: 11 });
+    const deadline = Date.now() + 2000;
+    while (!seen.some((s) => s.startsWith('35@')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(seen, [
+    `31@${streamKey(11)}`,
+    `32@${streamKey(12)}`,
+    `35@${GENERAL}`,
+  ]);
+  assert.equal(listCalls, 4);
+});
+
+test('a miss while a read of the stream list is in flight waits for that read', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const first = adapter.refreshStreams('stream 11');
+  let secondDone = false;
+  const second = adapter.refreshStreams('#north').then(() => { secondDone = true; });
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(secondDone, false, 'the second miss waits for the read in flight');
+  release!();
+  await Promise.all([first, second]);
+  assert.equal(directory.nameOf(11), 'north');
+  assert.equal(listCalls, 1);
+});
+
+test('a miss that joined a read already in flight is read for again at its next miss, since that read may have begun before its stream existed', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }] };
+      }
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }, { name: 'south', stream_id: 12 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const first = adapter.refreshStreams('stream 11');
+  const joined = adapter.refreshStreams('stream 12');
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  release!();
+  await Promise.all([first, joined]);
+  assert.equal(directory.nameOf(12), undefined, 'the read in flight began before #south');
+  await adapter.refreshStreams('stream 12');
+  assert.equal(directory.nameOf(12), 'south');
+  assert.equal(listCalls, 2);
+});
+
+test('a miss within its hold-off still waits for a read already in flight, which may hold its stream', async () => {
+  let release: (() => void) | undefined;
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      if (listCalls === 1) return { result: 'success', streams: [{ name: 'general', stream_id: 7 }] };
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { result: 'success', streams: [{ name: 'general', stream_id: 7 }, { name: 'north', stream_id: 11 }, { name: 'south', stream_id: 12 }] };
+    },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  await adapter.refreshStreams('stream 12');
+  assert.equal(directory.nameOf(12), undefined, 'the first read has no #south, so stream 12 is held off');
+  const other = adapter.refreshStreams('stream 11');
+  const deadline = Date.now() + 2000;
+  while (!release && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  let againDone = false;
+  const again = adapter.refreshStreams('stream 12').then(() => { againDone = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(againDone, false, 'the held-off miss waits for the read in flight');
+  release!();
+  await Promise.all([other, again]);
+  assert.equal(directory.nameOf(12), 'south');
+  assert.equal(listCalls, 2);
+});
+
+test('a stream-list answer without a streams array is no list: the directory keeps what it holds', async () => {
+  let listCalls = 0;
+  const client = standInApi({
+    'GET /streams': async () => {
+      listCalls++;
+      return { result: 'success' };
+    },
+  }).api;
+  const directory = new StreamDirectory();
+  directory.restart({ streams: { '7': 'general', '11': 'north' } });
+  const removed: number[] = [];
+  directory.onChange((change) => removed.push(...change.removed.map((r) => r.id)));
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await adapter.discoverChannels();
+    await adapter.refreshStreams('stream 12');
+  } finally {
+    console.error = original;
+  }
+  assert.equal(listCalls, 2);
+  assert.deepEqual(removed, []);
+  assert.equal(directory.nameOf(7), 'general');
+  assert.equal(directory.nameOf(11), 'north');
+  assert.equal(directory.isFilled, false, 'no list has been read');
+});
+
+test('a stopped event loop\'s registration that answers late leaves the directory to the loop that runs now', async () => {
+  let registrations = 0;
+  let releaseFirst: (() => void) | undefined;
+  const client = standInApi({
+    'POST /register': async () => {
+      registrations++;
+      if (registrations === 1) {
+        const answer = { queue_id: 'q1', last_event_id: -1, streams: [{ stream_id: 7, name: 'general' }] };
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        return answer;
+      }
+      return { queue_id: `q${registrations}`, last_event_id: -1, streams: [{ stream_id: 7, name: 'lobby' }] };
+    },
+    'GET /events': async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return { events: [] };
+    },
+    'DELETE /events': { result: 'success' },
+  }).api;
+  const directory = directoryOf();
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(() => {});
+    let deadline = Date.now() + 2000;
+    while (!releaseFirst && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+    adapter.startEvents(() => {});
+    deadline = Date.now() + 2000;
+    while (directory.nameOf(7) !== 'lobby' && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(directory.nameOf(7), 'lobby', 'the second loop registered');
+    releaseFirst!();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(directory.nameOf(7), 'lobby');
+    assert.equal(directory.formerOf('lobby'), undefined);
+  } finally {
+    adapter.stopEvents();
+    console.error = original;
+  }
+});
+

@@ -19,10 +19,12 @@ import {
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
-import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
+import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
 import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
 import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
+import { parseKey, streamKey } from './channel-key.js';
+import type { ChannelIds } from './channel-ids.js';
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -198,7 +200,7 @@ export function formatHistoryLines(
     const head = messageLineHead({
       id: m.id,
       time: Number.isNaN(m.timestamp.getTime()) ? "" : formatTime(m.timestamp),
-      stream: m.isDm ? null : (m.streamName ?? ""),
+      stream: m.isDm ? null : (m.streamNameShown ?? ""),
       topic: m.topic,
       author: m.authorName,
       mentioned: m.mentioned,
@@ -241,6 +243,27 @@ export class ZulipToolRuntime {
    *  Awaited, and its result is reported by `listen`: an announcement the
    *  host did not confirm is the agent's business, not a stderr line. */
   onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
+
+  channelIds: ChannelIds | null = null;
+
+  private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const ids = this.channelIds;
+    if (!ids) return out;
+    const renamed: string[] = [];
+    for (const name of names) {
+      const answer = await ids.keyOf(`zulip:${name}`, { byName: true });
+      if ("key" in answer) {
+        const parsed = parseKey(answer.key);
+        if (parsed.kind === "stream") out.set(name, parsed.streamId);
+        continue;
+      }
+      const former = "refusal" in answer ? ids.directory.formerOf(name) : undefined;
+      if (former) renamed.push(`Zulip stream #${name} was renamed #${former.current}.`);
+    }
+    if (renamed.length > 0) throw new Error(`${renamed.join(" ")} Nothing went to Zulip.`);
+    return out;
+  }
 
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy;
@@ -316,10 +339,13 @@ export class ZulipToolRuntime {
     if (message.type === "stream") {
       const name = message.display_recipient;
       if (typeof name !== "string" || !name || typeof message.subject !== "string") throw unreadable();
-      const channelId = `zulip:${name}`;
+      const named = `zulip:${name}`;
+      // The receipt names the stream by the id the host holds for it, or by none
+      // while the host holds its name's id for another stream.
+      const channelId = this.channelIds != null && Number.isSafeInteger(message.stream_id) ? this.channelIds.channelIdOf(streamKey(message.stream_id)) : named;
       return args.topic === undefined
-        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId, receipt: { channelId, channel: name, topic: message.subject } }
-        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId, receipt: { channelId, channel: name } };
+        ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: channelId ?? named, receipt: { channelId, channel: name, topic: message.subject } }
+        : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId: channelId ?? named, receipt: { channelId, channel: name } };
     }
     if (args.topic !== undefined) throw new Error(`reply_to ${id} is a direct message, which has no topic; omit topic`);
 
@@ -331,6 +357,24 @@ export class ZulipToolRuntime {
     const others = dmCounterparts(recipients, this.session.selfUserId).map((r) => r.id);
     const channelId = dmChannelIdFor(others);
     return { type: message.type, to: ids, topic: undefined, channelId, receipt: { channelId, to_user_ids: others } };
+  }
+
+  private async historyTarget(channel: string): Promise<{ query: Pick<HistoryQuery, 'dmUserIds' | 'streamId' | 'streamName'>; channel: string; channelId: string | null; isDm: boolean }> {
+    const asId = channel.startsWith("zulip:") ? channel : `zulip:${channel}`;
+    const dmIds = parseDmChannelId(asId);
+    if (dmIds) return { query: { dmUserIds: dmIds }, channel: dmChannelIdFor(dmIds), channelId: dmChannelIdFor(dmIds), isDm: true };
+    const ids = this.channelIds;
+    const answer = ids ? await ids.keyOf(asId, { byName: !channel.startsWith("zulip:") }) : null;
+    if (answer && "refusal" in answer) throw new Error(answer.refusal);
+    if (ids && answer && "key" in answer) {
+      const parsed = parseKey(answer.key);
+      if (parsed.kind === "stream") {
+        const name = ids.directory.nameOf(parsed.streamId) ?? "";
+        return { query: { streamId: parsed.streamId }, channel: name, channelId: ids.channelIdOf(answer.key), isDm: false };
+      }
+    }
+    const name = asId.slice("zulip:".length);
+    return { query: { streamName: name }, channel: name, channelId: asId, isDm: false };
   }
 
   // ── Persistent monitoring state ──
@@ -470,6 +514,7 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
+          await this.streamIdsByName(channels);
           const result = await api.requestAnswer<any>("POST", "/users/me/subscriptions", {
             subscriptions: channels.map(name => ({ name })),
           });
@@ -513,6 +558,7 @@ export class ZulipToolRuntime {
           return { error: "channels array is required and must be non-empty" };
         }
         try {
+          await this.streamIdsByName(channels);
           const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
             subscriptions: channels,
           });
@@ -708,9 +754,17 @@ export class ZulipToolRuntime {
         }
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
-        const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
+        const isDm = args.type === "private" || args.type === "direct";
+        let channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
+        if (!reply && !isDm && typeof args.to === "string") {
+          const streamId = (await this.streamIdsByName([args.to])).get(args.to);
+          if (streamId !== undefined) {
+            channelId = this.channelIds?.channelIdOf(streamKey(streamId)) ?? channelId;
+            args = { ...args, to: streamId };
+          }
+        }
         const { chunks, last, uploaded } = await this.send({ type: args.type, to: args.to, topic: args.topic }, hasText ? args.content : "", args, channelId);
         const ids = chunks.map((c) => c.id);
         return {
@@ -945,22 +999,19 @@ export class ZulipToolRuntime {
       case "fetch_history": {
         const channel = String(args.channel ?? "").trim().replace(/^#/, "");
         if (!channel) throw new Error("channel is required");
-        // A DM conversation reads by its channel id (`zulip:dm:<ids>`, the
-        // form every catch-up note and history line quotes); anything else
-        // is a stream name or stream channel id.
-        const dmIds = parseDmChannelId(channel.startsWith("zulip:") ? channel : `zulip:${channel}`);
-        const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
+        const target = await this.historyTarget(channel);
         const limit = clampInt(args.limit, 50, 1, 1000);
         const page = await fetchHistory(api, {
-          ...(dmIds ? { dmUserIds: dmIds } : { streamName, topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
+          ...target.query,
+          ...(target.isDm ? {} : { topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
           limit,
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
         return {
-          channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
-          channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
-          topic: dmIds ? undefined : args.topic,
+          channel: target.channel,
+          channelId: target.channelId,
+          topic: target.isDm ? undefined : args.topic,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
@@ -976,10 +1027,13 @@ export class ZulipToolRuntime {
         const limit = clampInt(args.limit, 50, 1, 200);
         const page = await fetchAround(api, messageId, limit);
         const anchor = page.messages.find((m) => m.id === messageId);
+        const shown = anchor?.streamNameShown ?? null;
+        const known = this.channelIds != null && anchor?.streamId != null;
+        const held = known ? this.channelIds!.channelIdOf(streamKey(anchor!.streamId!)) : null;
         return {
           message_id: messageId,
-          channel: anchor?.streamName ?? null,
-          channelId: anchor?.streamName ? `zulip:${anchor.streamName}` : null,
+          channel: shown,
+          channelId: known ? held : shown ? `zulip:${shown}` : null,
           topic: anchor?.topic ?? null,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,

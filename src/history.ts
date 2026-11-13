@@ -10,8 +10,9 @@
  * watermark is just the highest id already forwarded.
  */
 
-import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
+import type { ChannelDescriptor, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
+import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from './channel-key.js';
 import { cleanMarkdown, extractZulipAttachments, type AttachmentRef } from './content.js';
 import type { ZulipApi } from './zulip-api.js';
 
@@ -88,7 +89,8 @@ export interface ZulipRecipient {
 /** The normalized, model-facing view of one message. */
 export interface ZulipMessage {
   id: number;
-  streamName: string | null;
+  streamId: number | null;
+  streamNameShown: string | null;
   topic: string;
   isDm: boolean;
   /** Every party to a DM (the bot included); empty for stream messages. */
@@ -116,7 +118,8 @@ export interface ZulipMessage {
 }
 
 export interface HistoryQuery {
-  /** Stream to read; omit for a cross-stream window (fetch_around). */
+  /** Stream to read, by id; omit for a cross-stream window (fetch_around). */
+  streamId?: number;
   streamName?: string;
   topic?: string;
   /** The other parties of a DM conversation (user ids); reads that conversation instead of a stream. */
@@ -147,19 +150,17 @@ interface MessagesPage {
 export const ZULIP_MAX_PAGE = 5000;
 
 /**
- * The narrow for a query. Stream and topic use the `[operator, operand]`
- * pair form. A DM conversation cannot: its operand is a list of user ids,
- * and Zulip rejects a pair whose operand is not a string ("element is not
- * a string pair") while a stringified id is read as an email ("unknown
- * user"). The `{operator, operand}` object form takes the list as is. The
- * `dm` operator needs Zulip 7.0 (June 2023).
+ * The narrow for a query. A stream id and a DM conversation's user ids need
+ * the `{operator, operand}` object form: Zulip rejects a pair whose operand
+ * is not a string ("element is not a string pair"). The `dm` operator needs
+ * Zulip 7.0 (June 2023).
  */
-function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
-  const narrow: unknown[] = [];
-  if (q.dmUserIds && q.dmUserIds.length > 0) {
-    narrow.push({ operator: 'dm', operand: q.dmUserIds });
-    return narrow;
+function narrowFor(q: Pick<HistoryQuery, 'streamId' | 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
+  if (q.dmUserIds && q.dmUserIds.length > 0) return [{ operator: 'dm', operand: q.dmUserIds }];
+  if (q.streamId !== undefined) {
+    return [{ operator: 'stream', operand: q.streamId }, ...(q.topic ? [{ operator: 'topic', operand: q.topic }] : [])];
   }
+  const narrow: unknown[] = [];
   if (q.streamName) narrow.push(['stream', q.streamName]);
   if (q.topic) narrow.push(['topic', q.topic]);
   return narrow;
@@ -197,10 +198,10 @@ export function isDmChannelId(channelId: string): boolean {
   return parseDmChannelId(channelId) !== null;
 }
 
-/** The channel a message belongs to: its stream, or its DM conversation. */
-export function channelIdOf(m: ZulipMessage, selfUserId: number | null): string {
-  if (m.isDm) return dmChannelIdFor(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
-  return `zulip:${m.streamName ?? ''}`;
+/** The key of a message's channel: its stream, or its DM conversation; null for a stream message with no stream id. */
+export function keyOfMessage(m: ZulipMessage, selfUserId: number | null): ChannelKey | null {
+  if (m.isDm) return dmKey(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
+  return m.streamId === null ? null : streamKey(m.streamId);
 }
 
 /** Bot accounts in Zulip carry a `-bot@` local part; the event envelope has no is_bot. */
@@ -216,7 +217,8 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     : [];
   return {
     id: raw.id,
-    streamName: !isDm && typeof raw.display_recipient === 'string' ? raw.display_recipient : null,
+    streamId: !isDm && typeof raw.stream_id === 'number' ? raw.stream_id : null,
+    streamNameShown: !isDm && typeof raw.display_recipient === 'string' ? raw.display_recipient : null,
     topic: raw.subject ?? '',
     isDm,
     recipients,
@@ -266,7 +268,7 @@ export async function fetchHistory(api: ZulipApi, q: HistoryQuery): Promise<Hist
     numAfter = 0;
   }
 
-  const result = await api.request<MessagesPage>('GET', '/messages', `history of ${q.streamName ?? 'all'}`, {
+  const result = await api.request<MessagesPage>('GET', '/messages', `history of ${q.streamId !== undefined ? `stream ${q.streamId}` : q.streamName ? `#${q.streamName}` : q.dmUserIds ? 'a direct-message conversation' : 'all'}`, {
     anchor,
     num_before: numBefore,
     num_after: numAfter,
@@ -303,7 +305,7 @@ export async function fetchAround(api: ZulipApi, messageId: number, limit: numbe
   if (!anchorMsg) throw new Error(`message ${messageId} is not readable by this bot`);
   const narrow = anchorMsg.isDm
     ? narrowFor({ dmUserIds: anchorMsg.recipients.map((r) => r.id) })
-    : narrowFor({ streamName: anchorMsg.streamName ?? undefined, topic: anchorMsg.topic || undefined });
+    : narrowFor({ streamId: anchorMsg.streamId ?? undefined, streamName: anchorMsg.streamNameShown ?? undefined, topic: anchorMsg.topic || undefined });
   const result = await api.request<MessagesPage>('GET', '/messages', `messages around ${messageId}`, {
     anchor: messageId,
     num_before: half,
@@ -350,21 +352,22 @@ export function attachmentNote(attachments: AttachmentRef[]): TextContent | null
 }
 
 /**
- * The MCPL incoming shape for a message on `channelId`. Used for live
+ * The server's incoming shape for a message on `key`. Used for live
  * delivery and for history handed back on channels/open (`backscroll: true`
  * in metadata marks the latter).
  */
 export function toIncoming(
-  channelId: string,
+  key: ChannelKey,
   m: ZulipMessage,
   identity: ZulipIdentity,
   extra: Record<string, unknown> = {},
-): IncomingChannelMessage {
+): KeyedMessage {
   const content: TextContent[] = [{ type: 'text', text: m.cleanContent + editedTrailer(m) }];
   const note = attachmentNote(m.attachments);
   if (note) content.push(note);
   return {
-    channelId,
+    key,
+    ...(m.streamNameShown !== null ? { streamNameShown: m.streamNameShown } : {}),
     messageId: String(m.id),
     threadId: m.topic || undefined,
     author: { id: String(m.authorId), name: m.authorName },

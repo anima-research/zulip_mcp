@@ -345,7 +345,7 @@ test('reaction events are forwarded to the reaction handler and never to onMessa
   await loop.start(api, (_s, m) => { messages.push(m); }, undefined, (ev) => {
     reactions.push({ op: ev.op, emoji_name: ev.emoji_name, message_id: ev.message_id, name: ev.user?.full_name });
   });
-  assert.deepEqual(registered[0].event_types, ['message', 'reaction', 'update_message', 'delete_message'], 'the queue asks for reactions, edits and deletions');
+  assert.deepEqual(registered[0].event_types, ['message', 'reaction', 'update_message', 'delete_message', 'stream'], 'the queue asks for reactions, edits, deletions and stream changes');
   assert.equal(registered[0].apply_markdown, false, 'the queue asks for raw markdown; cleanMarkdown depends on it (#24)');
   // bulk_message_deletion: a topic deletion arrives as one event, not N.
   // notification_settings_null at its default: Zulip 12 refuses the

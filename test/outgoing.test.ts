@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
+import { dmKey, streamKey } from '../src/channel-key.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
 import type { UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
@@ -43,10 +45,14 @@ function tools(api: ZulipSession['api'], maxMessageLength?: number) {
 }
 
 function adapter(api: ZulipSession['api'], options: Record<string, unknown> = {}) {
-  const a = new ZulipAdapter(api, 790, 's', options as never);
+  const directory = new StreamDirectory();
+  directory.registration([{ stream_id: 7, name: 'general' }]);
+  const a = new ZulipAdapter(api, 790, 's', { directory, ...options } as never);
   const sent: Sent[] = [];
   (a as unknown as { onSent: (s: Sent) => void }).onSent = (s) => sent.push(s);
-  return { adapter: a, sent };
+  const publish = (channelId: string, ...rest: Parameters<ZulipAdapter['publish']> extends [unknown, ...infer R] ? R : never) =>
+    a.publish(channelId === 'zulip:dm:42' ? dmKey([42]) : streamKey(7), ...rest);
+  return { adapter: a, sent, publish };
 }
 
 const text = (s: string) => [{ type: 'text' as const, text: s }];
@@ -69,7 +75,7 @@ test('R1: send_message, send_dm and publish split a long text at the configured 
   t2.done();
 
   const pub = messagesApi();
-  await adapter(pub.api, { maxMessageLength: 100 }).adapter.publish('zulip:general', undefined, text(long), { threadId: 't' });
+  await adapter(pub.api, { maxMessageLength: 100 }).publish('zulip:general', undefined, text(long), { threadId: 't' });
 
   assert.deepEqual(bodies(sm.calls), expected, 'send_message');
   assert.deepEqual(bodies(dm.calls), expected, 'send_dm');
@@ -127,12 +133,12 @@ test('R2: publish returns and posts as before, at one chunk, three chunks, with 
   ];
   for (const [channelId, blocks, hints, result, posted, options] of cases) {
     const { api, calls } = messagesApi();
-    assert.deepEqual(await adapter(api, options).adapter.publish(channelId, undefined, blocks as never, hints as never), result);
-    const target = channelId === 'zulip:dm:42' ? { type: 'private', to: [42] } : { type: 'stream', to: 'general', topic: 'deploys' };
+    assert.deepEqual(await adapter(api, options).publish(channelId, undefined, blocks as never, hints as never), result);
+    const target = channelId === 'zulip:dm:42' ? { type: 'private', to: [42] } : { type: 'stream', to: 7, topic: 'deploys' };
     assert.deepEqual(calls.map((c) => c.params), posted.map((content) => ({ ...target, content })));
   }
   const empty = messagesApi();
-  assert.deepEqual(await adapter(empty.api).adapter.publish('zulip:general', undefined, text('')), { delivered: false });
+  assert.deepEqual(await adapter(empty.api).publish('zulip:general', undefined, text('')), { delivered: false });
   assert.equal(empty.calls.length, 0, 'nothing to send posts nothing');
 });
 
@@ -157,11 +163,11 @@ test('R3: a refusal at the second of three chunks keeps each caller\'s error tex
   dm.done();
 
   const pub = adapter(messagesApi(refuseSecond).api);
-  await assert.rejects(pub.adapter.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message === 'Zulip refused message to #general: nope');
+  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message === 'Zulip refused message to #general: nope');
   assert.deepEqual(pub.sent, [{ messageId: '901', channelId: 'zulip:general', content: big(1, 9000) }]);
 
   const pubDm = adapter(messagesApi(refuseSecond).api);
-  await assert.rejects(pubDm.adapter.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => e.message === 'Zulip refused direct message to zulip:dm:42: nope');
+  await assert.rejects(pubDm.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => e.message === 'Zulip refused direct message to zulip:dm:42: nope');
   assert.deepEqual(pubDm.sent.map((s) => s.messageId), ['901']);
 });
 
@@ -177,6 +183,6 @@ test('R3b: no answer at the second of three chunks throws that error, and the fi
   dm.done();
 
   const pub = adapter(messagesApi(noAnswerSecond).api);
-  await assert.rejects(pub.adapter.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e === noAnswer);
+  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e === noAnswer);
   assert.deepEqual(pub.sent.map((s) => s.messageId), ['901']);
 });
