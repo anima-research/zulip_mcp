@@ -75,7 +75,7 @@ import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
+import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
@@ -319,6 +319,10 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.tools.answerHints = {
+      followed: (key) => this.channelManager.hintsOf(key),
+      follow: (key, from, readTopic, topic) => this.followInLane(key, from, readTopic, topic),
+    };
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -2024,6 +2028,18 @@ export class ZulipMcplServer {
         line();
       }
       ran();
+    }));
+  }
+
+  private followInLane(key: ChannelKey, from: number, readTopic: string | undefined, topic: string): Promise<FollowSeen> {
+    const lane = this.lanes?.lane(key);
+    if (!lane) return Promise.resolve("sure");
+    return new Promise((ran) => lane.answer((ctx) => {
+      const now = this.channelManager.hintsOf(key);
+      if (now?.from !== from) return ran({ follows: now?.from });
+      if (now.topic === readTopic) ctx.w.channels.followMove(key, [String(from)], topic);
+      else if (now.topic !== topic) return ran("unsure");
+      ran(ctx.lane.changeWaitsAbout([from]) ? "unsure" : "sure");
     }));
   }
 

@@ -270,6 +270,33 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "move_messages",
+    description: "Move a Zulip message to another topic, another stream, or both, alone or with others of its topic. Returns where the message is afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: {
+          type: "number",
+          description: "ID of the message to move",
+        },
+        topic: {
+          type: "string",
+          description: "The topic to move it to",
+        },
+        stream: {
+          type: "string",
+          description: "The stream to move it to, by name",
+        },
+        scope: {
+          type: "string",
+          enum: ["one", "later", "all"],
+          description: "What moves: one (this message), later (this message and those after it in its topic), or all (its whole topic)",
+        },
+      },
+      required: ["message_id", "scope"],
+    },
+  },
+  {
     name: "delete_message",
     description: "Delete a Zulip message by ID. You can delete your own messages, and if you have permissions, others' messages too.",
     inputSchema: {

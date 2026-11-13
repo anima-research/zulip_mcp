@@ -23,7 +23,7 @@ import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChann
 import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
 import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
-import { parseKey, streamKey } from './channel-key.js';
+import { parseKey, streamKey, type ChannelKey } from './channel-key.js';
 import type { ChannelIds } from './channel-ids.js';
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
@@ -109,6 +109,21 @@ export interface ToolCallResult {
 }
 
 const STATE_DIR = join(homedir(), ".zulip_mcp_state");
+
+const MOVE_SCOPES: Record<string, string> = { one: "change_one", later: "change_later", all: "change_all" };
+
+const MOVE_NOTE = "To answer this message where it is now, use send_message with reply_to.";
+
+// The host ends a tool call at 60 s by default (agent-framework's DEFAULT_REQUEST_TIMEOUT_MS). A move makes up
+// to three requests of 15 s each before this wait, so the call's bounds add up to 50 s (anima-research/zulip_mcp#60).
+const FOLLOW_WAIT_MS = 5_000;
+
+export type FollowSeen = "sure" | "unsure" | { follows: number | undefined };
+
+export interface AnswerHints {
+  followed(key: ChannelKey): { from?: number; topic?: string } | undefined;
+  follow(key: ChannelKey, from: number, readTopic: string | undefined, topic: string): Promise<FollowSeen>;
+}
 
 // Helper function to parse date strings
 export function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
@@ -246,13 +261,17 @@ export class ZulipToolRuntime {
 
   channelIds: ChannelIds | null = null;
 
-  private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
+  answerHints: AnswerHints | null = null;
+
+  private async streamIdsByName(names: string[], opts: { readList?: boolean } = {}): Promise<Map<string, number>> {
     const out = new Map<string, number>();
     const ids = this.channelIds;
     if (!ids) return out;
     const renamed: string[] = [];
     for (const name of names) {
-      const answer = await ids.keyOf(`zulip:${name}`, { byName: true });
+      const answer = opts.readList === false
+        ? ids.resolve(`zulip:${name}`, { byName: true }) ?? { unknownName: name }
+        : await ids.keyOf(`zulip:${name}`, { byName: true });
       if ("key" in answer) {
         const parsed = parseKey(answer.key);
         if (parsed.kind === "stream") out.set(name, parsed.streamId);
@@ -263,6 +282,56 @@ export class ZulipToolRuntime {
     }
     if (renamed.length > 0) throw new Error(`${renamed.join(" ")} Nothing went to Zulip.`);
     return out;
+  }
+
+  private async streamIdForName(name: string): Promise<number> {
+    const known = (await this.streamIdsByName([name], { readList: false })).get(name);
+    if (known !== undefined) return known;
+    let id: unknown;
+    try {
+      id = (await this.api.request<{ stream_id?: unknown }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(name)}`, { stream: name })).stream_id;
+    } catch (err) {
+      if (err instanceof ZulipNoAnswer) throw err;
+      const text = (err as Error).message;
+      throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
+    }
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error(`Zulip's answer to looking up stream ${JSON.stringify(name)} gave no stream id.`);
+    return id;
+  }
+
+  private async followOwnMove(messageId: number, streamId: number, topic: string, scope: string): Promise<boolean> {
+    const hints = this.answerHints;
+    const key = streamKey(streamId);
+    const read = hints?.followed(key);
+    const from = read?.from;
+    if (!hints || from === undefined || (from !== messageId && scope === "one")) return true;
+    let followedTopic = topic;
+    if (from !== messageId) {
+      const followed = await this.followedTopic(from, streamId);
+      if (followed === "elsewhere") return true;
+      if (followed === undefined) return false;
+      followedTopic = followed.topic;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), FOLLOW_WAIT_MS); });
+    try {
+      const seen = hints.follow(key, from, read?.topic, followedTopic);
+      return await Promise.race([seen.then((it) => it === "sure" || (typeof it === "object" && scope === "one")), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async followedTopic(messageId: number, streamId: number): Promise<{ topic: string } | "elsewhere" | undefined> {
+    let message: any;
+    try {
+      message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId}`)).message;
+    } catch {
+      return undefined;
+    }
+    if (!Number.isSafeInteger(message?.stream_id) || message.stream_id <= 0) return undefined;
+    if (message.stream_id !== streamId) return "elsewhere";
+    return typeof message.subject === "string" ? { topic: message.subject } : undefined;
   }
 
   private readonly uploader: Uploader | null;
@@ -844,6 +913,41 @@ export class ZulipToolRuntime {
         }
       }
 
+      case "move_messages": {
+        const messageId = positiveIdArg("message_id", args.message_id);
+        const topic = args.topic ?? undefined;
+        const stream = args.stream ?? undefined;
+        if (topic === undefined && stream === undefined) throw new Error("Give a topic, a stream, or both.");
+        if (topic !== undefined && typeof topic !== "string") throw new Error("topic must be a string.");
+        if (stream !== undefined && (typeof stream !== "string" || stream === "")) throw new Error("stream must be a stream's name.");
+        const scope = args.scope;
+        if (typeof scope !== "string" || !Object.hasOwn(MOVE_SCOPES, scope)) throw new Error("scope must be one, later or all.");
+        const streamId = stream === undefined ? undefined : await this.streamIdForName(stream);
+        await api.request("PATCH", `/messages/${messageId}`, `moving message ${messageId}`, {
+          propagate_mode: MOVE_SCOPES[scope],
+          ...(topic !== undefined ? { topic } : {}),
+          ...(streamId !== undefined ? { stream_id: streamId } : {}),
+        });
+        const asked = { ...(topic !== undefined ? { topic } : {}), ...(stream !== undefined ? { stream } : {}), scope };
+        let message: any;
+        try {
+          message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId} back`)).message;
+        } catch (err) {
+          return { moved: true, asked, readBackError: (err as Error).message, note: MOVE_NOTE };
+        }
+        const name = message?.display_recipient;
+        if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
+          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, note: MOVE_NOTE };
+        }
+        const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
+        return {
+          channelId: this.channelIds ? this.channelIds.channelIdOf(streamKey(message.stream_id)) : `zulip:${name}`,
+          channel: name,
+          topic: message.subject,
+          ...(answersFollow ? {} : { note: MOVE_NOTE }),
+        };
+      }
+
       case "list_streams": {
         const result = await api.request<{ streams?: any[] }>("GET", "/streams", "listing streams", {
           include_public: args.include_public ?? true,
@@ -880,16 +984,7 @@ export class ZulipToolRuntime {
         if (limit !== undefined && !(typeof limit === "number" && Number.isInteger(limit) && limit > 0)) {
           throw new Error("limit must be a positive integer.");
         }
-        let streamId = givenId;
-        if (byName) {
-          try {
-            streamId = (await api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(args.stream)}`, { stream: args.stream })).stream_id;
-          } catch (err) {
-            if (err instanceof ZulipNoAnswer) throw err;
-            const text = (err as Error).message;
-            throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
-          }
-        }
+        const streamId = byName ? await this.streamIdForName(args.stream) : givenId;
         const result = await api.request<{ topics?: any[] }>("GET", `/users/me/${streamId}/topics`, `topics of stream ${streamId}`);
 
         const topics = result.topics || [];

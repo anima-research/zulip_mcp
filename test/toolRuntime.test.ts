@@ -11,6 +11,11 @@ import type { ZulipSession } from '../src/zulip-client.ts';
 import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
 import { httpTransport, zulipApi, ZulipNoAnswer, type ZulipApi } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { ChannelIds } from '../src/channel-ids.ts';
+import { streamKey } from '../src/channel-key.ts';
+import { StreamDirectory } from '../src/stream-directory.ts';
+import { featureSetForTool, MESSAGING_FEATURE_SET } from '../src/feature-sets.ts';
+import { TOOL_CLASSES } from '../src/tool-classes.ts';
 
 function runtime(api: ZulipApi): { tools: ZulipToolRuntime; dir: string } {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-tools-'));
@@ -815,5 +820,262 @@ test('get_stream_topics for a name no stream has gives Zulip\'s refusal, with th
       assert.doesNotMatch(err.message, /list_streams/);
       return true;
     });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics with MCPL reads a name as the send tools do: a former name is refused with their words, and a known one asks Zulip only for its topics', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    const directory = new StreamDirectory();
+    directory.load({ streams: { 12: 'deploys' }, formerNames: { 'old-deploys': 12 } });
+    tools.channelIds = new ChannelIds(directory);
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'old-deploys' }), /^Error: Zulip stream #old-deploys was renamed #deploys\. Nothing went to Zulip\.$/);
+    assert.deepEqual(calls, [], 'Zulip was never asked');
+    const result = await tools.handleToolCall('get_stream_topics', { stream: 'deploys' }) as { topic_count: number };
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /users/me/12/topics']);
+    assert.equal(result.topic_count, 4);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+const MOVE_STREAMS: Record<number, string> = { 7: 'general', 8: 'ops' };
+
+for (const [tool, args, asked] of [
+  ['move_messages', { message_id: 77, stream: 'ops', scope: 'one' }, ['GET /get_stream_id', 'PATCH /messages/77', 'GET /messages/77']],
+  ['get_stream_topics', { stream: 'deploys' }, ['GET /get_stream_id', 'GET /users/me/12/topics']],
+] as const) {
+  test(`${tool} with MCPL asks Zulip for a name the directory doesn't hold, with no read of the stream list, and refuses a former name it holds with nothing sent`, async () => {
+    const { tools, dir, calls } = tool === 'move_messages' ? moveRuntime({ known: false }) : topicsRuntime();
+    try {
+      const directory = new StreamDirectory();
+      directory.load({ streams: { 7: 'general' }, formerNames: { 'old-general': 7 } });
+      const listReads: string[] = [];
+      tools.channelIds = new ChannelIds(directory, async (why) => { listReads.push(why); });
+      await assert.rejects(tools.handleToolCall(tool, { ...args, stream: 'old-general' }), /^Error: Zulip stream #old-general was renamed #general\. Nothing went to Zulip\.$/);
+      assert.deepEqual(calls, [], 'a former name: nothing went to Zulip');
+      await tools.handleToolCall(tool, args);
+      assert.deepEqual(listReads, [], 'no read of the stream list');
+      assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), asked);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+function moveRuntime(opts: { patch?: (params: Record<string, unknown>) => unknown; readBack?: () => unknown; lookup?: () => unknown; known?: boolean; formerNames?: Record<string, number> } = {}) {
+  const message = { id: 77, type: 'stream', stream_id: 7, display_recipient: 'general', subject: 'deploys' };
+  const stand = standInApi({
+    'PATCH /messages/:id': (params: Record<string, unknown>) => {
+      const refused = opts.patch?.(params);
+      if (refused !== undefined) return refused;
+      if (typeof params.topic === 'string') message.subject = params.topic.trim();
+      if (typeof params.stream_id === 'number') {
+        message.stream_id = params.stream_id;
+        message.display_recipient = MOVE_STREAMS[params.stream_id];
+      }
+      return { result: 'success' };
+    },
+    'GET /messages/:id': () => opts.readBack?.() ?? { result: 'success', message: { ...message } },
+    'GET /get_stream_id': (params: Record<string, unknown>) => {
+      if (opts.lookup) return opts.lookup();
+      const id = Object.entries(MOVE_STREAMS).find(([, name]) => name === params.stream)?.[0];
+      return id === undefined ? { result: 'error', code: 'BAD_REQUEST', msg: `Invalid channel name '${params.stream}'` } : { result: 'success', stream_id: Number(id) };
+    },
+  });
+  const { tools, dir } = runtime(stand.api);
+  if (opts.known !== false) {
+    const directory = new StreamDirectory();
+    directory.load({ streams: Object.fromEntries(Object.entries(MOVE_STREAMS)), formerNames: opts.formerNames ?? {} });
+    tools.channelIds = new ChannelIds(directory);
+  }
+  return { tools, dir, calls: stand.calls, ids: tools.channelIds };
+}
+
+const MODES = { one: 'change_one', later: 'change_later', all: 'change_all' } as const;
+
+for (const scope of ['one', 'later', 'all'] as const) {
+  for (const target of [{ topic: 'renamed' }, { stream: 'ops' }, { topic: 'renamed', stream: 'ops' }]) {
+    test(`move_messages with scope ${scope} and ${Object.keys(target).join(' and ')} asks Zulip once and says where the message is now`, async () => {
+      const { tools, dir, calls } = moveRuntime();
+      try {
+        const result = await tools.handleToolCall('move_messages', { message_id: 77, ...target, scope });
+        const patches = calls.filter((c) => c.method === 'PATCH');
+        assert.equal(patches.length, 1);
+        assert.equal(patches[0].path, '/messages/77');
+        assert.deepEqual(patches[0].params, {
+          propagate_mode: MODES[scope],
+          ...('topic' in target ? { topic: 'renamed' } : {}),
+          ...('stream' in target ? { stream_id: 8 } : {}),
+        }, 'the move sends no notice switch, so Zulip\'s defaults stand');
+        const channel = 'stream' in target ? 'ops' : 'general';
+        assert.deepEqual(result, {
+          channelId: `zulip:${channel}`,
+          channel,
+          topic: 'topic' in target ? 'renamed' : 'deploys',
+          ...('stream' in target ? { note: 'To answer this message where it is now, use send_message with reply_to.' } : {}),
+        });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+}
+
+test('move_messages gives the topic as Zulip reads it back, not as sent', async () => {
+  const { tools, dir } = moveRuntime();
+  try {
+    const result = await tools.handleToolCall('move_messages', { message_id: 77, topic: '  spaced  ', scope: 'one' });
+    assert.equal(result.topic, 'spaced');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('move_messages refuses a call with neither topic nor stream, with no scope or a bad one, or a bad stream or topic, before asking Zulip', async () => {
+  const { tools, dir, calls } = moveRuntime();
+  try {
+    for (const args of [{}, { topic: null, stream: null }, { topic: undefined }]) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, scope: 'one', ...args }), /topic.*stream|stream.*topic/, JSON.stringify(args));
+    }
+    for (const args of [{}, { scope: null }, { scope: undefined }]) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic: 'x', ...args }), /scope must be one, later or all/, `no scope: ${JSON.stringify(args)}`);
+    }
+    for (const scope of ['everything', '', 1, 'ONE']) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic: 'x', scope }), /scope/, `scope ${JSON.stringify(scope)}`);
+    }
+    for (const stream of ['', 8, ['ops']]) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream, scope: 'one' }), /stream must be a stream's name/, `stream ${JSON.stringify(stream)}`);
+    }
+    for (const topic of [5, ['x']]) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic, scope: 'one' }), /topic must be a string/, `topic ${JSON.stringify(topic)}`);
+    }
+    for (const message_id of [0, '0x4d', '77/../users/me']) {
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id, topic: 'x', scope: 'one' }), /message_id/, `message_id ${JSON.stringify(message_id)}`);
+    }
+    assert.equal(calls.length, 0, 'Zulip was never asked');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('move_messages passes on Zulip\'s refusal in Zulip\'s words, and reads nothing back', async () => {
+  const { tools, dir, calls } = moveRuntime({ patch: () => ({ result: 'error', code: 'BAD_REQUEST', msg: "You don't have permission to edit this message" }) });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' }), /You don't have permission to edit this message/);
+    assert.deepEqual(calls.map((c) => c.method), ['PATCH']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('move_messages is a messaging tool classed comms, as edit_message is', () => {
+  assert.equal(featureSetForTool('move_messages'), MESSAGING_FEATURE_SET);
+  assert.deepEqual(TOOL_CLASSES.move_messages, ['comms']);
+  const definition = toolDefinitions.find((t) => t.name === 'move_messages');
+  assert.ok(definition, 'tools/list carries move_messages');
+  assert.deepEqual(Object.keys(definition.inputSchema.properties ?? {}).sort(), ['message_id', 'scope', 'stream', 'topic']);
+  assert.deepEqual(definition.inputSchema.required, ['message_id', 'scope']);
+});
+
+test('move_messages names the channel by the id the host holds for it', async () => {
+  const { tools, dir, ids } = moveRuntime();
+  try {
+    ids!.noteHeld(streamKey(8), 'zulip:ops-before-rename');
+    const result = await tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+    assert.equal(result.channelId, 'zulip:ops-before-rename');
+    assert.equal(result.channel, 'ops');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("move_messages gives no channel id where the host holds the stream's name's id for another stream, or the directory can't name it yet, and without MCPL makes one from the name", async () => {
+  const taken = moveRuntime();
+  try {
+    taken.ids!.noteHeld(streamKey(99), 'zulip:ops');
+    const result = await taken.tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+    assert.equal(result.channelId, null, "the host holds zulip:ops for the stream that was renamed");
+    assert.equal(result.channel, 'ops');
+  } finally { rmSync(taken.dir, { recursive: true, force: true }); }
+  const unnamed = moveRuntime({ readBack: () => ({ result: 'success', message: { id: 77, type: 'stream', stream_id: 9, display_recipient: 'brand-new', subject: 'deploys' } }) });
+  try {
+    const result = await unnamed.tools.handleToolCall('move_messages', { message_id: 77, topic: 'deploys', scope: 'one' });
+    assert.equal(result.channelId, null, "the directory doesn't list stream 9 yet");
+    assert.equal(result.channel, 'brand-new');
+  } finally { rmSync(unnamed.dir, { recursive: true, force: true }); }
+  const plain = moveRuntime({ known: false });
+  try {
+    const result = await plain.tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+    assert.equal(result.channelId, 'zulip:ops');
+  } finally { rmSync(plain.dir, { recursive: true, force: true }); }
+});
+
+test('move_messages says the move was made when Zulip accepted it but the read back fails, claims no place, and gives the note whatever the call names', async () => {
+  const { tools, dir, calls } = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
+  try {
+    const result = await tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', stream: 'ops', scope: 'later' });
+    assert.deepEqual(Object.keys(result).sort(), ['asked', 'moved', 'note', 'readBackError'], 'a call that names a stream keeps its note');
+    assert.equal(result.moved, true);
+    assert.deepEqual(result.asked, { topic: 'renamed', stream: 'ops', scope: 'later' });
+    assert.match(result.readBackError, /Invalid message\(s\)/);
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.');
+    assert.deepEqual(calls.map((c) => c.method), ['PATCH', 'GET']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+  const unread = moveRuntime({ readBack: () => ({ result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' }) });
+  try {
+    const result = await unread.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.', 'a topic alone has the note too');
+  } finally { rmSync(unread.dir, { recursive: true, force: true }); }
+  for (const answer of [
+    { result: 'success' },
+    { result: 'success', message: { id: 77, type: 'stream', stream_id: 0, display_recipient: 'general', subject: 'renamed' } },
+    { result: 'success', message: { id: 77, type: 'stream', stream_id: 7, display_recipient: '', subject: 'renamed' } },
+  ]) {
+    const placeless = moveRuntime({ readBack: () => answer });
+    try {
+      const result = await placeless.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
+      assert.deepEqual(result, {
+        moved: true,
+        asked: { topic: 'renamed', scope: 'one' },
+        readBackError: "Zulip's answer gave no stream and topic for message 77.",
+        note: 'To answer this message where it is now, use send_message with reply_to.',
+      }, `an answer with no usable stream claims no place, and has the note: ${JSON.stringify(answer)}`);
+    } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
+  }
+});
+
+test('move_messages refuses a stream\'s former name with the send tools\' words, and asks Zulip nothing', async () => {
+  const { tools, dir, calls } = moveRuntime({ formerNames: { 'old-ops': 8 } });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'old-ops', scope: 'one' }), /Zulip stream #old-ops was renamed #ops\. Nothing went to Zulip\./);
+    assert.equal(calls.length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const known of [false, true]) {
+  test(`move_messages asks Zulip for a stream's id where the directory gives none (${known ? 'a name it lacks' : 'no MCPL'}), and passes on Zulip's refusal with the pointer to list_streams`, async () => {
+    const { tools, dir, calls } = moveRuntime({ known });
+    try {
+      if (!known) {
+        await tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' });
+        assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id', 'PATCH /messages/77', 'GET /messages/77']);
+        assert.deepEqual(calls[0].params, { stream: 'ops' });
+        assert.equal(calls[1].params.stream_id, 8);
+        calls.length = 0;
+      }
+      await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'nowhere', scope: 'one' }), (err: Error) => {
+        assert.match(err.message, /Invalid channel name 'nowhere'/);
+        assert.match(err.message, /list_streams gives each stream's name\.$/);
+        return true;
+      });
+      assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id'], 'nothing is moved');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('move_messages keeps a stream lookup that got no answer as it is, with no pointer to list_streams, and moves nothing', async () => {
+  const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => { throw new ZulipNoAnswer('timeout', 'GET', '/get_stream_id', false, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.'); } });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' }), (err: Error) => {
+      assert.ok(err instanceof ZulipNoAnswer, `${err.constructor.name}: ${err.message}`);
+      assert.equal(err.message, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.');
+      return true;
+    });
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('move_messages refuses a stream lookup whose answer gives no stream id, and moves nothing', async () => {
+  const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => ({ result: 'success' }) });
+  try {
+    await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', topic: 'there', scope: 'one' }), /Zulip's answer to looking up stream "ops" gave no stream id\./);
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id'], 'nothing is moved');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
