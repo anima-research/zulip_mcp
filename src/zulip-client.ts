@@ -5,7 +5,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
-import { httpTransport, LONG_TIMEOUT_MS, selfIdGate, zulipApi, type ZulipApi } from './zulip-api.js';
+import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, selfIdGate, zulipApi, type ZulipApi } from './zulip-api.js';
 import type { StreamDirectory } from './stream-directory.js';
 
 export interface ZulipSession {
@@ -73,7 +73,11 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
     const answer = await exchange.requestAnswer<{ api_key?: unknown }>("POST", "/fetch_api_key", { username: email, password });
-    apiKey = answer.result === "success" && typeof answer.api_key === "string" ? answer.api_key : "";
+    if (answer.result === "success" && typeof answer.api_key === "string" && answer.api_key !== "") apiKey = answer.api_key;
+    else {
+      const why = isRefusal(answer) ? `Zulip refused POST /fetch_api_key: ${refusalText(answer)}` : "Zulip's answer to POST /fetch_api_key held no API key";
+      console.error(`Failed to get an API key with ZULIP_PASSWORD: ${why}. The server has no API key for this run, so Zulip refuses each call that needs one.`);
+    }
   }
 
   realm = realm.replace(/\/+$/, "");
@@ -99,6 +103,9 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     const settings = await zulipApi(transport).requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS });
     const mib = settings.result === "success" ? settings.max_file_upload_size_mib : undefined;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
+    else if (isRefusal(settings)) {
+      console.error(`Failed to read realm server settings (upload cap): Zulip refused GET /server_settings: ${refusalText(settings)}.`);
+    }
   } catch (err) {
     console.error("Failed to read realm server settings (upload cap):", err);
   }
@@ -134,8 +141,12 @@ export async function subscribeConfigured(api: ZulipApi, directory: StreamDirect
     const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
       subscriptions: streams.map((name) => ({ name })),
     });
-    const subscribed = result.result === "success" ? result.subscribed ?? {} : {};
-    const already = result.result === "success" ? result.already_subscribed ?? {} : {};
+    if (isRefusal(result)) {
+      console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]: Zulip refused POST /users/me/subscriptions: ${refusalText(result)}`);
+      return;
+    }
+    const subscribed = result.subscribed ?? {};
+    const already = result.already_subscribed ?? {};
     console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
   } catch (err) {
     console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);

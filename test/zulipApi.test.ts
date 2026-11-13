@@ -4,7 +4,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
-import { initializeZulipClient } from '../src/zulip-client.ts';
+import { initializeZulipClient, subscribeConfigured } from '../src/zulip-client.ts';
+import type { StreamDirectory } from '../src/stream-directory.ts';
+import { standInApi } from './zulip-stand-in.ts';
 import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
 import { realm } from './http-realm.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
@@ -232,6 +234,86 @@ test('a password exchange that gets no JSON answer fails the start, and its erro
     );
     assert.equal(z.requests.filter((r) => r.path === '/fetch_api_key').length, 1);
   } finally { z.close(); }
+});
+
+async function startLogging(env: Record<string, string>) {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    return { session: await initializeZulipClient(env), lines };
+  } finally {
+    console.error = original;
+  }
+}
+
+test('a password exchange that Zulip refuses is logged with Zulip\'s words and the missing key, the start goes on, and no line shows the password', async () => {
+  const password = 'pw-that-must-not-show';
+  const z = await realm({
+    'POST /fetch_api_key': { status: 403, json: { result: 'error', msg: 'Your username or password is incorrect.', code: 'AUTHENTICATION_FAILED' } },
+  });
+  try {
+    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: password });
+    assert.equal(session.authHeader, '');
+    assert.ok(lines.includes('Failed to get an API key with ZULIP_PASSWORD: Zulip refused POST /fetch_api_key: Your username or password is incorrect. (AUTHENTICATION_FAILED). The server has no API key for this run, so Zulip refuses each call that needs one.'), lines.join('\n'));
+    assert.ok(lines.every((line) => !line.includes(password)));
+  } finally { z.close(); }
+});
+
+test('a refused read of the bot\'s profile, or of the realm\'s settings, is logged with Zulip\'s words, and the profile\'s line says that a later request reads it again', async () => {
+  const z = await realm({
+    'GET /users/me': { status: 429, json: { result: 'error', msg: 'API usage exceeded rate limit', code: 'RATE_LIMIT_HIT', 'retry-after': 0.2 } },
+    'GET /server_settings': { status: 400, json: { result: 'error', msg: 'Invalid subdomain', code: 'BAD_REQUEST' } },
+  });
+  try {
+    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+    assert.equal(session.selfUserId, null);
+    assert.equal(session.maxUploadBytes, null);
+    assert.ok(lines.includes('Failed to read the bot\'s own user id: Zulip answered GET /users/me with HTTP 429: API usage exceeded rate limit (RATE_LIMIT_HIT). A later request reads it again, and fails if that read does.'), lines.join('\n'));
+    assert.ok(lines.includes('Failed to read realm server settings (upload cap): Zulip refused GET /server_settings: Invalid subdomain (BAD_REQUEST).'), lines.join('\n'));
+  } finally { z.close(); }
+});
+
+test('a password exchange whose answer holds no API key, or an empty one, gets the same line', async () => {
+  for (const answer of [{ result: 'success' }, { result: 'success', api_key: '' }]) {
+    const z = await realm({ 'POST /fetch_api_key': { json: answer } });
+    try {
+      const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: 'pw' });
+      assert.equal(session.authHeader, '');
+      assert.ok(lines.includes("Failed to get an API key with ZULIP_PASSWORD: Zulip's answer to POST /fetch_api_key held no API key. The server has no API key for this run, so Zulip refuses each call that needs one."), lines.join('\n'));
+    } finally { z.close(); }
+  }
+});
+
+test('a profile answer with no user id, or a profile read with no answer, says that a later request reads it again', async () => {
+  const noId = await realm({ 'GET /users/me': { json: { result: 'success', email: 'bot@example.com' } } });
+  const unanswered = await realm({ 'GET /users/me': { html: '<html><body>502 Bad Gateway</body></html>', status: 502 } });
+  try {
+    for (const [z, why] of [
+      [noId, "Zulip's answer to GET /users/me (HTTP 200) held no user id"],
+      [unanswered, "Zulip's answer to GET /users/me wasn't JSON (HTTP 502)"],
+    ] as const) {
+      const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+      assert.equal(session.selfUserId, null);
+      assert.ok(lines.includes(`Failed to read the bot's own user id: ${why}. A later request reads it again, and fails if that read does.`), lines.join('\n'));
+    }
+  } finally { noId.close(); unanswered.close(); }
+});
+
+test('a ZULIP_SUBSCRIBE that Zulip refuses gets the failure line, with Zulip\'s words, and no success line', async () => {
+  const { api } = standInApi({
+    'POST /users/me/subscriptions': { result: 'error', msg: 'Not allowed for guest users', code: 'BAD_REQUEST' },
+  });
+  const directory = { whenListed: async () => {}, formerOf: () => undefined } as unknown as StreamDirectory;
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await subscribeConfigured(api, directory, 'general, dev');
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines, ['Zulip MCP auto-subscribe failed for [general, dev]: Zulip refused POST /users/me/subscriptions: Not allowed for guest users (BAD_REQUEST)']);
 });
 
 test('a call\'s own bound ends a real HTTP call at it, below the default', { timeout: 10_000 }, async () => {

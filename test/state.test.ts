@@ -40,3 +40,17 @@ test('chunkMessage splits long text at paragraph, then line, then hard boundarie
   assert.ok(chunks.every((c) => c.length <= ZULIP_MAX_MESSAGE_LENGTH));
   assert.equal(chunks.join('').replace(/\s/g, '').length, mixed.replace(/\s/g, '').length);
 });
+
+test('R3 (22): a hard cut never falls between the two halves of one character', () => {
+  const text = `a${'\u{1F600}'.repeat(60)}`;
+  for (const limit of [10, 11, 50, 100]) {
+    const chunks = chunkMessage(text, limit);
+    assert.equal(chunks.join(''), text, `limit ${limit}: nothing lost`);
+    for (const c of chunks) {
+      assert.ok(c.length <= limit, `limit ${limit}: a chunk past the limit`);
+      assert.ok(!/[\ud800-\udbff]$/.test(c), `limit ${limit}: a chunk ends in a high surrogate`);
+      assert.ok(!/^[\udc00-\udfff]/.test(c), `limit ${limit}: a chunk starts with a low surrogate`);
+    }
+  }
+  assert.deepEqual(chunkMessage('\u{1F600}\u{1F600}\u{1F600}', 1), ['\u{1F600}', '\u{1F600}', '\u{1F600}'], 'at limit 1, one character to a chunk');
+});

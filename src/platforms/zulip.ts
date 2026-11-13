@@ -37,7 +37,7 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
-import { NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
+import { namePosted, NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -780,19 +780,23 @@ export class ZulipAdapter implements PlatformAdapter {
       what = `message to #${streamName}`;
     }
 
+    const posted: number[] = [];
     try {
       const { chunks } = await sendMessage(this.api, destination, textContent, {
         limit: this.maxMessageLength,
         unlinkable: 'as-typed',
         ...(upload ? { upload } : {}),
-        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+        onChunk: (chunk) => {
+          posted.push(chunk.id);
+          this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content });
+        },
       });
       const messageIds = chunks.map((c) => String(c.id));
       return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
     } catch (err) {
       if (err instanceof NothingToSend) return { delivered: false };
-      if (err instanceof SendRefused) throw new ZulipRefused(what, err.answer);
-      throw err;
+      if (err instanceof SendRefused) throw namePosted(new ZulipRefused(what, err.answer), posted);
+      throw err instanceof Error ? namePosted(err, posted) : err;
     }
   }
 

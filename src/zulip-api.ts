@@ -56,6 +56,10 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
 }
 
+export function refusalText(answer: ZulipRefusal): string {
+  return answer.msg ? `${answer.msg}${answer.code ? ` (${answer.code})` : ''}` : answer.code ?? 'unknown error';
+}
+
 export class ZulipRefused extends Error {
   readonly code: string | undefined;
   readonly retryAfterSeconds: number | undefined;
@@ -103,10 +107,6 @@ export interface SelfIdGate {
   read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number } | null>;
 }
 
-function refusalWords(answer: ZulipRefusal): string {
-  return answer.msg ? `${answer.msg}${answer.code ? ` (${answer.code})` : ''}` : answer.code ?? 'unknown error';
-}
-
 export function selfIdGate(inner: Transport): SelfIdGate {
   let selfUserId: number | null = null;
   let refused = false;
@@ -127,7 +127,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
       return null;
     }
     const reason = isRefusal(body)
-      ? `Zulip answered GET /users/me with HTTP ${status}: ${refusalWords(body).replace(/\.+$/, '')}`
+      ? `Zulip answered GET /users/me with HTTP ${status}: ${refusalText(body).replace(/\.+$/, '')}`
       : `Zulip's answer to GET /users/me (HTTP ${status}) held no user id`;
     if (status >= 400 && status <= 499 && status !== 429) {
       refused = true;
