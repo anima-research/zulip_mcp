@@ -6066,6 +6066,32 @@ test('a try that fails after its read has waited 90 s tells every open channel o
   await h.close();
 });
 
+test('a read that waits while no channel is open tells a channel opened during the wait, at its next failed try', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ readRetryWait: waits.wait, now: () => clock.t, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 90_000 }, { ms: 90_000 }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the first wait');
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  await sentinelThrough(h, 1);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no channel was open at the first failed try');
+  waits.release();
+  await until(() => waits.asked.length === 2, 'the second wait');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(readWaitLines(h, 'history-waiting').map((m) => m.channelId), ['zulip:general']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(readWaitLines(h, 'history-answered').map((m) => m.channelId), ['zulip:general']);
+  await h.close();
+});
+
 for (const [label, narrowOther, narrowGeneral] of [
   ['muted', (f: ZulipFilters) => ({ ...f, mutedStreams: ['other'] }), (f: ZulipFilters) => ({ ...f, mutedStreams: ['general'] })],
   ['left out of the allowlist', (f: ZulipFilters) => ({ ...f, streams: ['general'] }), (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
