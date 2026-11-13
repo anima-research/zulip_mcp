@@ -848,8 +848,8 @@ test('a flush() batch on the wire counts for isIdle(), a timer that fires meanwh
   assert.equal(settled, false, 'idle() still waits');
   release();
   await flushed;
-  const deadline = Date.now() + 1000;
-  while (!settled && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  const deadline = performance.now() + 1000;
+  while (!settled && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(settled, true, 'idle() settles once both batches are sent');
   assert.equal(sends, 2);
   manager.destroy();
