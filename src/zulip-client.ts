@@ -26,6 +26,10 @@ export interface ZulipClientOptions {
   timeoutMs?: number;
 }
 
+function selfFilterOff(why: string): void {
+  console.error(`Failed to fetch bot profile for self-filter: ${why}. The self-filter is off for this run, so the bot's own messages come back to the agent.`);
+}
+
 function basic(email: string, apiKey: string): string {
   return "Basic " + Buffer.from(`${email}:${apiKey}`).toString("base64");
 }
@@ -96,9 +100,11 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     if (profile.result === "success" && typeof profile.user_id === "number") {
       selfUserId = profile.user_id;
       console.error(`Zulip MCP bot user_id: ${selfUserId}`);
+    } else {
+      selfFilterOff(isRefusal(profile) ? `Zulip refused GET /users/me: ${refusalText(profile)}` : "Zulip's answer to GET /users/me held no user id");
     }
   } catch (err) {
-    console.error("Failed to fetch bot profile for self-filter:", err);
+    selfFilterOff((err instanceof Error ? err.message : String(err)).replace(/\.+$/, ""));
   }
 
   // The realm's upload cap, so the outbound ceiling is what the server will
@@ -108,6 +114,9 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS });
     const mib = settings.result === "success" ? settings.max_file_upload_size_mib : undefined;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
+    else if (isRefusal(settings)) {
+      console.error(`Failed to read realm server settings (upload cap): Zulip refused GET /server_settings: ${refusalText(settings)}.`);
+    }
   } catch (err) {
     console.error("Failed to read realm server settings (upload cap):", err);
   }

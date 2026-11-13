@@ -341,6 +341,20 @@ test('a password exchange that Zulip refuses is logged with Zulip\'s words and t
   } finally { z.close(); }
 });
 
+test('a refused read of the bot\'s profile, or of the realm\'s settings, is logged with Zulip\'s words, and the profile\'s line says the self-filter is off', async () => {
+  const z = await realm({
+    'GET /users/me': { status: 429, json: { result: 'error', msg: 'API usage exceeded rate limit', code: 'RATE_LIMIT_HIT', 'retry-after': 0.2 } },
+    'GET /server_settings': { status: 400, json: { result: 'error', msg: 'Invalid subdomain', code: 'BAD_REQUEST' } },
+  });
+  try {
+    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+    assert.equal(session.selfUserId, null);
+    assert.equal(session.maxUploadBytes, null);
+    assert.ok(lines.includes('Failed to fetch bot profile for self-filter: Zulip refused GET /users/me: API usage exceeded rate limit (RATE_LIMIT_HIT). The self-filter is off for this run, so the bot\'s own messages come back to the agent.'), lines.join('\n'));
+    assert.ok(lines.includes('Failed to read realm server settings (upload cap): Zulip refused GET /server_settings: Invalid subdomain (BAD_REQUEST).'), lines.join('\n'));
+  } finally { z.close(); }
+});
+
 test('a password exchange whose answer holds no API key gets the same line', async () => {
   const z = await realm({ 'POST /fetch_api_key': { json: { result: 'success' } } });
   try {
@@ -348,6 +362,21 @@ test('a password exchange whose answer holds no API key gets the same line', asy
     assert.equal(session.authHeader, '');
     assert.ok(lines.includes("Failed to get an API key with ZULIP_PASSWORD: Zulip's answer to POST /fetch_api_key held no API key. The server has no API key for this run, so Zulip refuses each call that needs one."), lines.join('\n'));
   } finally { z.close(); }
+});
+
+test('a profile answer with no user id, or a profile read with no answer, says that the self-filter is off', async () => {
+  const noId = await realm({ 'GET /users/me': { json: { result: 'success', email: 'bot@example.com' } } });
+  const unanswered = await realm({ 'GET /users/me': { html: '<html><body>502 Bad Gateway</body></html>', status: 502 } });
+  try {
+    for (const [z, why] of [
+      [noId, "Zulip's answer to GET /users/me held no user id"],
+      [unanswered, "Zulip's answer to GET /users/me wasn't JSON (HTTP 502)"],
+    ] as const) {
+      const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+      assert.equal(session.selfUserId, null);
+      assert.ok(lines.includes(`Failed to fetch bot profile for self-filter: ${why}. The self-filter is off for this run, so the bot's own messages come back to the agent.`), lines.join('\n'));
+    }
+  } finally { noId.close(); unanswered.close(); }
 });
 
 test('a ZULIP_SUBSCRIBE that Zulip refuses gets the failure line, with Zulip\'s words, and no success line', async () => {
