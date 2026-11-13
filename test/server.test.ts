@@ -35,6 +35,7 @@ import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
+import { standInApi } from './zulip-stand-in.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
 // individual cases (including the multi-adapter saturation regression).
@@ -2250,16 +2251,16 @@ function quoteHistory(readableTarget = true): ZulipAdapter {
     ...original, id: 5, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
     content: '@_**Bot|100** [said](/#narrow/channel/7-general/near/2):\n\n```quote\noriginal\n```\nreply',
   };
-  return new ZulipAdapter({ messages: {
-    retrieve: async (q: { anchor: string | number; num_after: number; num_before: number }) => ({
+  return new ZulipAdapter(standInApi({
+    'GET /messages': async (q: { anchor: string | number; num_after: number; num_before: number }) => ({
       messages: q.num_after > 0 ? [original, reply].filter((m) => m.id > Number(q.anchor)) : [original, reply],
       found_newest: true,
     }),
-    getById: async () => {
+    'GET /messages/:id': async () => {
       if (!readableTarget) throw new Error('target unavailable');
       return { message: original };
     },
-  } }, 100, 'session');
+  }).api, 100, 'session');
 }
 
 test('a refused quote-reply push is redelivered from classified history when another stream is accepted', async () => {
@@ -2425,8 +2426,8 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
     } finally { await first.close(); }
     let gets = 0;
     const queries: ChannelHistoryQuery[] = [];
-    const history = new ZulipAdapter({ messages: {
-      retrieve: async (q: { narrow: [string, string][]; anchor: number; num_after: number }) => {
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async (q: { narrow: [string, string][]; anchor: number; num_after: number }) => {
         const stream = q.narrow[0][1];
         const offset = stream === 'general' ? 0 : 20;
         const rows = Array.from({ length: 12 }, (_, i): ZulipRawMessage => ({
@@ -2436,14 +2437,14 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
         })).filter((m) => m.id > q.anchor);
         return { messages: rows.slice(0, 3), found_newest: rows.length <= 3 };
       },
-      getById: async ({ message_id }: { message_id: number }) => {
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         return { message: {
           id: message_id, sender_id: 102, sender_full_name: 'Other', sender_email: 'other@example.invalid',
           display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', content: 'original',
         } };
       },
-    } }, 100, 'session');
+    }).api, 100, 'session');
     second = harness({ stateDir: dir, sessionId: 'budget' });
     second.adapter.visible.push(other);
     second.adapter.fetchHistory = (channelId, query) => {
@@ -2457,6 +2458,43 @@ test('a reconnect sweep gives each history page and channel its own quote-lookup
     assert.ok(queries.every((q) => !('lookupBudget' in q)));
     assert.equal(second.server.delivery.watermark('zulip:general'), 16);
     assert.equal(second.server.delivery.watermark(other.id), 36);
+  } finally {
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the reconnect catch-up and the missed-tally backfill wait 90 s for each history page, and channels/open\'s page keeps the default', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-recovery-bound-'));
+  let second: Harness | undefined;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'bound' });
+    try {
+      await initialize(first, true);
+      await settled(first);
+      first.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => first.server.delivery.watermark('zulip:general') === 1, 'the addressed message accepted');
+      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+      first.adapter.emit!(streamMsg(2));
+      await until(() => first.server.delivery.tally('zulip:general')?.talliedThrough === 2, 'ambient tally seeded');
+    } finally { await first.close(); }
+    const bounds: (number | undefined)[] = [];
+    const { api } = standInApi({ 'GET /messages': { result: 'success', messages: [], found_newest: true, found_oldest: true } });
+    const history = new ZulipAdapter({
+      ...api,
+      request: ((verb, path, what, params, opts) => {
+        if (path === '/messages') bounds.push(opts?.timeoutMs);
+        return api.request(verb, path, what, params, opts);
+      }) as typeof api.request,
+    }, 100, 'session');
+    second = harness({ stateDir: dir, sessionId: 'bound' });
+    second.adapter.fetchHistory = (channelId, query) => history.fetchHistory(channelId, query);
+    await initialize(second, true);
+    await settled(second);
+    assert.deepEqual(bounds, [90_000, 90_000], 'one catch-up page, then one backfill page');
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5 } });
+    assert.deepEqual(bounds, [90_000, 90_000, undefined], 'the page for channels/open takes the default bound');
   } finally {
     await second?.close();
     rmSync(dir, { recursive: true, force: true });
@@ -2712,13 +2750,13 @@ test('a budget-starved quote row is retried before catch-up advances past it', a
       display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream',
       content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`, flags: [],
     }));
-    const history = new ZulipAdapter({ messages: {
-      retrieve: async ({ anchor }: { anchor: number }) => ({ messages: rows.filter((m) => m.id > anchor), found_newest: true }),
-      getById: async ({ message_id }: { message_id: number }) => {
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async ({ anchor }: { anchor: number }) => ({ messages: rows.filter((m) => m.id > anchor), found_newest: true }),
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         return { message: { ...rows[0], id: message_id, sender_id: message_id === 508 ? 100 : 102 } };
       },
-    } }, 100, 'session');
+    }).api, 100, 'session');
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.server.delivery.watermark('zulip:general') === 10, 'immediate retry verifies and delivers row 10 without another gap');
@@ -2902,13 +2940,13 @@ test('R2-2: a timed-out quote target can answer on the single deferred pass', { 
       display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
       content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
     };
-    const history = new ZulipAdapter({ messages: {
-      retrieve: async () => ({ messages: [row], found_newest: true }),
-      getById: async () => {
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async () => ({ messages: [row], found_newest: true }),
+      'GET /messages/:id': async () => {
         if (++gets === 1) return new Promise(() => {});
         return { message: { ...row, id: 500, sender_id: 100 } };
       },
-    } }, 100, 'session');
+    }).api, 100, 'session');
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.server.delivery.watermark('zulip:general') === 5, 'timeout retried', 7000);
@@ -2935,17 +2973,17 @@ test('R2-2: many hung quote targets use at most two walks and six seconds of wai
       display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
       content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`,
     }));
-    const history = new ZulipAdapter({ messages: {
-      retrieve: async ({ anchor }: { anchor: number }) => {
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async ({ anchor }: { anchor: number }) => {
         walks++;
         return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
       },
-      getById: async () => {
+      'GET /messages/:id': async () => {
         gets++;
         if (cleaningUp) return { result: 'error' };
         return new Promise((resolve) => release.push(() => resolve({ result: 'error' })));
       },
-    } }, 100, 'session');
+    }).api, 100, 'session');
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     const started = performance.now();
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
@@ -2978,17 +3016,17 @@ test('R2-2: catch-up shares a total quote wait budget across history pages', asy
       display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
       content: `[said](/#narrow/near/${500 + i}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`,
     }));
-    const history = new ZulipAdapter({ messages: {
-      retrieve: async ({ anchor }: { anchor: number }) => {
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async ({ anchor }: { anchor: number }) => {
         const tail = rows.filter((m) => m.id > anchor);
         return { messages: tail.slice(0, 1), found_newest: tail.length <= 1 };
       },
-      getById: async ({ message_id }: { message_id: number }) => {
+      'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => {
         gets++;
         now += 1500;
         return { message: { ...rows[0], id: message_id, sender_id: 102 } };
       },
-    } }, 100, 'session');
+    }).api, 100, 'session');
     h.adapter.fetchHistory = history.fetchHistory.bind(history);
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.server.delivery.watermark('zulip:general') === 11, 'all pages scanned with bounded quote waiting');
@@ -3129,18 +3167,18 @@ for (const slowPart of ['history HTTP', 'prefix acceptance'] as const) {
         display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
         content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
       };
-      const history = new ZulipAdapter({ messages: {
-        retrieve: async ({ anchor }: { anchor: number }) => {
+      const history = new ZulipAdapter(standInApi({
+        'GET /messages': async ({ anchor }: { anchor: number }) => {
           if (slowPart === 'history HTTP') now += 3100;
           const rows = slowPart === 'prefix acceptance'
             ? [{ ...row, id: 2, content: 'explicit mention', flags: ['mentioned'] }, row] : [row];
           return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
         },
-        getById: async () => {
+        'GET /messages/:id': async () => {
           if (++gets === 1 && slowPart === 'prefix acceptance') return { result: 'error', code: 'RATE_LIMIT_HIT' };
           return { message: { ...row, id: 500, sender_id: 100 } };
         },
-      } }, 100, 'session');
+      }).api, 100, 'session');
       h.adapter.fetchHistory = history.fetchHistory.bind(history);
       const respond = h.host.sendResponse.bind(h.host);
       t.mock.method(h.host, 'sendResponse', (...args: Parameters<typeof h.host.sendResponse>) => {

@@ -41,10 +41,11 @@
   ],
   "dependencies": {
     "@animalabs/mcpl-core": "^0.3.0",
-    "sharp": "^0.33.5",
-    "zulip-js": "^2.1.0"
+    "ini": "^5.0.0",
+    "sharp": "^0.33.5"
   },
   "devDependencies": {
+    "@types/ini": "^4.1.1",
     "@types/node": "^22.10.1",
     "tsx": "^4.22.4",
     "typescript": "^7.0.2"

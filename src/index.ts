@@ -26,7 +26,7 @@
  *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
  *   ZULIP_ATTRIBUTE_DELIVERY                    - "false" delivers bare bodies; default renders
  *                                                 "[time id=N] [#stream > topic] Author: " into each
- *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split (10000)
+ *   ZULIP_MAX_MESSAGE_LENGTH                    - the realm's max message length; longer sends are split, longer edits refused (10000)
  *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
  *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
  *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
@@ -112,16 +112,17 @@ async function main(): Promise<void> {
   }
   // One line-time formatter for every surface (and one warning for a bad AGENT_TIMEZONE).
   const formatTime = agentLineTimeFormatter();
-  const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+  const maxMessageLength = process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined;
+  const adapter = new ZulipAdapter(session.api, session.selfUserId, session.sessionId, {
     formatTime,
     uploader,
     uploadPolicy,
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
-    maxMessageLength: process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000) : undefined,
+    maxMessageLength,
   });
-  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime });
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });

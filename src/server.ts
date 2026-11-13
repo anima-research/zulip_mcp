@@ -57,6 +57,7 @@ import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewO
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
+import { LONG_TIMEOUT_MS } from './zulip-api.js';
 import type { FiltersPlane } from './filters.js';
 import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
 import type { AttachmentRef } from './content.js';
@@ -1234,7 +1235,7 @@ export class ZulipMcplServer {
     let complete = false;
     while (out.length < this.catchupLimit) {
       const want = this.catchupLimit - out.length;
-      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget });
+      const page = await this.adapter.fetchHistory!(channelId, { limit: want, afterMessageId: String(cursor), quoteLookupBudget, timeoutMs: LONG_TIMEOUT_MS });
       if (page.scannedThrough === null) {
         complete = true;
         break;

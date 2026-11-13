@@ -1,9 +1,4 @@
 /**
- * Outbound attachments — uploading files to Zulip so a message can carry
- * them. zulip-js has no upload surface, so this goes straight at
- * `POST /api/v1/user_uploads` with the bot's credentials, the same realm +
- * Basic-auth pair the fetch side uses.
- *
  * Zulip attaches a file to a message by markdown link: the upload returns a
  * `/user_uploads/...` path and the message body links to it. Images so
  * linked get a preview in the web client automatically.
@@ -129,13 +124,6 @@ export function isValidMimeType(value: string): boolean {
   return MIME_RE.test(value);
 }
 
-/**
- * A multipart/form-data body, built by hand. zulip-js drags in
- * isomorphic-form-data, which replaces the global `FormData` with a
- * stream-based one that cannot take a Blob — so neither the WHATWG form
- * nor that one is safe to rely on. A Buffer body works under every fetch.
- * The header fields are re-sanitised here so no caller can inject a line.
- */
 export function multipartBody(input: UploadInput, boundary: string): Buffer {
   const name = input.name.replace(/["\r\n]/g, '_');
   const type = bareMimeType(input.mimeType) ?? 'application/octet-stream';
