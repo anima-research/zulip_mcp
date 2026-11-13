@@ -9,7 +9,7 @@ import { ZulipToolRuntime, stripSuppressedReactions } from '../src/tool-runtime.
 import { toolDefinitions } from '../src/tools.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
 import { LOCAL_FILES_SUPPORTED, type UploadPolicy } from '../src/uploads.ts';
-import { httpTransport, zulipApi, type ZulipApi } from '../src/zulip-api.ts';
+import { httpTransport, zulipApi, ZulipNoAnswer, type ZulipApi } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
 
 function runtime(api: ZulipApi): { tools: ZulipToolRuntime; dir: string } {
@@ -722,3 +722,98 @@ for (const field of ['to', 'type']) {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+function topicsRuntime() {
+  const topics = [{ name: 'four', max_id: 40 }, { name: 'three', max_id: 30 }, { name: 'two', max_id: 20 }, { name: 'one', max_id: 10 }];
+  const { api, calls } = standInApi({
+    'GET /get_stream_id': async ({ stream }: Record<string, unknown>) => {
+      if (stream === 'unreachable') throw new ZulipNoAnswer('network', 'GET', '/get_stream_id', false, "Couldn't reach Zulip for GET /get_stream_id (ECONNREFUSED).");
+      return stream === 'deploys'
+        ? { result: 'success', stream_id: 12 }
+        : { result: 'error', code: 'BAD_REQUEST', msg: `Invalid channel name '${String(stream)}'` };
+    },
+    'GET /users/me/12/topics': { result: 'success', topics },
+  });
+  return { ...runtime(api), calls, topics };
+}
+
+test('get_stream_topics takes the stream by name, and asks Zulip for its id once', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    const result = await tools.handleToolCall('get_stream_topics', { stream: 'deploys' }) as { topic_count: number; formatted_list: string };
+    assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id', 'GET /users/me/12/topics']);
+    assert.deepEqual(calls[0].params, { stream: 'deploys' });
+    assert.equal(result.topic_count, 4);
+    assert.deepEqual([...result.formatted_list.matchAll(/\*\*(\w+)\*\* \(latest/g)].map((m) => m[1]), ['four', 'three', 'two', 'one']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics with a limit lists the newest topics in Zulip\'s order, and counts them all', async () => {
+  const { tools, dir, topics } = topicsRuntime();
+  try {
+    const result = await tools.handleToolCall('get_stream_topics', { stream_id: 12, limit: 2, verbose: true }) as { topic_count: number; formatted_list: string; raw_data: unknown };
+    assert.equal(result.topic_count, 4);
+    assert.equal(result.formatted_list, '📑 **4 Topics, the newest 2 shown**\n\n1. **four** (latest msg: 40)\n2. **three** (latest msg: 30)');
+    assert.deepEqual(result.raw_data, { result: 'success', topics });
+    for (const limit of [4, 5, 2 ** 53]) {
+      const uncut = await tools.handleToolCall('get_stream_topics', { stream_id: 12, limit }) as { formatted_list: string };
+      assert.match(uncut.formatted_list, /^📑 \*\*4 Topics\*\*\n/, `limit ${limit}`);
+      assert.equal([...uncut.formatted_list.matchAll(/\(latest/g)].length, 4, `limit ${limit}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics with stream_id and no limit returns what it returned before', async () => {
+  const { tools, dir, topics } = topicsRuntime();
+  try {
+    const verbose = await tools.handleToolCall('get_stream_topics', { stream_id: 12, verbose: true }) as { raw_data: unknown };
+    assert.deepEqual(verbose.raw_data, { result: 'success', topics });
+    const asDigits = await tools.handleToolCall('get_stream_topics', { stream_id: '12' }) as { topic_count: number };
+    assert.equal(asDigits.topic_count, 4);
+    assert.deepEqual(await tools.handleToolCall('get_stream_topics', { stream_id: 12 }), {
+      topic_count: 4,
+      formatted_list: '📑 **4 Topics**\n\n1. **four** (latest msg: 40)\n2. **three** (latest msg: 30)\n3. **two** (latest msg: 20)\n4. **one** (latest msg: 10)',
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics refuses neither or both of stream and stream_id, and a limit that is not a positive integer, before asking Zulip', async () => {
+  const { tools, dir, calls } = topicsRuntime();
+  try {
+    for (const args of [{}, { stream: 'deploys', stream_id: 12 }]) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', args), (err: Error) => {
+        assert.match(err.message, /stream_id/);
+        assert.match(err.message.replaceAll('stream_id', ''), /\bstream\b/);
+        return true;
+      }, JSON.stringify(args));
+    }
+    for (const limit of [0, -1, 1.5, '2']) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream_id: 12, limit }), /limit/, `limit ${String(limit)}`);
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'deploys', limit }), /limit/, `by name, limit ${String(limit)}`);
+    }
+    for (const stream of [123, '', ['deploys']]) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream }), /stream/, `stream ${JSON.stringify(stream)}`);
+    }
+    for (const stream_id of [0, 1.5, 'abc', '12/../../messages', ' 12']) {
+      await assert.rejects(tools.handleToolCall('get_stream_topics', { stream_id }), /stream_id/, `stream_id ${JSON.stringify(stream_id)}`);
+    }
+    assert.equal(calls.length, 0, 'Zulip was never asked');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('get_stream_topics for a name no stream has gives Zulip\'s refusal, with the name', async () => {
+  const { tools, dir } = topicsRuntime();
+  try {
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'nowhere' }), (err: Error) => {
+      assert.match(err.message, /^Zulip refused/);
+      assert.match(err.message, /Invalid channel name 'nowhere'/);
+      assert.match(err.message, /list_streams/);
+      return true;
+    });
+    await assert.rejects(tools.handleToolCall('get_stream_topics', { stream: 'unreachable' }), (err: Error) => {
+      assert.ok(err instanceof ZulipNoAnswer, 'a lookup with no answer keeps its own error');
+      assert.doesNotMatch(err.message, /list_streams/);
+      return true;
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

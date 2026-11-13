@@ -170,7 +170,7 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         topic: {
           type: "string",
-          description: "Required for a stream message without reply_to. With reply_to on a stream message, optional: it sends to that message's stream in this topic.",
+          description: "Required for a stream message without reply_to. With reply_to on a stream message, optional: it sends to that message's stream in this topic. To see a stream's recent topics first, call get_stream_topics.",
         },
         reply_to: {
           type: "integer",
@@ -309,13 +309,22 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "get_stream_topics",
-    description: "Get all topics in a specific stream",
+    description: "List a stream's topics, newest first.",
     inputSchema: {
       type: "object",
       properties: {
+        stream: {
+          type: "string",
+          description: "The stream's name. Give this or stream_id.",
+        },
         stream_id: {
           type: "number",
-          description: "ID of the stream",
+          description: "The stream's ID. Give this or stream.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Only the newest N topics.",
         },
         verbose: {
           type: "boolean",
@@ -323,7 +332,6 @@ export const toolDefinitions: ToolDefinition[] = [
           default: false,
         },
       },
-      required: ["stream_id"],
     },
   },
   {
