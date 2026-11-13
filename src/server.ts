@@ -1865,7 +1865,13 @@ export class ZulipMcplServer {
     const below = () => this.firstWaiting(key) - 1;
     if (place === undefined || below() <= place) return;
     if (!this.channelManager.isKeyOpen(key)) {
-      return this.readCatchUp(r, key, { keepAll: false, after: place, through: below, answers: gap?.answers, ceiling, fill: true });
+      const catchUp = await this.readCatchUp(r, key, { keepAll: false, after: place, through: below, answers: gap?.answers, ceiling, fill: true });
+      const backfill = !r.ended && this.delivery.tally(key) ? await this.readBackfill(r, key) : undefined;
+      if (!catchUp && !backfill) return;
+      return async (ctx) => {
+        await catchUp?.(ctx);
+        if (!ctx.ended) await backfill?.(ctx);
+      };
     }
     let fetched: HistoryRead;
     const bound = below();

@@ -1872,6 +1872,32 @@ scenario('76. while the host holds a renamed stream\'s old id, a reply to a mess
   } finally { await run.close(); }
 });
 
+scenario('78. a closed channel counts the ambient messages that a break of the event queue brought it, also when a live ambient message comes after the break', async (dir) => {
+  const r = realm({ 19: 'dev', 20: 'other' });
+  writeFilters(dir, {});
+  const first = await start(r, dir);
+  const gapNotice = () => first.incoming.some((m) => JSON.stringify(m).includes('recoveredMessages'));
+  try {
+    await first.open('zulip:other');
+    await first.open('zulip:dev');
+    const seen = r.post(19, 'seen while open');
+    await until(() => arrivedOn(first, seen) !== null, 'the message while open');
+    await deliveriesSettled(first);
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:dev' });
+    r.gap(() => { r.post(19, 'ambient in dev during the break'); });
+    await until(gapNotice, 'the gap notice on zulip:other');
+    await deliveriesSettled(first);
+    assert.equal(await missedOn(first, 'zulip:dev'), 1, 'the break\'s ambient message is counted');
+    r.post(19, 'ambient in dev after the break');
+    await untilAsync(async () => (await missedOn(first, 'zulip:dev')) === 2, 'the live ambient message counted too');
+  } finally { await first.end(); }
+  const second = await start(r, dir, { reuse: first });
+  try {
+    await deliveriesSettled(second);
+    assert.equal(await missedOn(second, 'zulip:dev'), 2, 'each counted once, at the next connection too');
+  } finally { await second.close(); }
+});
+
 scenario('79. an open stream removed, its removal answered, and the stream back: the host has it closed, so its ambient messages are counted, and its next catch-up holds addressed messages only', async (dir) => {
   const r = realm({ 17: 'general', 18: 'random' });
   writeFilters(dir, {});
