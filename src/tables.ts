@@ -41,10 +41,8 @@ const RE_CODE_PIPES = /(\\\\)|(\\`+)|(`+)|(\\\|)|(\|)/g;
 const RE_END_BORDER = /(?<!\\)(?:\\\\)*\|$/;
 
 /**
- * TableProcessor.test for the block of lines `from` to `to`, reading only
- * the lines it needs. It checks the delimiter row before a one-column
- * table's rows, which gives the same answer. `nextUnbordered` gives, for
- * each line, the next line at or after it with no pipe at either end.
+ * TableProcessor.test for the block of lines `from` to `to`. It checks the
+ * delimiter row before a one-column table's rows, which gives the same answer.
  */
 function isTable(lines: string[], from: number, to: number, nextUnbordered: number[]): boolean {
   if (to - from < 2) return false;

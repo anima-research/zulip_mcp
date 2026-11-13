@@ -92,8 +92,8 @@ test('extractZulipAttachments: trailing punctuation in markdown links is not con
   assert.equal(refs[0].path, '/user_uploads/1/a.png');
 });
 
-// Raw markdown path (apply_markdown:false): history, backscroll and wake text.
-// Nothing here is HTML, so angle brackets are the author's own text (#24).
+// Raw markdown (apply_markdown:false): nothing here is HTML, so angle
+// brackets are the author's own text (#24).
 test('cleanMarkdown: XML inside a fenced block survives untouched', () => {
   const raw = 'new mapping:\n```\n<tag_mapping>\n  <tag fix="6001" field="PERSIST_STR"/>\n</tag_mapping>\n```';
   assert.equal(cleanMarkdown(raw), raw);

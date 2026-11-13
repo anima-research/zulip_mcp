@@ -36,8 +36,7 @@ password="contract-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 docker compose exec -T -u zulip zulip /home/zulip/deployments/current/manage.py \
   create_realm 'Contract Realm' "$human" 'Contract Human' --password "$password" >&2
 
-# Calls Zulip's API; the image's certificate is self-signed. Each call's
-# stdout is captured, so a failed call's answer goes to stderr.
+# The image's certificate is self-signed.
 api() {
   local answer
   if answer=$(curl -sS --fail-with-body --insecure "$@"); then

@@ -79,7 +79,6 @@ interface MessageToken {
  * block processors take a block, in their order: an indented start (code,
  * whose backticks open no span), a heading, a table (each row apart), a
  * rule. What is left is a paragraph, a list (each item apart) or a quote.
- * Each run is the lines from its first to before its second number.
  */
 function inlineRuns(
   from: number,

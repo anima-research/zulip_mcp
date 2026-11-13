@@ -1,17 +1,11 @@
 /**
- * Zulip Event Loop — Real-time message delivery via long-polling.
- *
- * Registers an event queue for message, reaction, edit and delete events,
- * polls for them (stream messages and direct messages alike), and routes
- * each kind through its callback. Handles queue expiry recovery and
- * graceful shutdown.
- *
  * Zulip offers no gap recovery for a dead queue (code BAD_EVENT_QUEUE_ID):
  * events between the last delivered message and re-registration are lost.
  * An event id is local to its queue, and means nothing to the new queue or to
  * the messages API, so a gap is anchored on the last delivered message's id
  * and time.
- * Zulip answers a long poll with a heartbeat at least every 45 s.
+ * Zulip answers a long poll that has no event with a heartbeat after 45 to
+ * 55 s.
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
@@ -33,8 +27,7 @@ export interface ZulipEventMessage {
 }
 
 /** `flags` are the receiving user's message flags from the event envelope
- * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
- * `streamName` is null for direct messages. */
+ * (e.g. 'mentioned', 'wildcard_mentioned'), computed server-side by Zulip. */
 export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
 
 /** A `reaction` event as the queue delivers it. */
@@ -51,12 +44,11 @@ export interface ZulipReactionEvent {
 export type OnZulipReaction = (event: ZulipReactionEvent) => void;
 
 /**
- * An `update_message` event as the queue delivers it — the fields this loop
- * reads. Zulip sends `orig_content`/`content` only when the content changed,
- * `orig_subject`/`subject` only when the topic changed, and `new_stream_id`
- * only when the message moved to another stream. `rendering_only` marks a
- * re-render (a link preview arriving, an inline image resolving) that
- * changed nothing the author wrote.
+ * Zulip sends `orig_content` only when the content changed, and `content`
+ * then and on a re-render that changed nothing the author wrote, such as a
+ * link preview arriving (`rendering_only`). It sends `subject` only when the
+ * topic changed, `orig_subject` with every move, and `new_stream_id` only
+ * when the message moved to another stream.
  */
 export interface ZulipUpdateMessageEvent {
   message_id: number;
@@ -89,6 +81,8 @@ export interface ZulipDeleteMessageEvent {
   topic?: string;
 }
 
+type UnixSeconds = number;
+
 /** A change to an existing message, as the loop forwards it. */
 export type ZulipMessageChange =
   | {
@@ -97,12 +91,11 @@ export type ZulipMessageChange =
       messageIds: number[];
       actorId: number | null;
       /** Unix seconds. */
-      editedAt: number;
+      editedAt: UnixSeconds;
       /** New raw content; null when only the topic or stream changed. */
       content: string | null;
       origContent: string | null;
-          /** New topic; null when the topic name did not change (Zulip omits
-       *  `subject` for a stream-only move but still sends `orig_subject`). */
+      /** Zulip omits `subject` for a stream-only move but still sends `orig_subject`. */
       topic: string | null;
       /** The topic before any move (topic or stream); null for a content edit. */
       origTopic: string | null;
@@ -248,11 +241,7 @@ export class ZulipEventLoop {
       client_capabilities: { notification_settings_null: false, bulk_message_deletion: true },
     }, { needsSelfId: false });
 
-    // A refused registration comes back as a value, not a throw. Without
-    // this check the loop went on polling queue "undefined" and logged only
-    // "returned no events array" — every event lost, the cause invisible.
-    // Throwing hands it to the outer loop: logged with Zulip's reason and
-    // retried after its pause.
+    // A refused registration comes back as a value, not a throw.
     if (isRefusal(registration) || typeof registration.queue_id !== 'string') {
       const refusal = isRefusal(registration) ? registration : undefined;
       throw new Error(
@@ -428,11 +417,8 @@ export class ZulipEventLoop {
             const isStream = msg.type === 'stream' && streamName !== null;
             const isDm = msg.type === 'private';
             if (isStream || isDm) {
-              // A throwing onMessage is a handler bug, not a poll failure —
-              // isolate it so it neither aborts the rest of the batch nor
-              // inflates consecutiveFailures toward a bogus 'degraded' marker.
-              // The event is already acked (lastEventId advanced); Zulip won't
-              // redeliver it, so we log and move on (at-most-once).
+              // Zulip won't redeliver an event once the next poll acknowledges
+              // it, so a handler failure is logged, not retried (at-most-once).
               try {
                 onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {

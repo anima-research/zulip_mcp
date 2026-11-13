@@ -31,8 +31,9 @@ test('accepts a valid configured zone without warning', () => {
 test('invalid AGENT_TIMEZONE falls back loudly instead of throwing at import', () => {
   const systemDefault = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   const warnings = capturing(() => {
-    // Must not throw — a throw here kills the stdio child before the MCPL
-    // handshake, and a dead subprocess is never respawned by reconnect.
+    // Must not throw: a throw here kills the stdio child before the MCPL
+    // handshake, and a host respawns a dead child only when it is configured
+    // to reconnect.
     assert.equal(resolveAgentTimeZone('Amrica/New_York'), systemDefault);
   });
   assert.equal(warnings.length, 1);

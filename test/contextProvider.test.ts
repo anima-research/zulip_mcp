@@ -1,10 +1,8 @@
 /**
- * ContextProvider — SPEC 0.5 §6.5, §6.7, §10.1, §10.4, §10.8.
- *
  * This server is the write-without-read shape of §10.1: it injects channel
  * history and never reads `userMessage`, so it declares `inject.beforeUser`
- * and not `observe`. The hook is still invoked — withholding the call would
- * deny injection along with observation — and the params simply go unread.
+ * and not `observe`. The hook is still invoked (withholding the call would
+ * deny injection along with observation), and the params go unread.
  */
 
 import test from 'node:test';

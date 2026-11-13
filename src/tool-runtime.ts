@@ -253,10 +253,8 @@ export class ZulipToolRuntime {
   onDeleted: ((messageId: string) => void) | null = null;
   onDeleteFailed: ((messageId: string) => void) | null = null;
 
-  /** Set by the MCPL server: streams `listen` just subscribed the bot to, so
-   *  they can be registered without waiting for a refresh or an event (#20).
-   *  Awaited, and its result is reported by `listen`: an announcement the
-   *  host did not confirm is the agent's business, not a stderr line. */
+  /** Streams `listen` just subscribed the bot to, so they can be registered
+   *  without waiting for a refresh or an event (#20). */
   onSubscribed: ((streams: string[]) => SubscriptionRegistration | Promise<SubscriptionRegistration | void> | void) | null = null;
 
   channelIds: ChannelIds | null = null;
@@ -908,7 +906,7 @@ export class ZulipToolRuntime {
 
       case "delete_message": {
         // Noted before the call: the delete event can arrive before the
-        // response does. Un-noted once the delete surely failed: nothing will echo.
+        // response does.
         const messageId = positiveIdArg("message_id", args.message_id);
         this.onDeleted?.(String(args.message_id));
         try {

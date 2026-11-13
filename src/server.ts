@@ -265,8 +265,7 @@ export class ZulipMcplServer {
     const manifest = buildServerCapabilities({ typing: typeof adapter.sendTyping === 'function' });
 
     // The manifest is what `initialize` presents (§5.1) and what `mcpl/manifest`
-    // returns (§17.4). Building it through the tracker stamps the canonical
-    // content digest (§17.2) onto the same snapshot both paths serve.
+    // returns (§17.4).
     this.manifestTracker = new ManifestTracker(manifest);
 
     // The effective capability grant for this connection (§5.4). It starts
@@ -611,8 +610,7 @@ export class ZulipMcplServer {
     conn.sendResponse(msg.request.id, result);
 
     // The client's `notifications/initialized` (or, from a lax client, its
-    // first request) follows. Anything that is not the initialized
-    // notification is handed to the main loop untouched.
+    // first request) follows.
     if (!this.mcplActive && !this.directory.isFilled && this.adapter.refreshStreams) {
       void this.adapter.refreshStreams('a client without MCPL', true).then(() => {
         if (!this.directory.isFilled) this.directory.listUnanswered();
@@ -729,8 +727,8 @@ export class ZulipMcplServer {
           this.requireMcpl();
           const publish = params as unknown as ChannelsPublishParams;
           // No checkpoint is minted here: the publish result has no field to
-          // carry one (§14.6), so a host can only learn checkpoints from tool
-          // results — see callTool.
+          // carry one (§14.3), so a host can only learn checkpoints from tool
+          // results.
           const result = await this.channelManager.publish(publish);
           conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) });
           break;
@@ -797,7 +795,7 @@ export class ZulipMcplServer {
           break;
 
         case method.FEATURE_SETS_UPDATE:
-          // §6.7 Notification form: descriptive metadata only. Grant-bearing
+          // §6.7 Notification form: only `disabled` reductions apply. Grant-bearing
           // updates (including the §5.3 initial policy) arrive as a Request.
           if (this.mcplActive) {
             this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'notification');
@@ -963,8 +961,7 @@ export class ZulipMcplServer {
   }
 
   private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
-    // As with open: the host named a channel, so it has it. agent-framework
-    // reconciles a channel it does not want with `channels/close`.
+    // agent-framework reconciles a channel it does not want with `channels/close`.
     this.channelManager.confirmAnnounced(params.channelId);
     return this.channelManager.closeChannel(params);
   }
@@ -1162,18 +1159,15 @@ export class ZulipMcplServer {
       return this.letGo(ctx.w, key, id);
     }
 
-    // §6.7: a disabled zulip.messaging stops its traffic at once — incoming
-    // and push alike. Held, not let go: the host asked not to hear it now,
-    // which is not the same as having heard it.
+    // §6.7: a disabled zulip.messaging stops its traffic at once, incoming
+    // and push alike.
     if (!this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
       ctx.decide(id);
       return ctx.w.delivery.hold(key, id, 'failed');
     }
 
-    // A channel the host has never seen — a DM from someone new, or a stream
-    // the bot was added to after startup (#20): make it a registered channel
-    // first, so the host can open it and route a reply back to it. The
-    // message that arrived is itself the proof that the channel is reachable.
+    // A channel the host has never seen (#20) is registered first, so the host
+    // can open it and route a reply back to it.
     if (newChannel && this.ids.heldIdOf(key) === undefined) {
       void this.channelManager.registerAdditional([newChannel]);
       const entryId = numericId(message);
@@ -1193,10 +1187,8 @@ export class ZulipMcplServer {
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
-    // Who said it, where and when, in the body the model reads. The
-    // structured fields stay; this is what a host that renders only the
-    // content blocks shows the model (the Discord surface does the same).
-    // The missed tally below counts the body as written, not the header.
+    // A host that renders only the content blocks shows the model only the
+    // body, so who said it, where and when go into it.
     const bodyText = viewOf(message).text;
     message = this.attributed(message);
 
@@ -1353,11 +1345,9 @@ export class ZulipMcplServer {
   }
 
   /**
-   * Addressed message on a closed channel → push/event. Requires the
-   * `pushEvents` capability and an active zulip.messaging. The origin carries
-   * the MCPL channel id (what the host registers and routes replies to) and
-   * the missed-ambient tally, so the host's closed-channel invitation can
-   * show what staying out has cost.
+   * Requires the `pushEvents` capability and an active zulip.messaging. The
+   * origin carries the MCPL channel id, which the host registers and routes
+   * replies to.
    */
   private async pushEvent(message: KeyedMessage, eventId: string, extraOrigin: Record<string, unknown> = {}, beforeOffer?: () => void): Promise<boolean> {
     const conn = this.conn;
@@ -1693,14 +1683,8 @@ export class ZulipMcplServer {
   }
 
   /**
-   * A Zulip event queue died and its replacement starts from "now". Each
-   * channel's lane offers again what it holds, then reads the hole from
-   * history, from its place up to the first message that waits in it, and
-   * the gap marker follows on each open channel once every lane's read has
-   * handed what it read or waits to try again, so the agent gets the
-   * messages, not advice to go looking for them: open channels get them as
-   * recovered messages; every other watermarked channel gets its addressed
-   * messages as a `<missed>` push, as after a restart.
+   * A Zulip event queue's replacement starts from "now", so each channel's
+   * lane reads the hole from history.
    */
   private onSystemEvent(event: PlatformSystemEvent): void {
     const lanes = this.lanes;
@@ -2156,10 +2140,9 @@ export class ZulipMcplServer {
   }
 
   /**
-   * Execute a tool for `tools/call`. In MCPL mode the tool surface is gated:
-   * `tools` must be in the effective grant (§14.1 / §6.2), and a tool owned
-   * by a feature set the host disabled is unavailable with it (§6.7). Plain
-   * MCP clients are not subject to a grant — there is none to consult.
+   * In MCPL mode `tools` must be in the effective grant (§14.1 / §6.2), and a
+   * tool owned by a feature set the host disabled is unavailable with it
+   * (§6.7). Plain MCP clients have no grant to consult.
    */
   private async callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
     if (this.mcplActive) {
@@ -2176,11 +2159,7 @@ export class ZulipMcplServer {
       const own = await this.serverTool(name, args);
       const result = toToolCallResult(own !== undefined ? own : await this.tools.handleToolCall(name, args));
       // §8: a tool of the rollback-capable feature set mints a checkpoint and
-      // hands it back in `state`, which is the only way a host ever learns
-      // one. A rollback to this checkpoint undoes every send made after it
-      // (this tool's own send is before it, on the record). Error results
-      // carry none. A part that a failed send posted is on the record all
-      // the same, so a rollback to an earlier checkpoint undoes it.
+      // hands it back in `state`, the only way a host ever learns one.
       if (this.mcplActive && featureSetForTool(name) === MESSAGING_FEATURE_SET) {
         const checkpoint = this.stateTracker.createCheckpoint();
         const parent = this.stateTracker.getCheckpointState()?.parent ?? null;

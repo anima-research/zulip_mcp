@@ -36,11 +36,9 @@ export interface SentRecord {
 export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
 
 /**
- * Routing hints for outgoing messages, derived by the MCPL layer from the
- * newest message ChannelManager.noteConversation took on the target channel
- * (its comment says which messages those are). The host's channels/publish
- * carries no thread information, so "reply where the conversation is" is
- * reconstructed server-side: Zulip maps threadId to a topic.
+ * `channels/publish` carries no thread information (SPEC 0.5 §14.3), so "reply
+ * where the conversation is" is reconstructed server-side: Zulip maps threadId
+ * to a topic.
  */
 export interface RoutingHints {
   /** threadId of that message, if any. */
@@ -94,9 +92,8 @@ export interface ReactionEvent {
   messageId: string;
   /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
   emoji: string;
-  /** The platform's code for the emoji (Zulip: codepoints for unicode emoji,
-   *  the realm emoji id otherwise) — what a glyph-shaped suppression entry
-   *  is matched against. */
+  /** Zulip's `emoji_code`: a unicode emoji's codepoints, a custom emoji's id, or
+   *  the name of one of Zulip's own extra emoji. */
   emojiCode?: string;
   /** Zulip: 'unicode_emoji' | 'realm_emoji' | 'zulip_extra_emoji'. */
   emojiType?: string;
@@ -159,10 +156,8 @@ export interface MessageChangeEvent {
   /** True only for a resolved verdict (including content with no quote targets). */
   replyToSelfVerified?: boolean;
   previouslyReplyToSelf?: boolean | null;
-  /** The bot was mentioned in the message as it read before the change, as
-   *  far as the adapter knows (a deleted message keeps its last verdict);
-   *  null when the message was not in the adapter's cache and only its
-   *  post-change state could be read. */
+  /** null when the message was not in the adapter's cache: a GET reads only
+   *  the post-change state. */
   previouslyMentioned: boolean | null;
   /** A deletion event for a message that had just moved to a stream the bot
    *  cannot see: Zulip reports lost visibility as a deletion. */
@@ -272,10 +267,9 @@ export interface PlatformAdapter {
   fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
-   * Make sure the platform delivers events for this channel. Without a
-   * subscription, a public stream's edits and reactions come only for
-   * messages that mention the bot, and a private stream sends at most the
-   * messages that mention it. Optional; idempotent.
+   * Without a subscription, a public stream's edits and reactions come only
+   * for messages that mention the bot, and a private stream sends at most the
+   * messages that mention it.
    */
   ensureSubscribed?(key: ChannelKey): Promise<void>;
 

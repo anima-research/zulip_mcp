@@ -3516,8 +3516,7 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
     (await h.host.sendRequest('tools/call', { name, arguments: args })) as { isError?: boolean; state?: { featureSet: string; checkpoint: string; parent: string | null } };
 
   await publish('one');
-  // The only way a host learns a checkpoint is a tool result's `state` (§8):
-  // a messaging tool mints one after its own send is on the record.
+  // The only way a host learns a checkpoint is a tool result's `state` (§8).
   const sent = await call('send_message', { content: 'via tool' });
   assert.equal(sent.state?.featureSet, 'zulip.messaging');
   assert.match(sent.state!.checkpoint, /^chk_/);
@@ -4402,7 +4401,8 @@ test('catch-up pages past a page holding nothing but the bot\'s own messages', a
   const realFetch = h.adapter.fetchHistory!.bind(h.adapter);
   h.adapter.fetchHistory = async (channelId, query) => {
     const page = await realFetch(channelId, query);
-    return { ...page, messages: page.messages.filter((m) => Number(m.messageId) > 102) };
+    const lastWithheldId = 102;
+    return { ...page, messages: page.messages.filter((m) => Number(m.messageId) > lastWithheldId) };
   };
   h.adapter.pageCap = 2;
   await initialize(h, true);
@@ -4639,10 +4639,7 @@ test('a host that opens a channel before it answers its announcement gets the op
 
 test('channels/open re-discovery settles against a host that reconciles before it answers (#20)', async () => {
   // The re-discovery runs inside the open, so such a host cannot answer its
-  // announcement until the open returns. With the descriptor recorded before
-  // the announcement goes out, the open succeeds after the timeout, and the
-  // host's queued reconcile-time open then finds the channel instead of
-  // re-discovering it and starting the same cycle over.
+  // announcement until the open returns.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);

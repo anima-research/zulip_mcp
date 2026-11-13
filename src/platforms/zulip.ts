@@ -219,17 +219,14 @@ export class ZulipAdapter implements PlatformAdapter {
 
   /** Failed quote-target GETs only; id → retry-after timestamp. Bounded like seen. */
   private failedQuoteLookups = new Map<number, number>();
-  /** Messages this adapter deleted itself (rollback, the delete tool), by
-   *  id → when: Zulip's delete event names no actor, so the echo of the
-   *  bot's own deletion is recognised here and dropped. Bounded and expiring
-   *  — a failed delete never echoes. */
+  /** Zulip's delete event names no actor, so the echo of the bot's own
+   *  deletion is recognised here and dropped. */
   private selfDeleted = new Map<number, number>();
   /** What the stream list was last read for, a stream id or a name the
    *  directory did not hold, and when. */
   private readonly listReadFor = new Map<string, number>();
   private listRead: Promise<boolean> | null = null;
-  /** Messages just moved to a stream the bot cannot see, by id → when: the
-   *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
+  /** Zulip reports a move to a stream the bot cannot see as a delete event. */
   private movedAway = new Map<number, number>();
   private readonly changeOf = new WeakMap<ChangeEntry, ZulipMessageChange>();
   private placing = 0;
@@ -561,19 +558,15 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * An edit, move or deletion from the event queue, cleaned for the server
-   * in the channel it was placed in. A change someone else made to the
-   * bot's message is news. A deletion is described from the cache (the
-   * message is gone), or else by the stream the event names alone — a
-   * deleted DM the cache never saw cannot be placed and is dropped.
+   * A deleted message can't be fetched, so a deletion is described from the
+   * cache, or else by the stream the event names alone; a deleted DM the
+   * cache never saw can't be placed.
    */
   private async onZulipChange(change: ZulipMessageChange, located?: SeenMessage, only?: readonly number[]): Promise<MessageChangeEvent | null> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
-      // A cache miss GETs the message as it reads NOW. For a content edit
-      // that is the right place; for a cross-stream move it is the stream
-      // the message went to, and the agent only ever saw it in the one it
-      // came from — which the event names.
+      // A GET reads the message as it is now: after a cross-stream move, the
+      // stream it went to, while the event names the one it came from.
       const known = located ? null : this.seen.get(change.messageId) ?? null;
       const first = located ?? known ?? await this.locate(change.messageId, 'an edit');
       const id = first ? change.messageId : change.messageIds.find((m) => this.seen.has(m)) ?? change.messageId;
@@ -751,9 +744,8 @@ export class ZulipAdapter implements PlatformAdapter {
       .map(c => c.text)
       .join('\n');
     // Image and audio blocks ride along as uploads, linked after the text
-    // (Zulip's own attachment form). Uploads happen before the send, so a
-    // failed upload fails the publish whole; a send that fails after them
-    // leaves unreferenced uploads, which Zulip garbage-collects.
+    // (Zulip's own attachment form). A send that fails after them leaves
+    // unreferenced uploads, which Zulip garbage-collects.
     const uploader = this.uploader;
     const uploadPolicy = this.uploadPolicy;
     const upload = uploader && uploadPolicy ? () => uploadBlocks(uploader, content, uploadPolicy) : undefined;
@@ -884,16 +876,8 @@ export class ZulipAdapter implements PlatformAdapter {
   }
 
   /**
-   * Best-effort typing indicator.
-   *
-   * Stream typing goes to `metadata.topic`. ChannelManager.sendTyping fills
-   * it in when the host names none (the topic of the newest message
-   * noteConversation took) and stops a run in the topic it started in;
-   * falls back to 'mcpl' only when there is still no topic.
-   *
-   * `op` is passed through: 'start' while the host refreshes (every ~7s
-   * during inference), 'stop' when the turn ends. Zulip expires a start that
-   * is never stopped on its own, so a missed stop lingers but does not stick.
+   * Zulip clients stop showing a typing start that is never stopped once the
+   * server's expiry period passes, so a missed stop lingers but does not stick.
    */
   async sendTyping(
     key: ChannelKey,
@@ -1033,24 +1017,13 @@ export class ZulipAdapter implements PlatformAdapter {
    * Even with `all_public_streams` on the queue, a bot that isn't subscribed
    * gets a public stream's edits and reactions only for messages that
    * mention it, and from a private stream at most the messages that mention
-   * it. So opening a channel must also subscribe the bot, or the host would
-   * miss the rest.
-   * Idempotent; subscription persists server-side. DMs need nothing.
-   *
-   * Asks Zulip every time rather than remembering: the `unlisten` tool
-   * removes subscriptions behind this adapter's back, and a remembered
-   * "subscribed" would let a later open succeed without it. The add call
-   * is cheap and answers `already_subscribed` when there is nothing to do.
-   *
-   * Throws when the subscription did not happen: an API error, a transport
-   * failure, or — Zulip's way of refusing a private stream — a `success`
-   * result that lists the stream under `unauthorized`. The caller (the open
-   * lifecycle) turns that into a failed open rather than a silent one.
+   * it. So opening a channel subscribes the bot. The call answers
+   * `already_subscribed` when there is nothing to do.
    */
   async ensureSubscribed(key: ChannelKey): Promise<void> {
     const streamId = streamIdOfKey(key);
     if (streamId === null) return;
-    // Zulip's subscribe call takes names only: the name is read at the call.
+    // Zulip's subscribe call takes names only.
     const streamName = this.directory.nameOf(streamId);
     if (streamName === undefined) throw new Error(`stream ${streamId} is not in the stream list`);
     const result = await this.api.request<{ unauthorized?: unknown; subscribed?: Record<string, unknown> }>(
@@ -1202,13 +1175,8 @@ export class ZulipAdapter implements PlatformAdapter {
     m.replyToSelf = await this.classifyQuoteReply(m) === 'reply';
     const cached = this.seen.get(m.id);
     if (cached) cached.replyToSelf = m.replyToSelf;
-    // A stream the bot joined after startup is unknown to the host; the
-    // message proves it is reachable, so it travels with its descriptor
-    // (#20). Sent with EVERY message, never suppressed as "already
-    // described": the registry that decides what is new is the server's,
-    // it is cleared on reconnect, and a descriptor the host refused or
-    // never confirmed must be offered again rather than held back by
-    // adapter-side memory.
+    // A stream the bot joined after startup is unknown to the host, so its
+    // messages carry their descriptor (#20).
     const newChannel = this.streamDescriptor(streamId);
     return { message: toIncoming(key, m, this.identity), ...(newChannel ? { newChannel } : {}) };
   }
