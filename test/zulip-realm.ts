@@ -27,6 +27,8 @@ export interface Realm {
   /** `noStreamId`: its event carries the stream's name alone, as some Zulip versions send it. */
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
+  /** Someone moves a message to another stream, keeping its topic. */
+  move(messageId: number, toStreamId: number): void;
 }
 
 export const SELF = 790;
@@ -220,6 +222,12 @@ export function realm(initial: Record<number, string>): Realm {
     },
     react(messageId, emojiName, emojiCode) {
       queue({ type: 'reaction', op: 'add', message_id: messageId, emoji_name: emojiName, emoji_code: emojiCode, reaction_type: 'unicode_emoji', user_id: PERSON.id, user: { user_id: PERSON.id, full_name: PERSON.full_name, email: PERSON.email } });
+    },
+    move(messageId, toStreamId) {
+      const m = messages.find((x) => x.id === messageId)!;
+      const from = m.streamId;
+      m.streamId = toStreamId;
+      queue({ type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60, orig_subject: m.topic, stream_id: from, new_stream_id: toStreamId, flags: [] });
     },
   };
   return self;

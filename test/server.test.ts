@@ -79,7 +79,7 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   enter: OnIncomingMessage | null;
   enterChange: OnMessageChange | null;
   systemEvent: OnSystemEvent | null;
-  react: ((event: Omit<Parameters<OnReaction>[0], 'key'> & { channelId: string }) => void) | null;
+  react: ((event: Omit<Parameters<OnReaction>[0], 'key' | 'placed'> & { channelId: string }) => void) | null;
   change: ((event: Omit<MessageChangeEvent, 'key' | 'movedToKey'> & { channelId: string; movedToChannelId: string | null }) => void) | null;
   /** The stream's messages, oldest first; fetchHistory pages over them by id. */
   history: IncomingChannelMessage[];
@@ -198,7 +198,12 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       adapter.enter = onMessage;
       adapter.enterChange = onMessageChange ?? null;
       adapter.systemEvent = onSystemEvent ?? null;
-      adapter.react = onReaction ? ({ channelId, ...ev }) => onReaction({ ...ev, key: adapter.keyOf(channelId) }) : null;
+      adapter.react = onReaction
+        ? ({ channelId, ...ev }) => {
+            const event = { ...ev, key: adapter.keyOf(channelId) };
+            onReaction({ ...event, placed: () => event });
+          }
+        : null;
       adapter.change = onMessageChange
         ? ({ channelId, movedToChannelId, ...ev }) => {
             const change = { ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) };

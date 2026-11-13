@@ -1492,6 +1492,27 @@ scenario("60. a reaction to a new stream's first message, on a channel set to sh
   } finally { await run.close(); }
 });
 
+scenario("64. a message's move to another stream waits in its busy lane, and a reaction to the message arrives meanwhile: the reaction's line goes on the new stream's channel", async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  writeFilters(dir, { reactionChannels: ['zulip:general', 'zulip:dev'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const moved = r.post(17, 'to be moved');
+    r.post(17, `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`);
+    await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), "general's lane busy with a quote lookup");
+    r.move(moved, 18);
+    r.react(moved, 'thumbs_up', '1f44d');
+    const marker = r.post(18, '@bot after the reaction', { mentioned: true });
+    await until(() => named(run, marker), 'an event read after the reaction');
+    release();
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${moved}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.equal(origin(reaction()!).mcplChannelId, 'zulip:dev');
+    await run.server.quiet();
+  } finally { release(); await run.close(); }
+});
+
 scenario('61. one process: a host that leaves while a request is still served, and while a rename\'s push waits behind its open on the stream\'s lane, leaves the push to the next host', async (dir) => {
   const r = realm({ 17: 'general', 18: 'random' });
   const first = await start(r, dir, { shutdownGraceMs: 20 });

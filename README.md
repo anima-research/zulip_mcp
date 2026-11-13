@@ -34,8 +34,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
   (`channel_missed`). On live delivery, each channel's messages, reactions and
   changes are offered to the host in the order the server received them. A
-  change to a message that arrives while the message's move to another
-  stream still waits is offered in the new stream's channel, after what waits
+  change or a reaction to a message that arrives while the message's move to
+  another stream still waits is offered in the new stream's channel, after what waits
   there, so it can follow a message the server received after it. A
   message waiting for its quote lookup or its attachments holds back only its
   own channel. An event that only a lookup can place waits for it, such as a

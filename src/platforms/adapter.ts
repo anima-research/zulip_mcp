@@ -109,7 +109,16 @@ export interface ReactionEvent {
   timestamp: Date;
 }
 
-export type OnReaction = (event: ReactionEvent) => void;
+/**
+ * A reaction from the event stream, placed in its channel when it arrives.
+ * The server calls `placed` in the channel's turn; it answers the reaction
+ * placed where its message is then, which a move ahead of it may have changed.
+ */
+export interface ReactionEntry extends ReactionEvent {
+  placed(): ReactionEvent;
+}
+
+export type OnReaction = (entry: ReactionEntry) => void;
 
 /**
  * A message the agent may have seen was edited, moved to another topic or

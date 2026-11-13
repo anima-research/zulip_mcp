@@ -30,6 +30,7 @@ import type {
   OnSystemEvent,
   PlatformAdapter,
   PublishResult,
+  ReactionEvent,
   RoutingHints,
   SentRecord,
 } from './adapter.js';
@@ -1059,21 +1060,23 @@ export class ZulipAdapter implements PlatformAdapter {
       ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
           // The bot's own reactions are its own doing; only others' are news.
           if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
+          const at = (where: SeenMessage, timestamp: Date): ReactionEvent => ({
+            action: ev.op,
+            key: where.key,
+            messageId: String(ev.message_id),
+            emoji: ev.emoji_name,
+            emojiCode: ev.emoji_code || undefined,
+            emojiType: ev.reaction_type || undefined,
+            reactorId: String(ev.user_id),
+            reactorName: ev.user?.full_name ?? `user ${ev.user_id}`,
+            onOwnMessage: this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId,
+            messageSnippet: where.snippet,
+            timestamp,
+          });
           const emit = (where: SeenMessage | null) => {
             if (!where || !current()) return;
-            onReaction({
-              action: ev.op,
-              key: where.key,
-              messageId: String(ev.message_id),
-              emoji: ev.emoji_name,
-              emojiCode: ev.emoji_code || undefined,
-              emojiType: ev.reaction_type || undefined,
-              reactorId: String(ev.user_id),
-              reactorName: ev.user?.full_name ?? `user ${ev.user_id}`,
-              onOwnMessage: this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId,
-              messageSnippet: where.snippet,
-              timestamp: new Date(),
-            });
+            const arrived = at(where, new Date());
+            onReaction({ ...arrived, placed: () => at(this.seen.get(ev.message_id) ?? where, arrived.timestamp) });
           };
           const cached = this.seen.get(ev.message_id);
           if (cached && this.placing === 0) return emit(cached);

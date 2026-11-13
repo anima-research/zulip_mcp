@@ -2383,7 +2383,12 @@ export class ZulipMcplServer {
       },
       (reaction) => {
         const unnamed = !isDmKey(reaction.key) && this.streamNameOf(reaction.key) === null;
-        if (unnamed || this.reactionShown(reaction)) this.lanes?.lane(reaction.key).enter((ctx) => this.onReaction(ctx.w, reaction));
+        if (!unnamed && !this.reactionShown(reaction)) return;
+        this.lanes?.lane(reaction.key).enter((ctx) => {
+          const placed = reaction.placed();
+          if (placed.key === reaction.key) return this.onReaction(ctx.w, placed);
+          this.lanes?.lane(placed.key).enter((c) => this.onReaction(c.w, placed));
+        });
       },
       (entry) => {
         this.lanes?.lane(entry.key).enter(async (ctx) => {

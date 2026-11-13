@@ -3,9 +3,9 @@
   refused it, having accepted the later one, it was not offered again. Each
   channel's messages, reactions and changes are now handled one at a time, in
   the order the server received them, so a reaction or an edit follows the
-  message it is about. A change to a message that arrives while the
-  message's move to another stream still waits is handed on in the new
-  stream's channel, after what waits there. A message waiting for its
+  message it is about. A change or a reaction to a message that arrives
+  while the message's move to another stream still waits is handed on in
+  the new stream's channel, after what waits there. A message waiting for its
   attachments holds back only its own channel. A reaction is checked
   against the filters when it is placed in its channel and again at its
   turn. One whose stream the server doesn't know yet is checked at its turn
