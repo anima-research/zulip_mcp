@@ -122,7 +122,10 @@
   messages offers them, after messages that arrived after them. If that
   read is refused too, the next connection's catch-up brings them. A
   reaction, or a change about another message, that was waiting stays, and
-  its turn comes after the read.
+  its turn comes after the read. On a closed channel, the given-up messages
+  that don't address the agent aren't counted as missed. A later such
+  message of that connection moves the count past them, and then nothing
+  counts them. With none before the next connection, its start counts them.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip

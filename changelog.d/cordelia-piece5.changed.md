@@ -22,11 +22,11 @@
 - A message waiting for its quote lookup, or for a read of the stream list
   for its stream id, now holds back only its own channel. It held back every
   later event: up to 3 s for a quote lookup, and up to 15 s for the read.
-- While the host hasn't answered a stream's rename, nothing of that stream
-  goes to the host: agent-framework drops the old id as it reads the
-  announcement, before it answers. A host that doesn't answer delays the
-  stream's messages by the announcement's 5 s bound, after which they go
-  under the old id.
+- While the host hasn't answered a stream's rename, none of that stream's
+  messages, or the lines about them, go to the host: agent-framework drops
+  the old id as it reads the announcement, before it answers. A host that
+  doesn't answer delays the stream's messages by the announcement's 5 s
+  bound, after which they go under the old id.
 - A read from history that fills a hole and gets no answer from Zulip, or
   that Zulip refuses by its rate limit, is now tried again: after 2 s, then
   at waits that double up to 60 s, or after Zulip's `retry-after` where that
