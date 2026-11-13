@@ -1267,7 +1267,7 @@ function heldMoveOfThree(h: Harness, topic: string, byBot: boolean) {
 }
 
 for (const [label, topic, byBot, noted, lands] of [
-  ["a newer move of the followed message, handled while the job waits, isn't overwritten, and the result has the note", 'elsewhere', false, true, 'elsewhere'],
+  ['a move of the followed message to a third topic, handled while the job waits, is left as it is, and the result has the note', 'elsewhere', false, true, 'elsewhere'],
   ["the bot's own move event, handled while the job waits, leaves the answer in the tool's topic, and the result has no note", 'releases', true, false, 'releases'],
 ] as const) {
   test(`move_messages: ${label}`, async () => {
