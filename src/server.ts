@@ -1078,7 +1078,11 @@ export class ZulipMcplServer {
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
         moved = w.delivery.release(key, id) || moved;
-      } else w.delivery.hold(key, id, 'failed');
+      } else {
+        w.delivery.hold(key, id, 'failed');
+        // Never offered, so a held read that routed it hasn't tried it.
+        w.delivery.clearReplayed(key, [id]);
+      }
     }
     if (moved) this.delivery.save();
   }

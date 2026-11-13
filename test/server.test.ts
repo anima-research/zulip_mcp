@@ -6289,6 +6289,28 @@ test("a refused message that a held read brings while zulip.messaging is disable
   await h.close();
 });
 
+test("a refused message that a held read hands on just before zulip.messaging is disabled, and that waits in the batch window meanwhile, is offered again once it is enabled", async () => {
+  const h = harness({ batchWindowMs: 300, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), '2 accepted, which starts the read for 1');
+  await until(() => h.delivery.heldIds('zulip:general').includes(1) && !h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), "the read's try of 1, in the batch window");
+  await disableMessaging(h);
+  await h.server.quiet();
+  assert.equal(h.incoming.some((m) => m.messageId === '1'), false, 'withheld in the batch window');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.some((m) => m.messageId === '1'), '1 offered again once enabled');
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 2);
+  await h.close();
+});
+
 test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
   const h = harness({ history: [streamMsg(1), streamMsg(2)] });
   await initialize(h, true);

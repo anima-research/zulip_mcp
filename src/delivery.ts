@@ -395,8 +395,11 @@ export class DeliveryState {
     if (h) h.replyVerified = false;
   }
 
-  clearReplayed(key: ChannelKey): void {
-    for (const h of this.held.get(key)?.values() ?? []) h.replayed = false;
+  /** These ids (every one when none is named) may be asked for again by a later held read. */
+  clearReplayed(key: ChannelKey, ids?: number[]): void {
+    const held = this.held.get(key);
+    if (!held) return;
+    for (const h of ids ? ids.map((id) => held.get(id)) : held.values()) if (h) h.replayed = false;
   }
 
   // ── open mirror ──
