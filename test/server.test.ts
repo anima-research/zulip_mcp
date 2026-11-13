@@ -2790,6 +2790,55 @@ test('while zulip.messaging is disabled, a change to an accepted message whose l
   await h.close();
 });
 
+async function withheldBehindASilentChange(h: Harness): Promise<{ answer: () => void }> {
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const flushes = heldFlushes(h, ['2']);
+  h.adapter.emit!(streamMsg(2));
+  await until(() => flushes.reached(), '2 at its flush');
+  await disableMessaging(h);
+  const key = h.adapter.keyOf('zulip:general');
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let looking = false;
+  h.adapter.enterChange!({ key, messageIds: [1], kind: 'edit', ready: async () => {
+    looking = true;
+    await lookup;
+    return { ...deletion('zulip:general', '1', false), key, kind: 'edit', actorId: '9', content: 'msg 1, fixed', previousContent: 'msg 1' };
+  } });
+  await until(() => looking, "the edit's lookup");
+  flushes.release();
+  await h.server.channelManager.idle();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1'], '2 withheld');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  return { answer };
+}
+
+test('a message that the batch withholds while a change that tells nothing runs on its lane comes once zulip.messaging is enabled, with nothing else accepted', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  const { answer } = await withheldBehindASilentChange(h);
+  answer();
+  await until(() => h.incoming.some((m) => m.messageId === '2'), '2 offered once enabled');
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2']);
+  await h.close();
+});
+
+test('a message that the batch withholds while a change that tells nothing runs on its lane through the enable comes before a later message of its channel', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2), streamMsg(3)] });
+  const { answer } = await withheldBehindASilentChange(h);
+  const lane = (h.server as unknown as { lanes: { lane(key: ChannelKey): { waitingMessages(): number[] } } }).lanes.lane(h.adapter.keyOf('zulip:general'));
+  h.adapter.emit!(streamMsg(3));
+  await until(() => lane.waitingMessages().includes(3), '3 waits behind the change');
+  answer();
+  await until(() => h.incoming.length === 3, 'all three offered');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2', '3']);
+  await h.close();
+});
+
 test('while zulip.messaging is disabled, a move of an accepted message that its turn places in another channel tells nothing on either channel', async () => {
   const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:aaa', label: '#aaa', address: { stream_name: 'aaa', stream_id: 6 } };
   const h = harness({ visible: [DESCRIPTOR, OTHER] });

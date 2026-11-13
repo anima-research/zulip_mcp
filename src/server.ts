@@ -1077,6 +1077,7 @@ export class ZulipMcplServer {
    */
   private onWithheld(w: DeliveryWriter, key: ChannelKey, messages: KeyedMessage[]): void {
     let moved = false;
+    let held = false;
     for (const m of messages) {
       const id = numericId(m);
       if (id === null) continue;
@@ -1086,9 +1087,11 @@ export class ZulipMcplServer {
         w.delivery.hold(key, id, 'failed');
         // Never offered, so a held read that routed it hasn't tried it.
         w.delivery.clearReplayed(key, [id]);
+        held = true;
       }
     }
     if (moved) this.delivery.save();
+    if (held) this.enterHeldReads(true);
   }
 
   /** Queue a message for an open channel, holding its id until the host accepts it. */
