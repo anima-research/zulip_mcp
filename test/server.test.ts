@@ -2017,6 +2017,35 @@ for (const form of ['behind a slow job on an open channel', 'while zulip.messagi
   });
 }
 
+test('a message that waits with a reaction and a move behind it, and is deleted: neither line reaches the host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-taken-out-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.emit!(withLog(streamMsg(10)));
+    await until(() => fetches.started.length === 1, "10's attachment fetch");
+    h.adapter.emit!(streamMsg(11));
+    h.adapter.react!({ action: 'add', channelId: 'zulip:general', messageId: '11', emoji: 'eyes', reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: 'msg 11', timestamp: new Date(1_700_000_010_000) });
+    h.adapter.change!({ ...deletion('zulip:general', '11', false), kind: 'move', topic: 'elsewhere', previousTopic: 'deploys', previousContent: null, actorId: '9' });
+    h.adapter.change!(deletion('zulip:general', '11', false));
+    h.adapter.emit!(streamMsg(12));
+    fetches.release();
+    await until(() => h.incoming.some((m) => m.messageId === '12'), 'the message after it');
+    await h.server.quiet();
+    assert.deepEqual(h.incoming.map((m) => m.messageId.split(':')[0]), ['10', '12']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a reaction on a stream that the directory doesn't name yet, while zulip.messaging is disabled, waits in no lane", async () => {
   const h = harness();
   await initialize(h, true);

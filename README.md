@@ -37,7 +37,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   edit that doesn't move its message, or a deletion, that arrives while the
   message still waits for its turn is applied to the message instead: the
   message comes once with its new text and "(edited)", or doesn't come, and
-  no line is offered for the change. A change or a reaction to a
+  no line is offered for the change, nor for a reaction or a move that
+  waited about the deleted message alone. A change or a reaction to a
   message that arrives while the message's move to another stream still
   waits is offered in the new stream's channel, after what waits there, so it
   can follow a message the server received after it. A message waiting for

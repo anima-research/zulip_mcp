@@ -2400,7 +2400,7 @@ export class ZulipMcplServer {
           const placed = reaction.placed();
           if (placed.key === reaction.key) return this.onReaction(ctx.w, placed);
           this.lanes?.lane(placed.key).enter((c) => this.onReaction(c.w, placed));
-        });
+        }, { kind: 'reaction', about: [Number(reaction.messageId)] });
       },
       (entry) => {
         const lane = this.lanes?.lane(entry.key);
@@ -2408,10 +2408,11 @@ export class ZulipMcplServer {
         const waiting = new Set(lane.waitingMessages());
         const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => waiting.has(id));
         for (const id of applied) this.changesOnTurn.set(id, [...(this.changesOnTurn.get(id) ?? []), entry]);
+        if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
         if (rest.length === 0) return;
         if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) return;
-        lane.enter((ctx) => this.runChange(ctx, entry, rest), { kind: 'other', about: rest });
+        lane.enter((ctx) => this.runChange(ctx, entry, rest), { kind: 'change', about: rest });
       },
     );
   }
@@ -2470,7 +2471,7 @@ export class ZulipMcplServer {
     const change = await entry.ready(ids);
     if (change === null || ctx.ended) return;
     if (change.key === entry.key) return this.onMessageChange(ctx, change);
-    this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'other', about: ids });
+    this.lanes?.lane(change.key).enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
   }
 
   /**
