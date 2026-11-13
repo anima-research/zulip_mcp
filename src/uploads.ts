@@ -427,7 +427,7 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
 
 /** Uploads happen before the send; a send that then fails leaves them
  *  unreferenced, and by default Zulip deletes unclaimed uploads after five
- *  weeks. */
+ *  weeks: https://github.com/zulip/zulip/blob/12.4/zerver/management/commands/delete_old_unclaimed_attachments.py */
 export async function uploadAttachmentArgs(uploader: Uploader, args: unknown, policy: UploadPolicy): Promise<UploadedFile[]> {
   return uploadPrepared(uploader, await prepareAttachments(args, policy), policy);
 }

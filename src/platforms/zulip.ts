@@ -1053,8 +1053,8 @@ export class ZulipAdapter implements PlatformAdapter {
     m.replyToSelf = await this.classifyQuoteReply(m) === 'reply';
     const cached = this.seen.get(m.id);
     if (cached) cached.replyToSelf = m.replyToSelf;
-    // A stream the bot joined after startup is unknown to the host, so its
-    // messages carry their descriptor (#20).
+    // A stream the bot joined after startup is unknown to the host, so every
+    // message whose stream the directory holds carries its descriptor (#20).
     const newChannel = this.streamDescriptor(streamId);
     return { message: toIncoming(key, m, this.identity), ...(newChannel ? { newChannel } : {}) };
   }

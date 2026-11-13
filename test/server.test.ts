@@ -4492,8 +4492,6 @@ test('a host that opens a channel before it answers its announcement gets the op
 });
 
 test('channels/open re-discovery settles against a host that reconciles before it answers (#20)', async () => {
-  // The re-discovery runs inside the open, so such a host cannot answer its
-  // announcement until the open returns.
   const h = harness({ announceTimeoutMs: 80 });
   await initialize(h, true);
   await settled(h);

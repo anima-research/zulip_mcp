@@ -7,13 +7,13 @@ import type { AttachmentRef } from './content.js';
 
 /** Anthropic downscales an image whose long edge is over 1568 px or whose cost
  *  would be over 1568 visual tokens (2576 px and 4784 tokens on Claude 4.7 and
- *  later models). */
+ *  later models): https://platform.claude.com/docs/en/build-with-claude/vision */
 export const IMAGE_LONG_EDGE_MAX = 1568;
 const IMAGE_JPEG_QUALITY = 85;
 /** Anthropic accepts up to 5 MB of base64 per image on Amazon Bedrock, and
  *  10 MB on the Claude API and on Claude models on Google Cloud (Google
- *  managed); base64 adds a third, so 3.5 MB of image bytes stays under the
- *  smaller limit. */
+ *  managed), by the same page; base64 adds a third, so 3.5 MB of image bytes
+ *  stays under the smaller limit. */
 export const IMAGE_OUTPUT_RAW_CAP = 3.5 * 1024 * 1024;
 export const IMAGE_FETCH_CEILING = 25 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 256 * 1024;

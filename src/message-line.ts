@@ -1,10 +1,3 @@
-/**
- * A message line's header fields, such as the author's name and the topic,
- * are not escaped: a name or topic containing `]: ` still reads ambiguously
- * to a regex. Zulip already refuses control characters and some punctuation
- * in display names; topics are the realistic source.
- */
-
 export interface MessageLineHead {
   id: number | string;
   time: string;
