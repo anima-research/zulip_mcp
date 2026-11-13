@@ -20,7 +20,7 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import { namePosted, prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
 import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
 import { parseKey, streamKey, type ChannelKey } from './channel-key.js';
@@ -373,17 +373,23 @@ export class ZulipToolRuntime {
   }
 
   private async send(destination: Destination, content: string, args: Record<string, any>, channelId: string) {
+    const posted: number[] = [];
     try {
       return await sendMessage(this.api, destination, content, {
         limit: this.maxMessageLength,
         unlinkable: "refuse",
         upload: () => this.uploadFor(args),
-        onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
+        onChunk: (chunk) => {
+          posted.push(chunk.id);
+          this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content });
+        },
       });
     } catch (err) {
-      if (err instanceof SendRefused) throw new Error(err.answer.msg ?? "Zulip refused the message");
+      if (err instanceof SendRefused) {
+        throw namePosted(new Error(`${posted.length > 0 ? "Zulip: " : ""}${err.answer.msg ?? "Zulip refused the message"}`), posted);
+      }
       if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
-      throw err;
+      throw err instanceof Error ? namePosted(err, posted) : err;
     }
   }
 
