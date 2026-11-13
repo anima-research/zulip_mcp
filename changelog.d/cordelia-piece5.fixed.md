@@ -46,10 +46,10 @@
   it stays held until that channel is registered. Where that read
   fails, later messages go first, and until it comes, an edit, a move or a
   deletion of one of them sends no line, unless that message addresses the
-  agent or is the agent's own. Where `zulip.messaging` is disabled and
-  enabled again while one message, change or read of a channel is being
-  handled, what that handling held, or what the batch withheld, can come
-  after that channel's later messages.
+  agent or is the agent's own. A message that the batch withheld while
+  `zulip.messaging` was disabled can come after its channel's later
+  messages, where the enable comes while a message, change or read of that
+  channel is still being handled.
 - A catch-up at a connection's start, or a recovery after Zulip's event
   queue broke, that fell while `zulip.messaging` was disabled was skipped. It
   is now made once the host enables `zulip.messaging`.
