@@ -1207,7 +1207,10 @@ export class ZulipMcplServer {
         if (delivered) {
           // The agent's answer goes back through channels/publish, so it goes
           // to this message's topic, as an answer on an open channel does.
-          w.channels.noteConversation(key, message);
+          const place = isDmKey(key) ? null : this.adapter.placeOf?.(message.messageId) ?? null;
+          w.channels.noteConversation(key, place === null || place.key !== key
+            ? message
+            : { ...message, threadId: place.topic || undefined, metadata: { ...(message.metadata as Record<string, unknown> | undefined), topic: place.topic } });
           if (this.accepted(w, key, id)) this.delivery.save();
           this.enterHeldReads();
         } else {

@@ -825,6 +825,13 @@ export class ZulipAdapter implements PlatformAdapter {
     this.selfDeleted.delete(messageId);
   }
 
+  placeOf(messageId: string): { key: ChannelKey; topic: string } | null {
+    const id = Number(messageId);
+    const seen = this.seen.get(id);
+    if (!seen || seen.isDm || this.movedAway.has(id)) return null;
+    return { key: seen.key, topic: seen.topic };
+  }
+
   private wasSelfDeleted(messageId: number): boolean {
     const at = this.selfDeleted.get(messageId);
     if (at === undefined) return false;
