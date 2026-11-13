@@ -1067,6 +1067,24 @@ test('a rename while the channel is muted moves where a plain answer goes after 
   }
 });
 
+test('a rename while zulip.messaging is disabled moves where a plain answer goes after the enable, and tells the host nothing', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+  await disableMessaging(h);
+  const before = { incoming: h.incoming.length, pushed: h.pushed.length };
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await h.server.quiet();
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual({ incoming: h.incoming.length, pushed: h.pushed.length }, before, 'no line about the move');
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the enable');
+  await h.close();
+});
+
 test('a plain answer stays where it was after a reaction, an edit and a deletion of its message', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-hints-'));
   try {
