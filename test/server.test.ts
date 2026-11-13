@@ -6283,9 +6283,10 @@ test("a deletion that arrives with the live event of a row that a break's read i
   await h.close();
 });
 
-// An adapter hands on at once a message whose event carries its stream's id, and makes one without the id wait for
-// its lookup. On a queue that sends the id with one message of a stream and not with another, the earlier message
-// can then enter its lane behind a later one.
+// An adapter hands on at once a message whose event carries its stream's id. One without the id waits while another
+// event is being placed, and for its own lookup where the adapter's directory doesn't name its stream. On a queue that
+// sends the id with one message of a stream and not with another, the earlier message can then enter its lane behind
+// a later one.
 test("an earlier message that enters its lane behind a later one, while the later one's attachment is fetched, is offered after it", async () => {
   const fetches = heldFetches();
   const h = harness({ attachments: fetches.options });

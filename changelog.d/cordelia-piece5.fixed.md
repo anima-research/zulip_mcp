@@ -42,9 +42,9 @@
   with its new text, and one deleted meanwhile doesn't come. A message
   already being handled when `zulip.messaging` was disabled is held, and a
   read from history brings it first once it is enabled. Where that read
-  fails, later messages go first, and until it comes, an edit or a deletion
-  of one of them sends no line, unless that message addresses the agent or
-  is the agent's own.
+  fails, later messages go first, and until it comes, an edit, a move or a
+  deletion of one of them sends no line, unless that message addresses the
+  agent or is the agent's own.
 - A catch-up at a connection's start, or a recovery after Zulip's event
   queue broke, that fell while `zulip.messaging` was disabled was skipped. It
   is now made once the host enables `zulip.messaging`.
@@ -125,9 +125,9 @@
   of them either, and the log gives the refusal. They stay held, up to the
   50,000 holds a channel keeps, so on an open channel a later read of held
   messages offers them, after messages that arrived after them. Until they
-  come, an edit or a deletion of one of those later messages sends no line,
-  unless that message addresses the agent or is the agent's own. If that
-  read is refused too, the next connection's catch-up brings them. A
+  come, an edit, a move or a deletion of one of those later messages sends
+  no line, unless that message addresses the agent or is the agent's own. If
+  that read is refused too, the next connection's catch-up brings them. A
   reaction, or a change about another message, that was waiting stays, and
   its turn comes after the read. On a closed channel, the given-up messages
   that don't address the agent aren't counted as missed. A later such
