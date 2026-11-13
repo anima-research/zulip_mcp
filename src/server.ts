@@ -383,8 +383,7 @@ export class ZulipMcplServer {
       // window, and nothing received meanwhile can advance a watermark over
       // the offline gap.
       const lanes = this.lanes!;
-      let openLanes!: () => void;
-      lanes.holdAll(new Promise<void>((resolve) => { openLanes = resolve; }));
+      const openLanes = lanes.holdAll();
       void this.grant.whenReady().then(() => {
         if (conn.isClosed) return;
         const start = this.start(conn, lanes, openLanes);

@@ -283,7 +283,7 @@ export class Lanes<W> {
   private readonly runningJobs = new Set<Promise<void>>();
   private turnHolder: Lane<W> | null = null;
   private readonly turnWaiters: Lane<W>[] = [];
-  private heldUntil: Promise<unknown> | null = null;
+  private readonly holdsAll = new Set<Promise<void>>();
   private waitingMessageCount = 0;
   private quietWaiters: (() => void)[] = [];
   private ended = false;
@@ -302,29 +302,30 @@ export class Lanes<W> {
     if (!lane) {
       lane = new Lane(key, this, this.#w);
       if (this.ended) lane.end();
-      else if (this.heldUntil) lane.holdOtherUntil(this.heldUntil);
+      else for (const until of this.holdsAll) lane.holdOtherUntil(until);
       this.lanes.set(key, lane);
     }
     return lane;
   }
 
-  /** Every lane's other queue waits until `until` settles, however it settles, a lane made meanwhile included. The host's queues run meanwhile. */
-  holdAll(until: Promise<unknown>): void {
-    this.heldUntil = until;
+  /** Every lane's other queue waits until the returned release is called, a lane made meanwhile included, and a lane waits for every hold that stands. The host's queues run meanwhile. */
+  holdAll(): () => void {
+    let settle!: () => void;
+    const until = new Promise<void>((resolve) => { settle = resolve; });
+    this.holdsAll.add(until);
     for (const lane of this.lanes.values()) lane.holdOtherUntil(until);
-    const release = () => {
-      if (this.heldUntil === until) this.heldUntil = null;
+    return () => {
+      if (this.holdsAll.delete(until)) settle();
     };
-    until.then(release, release);
   }
 
   keys(): IterableIterator<ChannelKey> {
     return this.lanes.keys();
   }
 
-  /** True from `holdAll` until its promise settles. */
+  /** True from a `holdAll` until its release, while any hold stands. */
   get allHeld(): boolean {
-    return this.heldUntil !== null;
+    return this.holdsAll.size > 0;
   }
 
   /** Settles once no job runs or waits in any lane. A job that a hold or the turn keeps back is waiting. */

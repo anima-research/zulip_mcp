@@ -92,23 +92,40 @@ test("a hold keeps the other queue back until it settles, and the host's queue r
   }
 });
 
-test("holding all lanes keeps each other queue back until it settles, a lane made meanwhile included, and the host's queues run", async () => {
+test("holding all lanes keeps each other queue back until it is released, a lane made meanwhile included, and the host's queues run", async () => {
   const l = lanes();
   const log: string[] = [];
-  const start = gate();
   l.lane(A).enter(() => { log.push('A message'); });
-  l.holdAll(start.opened);
+  const release = l.holdAll();
   l.lane(B).enter(() => { log.push('B message'); });
   l.lane(B).host(() => { log.push('B open'); });
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(log, ['B open']);
   assert.equal(l.allHeld, true);
   l.lane(A).enterFirst(() => { log.push('A read'); });
-  start.open();
+  release();
+  assert.equal(l.allHeld, false, 'false in the step that releases');
   await l.quiet();
   assert.deepEqual(log.filter((s) => s.startsWith('A')), ['A read', 'A message']);
   assert.deepEqual(log.filter((s) => s.startsWith('B')), ['B open', 'B message']);
   assert.equal(l.allHeld, false);
+});
+
+test('a lane made while two holds stand waits for both, whichever is released first', async () => {
+  for (const first of ['earlier', 'later'] as const) {
+    const l = lanes();
+    const log: string[] = [];
+    const earlier = l.holdAll();
+    const later = l.holdAll();
+    l.lane(A).enter(() => { log.push('A message'); });
+    (first === 'earlier' ? earlier : later)();
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(log, [], `${first} released: the other still holds`);
+    assert.equal(l.allHeld, true, first);
+    (first === 'earlier' ? later : earlier)();
+    await l.quiet();
+    assert.deepEqual(log, ['A message'], first);
+  }
 });
 
 test('enterFirst goes ahead of what waits in the other queue', async () => {
