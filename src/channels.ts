@@ -592,8 +592,9 @@ export class ChannelManager {
     this.lastIncoming.set(key, { hints: { threadId: topic || undefined, metadata: { ...last.hints.metadata, topic } }, from: last.from });
   }
 
-  hintsFrom(key: ChannelKey): number | undefined {
-    return this.lastIncoming.get(key)?.from;
+  hintsOf(key: ChannelKey): { from?: number; topic?: string } | undefined {
+    const last = this.lastIncoming.get(key);
+    return last && { from: last.from, topic: last.hints.threadId };
   }
 
   /**

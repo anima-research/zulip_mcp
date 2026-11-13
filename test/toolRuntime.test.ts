@@ -993,16 +993,22 @@ test('move_messages says the move was made when Zulip accepted it but the read b
     const result = await unread.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
     assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.', 'a topic alone has the note too');
   } finally { rmSync(unread.dir, { recursive: true, force: true }); }
-  const placeless = moveRuntime({ readBack: () => ({ result: 'success' }) });
-  try {
-    const result = await placeless.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
-    assert.deepEqual(result, {
-      moved: true,
-      asked: { topic: 'renamed', scope: 'one' },
-      readBackError: "Zulip's answer gave no stream and topic for message 77.",
-      note: 'To answer this message where it is now, use send_message with reply_to.',
-    }, 'an answer with no stream and topic claims no place, and has the note');
-  } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
+  for (const answer of [
+    { result: 'success' },
+    { result: 'success', message: { id: 77, type: 'stream', stream_id: 0, display_recipient: 'general', subject: 'renamed' } },
+    { result: 'success', message: { id: 77, type: 'stream', stream_id: 7, display_recipient: '', subject: 'renamed' } },
+  ]) {
+    const placeless = moveRuntime({ readBack: () => answer });
+    try {
+      const result = await placeless.tools.handleToolCall('move_messages', { message_id: 77, topic: 'renamed', scope: 'one' });
+      assert.deepEqual(result, {
+        moved: true,
+        asked: { topic: 'renamed', scope: 'one' },
+        readBackError: "Zulip's answer gave no stream and topic for message 77.",
+        note: 'To answer this message where it is now, use send_message with reply_to.',
+      }, `an answer with no usable stream claims no place, and has the note: ${JSON.stringify(answer)}`);
+    } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
+  }
 });
 
 test('move_messages refuses a stream\'s former name with the send tools\' words, and asks Zulip nothing', async () => {

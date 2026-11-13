@@ -1204,6 +1204,7 @@ for (const [label, answer, noted] of [
   ['is in another stream by then, with no note', { result: 'success', message: { id: 3, type: 'stream', stream_id: 8, display_recipient: 'other', subject: 'elsewhere' } }, false],
   ['comes back with no topic, with the note', { result: 'success', message: { id: 3, type: 'stream', stream_id: 7, display_recipient: 'general' } }, true],
   ['comes back with no stream, with the note', { result: 'success', message: { id: 3, subject: 'deploys' } }, true],
+  ['comes back with stream id 0, with the note', { result: 'success', message: { id: 3, type: 'stream', stream_id: 0, display_recipient: 'general', subject: 'deploys' } }, true],
 ] as const) {
   test(`where the message that the answers follow ${label}, move_messages leaves a plain answer where it was`, async () => {
     const realm = movingRealm({ 1: 'deploys', 3: 'deploys' }, { 3: answer });
@@ -1237,15 +1238,97 @@ async function laneBusyAfterThree(h: Harness, fetches: ReturnType<typeof heldFet
   await until(() => fetches.started.length === 1, "message 4's attachment holds the lane");
 }
 
-async function moveThree(realm: ReturnType<typeof movingRealm>) {
+async function startMove(realm: ReturnType<typeof movingRealm>, args: Record<string, unknown>) {
   let done = false;
   let asked = false;
   const hints = realm.tools.answerHints!;
-  realm.tools.answerHints = { followed: (key) => hints.followed(key), follow: (...args) => { asked = true; return hints.follow(...args); } };
-  const call = realm.tools.handleToolCall('move_messages', { message_id: 3, topic: 'releases', scope: 'one' }).finally(() => { done = true; });
+  realm.tools.answerHints = { followed: (key) => hints.followed(key), follow: (...rest) => { asked = true; return hints.follow(...rest); } };
+  const call = realm.tools.handleToolCall('move_messages', args).finally(() => { done = true; });
   await until(() => asked, 'the tool asked the server for its job');
   return { call, done: () => done };
 }
+
+function moveThree(realm: ReturnType<typeof movingRealm>) {
+  return startMove(realm, { message_id: 3, topic: 'releases', scope: 'one' });
+}
+
+function heldMoveOfThree(h: Harness, topic: string, byBot: boolean) {
+  let release!: () => void;
+  let started = false;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const key = h.adapter.keyOf('zulip:general');
+  const event = {
+    kind: 'move', key, movedToKey: null, messageId: '3', messageIds: ['3'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com',
+    actorId: byBot ? '1' : '12', topic, previousTopic: 'deploys', leftChannel: false, byBot, content: null, previousContent: null,
+    mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_100_000),
+  } as unknown as MessageChangeEvent;
+  h.adapter.enterChange!({ key, messageIds: [3], kind: 'move', ready: async () => { started = true; await gate; return event; } });
+  return { release: () => release(), started: () => started };
+}
+
+for (const [label, topic, byBot, noted, lands] of [
+  ["a newer move of the followed message, handled while the job waits, isn't overwritten, and the result has the note", 'elsewhere', false, true, 'elsewhere'],
+  ["the bot's own move event, handled while the job waits, leaves the answer in the tool's topic, and the result has no note", 'releases', true, false, 'releases'],
+] as const) {
+  test(`move_messages: ${label}`, async () => {
+    const realm = movingRealm({ 3: 'deploys' });
+    const h = harness({ tools: realm.tools });
+    try {
+      await mentionedOn(h, 3);
+      const held = heldMoveOfThree(h, topic, byBot);
+      await until(() => held.started(), 'the move holds the lane');
+      const moving = await moveThree(realm);
+      assert.equal(moving.done(), false, 'the tool waits for its job');
+      held.release();
+      const result = await moving.call;
+      assert.equal('note' in result, noted);
+      await h.server.quiet();
+      assert.deepEqual(await answerGoesTo(h), { threadId: lands, topic: lands });
+    } finally {
+      await h.close();
+      rmSync(realm.dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('move_messages writes where a change of the followed message waits in the lane, and the result has the note', async () => {
+  const fetches = heldFetches();
+  const realm = movingRealm({ 3: 'deploys', 4: 'deploys' });
+  const h = harness({ tools: realm.tools, attachments: fetches.options });
+  try {
+    await laneBusyAfterThree(h, fetches, false);
+    changeTo(h, { kind: 'edit', messageIds: ['3'], content: 'reworded', previousContent: '@bot ship it?', mentioned: true });
+    const moving = await moveThree(realm);
+    fetches.release();
+    const result = await moving.call;
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.');
+    await h.server.quiet();
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'the job wrote');
+  } finally {
+    fetches.release();
+    await h.server.quiet();
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
+test('move_messages with later gives the note where a newer message is what the answers follow by its job\'s turn', async () => {
+  const fetches = heldFetches();
+  const realm = movingRealm({ 1: 'deploys', 3: 'deploys', 4: 'deploys' });
+  const h = harness({ tools: realm.tools, attachments: fetches.options });
+  try {
+    await laneBusyAfterThree(h, fetches, true);
+    const moving = await startMove(realm, { message_id: 1, topic: 'releases', scope: 'later' });
+    fetches.release();
+    const result = await moving.call;
+    assert.equal(result.note, 'To answer this message where it is now, use send_message with reply_to.');
+  } finally {
+    fetches.release();
+    await h.server.quiet();
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
 
 test("move_messages still answers where the channel's lane ends while its job waits", async () => {
   const fetches = heldFetches();

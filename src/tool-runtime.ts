@@ -118,9 +118,11 @@ const MOVE_NOTE = "To answer this message where it is now, use send_message with
 // to three requests of 15 s each before this wait, so the call's bounds add up to 50 s (anima-research/zulip_mcp#60).
 const FOLLOW_WAIT_MS = 5_000;
 
+export type FollowSeen = "sure" | "unsure" | { follows: number | undefined };
+
 export interface AnswerHints {
-  followed(key: ChannelKey): number | undefined;
-  follow(key: ChannelKey, from: number, topic: string): Promise<void>;
+  followed(key: ChannelKey): { from?: number; topic?: string } | undefined;
+  follow(key: ChannelKey, from: number, readTopic: string | undefined, topic: string): Promise<FollowSeen>;
 }
 
 // Helper function to parse date strings
@@ -298,7 +300,8 @@ export class ZulipToolRuntime {
   private async followOwnMove(messageId: number, streamId: number, topic: string, scope: string): Promise<boolean> {
     const hints = this.answerHints;
     const key = streamKey(streamId);
-    const from = hints?.followed(key);
+    const read = hints?.followed(key);
+    const from = read?.from;
     if (!hints || from === undefined || (from !== messageId && scope === "one")) return true;
     let followedTopic = topic;
     if (from !== messageId) {
@@ -310,7 +313,8 @@ export class ZulipToolRuntime {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), FOLLOW_WAIT_MS); });
     try {
-      return await Promise.race([hints.follow(key, from, followedTopic).then(() => true), late]);
+      const seen = hints.follow(key, from, read?.topic, followedTopic);
+      return await Promise.race([seen.then((it) => it === "sure" || (typeof it === "object" && scope === "one")), late]);
     } finally {
       clearTimeout(timer);
     }
@@ -323,7 +327,7 @@ export class ZulipToolRuntime {
     } catch {
       return undefined;
     }
-    if (!Number.isSafeInteger(message?.stream_id)) return undefined;
+    if (!Number.isSafeInteger(message?.stream_id) || message.stream_id <= 0) return undefined;
     if (message.stream_id !== streamId) return "elsewhere";
     return typeof message.subject === "string" ? { topic: message.subject } : undefined;
   }
@@ -930,7 +934,7 @@ export class ZulipToolRuntime {
           return { moved: true, asked, readBackError: (err as Error).message, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;
-        if (message?.type !== "stream" || typeof name !== "string" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id)) {
+        if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
           return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
