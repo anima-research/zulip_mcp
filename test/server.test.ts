@@ -6131,6 +6131,46 @@ test('a read that waits while no channel is open tells a channel opened during t
   await h.close();
 });
 
+test('a read that waits through a disable of zulip.messaging tells the open channels at its first failed try after the enable', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ readRetryWait: waits.wait, now: () => clock.t, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let tries = 0;
+  let failFirst!: () => void;
+  const first = new Promise<void>((resolve) => { failFirst = resolve; });
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId !== undefined && tries < 2) {
+      tries++;
+      if (tries === 1) await first;
+      clock.t += 90_000;
+      throw noAnswer();
+    }
+    return real(key, query);
+  };
+  breakQueue(h);
+  await until(() => tries === 1, "the break's first try at Zulip");
+  await disableMessaging(h);
+  failFirst();
+  await until(() => waits.asked.length === 1, 'the wait after the first failed try');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await sentinelThrough(h, 1);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'nothing told while zulip.messaging was disabled');
+  waits.release();
+  await until(() => waits.asked.length === 2, 'the wait after the second failed try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(readWaitLines(h, 'history-waiting').map((m) => m.channelId), ['zulip:general']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(readWaitLines(h, 'history-answered').map((m) => m.channelId), ['zulip:general']);
+  await h.close();
+});
+
 for (const [label, narrowOther, narrowGeneral] of [
   ['muted', (f: ZulipFilters) => ({ ...f, mutedStreams: ['other'] }), (f: ZulipFilters) => ({ ...f, mutedStreams: ['general'] })],
   ['left out of the allowlist', (f: ZulipFilters) => ({ ...f, streams: ['general'] }), (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
