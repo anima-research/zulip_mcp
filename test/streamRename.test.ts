@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1236,6 +1236,9 @@ scenario('49. a stream outside the allowlist gets no push after a rename, nor at
     assert.deepEqual(first.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'no push for a stream outside the allowlist');
   } finally { await first.end(); }
   writeFilters(dir, {});
+  // Move the mtime forward, as test/filters.test.ts does: the plane sees a
+  // change by mtime, and two writes within one timestamp step share it.
+  utimesSync(join(dir, 'filters.json'), new Date(Date.now() + 5000), new Date(Date.now() + 5000));
   first.filters.tick();
   assert.equal(first.filters.streamAllowed('lobby'), true, 'the allowlist widened');
   const second = await start(r, dir, { reuse: first });
