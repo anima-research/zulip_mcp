@@ -20,7 +20,7 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type HistoryQuery, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import { namePosted, prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
 import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
 import { parseKey, streamKey, type ChannelKey } from './channel-key.js';
@@ -238,14 +238,6 @@ export function toToolCallResult(result: unknown): ToolCallResult {
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }
 
-function postedBefore(ids: number[]): string {
-  if (ids.length === 0) return "";
-  const one = ids.length === 1;
-  const list = one ? String(ids[0]) : `${ids.slice(0, -1).join(", ")} and ${ids[ids.length - 1]}`;
-  return `Posted as message${one ? "" : "s"} ${list} (${one ? "part 1" : `parts 1 to ${ids.length}`}) before the next part failed; ` +
-    `sending the whole text again posts ${one ? "that part" : "those parts"} twice. `;
-}
-
 export class ZulipToolRuntime {
   private readonly api: ZulipApi;
   private readonly sessionId: string;
@@ -393,11 +385,11 @@ export class ZulipToolRuntime {
         },
       });
     } catch (err) {
-      const before = postedBefore(posted);
-      if (err instanceof SendRefused) throw new Error(`${before}${before ? "Zulip: " : ""}${err.answer.msg ?? "Zulip refused the message"}`);
+      if (err instanceof SendRefused) {
+        throw namePosted(new Error(`${posted.length > 0 ? "Zulip: " : ""}${err.answer.msg ?? "Zulip refused the message"}`), posted);
+      }
       if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
-      if (before && err instanceof Error) err.message = `${before}${err.message}`;
-      throw err;
+      throw err instanceof Error ? namePosted(err, posted) : err;
     }
   }
 

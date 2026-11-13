@@ -2159,7 +2159,8 @@ export class ZulipMcplServer {
       // hands it back in `state`, which is the only way a host ever learns
       // one. A rollback to this checkpoint undoes every send made after it
       // (this tool's own send is before it, on the record). Error results
-      // carry none: nothing was sent, there is nothing new to return to.
+      // carry none. A part that a failed send posted is on the record all
+      // the same, so a rollback to an earlier checkpoint undoes it.
       if (this.mcplActive && featureSetForTool(name) === MESSAGING_FEATURE_SET) {
         const checkpoint = this.stateTracker.createCheckpoint();
         const parent = this.stateTracker.getCheckpointState()?.parent ?? null;

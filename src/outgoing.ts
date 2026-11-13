@@ -60,6 +60,16 @@ function splitsPair(text: string, at: number): boolean {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
+export function namePosted<E extends Error>(err: E, posted: readonly number[]): E {
+  if (posted.length === 0) return err;
+  const n = posted.length;
+  const ids = n === 1 ? String(posted[0]) : `${posted.slice(0, -1).join(', ')} and ${posted[n - 1]}`;
+  const parts = n === 1 ? 'part 1' : n === 2 ? 'parts 1 and 2' : `parts 1 to ${n}`;
+  err.message = `Posted as message${n === 1 ? '' : 's'} ${ids} (${parts}) before the send stopped; ` +
+    `sending the whole text again posts ${n === 1 ? 'that part' : 'those parts'} twice. ${err.message}`;
+  return err;
+}
+
 /** A send with no text and nothing uploaded. */
 export class NothingToSend extends Error {
   constructor() {
