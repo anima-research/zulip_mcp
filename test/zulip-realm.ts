@@ -28,6 +28,8 @@ export interface Realm {
   post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
   move(messageId: number, toStreamId: number): void;
+  edit(messageId: number, content: string, opts?: { mentioned?: boolean; topic?: string }): void;
+  remove(messageIds: number[]): void;
 }
 
 export const SELF = 790;
@@ -227,6 +229,23 @@ export function realm(initial: Record<number, string>): Realm {
       const from = m.streamId;
       m.streamId = toStreamId;
       queue({ type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60, orig_subject: m.topic, stream_id: from, new_stream_id: toStreamId, flags: [] });
+    },
+    edit(messageId, content, opts = {}) {
+      const m = messages.find((x) => x.id === messageId)!;
+      const before = { content: m.content, topic: m.topic };
+      m.content = content;
+      m.mentioned = opts.mentioned ?? m.mentioned;
+      m.topic = opts.topic ?? m.topic;
+      queue({
+        type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60,
+        orig_content: before.content, content, ...(opts.topic === undefined ? {} : { orig_subject: before.topic, subject: opts.topic }),
+        stream_id: m.streamId, flags: m.mentioned ? ['mentioned'] : [],
+      });
+    },
+    remove(messageIds) {
+      const gone = messages.filter((x) => messageIds.includes(x.id));
+      for (const m of gone) messages.splice(messages.indexOf(m), 1);
+      queue({ type: 'delete_message', message_ids: messageIds, message_type: 'stream', stream_id: gone[0].streamId, topic: gone[0].topic });
     },
   };
   return self;

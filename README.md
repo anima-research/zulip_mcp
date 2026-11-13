@@ -33,12 +33,17 @@ Discord and Slack adapters that once lived here moved to those servers.
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
   (`channel_missed`). On live delivery, each channel's messages, reactions and
-  changes are offered to the host in the order the server received them. A
-  change or a reaction to a message that arrives while the message's move to
-  another stream still waits is offered in the new stream's channel, after what waits
-  there, so it can follow a message the server received after it. A
-  message waiting for its quote lookup or its attachments holds back only its
-  own channel. An event that only a lookup can place waits for it, such as a
+  changes are offered to the host in the order the server received them. An
+  edit that doesn't move its message, or a deletion, that arrives while the
+  message still waits for its turn is applied to the message instead: the
+  message comes once with its new text and "(edited)", or doesn't come, and
+  no line is offered for the change, nor for a reaction or a move that
+  waited about the deleted message alone. A change or a reaction to a
+  message that arrives while the message's move to another stream still
+  waits is offered in the new stream's channel, after what waits there, so it
+  can follow a message the server received after it. A message waiting for
+  its quote lookup or its attachments holds back only its own channel. An
+  event that only a lookup can place waits for it, such as a
   reaction to a message the server hasn't seen, and the reactions, changes and
   messages after it that carry no stream id wait behind it. When delivery
   stops, a message the server already holds is offered at the next connection
@@ -215,11 +220,11 @@ Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
 tool sends and `channels/publish` alike. Disabling `zulip.messaging` stops
 its delivery (incoming and push) and its tools at once. A message that
-arrives meanwhile waits in its channel and goes once it is enabled again,
-followed by an edit or a deletion of it that arrived meanwhile. Any other
-change, and any reaction, that arrives meanwhile isn't told. A catch-up, and
-a recovery after a break of Zulip's event queue, wait too, and are made once
-it is enabled.
+arrives meanwhile waits in its channel until it is enabled again. An edit or
+a deletion of it that arrives meanwhile is applied to it, unless the change
+also moves it: then it is offered after it. Any other change, and any
+reaction, that arrives meanwhile isn't told. A catch-up, and a recovery after
+a break of Zulip's event queue, wait too, and are made once it is enabled.
 
 **Wake policy.** Closed-channel mentions, quote replies and DMs, new-DM
 announcements and `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
@@ -267,7 +272,9 @@ one line in the shared shape, carrying the message's own id:
 On a closed channel only an addressed change is pushed — the mention the
 agent is about to answer was rewritten or deleted, a quote reply changed,
 or a DM it is reading changed — the same rule as for messages. A change to a message the host was
-never offered is dropped. Zulip re-renders (a link preview arriving) are
+never offered is dropped, unless it arrives while that message still waits
+for its turn: the delivery model above says what then happens to it.
+Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits, moves and deletions (rollback,
 `move_messages`, `delete_message`) are its own doing and don't surface either. A deletion's
 mark lasts 10 minutes and holds the bot's latest 500 deletes, so one whose

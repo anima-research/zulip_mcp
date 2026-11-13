@@ -21,6 +21,7 @@ import type {
 import { dmKey, parseKey, streamIdOfKey, streamKey, type ChannelKey, type KeyedMessage } from '../channel-key.js';
 import { StreamDirectory } from '../stream-directory.js';
 import type {
+  ChangeEntry,
   ChannelHistoryPage,
   ChannelHistoryQuery,
   MessageChangeEvent,
@@ -230,6 +231,7 @@ export class ZulipAdapter implements PlatformAdapter {
   /** Messages just moved to a stream the bot cannot see, by id → when: the
    *  delete event Zulip sends for lost visibility is a vanishing, not a deletion. */
   private movedAway = new Map<number, number>();
+  private readonly changeOf = new WeakMap<ChangeEntry, ZulipMessageChange>();
   private placing = 0;
   private placed: Promise<void> = Promise.resolve();
 
@@ -565,7 +567,7 @@ export class ZulipAdapter implements PlatformAdapter {
    * message is gone), or else by the stream the event names alone — a
    * deleted DM the cache never saw cannot be placed and is dropped.
    */
-  private async onZulipChange(change: ZulipMessageChange, located?: SeenMessage): Promise<MessageChangeEvent | null> {
+  private async onZulipChange(change: ZulipMessageChange, located?: SeenMessage, only?: readonly number[]): Promise<MessageChangeEvent | null> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
       const cached = located ? null : this.seen.get(change.messageId) ?? null;
@@ -653,7 +655,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
     // The bot's own deletions (rollback, the delete tool) echo back without
     // an actor: drop what this adapter deleted itself.
-    const ids = change.messageIds.filter((id) => !this.wasSelfDeleted(id));
+    const ids = change.messageIds.filter((id) => (only === undefined || only.includes(id)) && !this.wasSelfDeleted(id));
     if (ids.length === 0) return null;
     // A bulk deletion is reported under an id the cache can vouch for, so the
     // line never shows one message's id with another's author and quote.
@@ -1052,7 +1054,12 @@ export class ZulipAdapter implements PlatformAdapter {
       ? (change: ZulipMessageChange) => {
           const byBot = change.kind === 'edit' && this.identity.selfUserId !== null && change.actorId === this.identity.selfUserId;
           if (byBot && change.topic === null && change.newStreamId === null) return;
-          const enter = (key: ChannelKey, located?: SeenMessage) => onMessageChange({ key, messageIds: change.messageIds, ready: () => this.onZulipChange(change, located) });
+          const kind = change.kind === 'delete' ? 'delete' : change.topic !== null || change.newStreamId !== null ? 'move' : 'edit';
+          const enter = (key: ChannelKey, located?: SeenMessage) => {
+            const entry: ChangeEntry = { key, messageIds: change.messageIds, kind, ready: (only) => this.onZulipChange(change, located, only) };
+            this.changeOf.set(entry, change);
+            onMessageChange(entry);
+          };
           const key = this.changeKeyNow(change);
           if (key !== null && (change.streamId !== null || this.placing === 0)) return enter(key);
           this.inOrder(async () => {
@@ -1094,17 +1101,17 @@ export class ZulipAdapter implements PlatformAdapter {
       const raw = { ...(msg as ZulipRawMessage), flags };
       const m = normalizeMessage(raw);
       const key = this.keyNow(m, raw);
-      if (key !== null && (m.isDm || m.streamId !== null || this.placing === 0)) return this.handOn(m, key, onMessage);
+      if (key !== null && (m.isDm || m.streamId !== null || this.placing === 0)) return this.handOn(raw, m, key, onMessage);
       this.inOrder(async () => {
         const placed = await this.keyFor(m, raw);
-        if (placed !== null && current()) this.handOn(m, placed, onMessage);
+        if (placed !== null && current()) this.handOn(raw, m, placed, onMessage);
       });
     }, onSystemEvent, reactionHandler, changeHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }
 
-  private handOn(m: ZulipMessage, key: ChannelKey, onMessage: OnIncomingMessage): void {
+  private handOn(raw: ZulipRawMessage, m: ZulipMessage, key: ChannelKey, onMessage: OnIncomingMessage): void {
     // Remember our own messages too: reactions to them are the ones that
     // matter most ("someone reacted to your message").
     this.remember(key, m);
@@ -1115,11 +1122,52 @@ export class ZulipAdapter implements PlatformAdapter {
         return;
       }
       const { descriptor, isNew } = this.describeDm(m);
-      const message = toIncoming(key, m, this.identity);
-      onMessage({ key, messageId: message.messageId, ready: async () => ({ message, ...(isNew ? { newChannel: descriptor } : {}) }) });
+      onMessage({
+        key,
+        messageId: String(m.id),
+        ready: async (changes) => {
+          const now = this.applyChanges(raw, m, changes);
+          return now === null ? null : { message: toIncoming(key, now, this.identity), ...(isNew ? { newChannel: descriptor } : {}) };
+        },
+      });
       return;
     }
-    onMessage({ key, messageId: String(m.id), ready: () => this.readyStreamMessage(m, key) });
+    onMessage({
+      key,
+      messageId: String(m.id),
+      ready: async (changes) => {
+        const now = this.applyChanges(raw, m, changes);
+        return now === null ? null : this.readyStreamMessage(now, key);
+      },
+    });
+  }
+
+  private applyChanges(raw: ZulipRawMessage, m: ZulipMessage, entries: readonly ChangeEntry[] | undefined): ZulipMessage | null {
+    if (!entries || entries.length === 0) return m;
+    let edited = raw;
+    for (const entry of entries) {
+      const change = this.changeOf.get(entry);
+      if (change?.kind === 'delete') {
+        this.seen.delete(m.id);
+        this.movedAway.delete(m.id);
+        return null;
+      }
+      if (change?.kind === 'edit' && change.content !== null) edited = { ...edited, content: change.content, flags: change.flags, last_edit_timestamp: change.editedAt };
+    }
+    if (edited === raw) return m;
+    const fresh = normalizeMessage(edited);
+    const now: ZulipMessage = {
+      ...m,
+      rawContent: fresh.rawContent,
+      cleanContent: fresh.cleanContent,
+      mentioned: fresh.mentioned,
+      wildcardMentioned: fresh.wildcardMentioned,
+      attachments: fresh.attachments,
+      editedAt: fresh.editedAt,
+    };
+    const cached = this.seen.get(m.id);
+    if (cached) this.seen.set(m.id, { ...cached, snippet: snippetOf(now.cleanContent), mentioned: now.mentioned, quoteTargets: quotedMessageIds(now.rawContent) });
+    return now;
   }
 
   private async readyStreamMessage(m: ZulipMessage, key: ChannelKey): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null> {

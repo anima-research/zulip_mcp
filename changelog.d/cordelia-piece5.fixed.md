@@ -2,14 +2,16 @@
   reach the host after a later message of its channel. If the host then
   refused it, having accepted the later one, it was not offered again. Each
   channel's messages, reactions and changes are now handled one at a time, in
-  the order the server received them, so a reaction or an edit follows the
-  message it is about. A change or a reaction to a message that arrives
-  while the message's move to another stream still waits is handed on in
-  the new stream's channel, after what waits there. A message waiting for its
-  attachments holds back only its own channel. A reaction is checked
-  against the filters when it is placed in its channel and again at its
-  turn. One whose stream the server doesn't know yet is checked at its turn
-  only.
+  the order the server received them, so a reaction follows the message it is
+  about, and so does an edit that arrives once that message is being handled.
+  An edit that doesn't move the message, or a deletion, that arrives while the
+  message still waits is applied to it: the message comes once with its new
+  text, or doesn't come. A change or a reaction to a message that arrives
+  while the message's move to another stream still waits is handed on in the
+  new stream's channel, after what waits there. A message waiting for its
+  attachments holds back only its own channel. A reaction is checked against
+  the filters when it is placed in its channel and again at its turn. One
+  whose stream the server doesn't know yet is checked at its turn only.
 - A host's `channels/open` or `channels/close` of a channel the server
   already knows no longer waits for the requests ahead of it, such as a tool
   call that waits for the host. It waits for the job running on its own
@@ -30,8 +32,9 @@
   still has it there.
 - A message that arrived while the host had `zulip.messaging` disabled was
   dropped, unless it was already waiting in the batch. It now waits in its
-  channel, and goes once the host enables `zulip.messaging` again, followed
-  by an edit or a deletion of it that arrived meanwhile.
+  channel until the host enables `zulip.messaging` again. An edit of it that
+  arrived meanwhile and didn't move it is applied to it, so it comes once
+  with its new text, and one deleted meanwhile doesn't come.
 - A catch-up at a connection's start, or a recovery after Zulip's event
   queue broke, that fell while `zulip.messaging` was disabled was skipped. It
   is now made once the host enables `zulip.messaging`.
@@ -102,10 +105,11 @@
   offered again later, after newer ones. Now, past 5,000 messages waiting in
   all channels together, the channel with the most gives them up, and a read
   from history brings them in order, in passes of at most the catch-up limit,
-  before the messages that arrived after them. An edit, a move or a deletion
-  that was waiting about given-up messages only isn't sent: the read brings
-  each of those messages as Zulip has it then, or doesn't bring it. A
-  reaction that was waiting stays, and its turn comes after the read.
+  before the messages that arrived after them. A move that was waiting about
+  given-up messages only isn't sent, and an edit or a deletion applied to one
+  of them goes with it: the read brings each of those messages as Zulip has
+  it then, or doesn't bring it. A reaction that was waiting stays, and its
+  turn comes after the read.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip

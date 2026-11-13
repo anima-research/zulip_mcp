@@ -1,7 +1,7 @@
 import type { ChannelKey } from './channel-key.js';
 
 export interface JobInfo {
-  kind: 'message' | 'other';
+  kind: 'message' | 'change' | 'reaction' | 'other';
   id?: number;
   about?: number[];
 }
@@ -29,6 +29,8 @@ export interface Moments<W> {
   start(w: W): void;
   end(w: W): void;
 }
+
+const aboutOnly = (info: JobInfo, ids: ReadonlySet<number>): boolean => info.about !== undefined && info.about.length > 0 && info.about.every((id) => ids.has(id));
 
 type Entry<W> = { info: JobInfo; answer?: boolean } & ({ job: Job<W>; read?: undefined } | { read: ReadJob<W>; job?: undefined });
 
@@ -129,7 +131,7 @@ export class Lane<W> {
     if (first < 0) return [];
     const ids = this.waitingMessages();
     const given = new Set(ids);
-    const aboutGiven = (e: Entry<W>) => e.info.about !== undefined && e.info.about.length > 0 && e.info.about.every((id) => given.has(id));
+    const aboutGiven = (e: Entry<W>) => e.info.kind === 'change' && aboutOnly(e.info, given);
     const kept = this.otherQueue.filter((e, i) => (i < first || e.info.kind !== 'message') && !aboutGiven(e));
     const at = this.otherQueue.slice(0, first).filter((e) => !aboutGiven(e)).length;
     kept.splice(at, 0, { read, info: { kind: 'other' } });
@@ -138,6 +140,15 @@ export class Lane<W> {
     this.lanes.messagesLeft(ids.length);
     this.lanes.changed(this);
     return ids;
+  }
+
+  dropAbout(ids: readonly number[]): void {
+    const out = new Set(ids);
+    const kept = this.otherQueue.filter((e) => !aboutOnly(e.info, out));
+    if (kept.length === this.otherQueue.length) return;
+    this.otherQueue.length = 0;
+    this.otherQueue.push(...kept);
+    this.lanes.changed(this);
   }
 
   get isEnded(): boolean {

@@ -377,21 +377,22 @@ test('past the cap, the lane with the most waiting messages is given up: its mes
   assert.ok(log.includes('B 20'));
 });
 
-test('at a give-up, a job about given-up messages alone leaves with them, and one about a message that waits elsewhere, or about none, stays', async () => {
+test('at a give-up, a change about given-up messages alone leaves with them, and a reaction about them, a change about a message that waits elsewhere, or a job about none, stays', async () => {
   const log: string[] = [];
   const running = gate();
   const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }); }, 2);
   l.lane(A).enter(async () => { await running.opened; log.push('running'); });
   l.lane(A).enter(() => { log.push('10'); }, { kind: 'message', id: 10 });
-  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'other', about: [10] });
+  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'change', about: [10] });
   l.lane(A).enter(() => { log.push('11'); }, { kind: 'message', id: 11 });
-  l.lane(A).enter(() => { log.push('about 10 and 5'); }, { kind: 'other', about: [10, 5] });
-  l.lane(A).enter(() => { log.push('about 10 and 11'); }, { kind: 'other', about: [10, 11] });
+  l.lane(A).enter(() => { log.push('about 10 and 5'); }, { kind: 'change', about: [10, 5] });
+  l.lane(A).enter(() => { log.push('about 10 and 11'); }, { kind: 'change', about: [10, 11] });
+  l.lane(A).enter(() => { log.push('reaction to 10'); }, { kind: 'reaction', about: [10] });
   l.lane(A).enter(() => { log.push('about none'); });
   l.lane(A).enter(() => { log.push('12'); }, { kind: 'message', id: 12 });
   running.open();
   await l.quiet();
-  assert.deepEqual(log, ['running', 'read', 'about 10 and 5', 'about none']);
+  assert.deepEqual(log, ['running', 'read', 'about 10 and 5', 'reaction to 10', 'about none']);
 });
 
 test('the place moves up to what a job decides, and never down', async () => {
@@ -410,7 +411,7 @@ test("at a give-up, the read takes the first given-up message's place, also when
   const running = gate();
   const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }); }, 1);
   l.lane(A).enter(async () => { await running.opened; log.push('running'); });
-  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'other', about: [10] });
+  l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'change', about: [10] });
   l.lane(A).enter(() => { log.push('10'); }, { kind: 'message', id: 10 });
   l.lane(A).enter(() => { log.push('after 10'); });
   l.lane(A).enter(() => { log.push('11'); }, { kind: 'message', id: 11 });
