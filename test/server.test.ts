@@ -7378,3 +7378,31 @@ test('an accepted ambient message deleted on an open channel gives its line whil
   assert.ok(h.incoming.some((m) => (m.content[0] as { text: string }).text.startsWith('[deleted] [T id=20]')), 'the deletion of 20 reaches the host');
   await h.close();
 });
+
+test('a refused mention behind more ambient messages than the catch-up limit is offered again at a later acceptance', async () => {
+  const h = harness({ history: [streamMsg(10, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(10, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 10, 'watermark 10 from an accepted push');
+  for (let id = 11; id <= 160; id++) h.adapter.history.push(streamMsg(id));
+  h.adapter.history.push(streamMsg(161, { mentioned: true }));
+  h.policy.rejectPushes.add('161');
+  h.adapter.emit!(streamMsg(161, { mentioned: true }));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(161), 'the refused mention held');
+  h.policy.rejectPushes.delete('161');
+  const offersOf161 = () => h.pushed.filter((p) => ((p.payload.content[0] as { text?: string }).text ?? '').includes('msg 161')).length;
+  // A held read that no acceptance starts: its read from the watermark stops at the limit, 100 here, with ambient rows only.
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.equal(offersOf161(), 1, 'the first read stops before 161');
+  for (const later of [162, 163]) {
+    h.adapter.history.push(streamMsg(later, { mentioned: true }));
+    h.adapter.emit!(streamMsg(later, { mentioned: true }));
+    await until(() => h.pushed.some((p) => String((p.origin as { messageId?: unknown }).messageId) === String(later)), `${later} pushed`);
+    await h.server.quiet();
+  }
+  assert.ok(offersOf161() >= 2, '161 is offered again at a later acceptance');
+  assert.ok(!h.delivery.heldIds('zulip:general').includes(161), 'and accepted');
+  await h.close();
+});

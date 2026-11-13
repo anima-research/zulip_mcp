@@ -1584,7 +1584,7 @@ export class ZulipMcplServer {
     const keepAll = read.keepAll || isDmKey(key);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
-      read.onAttempt?.(ctx.w, Infinity);
+      read.onAttempt?.(ctx.w, newestId);
       ctx.w.delivery.advanceThrough(key, newestId, after);
       if (blocked !== undefined) handSecond();
       return;
