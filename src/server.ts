@@ -1764,7 +1764,7 @@ export class ZulipMcplServer {
       ? 'with the catch-up limit at 0, no read from history brings them back'
       : !this.channelManager.isKeyOpen(key) && this.ids.heldIdOf(key) === undefined
         ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
-        : 'a read from history takes their place';
+        : 'a read from history is entered to take their place';
     console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; ${read}`);
   }
 
