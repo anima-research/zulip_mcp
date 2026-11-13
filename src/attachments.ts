@@ -10,10 +10,9 @@ import type { AttachmentRef } from './content.js';
  *  later models): https://platform.claude.com/docs/en/build-with-claude/vision */
 export const IMAGE_LONG_EDGE_MAX = 1568;
 const IMAGE_JPEG_QUALITY = 85;
-/** Anthropic accepts up to 5 MB of base64 per image on Amazon Bedrock, and
- *  10 MB on the Claude API and on Claude models on Google Cloud (Google
- *  managed), by the same page; base64 adds a third, so 3.5 MB of image bytes
- *  stays under the smaller limit. */
+/** Anthropic accepts up to 10 MB of base64 per image on the Claude API, and
+ *  5 MB on Amazon Bedrock, by the same page; base64 adds a third, so 3.5 MB of
+ *  image bytes stays under the smaller limit. */
 export const IMAGE_OUTPUT_RAW_CAP = 3.5 * 1024 * 1024;
 export const IMAGE_FETCH_CEILING = 25 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 256 * 1024;
