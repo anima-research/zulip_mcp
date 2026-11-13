@@ -2476,10 +2476,10 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true): Promise<void> {
-    if (!ev.byBot && ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
-    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (ev.previousTopic !== null && !ev.leftChannel) ctx.w.channels.followMove(ev.key, ev.messageIds, ev.topic);
     if (ev.byBot) return;
+    if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
+    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a

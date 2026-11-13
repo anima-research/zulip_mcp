@@ -1021,6 +1021,31 @@ test("the bot's own move takes a plain answer to the new topic, and nothing abou
   await h.close();
 });
 
+test('a rename while the channel is muted moves where a plain answer goes after the unmute, and tells the host nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-hints-muted-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+    await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+    await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+    const before = { incoming: h.incoming.length, pushed: h.pushed.length };
+
+    changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+    await h.server.quiet();
+    assert.deepEqual({ incoming: h.incoming.length, pushed: h.pushed.length }, before, 'muted: no line about the move');
+    await h.host.sendRequest('tools/call', { name: 'unmute_channel', arguments: { channel: '#general' } });
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'releases', topic: 'releases' }, 'after the unmute');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a plain answer stays where it was after a reaction, an edit and a deletion of its message', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-hints-'));
   try {
