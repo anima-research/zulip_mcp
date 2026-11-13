@@ -7,7 +7,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { once } from 'node:events';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { initializeZulipClient } from '../src/zulip-client.ts';
-import { httpTransport, zulipApi } from '../src/zulip-api.ts';
+import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
 
 interface Recorded {
   method: string;
@@ -624,4 +624,26 @@ test('edit_message refuses content above the message length, counted in code poi
     await s.tools.handleToolCall('edit_message', { message_id: 55, content: '😀'.repeat(10_000) });
     assert.equal(z.requests.filter((r) => r.method === 'PATCH').length, 1, '10,000 code points are 20,000 UTF-16 units, and fit');
   } finally { s.done(); z.close(); }
+});
+
+test("a refusal carries Zulip's code, and a rate limit's retry-after in seconds", async () => {
+  const z = await realm({
+    'GET /messages': { json: { result: 'error', msg: 'API usage exceeded rate limit', code: 'RATE_LIMIT_HIT', 'retry-after': 1.5 }, status: 429 },
+    'GET /streams': { json: { result: 'error', msg: 'Invalid narrow', code: 'BAD_REQUEST' }, status: 400 },
+  });
+  try {
+    const api = zulipApi(httpTransport({ apiUrl: `${z.url}/api/v1`, authHeader: '' }));
+    await assert.rejects(api.request('GET', '/messages', 'history'), (err: unknown) => {
+      assert.ok(err instanceof ZulipRefused);
+      assert.equal(err.code, 'RATE_LIMIT_HIT');
+      assert.equal(err.retryAfterSeconds, 1.5);
+      return true;
+    });
+    await assert.rejects(api.request('GET', '/streams', 'the stream list'), (err: unknown) => {
+      assert.ok(err instanceof ZulipRefused);
+      assert.equal(err.code, 'BAD_REQUEST');
+      assert.equal(err.retryAfterSeconds, undefined);
+      return true;
+    });
+  } finally { z.close(); }
 });

@@ -16,7 +16,7 @@ export interface Realm {
   staleList: Record<number, string> | null;
   listRefusals: number;
   registrations: number;
-  hold(call: 'POST /register' | 'GET /streams' | 'GET /messages'): () => void;
+  hold(call: 'POST /register' | 'GET /streams' | 'GET /messages' | 'GET /messages/:id'): () => void;
   rename(streamId: number, name: string): void;
   archive(streamId: number): void;
   /** The bot sees a stream again, under the same id, as Zulip tells a client that regains access to one. */
@@ -24,8 +24,14 @@ export interface Realm {
   create(name: string): number;
   /** The next poll is refused with BAD_EVENT_QUEUE_ID, as Zulip refuses a poll of a queue it has dropped. */
   gap(during: () => void): void;
-  post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean }): number;
+  /** `noStreamId`: its event carries the stream's name alone, as some Zulip versions send it. */
+  post(streamId: number, content: string, opts?: { topic?: string; mentioned?: boolean; noStreamId?: boolean }): number;
   react(messageId: number, emojiName: string, emojiCode: string): void;
+  move(messageId: number, toStreamId: number): void;
+  /** One event that moves several messages of a stream to a topic, under the first id. */
+  moveTopic(messageIds: number[], topic: string): void;
+  edit(messageId: number, content: string, opts?: { mentioned?: boolean; topic?: string }): void;
+  remove(messageIds: number[]): void;
 }
 
 export const SELF = 790;
@@ -76,10 +82,11 @@ export function realm(initial: Record<number, string>): Realm {
     timestamp: m.timestamp,
     flags: m.mentioned ? ['mentioned'] : [],
   });
-  const store = (streamId: number, content: string, senderId: number, topic: string, mentioned: boolean): StoredMessage => {
+  const store = (streamId: number, content: string, senderId: number, topic: string, mentioned: boolean, noStreamId = false): StoredMessage => {
     const m = { id: nextMessageId++, streamId, topic, content, senderId, mentioned, timestamp: 1_700_000_000 + nextMessageId };
     messages.push(m);
-    queue({ type: 'message', message: raw(m), flags: raw(m).flags });
+    const { stream_id: _, ...named } = raw(m);
+    queue({ type: 'message', message: noStreamId ? named : raw(m), flags: raw(m).flags });
     return m;
   };
   /** The narrow's stream, by either of Zulip's forms; a name no stream has refuses the read. */
@@ -145,7 +152,8 @@ export function realm(initial: Record<number, string>): Realm {
       const page = [...(before > 0 ? older : []), ...newer];
       return { result: 'success', messages: page.map(raw), found_newest: newer.length < after || after === 0, found_oldest: true };
     },
-    'GET /messages/:id': (_p, call) => {
+    'GET /messages/:id': async (_p, call) => {
+      await holds.get('GET /messages/:id');
       const m = messages.find((x) => x.id === call.id);
       return m ? { result: 'success', message: raw(m) } : { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid message(s)' };
     },
@@ -171,6 +179,7 @@ export function realm(initial: Record<number, string>): Realm {
       return { result: 'success', subscribed: {}, already_subscribed: {} };
     },
     'POST /typing': { result: 'success' },
+    'POST /messages/:id/reactions': { result: 'success' },
   });
 
   const self: Realm = {
@@ -213,10 +222,39 @@ export function realm(initial: Record<number, string>): Realm {
       for (const wake of waiting.splice(0)) wake();
     },
     post(streamId, content, opts = {}) {
-      return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false).id;
+      return store(streamId, content, PERSON.id, opts.topic ?? 'deploys', opts.mentioned ?? false, opts.noStreamId).id;
     },
     react(messageId, emojiName, emojiCode) {
       queue({ type: 'reaction', op: 'add', message_id: messageId, emoji_name: emojiName, emoji_code: emojiCode, reaction_type: 'unicode_emoji', user_id: PERSON.id, user: { user_id: PERSON.id, full_name: PERSON.full_name, email: PERSON.email } });
+    },
+    move(messageId, toStreamId) {
+      const m = messages.find((x) => x.id === messageId)!;
+      const from = m.streamId;
+      m.streamId = toStreamId;
+      queue({ type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60, orig_subject: m.topic, stream_id: from, new_stream_id: toStreamId, flags: [] });
+    },
+    moveTopic(messageIds, topic) {
+      const moved = messages.filter((x) => messageIds.includes(x.id));
+      const from = moved[0].topic;
+      for (const m of moved) m.topic = topic;
+      queue({ type: 'update_message', message_id: messageIds[0], message_ids: messageIds, user_id: PERSON.id, edit_timestamp: moved[0].timestamp + 60, orig_subject: from, subject: topic, stream_id: moved[0].streamId, flags: [] });
+    },
+    edit(messageId, content, opts = {}) {
+      const m = messages.find((x) => x.id === messageId)!;
+      const before = { content: m.content, topic: m.topic };
+      m.content = content;
+      m.mentioned = opts.mentioned ?? m.mentioned;
+      m.topic = opts.topic ?? m.topic;
+      queue({
+        type: 'update_message', message_id: messageId, message_ids: [messageId], user_id: PERSON.id, edit_timestamp: m.timestamp + 60,
+        orig_content: before.content, content, ...(opts.topic === undefined ? {} : { orig_subject: before.topic, subject: opts.topic }),
+        stream_id: m.streamId, flags: m.mentioned ? ['mentioned'] : [],
+      });
+    },
+    remove(messageIds) {
+      const gone = messages.filter((x) => messageIds.includes(x.id));
+      for (const m of gone) messages.splice(messages.indexOf(m), 1);
+      queue({ type: 'delete_message', message_ids: messageIds, message_type: 'stream', stream_id: gone[0].streamId, topic: gone[0].topic });
     },
   };
   return self;

@@ -34,7 +34,7 @@ export class ContextProvider {
   private readonly excludeChannel: (key: ChannelKey) => boolean;
 
   constructor(
-    private channelManager: ChannelManager,
+    private channelManager: Pick<ChannelManager, 'getOpenChannels' | 'keyOfHeld' | 'adapterFor' | 'getChannel' | 'firstAdapterType'>,
     private grant: CapabilityGrant,
     historySize?: number,
     options: ContextProviderOptions = {},

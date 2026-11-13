@@ -11,16 +11,17 @@
   sight does. A rename used to go unnoticed: the channel went quiet, and its
   place and its filters entries were lost.
 - A channel id under a stream's former name is refused by `channels/open`,
-  `channels/publish`, `channels/typing`, `channels/acknowledge`,
-  `channel_missed` and, with MCPL, `fetch_history`, and the refusal names
-  the new channel id. Before the host has answered the rename, the old id
-  isn't refused. With MCPL, `send_message`, `listen` and `unlisten` given a
-  former name refuse the call, naming the new name, and send nothing to
-  Zulip. Such a request used to go to Zulip by the old name, so it failed,
-  reached a new stream that had taken the name, or, from `channels/open` or
-  `listen` where the bot may create streams, created an empty stream of the
-  old name. With MCPL, `mute_channel`, `unmute_channel`, `filters_update`
-  and `set_reaction_visibility` given a former name refuse the call too, and
+  `channels/publish`, `channels/typing`, `channel_missed` and, with MCPL,
+  `fetch_history`, and the refusal names the new channel id. Before the
+  host has answered the rename, the old id isn't refused. With MCPL,
+  `send_message`, `listen` and `unlisten` given a former name refuse the
+  call, naming the new name, and send nothing to Zulip. These three, and
+  `channels/open`, `channels/publish` and `fetch_history`, used to go to
+  Zulip by the old name, so each failed, reached a new stream that had
+  taken the name, or, from `channels/open` or `listen` where the bot may
+  create streams, created an empty stream of the old name. With MCPL,
+  `mute_channel`, `unmute_channel`, `filters_update` and
+  `set_reaction_visibility` given a former name refuse the call too, and
   write nothing to the filters file. They used to write the old name, which
   matched no stream, and answer with success. A name another stream has
   taken since is that stream's.

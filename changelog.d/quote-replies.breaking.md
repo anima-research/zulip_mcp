@@ -6,6 +6,6 @@
   quote verification splits an accepted prefix from the retry block.
 - Addressed-only catch-up blocks use `reason="addressed"` when their count
   includes quote replies; mention-only counts retain `reason="mention"`.
-- Message events are handled in order; quote lookups delay later events in
-  the same batch by up to three seconds per message. Stopping delivery mid-batch
-  drops the rest of that batch, and the next sweep recovers what it can.
+- Message events are handled in order on each channel; a quote lookup
+  delays the later events of its own channel by up to three seconds per
+  message.

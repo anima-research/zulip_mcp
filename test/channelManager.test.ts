@@ -823,3 +823,52 @@ test('a host that acts on a pending channel has confirmed it (#20)', async () =>
   await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(sent.length, 1, 'nothing left to re-announce');
 });
+
+test('a flush() batch on the wire counts for isIdle(), a timer that fires meanwhile waits for it, and idle() settles after it', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let sends = 0;
+  const client = { registerChannels: async () => ({}), sendIncoming: async () => { sends++; await gate; } } as any;
+  const d: ChannelDescriptor = { id: 'zulip:general', type: 'zulip', label: '#general', direction: 'bidirectional' };
+  const { adapter, ids } = fakeAdapter('zulip', [d]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 20);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  const message = (id: string) => ({ messageId: id, author: { id: 'U1', name: 'a' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: 'hi' }] });
+  deliver(manager, 'zulip:general', message('7'));
+  let settled = false;
+  void manager.idle().then(() => { settled = true; });
+  const flushed = manager.flush();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(manager.isIdle(), false, "flush()'s batch is on the wire");
+  assert.equal(settled, false, 'idle() waits while the batch is on the wire');
+  deliver(manager, 'zulip:general', message('8'));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(sends, 1, 'the timer waits for the batch on the wire');
+  assert.equal(settled, false, 'idle() still waits');
+  release();
+  await flushed;
+  const deadline = performance.now() + 1000;
+  while (!settled && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(settled, true, 'idle() settles once both batches are sent');
+  assert.equal(sends, 2);
+  manager.destroy();
+});
+
+test('an idle() taken while the batch waits for its window settles when flush() sends that batch', async () => {
+  let sends = 0;
+  const client = { registerChannels: async () => ({}), sendIncoming: async () => { sends++; } } as any;
+  const d: ChannelDescriptor = { id: 'zulip:general', type: 'zulip', label: '#general', direction: 'bidirectional' };
+  const { adapter, ids } = fakeAdapter('zulip', [d]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), ids, 50);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  deliver(manager, 'zulip:general', { messageId: '7', author: { id: 'U1', name: 'a' }, timestamp: new Date(0).toISOString(), content: [{ type: 'text', text: 'hi' }] });
+  let settled = false;
+  void manager.idle().then(() => { settled = true; });
+  await manager.flush();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(sends, 1);
+  assert.equal(settled, true, 'idle() settles once flush() has sent the batch');
+  manager.destroy();
+});

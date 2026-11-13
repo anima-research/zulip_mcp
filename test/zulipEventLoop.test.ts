@@ -489,7 +489,7 @@ test('a long poll completed after stop delivers none of its events', async () =>
   assert.deepEqual(seen, []);
 });
 
-test('stopping in an awaited message handler drops all subsequent events in its batch', async () => {
+test('stopping in a message handler drops all subsequent events in its batch', async () => {
   const loop = new ZulipEventLoop();
   const seen: string[] = [];
   await loop.start(standInApi({
@@ -499,9 +499,8 @@ test('stopping in an awaited message handler drops all subsequent events in its 
       { id: 2, type: 'reaction', message_id: 1, user_id: 101 },
       { id: 3, type: 'delete_message', message_ids: [1], message_type: 'stream', stream_id: 7 },
     ] }),
-  }).api, async () => {
+  }).api, () => {
     seen.push('message');
-    await Promise.resolve();
     loop.stop();
   }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
   assert.deepEqual(seen, ['message']);

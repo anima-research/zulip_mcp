@@ -34,9 +34,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   /** `channels/changed`, Request form (§14.5) — itemized like register.
-   *  `timeoutMs` bounds the wait: a host that reconciles before answering
-   *  cannot be served while this server is inside a request of its own, so
-   *  waiting out the default 30s would stall the whole loop. */
+   *  `timeoutMs` bounds the wait. */
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
@@ -48,8 +46,8 @@ type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: str
 const MAX_PENDING_ANNOUNCEMENTS = 100;
 
 /** A batch that failed as a whole is retried this many times before it is
- *  given up on (the watermark then stays put and the next catch-up sweep
- *  re-fetches what was lost). */
+ *  given up on (the watermark then stays put and a later read from history
+ *  fetches what was lost again). */
 const MAX_BATCH_ATTEMPTS = 2;
 
 interface Queued {
@@ -100,6 +98,7 @@ export class ChannelManager {
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
   private flushing: Promise<void> | null = null;
+  private idleWaiters: (() => void)[] = [];
   /** Per-channel routing hints from the newest message noteConversation
    *  took, so publishes can land in the active thread/topic, with the id of
    *  the message they came from, so an older message delivered late doesn't
@@ -608,18 +607,22 @@ export class ChannelManager {
     const timestamp = new Date().toISOString();
     for (const channelId of targets) {
       const key = this.keyOfHeld(channelId);
-      if (key === null) continue;
-      this.enqueue(key, {
-        key,
-        messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
-        author: { id: 'system', name: `${platformType} connection` },
-        timestamp,
-        content: [{ type: 'text', text: event.text }],
-        // Spread adapter metadata FIRST so it can never clobber the
-        // discriminators consumers filter on (system / kind).
-        metadata: { ...event.metadata, system: true, kind: event.kind },
-      });
+      if (key !== null) this.systemEventTo(key, platformType, event, timestamp);
     }
+  }
+
+  systemEventTo(key: ChannelKey, platformType: string, event: PlatformSystemEvent, timestamp = new Date().toISOString()): void {
+    if (!this.isKeyOpen(key)) return;
+    this.enqueue(key, {
+      key,
+      messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
+      author: { id: 'system', name: `${platformType} connection` },
+      timestamp,
+      content: [{ type: 'text', text: event.text }],
+      // Spread adapter metadata FIRST so it can never clobber the
+      // discriminators consumers filter on (system / kind).
+      metadata: { ...event.metadata, system: true, kind: event.kind },
+    });
   }
 
   notifyChannel(key: ChannelKey, text: string, metadata: Record<string, unknown>): void {
@@ -740,15 +743,29 @@ export class ChannelManager {
    * Awaits an in-flight flush first so batches never interleave. Used at
    * shutdown so a message received in the last window is not stranded with
    * its watermark unadvanced — and, if the connection is already gone, the
-   * failure leaves the watermark alone for the next sweep.
+   * failure leaves the watermark alone for the next start's catch-up.
    */
   async flush(): Promise<void> {
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
-    if (this.flushing) await this.flushing;
-    await this.flushBatch();
+    while (this.flushing) await this.flushing;
+    const flushing: Promise<void> = this.flushBatch().finally(() => {
+      if (this.flushing === flushing) this.flushing = null;
+      this.wakeIdleWaiters();
+    });
+    this.flushing = flushing;
+    await flushing;
+  }
+
+  isIdle(): boolean {
+    return this.batchTimer === null && this.flushing === null;
+  }
+
+  idle(): Promise<void> {
+    if (this.isIdle()) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.push(resolve));
   }
 
   /** Buffered messages not yet delivered (for tests and diagnostics). */
@@ -767,13 +784,14 @@ export class ChannelManager {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
     }
+    this.wakeIdleWaiters();
   }
 
   /**
    * Forget everything that belonged to a connection: the descriptors the
    * peer accepted, what it had open, what was buffered for it. A new peer
    * registers and opens afresh; whatever was buffered is re-offered by the
-   * catch-up sweep, not sent to a host that never asked for it.
+   * new connection's catch-up, not sent to a host that never asked for it.
    */
   reset(): void {
     this.destroy();
@@ -816,8 +834,16 @@ export class ChannelManager {
       }
       this.flushing = this.flushBatch().finally(() => {
         this.flushing = null;
+        this.wakeIdleWaiters();
       });
     }, this.batchWindowMs);
+  }
+
+  private wakeIdleWaiters(): void {
+    if (this.idleWaiters.length === 0 || !this.isIdle()) return;
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   /**

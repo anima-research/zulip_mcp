@@ -3,8 +3,14 @@
  * missing, and which channels it had open. Persisted so a restart can catch
  * up instead of starting from "now".
  *
- *   watermarks   channelId → highest message id forwarded to the host. The
- *                "since when" anchor for the reconnect sweep, for gap
+ *   watermarks   channelId → highest message id forwarded to the host. A
+ *                channel the host has accepted nothing on gets one just
+ *                below its lowest held message once a hold there is no
+ *                longer on its way (`hold`, `refuse`, `failQueued`), and,
+ *                while `zulip.messaging` is disabled, as a message comes in
+ *                (`watermarkBelowHolds`). The
+ *                "since when" anchor for a channel's catch-up at a
+ *                connection's start, for gap
  *                recovery after a Zulip event-queue expiry, and for
  *                `sinceLastSeen` history on channels/open. It never passes
  *                an id the host was offered but has not accepted (the
@@ -14,8 +20,9 @@
  *                host had the channel closed. Reported by `channel_missed`
  *                and carried on closed-channel push events so "reply without
  *                opening" is an informed choice.
- *   lastOpen     channels the host had open at last sight. The reconnect
- *                sweep delivers their full missed backscroll (the host will
+ *   lastOpen     channels the host had open at last sight. A channel's
+ *                catch-up at a connection's start delivers their full
+ *                missed backscroll (the host will
  *                reopen them); every other watermarked channel gets only its
  *                addressed messages, with vicinity.
  *
@@ -62,6 +69,7 @@ interface Held {
   status: HeldStatus;
   /** A live replay from history has been attempted once already. */
   replayed: boolean;
+  replyVerified: boolean;
 }
 
 /** Ids held per channel before the newest ones stop being tracked. Far
@@ -71,22 +79,24 @@ const HELD_CAP_PER_CHANNEL = 50_000;
 
 export class DeliveryState {
   writes = true;
-  onResolved: ((keys: ChannelKey[]) => void) | null = null;
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
   private lastOpen = new Set<ChannelKey>();
   private unresolved = new Map<string, Unresolved>();
   /**
-   * The undelivered floor (in-memory). Every message id offered to the host
+   * The undelivered floor (in-memory). Every live message id is held here
+   * from when it enters its channel's lane, and every id offered to the host
    * on a channel — queued for `channels/incoming`, or sent as `push/event` —
-   * is held here until the host accepts it. The watermark never advances
+   * until the host accepts it or the server decides it is not for the host.
+   * The watermark never advances
    * past the lowest held id, whatever is accepted after it: a message the
    * host refused or a batch lost to a transport failure stays below the
-   * watermark, so the next sweep, a gap recovery, or a live replay can offer
-   * it again instead of a later acceptance burying it. Not persisted: the
-   * persisted watermark is already below every held id, which is all a
-   * restart needs.
+   * watermark, so the next start's catch-up, a gap recovery, or a live replay can offer
+   * it again instead of a later acceptance burying it. Not persisted: a
+   * hold that is not on its way has a watermark below it, and a connection's
+   * end ends every hold's way, so the persisted watermark is below every held
+   * id, which is all a restart needs.
    */
   private held = new Map<ChannelKey, Map<number, Held>>();
   /** The highest id acceptance has reached per channel; the watermark is
@@ -160,7 +170,6 @@ export class DeliveryState {
   }
 
   private resolveByName(): void {
-    const resolved: ChannelKey[] = [];
     for (const [name, u] of this.unresolved) {
       const id = this.directory.idOf(name);
       if (id === undefined) {
@@ -168,15 +177,11 @@ export class DeliveryState {
         continue;
       }
       const key = streamKey(id);
-      if (u.watermark !== undefined && !this.watermarks.has(key)) {
-        this.watermarks.set(key, u.watermark);
-        resolved.push(key);
-      }
+      if (u.watermark !== undefined && !this.watermarks.has(key)) this.watermarks.set(key, u.watermark);
       if (u.missed && !this.missed.has(key)) this.missed.set(key, u.missed);
       if (u.lastOpen) this.lastOpen.add(key);
     }
     this.unresolved.clear();
-    if (resolved.length > 0) this.onResolved?.(resolved);
     this.save();
   }
 
@@ -218,7 +223,7 @@ export class DeliveryState {
         ...(copy ?? {}),
       };
       // tmp + rename: a crash mid-write must not leave a truncated file that
-      // the next start reads as "no watermarks" and sweeps from nowhere.
+      // the next start reads as "no watermarks", catching no channel up.
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
       renameSync(tmp, path);
@@ -258,6 +263,10 @@ export class DeliveryState {
     return this.advance(key, messageId);
   }
 
+  restartReached(): void {
+    this.reached = new Map(this.watermarks);
+  }
+
   /** Apply the floor: watermark = highest reached, capped below the lowest held id. */
   private settle(key: ChannelKey): boolean {
     const reached = this.reached.get(key);
@@ -276,8 +285,8 @@ export class DeliveryState {
 
   // ── undelivered floor ──
 
-  /** The message was offered to the host and is not accepted yet. An id at
-   *  or below the watermark is already forwarded and is not held. */
+  /** The message is on its way to the host, or was offered and is not accepted
+   *  yet. An id at or below the watermark is already forwarded and is not held. */
   hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
@@ -289,18 +298,23 @@ export class DeliveryState {
     const existing = held.get(messageId);
     if (existing) {
       existing.status = status;
-      return;
-    }
-    if (held.size >= HELD_CAP_PER_CHANNEL) {
+    } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
       // Keep the lowest ids: the floor protects everything above it anyway.
-      const highest = Math.max(...held.keys());
-      if (messageId >= highest) {
-        console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
-        return;
-      }
-      held.delete(highest);
+      console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
+      return;
+    } else {
+      if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
+      held.set(messageId, { status, replayed: false, replyVerified: false });
     }
-    held.set(messageId, { status, replayed: false });
+    if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
+  }
+
+  watermarkBelowHolds(key: ChannelKey): boolean {
+    if (this.watermarks.has(key)) return false;
+    const floor = this.floor(key);
+    if (floor === undefined) return false;
+    this.watermarks.set(key, floor - 1);
+    return true;
   }
 
   /** The host accepted the message. Returns true if the watermark moved. */
@@ -309,6 +323,25 @@ export class DeliveryState {
     if (!held?.delete(messageId)) return false;
     if (held.size === 0) this.held.delete(key);
     return this.settle(key);
+  }
+
+  refuse(key: ChannelKey, afterId: number, messageId: number): void {
+    const held = this.held.get(key);
+    if (!held) return;
+    for (const [id, h] of held) if (id > afterId && id <= messageId) h.status = 'rejected';
+    if (this.watermarkBelowHolds(key)) this.save();
+  }
+
+  failQueued(): void {
+    for (const [key, held] of this.held) {
+      let failed = false;
+      for (const h of held.values()) {
+        if (h.status !== 'queued') continue;
+        h.status = 'failed';
+        failed = true;
+      }
+      if (failed) this.watermarkBelowHolds(key);
+    }
   }
 
   /** Drop every hold on a channel (nothing from it may reach the agent any more). */
@@ -338,7 +371,7 @@ export class DeliveryState {
       .sort((a, b) => a - b);
   }
 
-  /** A live replay of these ids has been attempted; only a sweep or gap recovery re-offers them after this. */
+  /** A held read has tried these ids again: no later held read asks for them until `clearReplayed`. */
   markReplayed(key: ChannelKey, ids: number[]): void {
     const held = this.held.get(key);
     if (!held) return;
@@ -346,6 +379,27 @@ export class DeliveryState {
       const h = held.get(id);
       if (h) h.replayed = true;
     }
+  }
+
+  verifiedReply(key: ChannelKey, messageId: number): boolean {
+    return this.held.get(key)?.get(messageId)?.replyVerified === true;
+  }
+
+  verifyReply(key: ChannelKey, messageId: number): void {
+    const h = this.held.get(key)?.get(messageId);
+    if (h) h.replyVerified = true;
+  }
+
+  forgetReply(key: ChannelKey, messageId: number): void {
+    const h = this.held.get(key)?.get(messageId);
+    if (h) h.replyVerified = false;
+  }
+
+  /** These ids (every one when none is named) may be asked for again by a later held read. */
+  clearReplayed(key: ChannelKey, ids?: number[]): void {
+    const held = this.held.get(key);
+    if (!held) return;
+    for (const h of ids ? ids.map((id) => held.get(id)) : held.values()) if (h) h.replayed = false;
   }
 
   // ── open mirror ──
@@ -381,13 +435,13 @@ export class DeliveryState {
     return [...this.missed.keys()];
   }
 
-  /** Count one dropped ambient message. No-op unless the channel is tracked. */
+  /** Count one dropped ambient message. No-op unless the channel is tracked and the message is above what the tally has counted through. */
   countMissed(key: ChannelKey, m: { id: number; text: string }): boolean {
     const t = this.missed.get(key);
-    if (!t) return false;
+    if (!t || m.id <= t.talliedThrough) return false;
     t.messages += 1;
     t.characters += m.text.length;
-    if (m.id > t.talliedThrough) t.talliedThrough = m.id;
+    t.talliedThrough = m.id;
     return true;
   }
 
@@ -401,13 +455,30 @@ export class DeliveryState {
   }
 }
 
+export type DeliveryReader = Pick<
+  DeliveryState,
+  | 'writes'
+  | 'save'
+  | 'directoryCopy'
+  | 'watermark'
+  | 'watermarkedChannels'
+  | 'floor'
+  | 'heldChannels'
+  | 'heldIds'
+  | 'verifiedReply'
+  | 'wasOpen'
+  | 'lastOpenChannels'
+  | 'tally'
+  | 'talliedChannels'
+>;
+
 function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
-// ── Pure selection/rendering helpers for the reconnect sweep ──
+// ── Pure selection/rendering helpers for catch-up blocks ──
 
-/** The fields of an incoming-shaped message the sweep reads. */
+/** The fields of an incoming-shaped message a catch-up reads. */
 export interface MissedView {
   id: number;
   mentioned: boolean;

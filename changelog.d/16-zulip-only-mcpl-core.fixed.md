@@ -3,14 +3,13 @@
 - `fetch_attachment` refuses a protocol downgrade from the realm's scheme
   (an `http` URL on an `https` realm), which would have sent the bot's
   credentials in clear.
-- Live events received before the catch-up sweep has run are held and
-  released in order afterwards, so a live delivery cannot advance the
-  watermark over the offline gap the sweep is about to fetch; delivery
-  opens only once the buffer is empty, so a live message arriving during
-  the release cannot overtake the held ones and bury them. The sweep
-  catches up from the watermarks as they stood when the connection began,
-  so a `channel_open` with backscroll answered meanwhile cannot hide the
-  gap from it.
+- A message that arrives before its channel's catch-up at a connection's
+  start waits for that catch-up and follows it, in order, so a live
+  delivery cannot advance the watermark over the offline gap, and a later
+  live message cannot overtake it. Past 5,000 waiting messages, the channel
+  with the most gives its waiting messages up to a read from history in
+  their place. A `channel_open` with backscroll
+  answered before the catch-up cannot hide the gap from it.
 - Catch-up pages past a page holding nothing but the bot's own messages
   instead of reading it as the end of history.
 - `ZULIP_MISSED_BLOCK_MAX_CHARS` is a hard cap on the whole `<missed>`

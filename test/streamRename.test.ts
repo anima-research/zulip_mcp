@@ -37,6 +37,7 @@ interface Run {
   server: ZulipMcplServer;
   filters: FiltersPlane;
   host: McplConnection;
+  serverSide: McplConnection;
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   changed: { removed?: string[]; added?: ChannelDescriptor[] }[];
@@ -79,6 +80,8 @@ interface StartOptions {
   grantLater?: boolean;
   /** Record channels/register but never answer it. */
   holdRegister?: boolean;
+  beforeRegisterAnswer?: () => Promise<void>;
+  shutdownGraceMs?: number;
 }
 
 async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Run> {
@@ -104,6 +107,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     catchupLimit: 100,
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 300,
+    shutdownGraceMs: opts.shutdownGraceMs,
     filters,
     directory,
   } as ConstructorParameters<typeof ZulipMcplServer>[2]);
@@ -121,7 +125,11 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     if (req.method === method.CHANNELS_REGISTER) {
       const p = req.params as ChannelsRegisterParams;
       registered.push(...p.channels);
-      if (!opts.holdRegister) host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
+      if (!opts.holdRegister) {
+        void Promise.resolve(opts.beforeRegisterAnswer?.()).then(() => {
+          try { host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) }); } catch { /* closed */ }
+        });
+      }
     } else if (req.method === method.CHANNELS_INCOMING) {
       const p = req.params as ChannelsIncomingParams;
       incoming.push(...p.messages);
@@ -138,7 +146,8 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
       host.sendError(req.id, -32601, `unexpected ${req.method}`);
     }
   });
-  const served = server.serve(McplConnection.fromStreams(toServer, toHost));
+  const serverSide = McplConnection.fromStreams(toServer, toHost);
+  const served = server.serve(serverSide);
   await host.sendRequest(method.INITIALIZE, {
     protocolVersion: '2025-03-26',
     capabilities: mcpl ? { experimental: { mcpl: { version: '0.5', channels: true } } } : {},
@@ -147,14 +156,15 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
   host.sendNotification('notifications/initialized');
   const grant = async () => {
     await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
-    await until(() => registered.length > 0 && server.isLive, 'registration and live delivery');
+    await until(() => registered.length > 0, 'registration');
+    await server.quiet();
   };
   if (mcpl && !opts.grantLater) {
     if (opts.noWait) await host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     else await grant();
   }
   return {
-    server, filters, host, incoming, pushed, changed, registered, logs, subscribing, directory, grant,
+    server, filters, host, serverSide, incoming, pushed, changed, registered, logs, subscribing, directory, grant,
     answerChanged() { for (const answer of held.splice(0)) answer(); },
     releaseChanged() { holding = false; for (const answer of held.splice(0)) answer(); },
     async open(channelId, history) {
@@ -271,7 +281,7 @@ const origin = (p: PushEventParams) => p.origin as { messageId: string; mcplChan
 const payloadText = (p: PushEventParams) => ((p.payload as { content?: { text?: string }[] }).content ?? []).map((c) => c.text ?? '').join('\n');
 const named = (run: Run, id: number) => [...run.incoming.map((m) => m.messageId), ...run.pushed.map((p) => origin(p).messageId)].includes(String(id))
   || run.pushed.some((p) => payloadText(p).includes(`id=${id}]`));
-const deliveriesSettled = (run: Run) => until(() => (run.server as unknown as { inFlight: Set<unknown> }).inFlight.size === 0, 'no delivery in flight');
+const deliveriesSettled = (run: Run) => run.server.quiet();
 
 async function tookRename(run: Run, newId = 'zulip:lobby'): Promise<void> {
   await untilAsync(async () => (await missedOn(run, newId)) !== null, `the host's answer taken for ${newId}`);
@@ -453,8 +463,8 @@ scenario('10. a stream archived while its channel is open: a line to the agent, 
   } finally { await run.close(); }
 });
 
-scenario('11. until the host answers the rename, an addressed message goes out under the old id, nothing goes out under the new one, and a new stream under the old name waits', async (dir) => {
-  const r = realm({ 17: 'general' });
+scenario('11. until the host answers the rename, nothing of the stream goes out, nothing goes out under the new id, and a new stream under the old name waits; after the answer, the stream\'s message comes from the new id', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
   const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
   try {
@@ -462,8 +472,6 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     r.rename(17, 'lobby');
     await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
     const addressed = r.post(17, '@bot meanwhile', { mentioned: true });
-    await until(() => run.incoming.some((m) => m.messageId === String(addressed)), 'the addressed message');
-    assert.equal(run.incoming.find((m) => m.messageId === String(addressed))!.channelId, 'zulip:general');
     await run.tool('refresh_channels', {});
     const ids = [
       ...run.incoming.map((m) => m.channelId),
@@ -473,15 +481,18 @@ scenario('11. until the host answers the rename, an addressed message goes out u
     assert.equal(ids.filter((id) => id === 'zulip:lobby').length, 1, 'only the held announcement names zulip:lobby');
     const reused = r.create('general');
     const intruder = r.post(reused, '@bot from the new #general', { mentioned: true });
-    const control = r.post(17, '@bot control', { mentioned: true });
+    const control = r.post(18, '@bot control', { mentioned: true });
     await until(() => named(run, control), 'the control mention');
-    await deliveriesSettled(run);
     assert.equal(gaveUp(), false, 'the announcement is still in flight when the new #general\'s message is handled');
+    assert.equal(named(run, addressed), false, 'nothing of the renamed stream goes while the host has the announcement');
     assert.equal(named(run, intruder), false, 'a new #general sends nothing under the id the host holds for stream 17');
     const listed = (await run.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
     assert.equal((listed.channels.find((c) => c.id === 'zulip:general')?.address as { stream_id?: number }).stream_id, 17, 'zulip:general stays stream 17\'s');
     run.answerChanged();
-  } finally { await run.close(); }
+    await until(() => arrivedOn(run, addressed) !== null, 'the renamed stream\'s message after the answer');
+    assert.equal(arrivedOn(run, addressed), 'zulip:lobby', 'from the new id, as a push while the host hasn\'t opened it');
+    assert.equal(run.pushed.filter((p) => origin(p).messageId === String(addressed)).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
 });
 
 scenario('12. a stream list read after a rename that still has the old name leaves the new one', async (dir) => {
@@ -1165,7 +1176,7 @@ scenario('46. one process: a host that leaves while its start reads the stream l
     release();
     await until(() => third.registered.length > 0, 'the second host\'s start, resumed, reaching the third host with its registration');
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    assert.deepEqual([...third.pushed.map(payloadText), ...third.incoming.map((m) => m.messageId)], [], 'nothing reaches the third host before its policy');
     await third.grant();
     await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
   } finally { await third.close(); }
@@ -1189,7 +1200,7 @@ scenario('47. one process: a host that leaves while its catch-up reads leaves th
   try {
     release();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(third.server.isLive, false, 'no live delivery before the third host\'s policy');
+    assert.deepEqual([...third.pushed.map(payloadText), ...third.incoming.map((m) => m.messageId)], [], 'nothing reaches the third host before its policy');
     await third.grant();
     await until(() => named(third, away), 'the third host\'s catch-up of the message written while no host was connected');
   } finally { await third.close(); }
@@ -1259,7 +1270,7 @@ scenario('50. one process: a host that leaves while its catch-up reads, and a ne
     await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     await until(() => r.reads.length > readsHeld, 'the third host\'s own catch-up reading');
     release();
-    await until(() => third.server.isLive && named(third, away) && named(third, awayRandom), 'the third host\'s catch-up of both streams');
+    await until(() => named(third, away) && named(third, awayRandom), 'the third host\'s catch-up of both streams');
     await deliveriesSettled(third);
     for (const id of [away, awayRandom]) {
       const catchUps = third.pushed.filter((p) => payloadText(p).includes(`id=${id}]`));
@@ -1333,7 +1344,7 @@ scenario('53. one process: a sweep whose host leaves during its last stream\'s r
   assert.deepEqual(r.reads.slice(readsHeld).map(streamOfRead), [], 'no read of dev\'s tally after the host left');
 });
 
-scenario('54. one process: a host that leaves while a rename\'s push waits for its answer leaves the other renames\' pushes to the next host', async (dir) => {
+scenario('54. one process: a host that leaves while its start\'s rename pushes wait for their answers was offered each push once, and the next host isn\'t offered them again', async (dir) => {
   const r = realm({ 17: 'general', 18: 'random' });
   const first = await start(r, dir);
   try {
@@ -1344,15 +1355,14 @@ scenario('54. one process: a host that leaves while a rename\'s push waits for i
   r.rename(18, 'lounge');
   const renamePush = (p: PushEventParams) => /was renamed/.test(payloadText(p));
   const second = await start(r, dir, { reuse: first, noWait: true, beforePushAnswer: (p) => (renamePush(p) ? new Promise<void>(() => {}) : Promise.resolve()) });
-  await until(() => second.pushed.some(renamePush), 'the first rename\'s push, which gets no answer');
-  const told = second.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId);
-  assert.equal(told.length, 1);
+  await until(() => second.pushed.filter(renamePush).length === 2, 'both renames\' pushes, which get no answer');
+  assert.deepEqual(second.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId).sort(), ['zulip:lobby', 'zulip:lounge']);
+  await second.open('zulip:lobby');
   await second.end();
   const third = await start(r, dir, { reuse: first });
   try {
-    await until(() => third.pushed.some(renamePush), 'the other rename\'s push at the next start');
     await deliveriesSettled(third);
-    assert.deepEqual(third.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId), ['zulip:lobby', 'zulip:lounge'].filter((id) => !told.includes(id)));
+    assert.deepEqual(third.pushed.filter(renamePush).map((p) => origin(p).mcplChannelId), [], 'no push again, zulip:lobby open at last sight included');
   } finally { await third.close(); }
 });
 
@@ -1378,9 +1388,444 @@ scenario('55. one process: a backfill of missed tallies whose host leaves during
     await third.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
     await until(() => r.reads.length > readsHeld, 'the third host\'s backfill reading dev');
     release();
-    await until(() => third.server.isLive, 'the third host live');
+    await third.server.quiet();
     assert.equal(await missedOn(third, 'zulip:dev'), 2, 'one ambient message counted live and one backfilled, each once');
   } finally { await third.close(); }
+});
+
+scenario('56. one process: a host that leaves while a rename\'s push waits behind its open on the stream\'s lane leaves the push to the next host', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir, { shutdownGraceMs: 20 });
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on random');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  let answerRegister!: () => void;
+  const registerAnswered = new Promise<void>((resolve) => { answerRegister = resolve; });
+  const second = await start(r, dir, { reuse: first, noWait: true, beforeRegisterAnswer: () => registerAnswered });
+  await until(() => second.registered.length > 0, 'the second host asked to register');
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  try {
+    second.open('zulip:lobby', { limit: 50, sinceLastSeen: true }).catch(() => {});
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 17), 'the open of zulip:lobby reading its page');
+    answerRegister();
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 18), 'the lanes open: random\'s catch-up reading');
+    assert.deepEqual(second.pushed.filter((p) => /was renamed/.test(payloadText(p))).map(payloadText), [], 'the push waits behind the open');
+    await second.end();
+  } finally { release(); }
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
+  } finally { await third.close(); }
+});
+
+scenario('57. a rename whose announcement gets no answer: the stream\'s message waits for the bound, then goes under the old id', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 200 });
+  const gaveUp = () => run.logs.some((l) => l.includes('zulip:general') && l.includes('got no answer'));
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    const addressed = r.post(17, '@bot meanwhile', { mentioned: true });
+    let gaveUpBefore: boolean | null = null;
+    const push = run.incoming.push.bind(run.incoming);
+    run.incoming.push = (...messages) => {
+      if (gaveUpBefore === null && messages.some((m) => m.messageId === String(addressed))) gaveUpBefore = gaveUp();
+      return push(...messages);
+    };
+    await until(() => arrivedOn(run, addressed) !== null, 'the message after the bound');
+    assert.equal(gaveUpBefore, true, 'it arrived only once the announcement was given up');
+    assert.equal(arrivedOn(run, addressed), 'zulip:general');
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
+scenario('58. a quote lookup held on one stream: a mention on another stream reaches the host meanwhile', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const quoting = r.post(17, `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`);
+    await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), 'the quote lookup');
+    const mention = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, mention), 'the other stream\'s mention');
+    assert.equal(run.logs.some((l) => l.includes('could not resolve message 999')), false, 'the mention came while the lookup was still out');
+    assert.equal(named(run, quoting), false);
+    release();
+    await run.server.quiet();
+  } finally { release(); await run.close(); }
+});
+
+scenario('59. two messages without stream_id of a stream the directory doesn\'t hold, the second after an event taught the directory its name: the first reaches the host first, and neither is lost', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot one', { mentioned: true, noStreamId: true });
+    r.regain(30, 'north');
+    const second = r.post(30, '@bot two', { mentioned: true, noStreamId: true });
+    await until(() => named(run, first) && named(run, second), 'both messages');
+    const order = run.pushed.map((p) => origin(p).messageId).filter((id) => id === String(first) || id === String(second));
+    assert.deepEqual(order, [String(first), String(second)]);
+  } finally { await run.close(); }
+});
+
+scenario("60. a reaction to a new stream's first message, on a channel set to show reactions, reaches the host after its message: it arrived before the directory held the stream's name", async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:north'] });
+  const run = await start(r, dir);
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot one', { mentioned: true });
+    r.react(first, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.findIndex((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${first}`));
+    await until(() => reaction() >= 0, 'the reaction');
+    const message = run.pushed.findIndex((p) => origin(p).messageId === String(first));
+    assert.ok(message >= 0 && message < reaction(), 'the message reaches the host before its reaction');
+    assert.equal(origin(run.pushed[reaction()]).mcplChannelId, 'zulip:north');
+  } finally { await run.close(); }
+});
+
+scenario("64. a message's move to another stream waits in its busy lane, and a reaction to the message arrives meanwhile: the reaction's line goes on the new stream's channel", async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  writeFilters(dir, { reactionChannels: ['zulip:general', 'zulip:dev'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const moved = r.post(17, 'to be moved');
+    r.post(17, `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`);
+    await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), "general's lane busy with a quote lookup");
+    r.move(moved, 18);
+    r.react(moved, 'thumbs_up', '1f44d');
+    const marker = r.post(18, '@bot after the reaction', { mentioned: true });
+    await until(() => named(run, marker), 'an event read after the reaction');
+    release();
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${moved}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.equal(origin(reaction()!).mcplChannelId, 'zulip:dev');
+    await run.server.quiet();
+  } finally { release(); await run.close(); }
+});
+
+scenario('61. one process: a host that leaves while a request is still served, and while a rename\'s push waits behind its open on the stream\'s lane, leaves the push to the next host', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'random' });
+  const first = await start(r, dir, { shutdownGraceMs: 20 });
+  try {
+    await first.open('zulip:general');
+    await first.open('zulip:random');
+    const seen = r.post(18, 'seen while open in random');
+    await until(() => first.incoming.some((m) => m.messageId === String(seen)), 'delivery on random');
+  } finally { await first.end(); }
+  r.rename(17, 'lobby');
+  let answerRegister!: () => void;
+  const registerAnswered = new Promise<void>((resolve) => { answerRegister = resolve; });
+  const second = await start(r, dir, { reuse: first, noWait: true, beforeRegisterAnswer: () => registerAnswered });
+  await until(() => second.registered.length > 0, 'the second host asked to register');
+  const readsBefore = r.reads.length;
+  const release = r.hold('GET /messages');
+  let releaseList = () => {};
+  let leaving: Promise<void> = Promise.resolve();
+  try {
+    second.open('zulip:lobby', { limit: 50, sinceLastSeen: true }).catch(() => {});
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 17), 'the open of zulip:lobby reading its page');
+    answerRegister();
+    await until(() => r.reads.slice(readsBefore).some((read) => streamOfRead(read) === 18), 'the lanes open: random\'s catch-up reading');
+    const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+    const listsBefore = lists();
+    releaseList = r.hold('GET /streams');
+    second.tool('refresh_channels', {}).catch(() => {});
+    await until(() => lists() > listsBefore, 'refresh_channels reading the stream list, on the request chain');
+    const sawClose = new Promise((resolve) => second.serverSide.once('close', resolve));
+    leaving = second.end();
+    await sawClose;
+    await new Promise((resolve) => setImmediate(resolve));
+    const laneOf = (streamId: number) => (second.server as unknown as { lanes: { lane(key: ReturnType<typeof streamKey>): { isQuiet: boolean } } }).lanes.lane(streamKey(streamId));
+    assert.equal(laneOf(17).isQuiet, false, 'the open still runs on its lane, held at its page read');
+    release();
+    await until(() => laneOf(17).isQuiet && laneOf(18).isQuiet, 'the open, resumed, and each job its lanes would run after it, done');
+  } finally {
+    release();
+    releaseList();
+  }
+  await leaving;
+  const third = await start(r, dir, { reuse: first });
+  try {
+    await until(() => third.pushed.some((p) => /was renamed #lobby/.test(payloadText(p))), 'the rename\'s push at the next start');
+  } finally { await third.close(); }
+});
+
+scenario('62. quiet() waits while a rename\'s channels/changed is with the host, and settles once the host answers', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  try {
+    await run.open('zulip:general');
+    r.rename(17, 'lobby');
+    await until(() => run.changed.some((c) => c.removed?.includes('zulip:general')), 'the held announcement');
+    let settled = false;
+    void run.server.quiet().then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(settled, false, 'quiet() waits for the announcement\'s answer');
+    run.answerChanged();
+    await until(() => settled, 'quiet() once the host answers');
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
+scenario('63. a read of the stream list held for one stream\'s message: a mention on another stream reaches the host meanwhile', async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+  const before = lists();
+  const release = r.hold('GET /streams');
+  try {
+    r.streams.set(30, 'north');
+    const unlisted = r.post(30, '@bot north', { mentioned: true });
+    await until(() => lists() > before, 'the read of the stream list');
+    const mention = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, mention), 'the other stream\'s mention');
+    assert.equal(named(run, unlisted), false, 'the mention came while the read was still out');
+    release();
+    await until(() => named(run, unlisted), 'the mention on the stream the read found');
+  } finally { release(); await run.close(); }
+});
+
+const quoting = `@_**User|${SELF}** [said](/#narrow/channel/17-general/near/999):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`;
+
+async function busyGeneral(r: Realm): Promise<void> {
+  r.post(17, quoting);
+  await until(() => r.calls.some((c) => c.method === 'GET' && c.id === 999), "general's lane busy with a quote lookup");
+}
+
+const pushesAbout = (run: Run, kind: string, id: number) => run.pushed.filter((p) => origin(p).messageId.startsWith(`${kind}:${id}:`));
+
+scenario('65. a mention that waits behind a quote lookup and is deleted reaches the host as nothing: no push, and no line', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const gone = r.post(17, '@bot soon gone', { mentioned: true });
+    r.remove([gone]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, gone), false);
+    assert.deepEqual(pushesAbout(run, 'delete', gone), []);
+  } finally { release(); await run.close(); }
+});
+
+scenario('66. on a closed channel, an ambient message that waits and is edited into a mention is pushed once, as a mention, with its new text and "(edited)"', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const plain = r.post(17, 'plain words');
+    r.edit(plain, '@bot now a mention', { mentioned: true });
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    const pushes = run.pushed.filter((p) => origin(p).messageId === String(plain));
+    assert.equal(pushes.length, 1);
+    assert.match(payloadText(pushes[0]), /now a mention \(edited\)/);
+    assert.ok(pushes[0].tags?.includes('chat:mention'));
+    assert.deepEqual(pushesAbout(run, 'edit', plain), []);
+  } finally { release(); await run.close(); }
+});
+
+scenario("67. an edit that arrives once its message's job has started follows it as a line: the message comes with its first text", async (dir) => {
+  const r = realm({ 17: 'general', 18: 'dev' });
+  const run = await start(r, dir);
+  const lists = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/streams').length;
+  const before = lists();
+  const release = r.hold('GET /streams');
+  try {
+    r.streams.set(30, 'north');
+    const first = r.post(30, '@bot first words', { mentioned: true });
+    await until(() => lists() > before, "the read of the stream list, in the message's job");
+    r.edit(first, '@bot second words', { mentioned: true });
+    const marker = r.post(18, '@bot meanwhile', { mentioned: true });
+    await until(() => named(run, marker), 'an event read after the edit');
+    release();
+    await until(() => pushesAbout(run, 'edit', first).length === 1, "the edit's line");
+    const at = run.pushed.findIndex((p) => origin(p).messageId === String(first));
+    assert.ok(at >= 0 && at < run.pushed.indexOf(pushesAbout(run, 'edit', first)[0]));
+    assert.match(payloadText(run.pushed[at]), /first words$/);
+  } finally { release(); await run.close(); }
+});
+
+scenario('68. a deletion that names a message the host has and a message that waits: the waiting one never comes, and the line names the other alone', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const had = r.post(17, '@bot first', { mentioned: true });
+    await until(() => named(run, had), 'the first mention');
+    await busyGeneral(r);
+    const waiting = r.post(17, '@bot second', { mentioned: true });
+    r.remove([had, waiting]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, waiting), false);
+    const lines = run.pushed.filter((p) => origin(p).messageId.startsWith('delete:'));
+    assert.equal(lines.length, 1);
+    assert.equal(origin(lines[0]).messageId.split(':')[1], String(had));
+    assert.doesNotMatch(payloadText(lines[0]), /2 messages/);
+  } finally { release(); await run.close(); }
+});
+
+scenario('69. one event that edits a waiting message and moves it to another topic: the message comes with its first text, and the line follows it', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const moved = r.post(17, '@bot first words', { mentioned: true });
+    r.edit(moved, '@bot second words', { mentioned: true, topic: 'elsewhere' });
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    const at = run.pushed.findIndex((p) => origin(p).messageId === String(moved));
+    assert.match(payloadText(run.pushed[at]), /first words$/);
+    const line = pushesAbout(run, 'edit', moved);
+    assert.equal(line.length, 1);
+    assert.ok(run.pushed.indexOf(line[0]) > at);
+  } finally { release(); await run.close(); }
+});
+
+scenario("70. an edit applied to a waiting message reaches the cache: a reaction after the message was handed over quotes the new text", async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:general'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    await busyGeneral(r);
+    const edited = r.post(17, '@bot first words', { mentioned: true });
+    r.edit(edited, '@bot second words', { mentioned: true });
+    release();
+    await until(() => named(run, edited), 'the edited mention');
+    r.react(edited, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${edited}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.match(payloadText(reaction()!), /second words/);
+    assert.doesNotMatch(payloadText(reaction()!), /first words/);
+  } finally { release(); await run.close(); }
+});
+
+scenario('71. under a disabled zulip.messaging, an edit runs after an older edit of the same message that waits in its lane: a reaction after the enable quotes the newer text', async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:general'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  const polls = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/events').length;
+  try {
+    const had = r.post(17, '@bot first words', { mentioned: true });
+    await until(() => named(run, had), 'the mention');
+    await busyGeneral(r);
+    let read = polls();
+    r.edit(had, '@bot second words', { mentioned: true });
+    await until(() => polls() > read, 'the older edit read');
+    run.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await run.host.sendRequest('ping');
+    read = polls();
+    r.edit(had, '@bot third words', { mentioned: true });
+    await until(() => polls() > read, 'the newer edit read');
+    release();
+    await run.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
+    await run.server.quiet();
+    r.react(had, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${had}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.match(payloadText(reaction()!), /third words/);
+    assert.equal(pushesAbout(run, 'edit', had).length, 1, "only the older edit's line, from before the disable");
+  } finally { release(); await run.close(); }
+});
+
+scenario('72. once the host has answered a rename, an acknowledge under the old id, or under an id of no known format, adds its reaction, and a publish under the old id is still refused', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  try {
+    const posted = r.post(17, 'to acknowledge');
+    await renameWhileOpen(r, run);
+    await tookRename(run);
+    const ack = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: String(posted), value: 'eyes' });
+    assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
+    assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [['POST', `/messages/${posted}/reactions`, 'eyes']]);
+    const unformed = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'nonsense-general', messageId: String(posted), value: 'tada' });
+    assert.deepEqual(unformed, { acknowledged: true, representation: ':tada:' }, 'an id of no known format adds the reaction too');
+    assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [
+      ['POST', `/messages/${posted}/reactions`, 'eyes'],
+      ['POST', `/messages/${posted}/reactions`, 'tada'],
+    ]);
+    await assert.rejects(publish(run, 'zulip:general', 'hello?'), /zulip:lobby/);
+  } finally { await run.close(); }
+});
+
+scenario('73. a host that leaves before it answers the push about a rename leaves the stream open at last sight: the next host gets its ambient messages in the backscroll', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const before = await start(r, dir);
+  let left: Run | undefined;
+  try {
+    await before.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => before.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+  } finally { await before.end(); }
+  r.rename(17, 'lobby');
+  try {
+    left = await start(r, dir, { reuse: before, noWait: true, beforePushAnswer: () => new Promise<void>(() => {}) });
+    await until(() => toldRename(left!).length > 0, 'the push');
+  } finally { await left?.end(); }
+  r.post(17, 'ambient after the rename');
+  const next = await start(r, dir, { reuse: left, noWait: true });
+  try {
+    await until(() => next.pushed.some((p) => payloadText(p).includes('ambient after the rename')), "the ambient message, in an open channel's backscroll");
+  } finally { await next.close(); }
+});
+
+scenario("74. a deletion of a new stream's first message that comes while the message waits for the stream's announcement follows the message as a line", async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  const polls = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/events').length;
+  try {
+    const fresh = r.create('fresh');
+    const first = r.post(fresh, '@bot hello', { mentioned: true });
+    await until(() => run.changed.some((c) => c.added?.some((d) => d.id === 'zulip:fresh')), 'the held announcement');
+    const read = polls();
+    r.remove([first]);
+    await until(() => polls() > read, 'the deletion read');
+    run.releaseChanged();
+    await until(() => named(run, first), 'the message');
+    await run.server.quiet();
+    assert.equal(pushesAbout(run, 'delete', first).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
+scenario('77. a move of a waiting message and a message the host has, whose waiting message is then deleted, reaches the host as a line about the other message', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const had = r.post(17, '@bot first', { mentioned: true });
+    await until(() => named(run, had), 'the first mention');
+    await busyGeneral(r);
+    const waiting = r.post(17, '@bot second', { mentioned: true });
+    r.moveTopic([waiting, had], 'elsewhere');
+    r.remove([waiting]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, waiting), false);
+    assert.equal(pushesAbout(run, 'move', had).length, 1);
+  } finally { release(); await run.close(); }
 });
 
 scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {

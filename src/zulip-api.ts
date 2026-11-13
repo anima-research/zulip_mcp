@@ -56,8 +56,14 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
 }
 
 export class ZulipRefused extends Error {
+  readonly code: string | undefined;
+  readonly retryAfterSeconds: number | undefined;
+
   constructor(what: string, answer: ZulipRefusal, readonly mayHaveBeenApplied = false) {
     super(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
+    this.code = typeof answer.code === 'string' ? answer.code : undefined;
+    const after = answer['retry-after'];
+    this.retryAfterSeconds = typeof after === 'number' && Number.isFinite(after) && after >= 0 ? after : undefined;
   }
 }
 

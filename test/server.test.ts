@@ -25,21 +25,23 @@ import {
   type PushEventParams,
   type TextContent,
 } from '@animalabs/mcpl-core';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
+import type { ChangeEntry, ChannelHistoryPage, ChannelHistoryQuery, MessageChangeEvent, OnIncomingMessage, OnMessageChange, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
-import { FiltersPlane } from '../src/filters.ts';
+import { FiltersPlane, type ZulipFilters } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
+import type { DeliveryState } from '../src/delivery.ts';
 
 // Isolate the process-wide limiter between tests, without bypassing it in
 // individual cases (including the multi-adapter saturation regression).
@@ -74,8 +76,11 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   published: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[];
   typing: { channelId: string; op: string; metadata?: Record<string, unknown> }[];
   emit: ((message: IncomingChannelMessage | KeyedMessage, newChannel?: ChannelDescriptor) => void) | null;
+  enter: OnIncomingMessage | null;
+  enterChange: OnMessageChange | null;
   systemEvent: OnSystemEvent | null;
-  react: ((event: Omit<Parameters<OnReaction>[0], 'key'> & { channelId: string }) => void) | null;
+  react: ((event: Omit<Parameters<OnReaction>[0], 'key' | 'placed'> & { channelId: string }) => void) | null;
+  reactAt: OnReaction | null;
   change: ((event: Omit<MessageChangeEvent, 'key' | 'movedToKey'> & { channelId: string; movedToChannelId: string | null }) => void) | null;
   /** The stream's messages, oldest first; fetchHistory pages over them by id. */
   history: IncomingChannelMessage[];
@@ -98,6 +103,16 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
 function fakeAdapter(withTyping = true): FakeAdapter {
   let server: ZulipMcplServer | null = null;
   let nextStreamId = 1000;
+  const changeOf = new WeakMap<ChangeEntry, MessageChangeEvent>();
+  const applied = (message: KeyedMessage, changes: readonly ChangeEntry[] | undefined): KeyedMessage | null => {
+    let now = message;
+    for (const entry of changes ?? []) {
+      const change = changeOf.get(entry);
+      if (change?.kind === 'delete') return null;
+      if (change?.kind === 'edit' && change.content !== null) now = { ...now, content: [{ type: 'text', text: `${change.content} (edited)` }] };
+    }
+    return now;
+  };
   const directory = () => server!.directory;
   const streamList = (descriptors: ChannelDescriptor[]) => descriptors.map((d) => {
     const a = (d.address ?? {}) as { stream_id?: unknown; stream_name?: unknown };
@@ -114,8 +129,11 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     published: [],
     typing: [],
     emit: null,
+    enter: null,
+    enterChange: null,
     systemEvent: null,
     react: null,
+    reactAt: null,
     change: null,
     history: [],
     historyCalls: [],
@@ -182,17 +200,42 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       directory().registration(streamList(adapter.visible));
       adapter.emit = (message, newChannel) => {
         if (newChannel) learn([newChannel]);
-        if ('key' in message) return onMessage(message as unknown as KeyedMessage, newChannel);
-        const { channelId, ...m } = message;
-        onMessage({ ...m, key: adapter.keyOf(channelId) } as KeyedMessage, newChannel);
+        let keyed = message as unknown as KeyedMessage;
+        if (!('key' in message)) {
+          const { channelId, ...m } = message;
+          keyed = { ...m, key: adapter.keyOf(channelId) } as KeyedMessage;
+        }
+        onMessage({ key: keyed.key, messageId: keyed.messageId, ready: async (changes) => {
+          const now = applied(keyed, changes);
+          return now === null ? null : { message: now, ...(newChannel ? { newChannel } : {}) };
+        } });
       };
+      adapter.enter = onMessage;
+      adapter.enterChange = onMessageChange ?? null;
       adapter.systemEvent = onSystemEvent ?? null;
-      adapter.react = onReaction ? ({ channelId, ...ev }) => onReaction({ ...ev, key: adapter.keyOf(channelId) }) : null;
+      adapter.react = onReaction
+        ? ({ channelId, ...ev }) => {
+            const event = { ...ev, key: adapter.keyOf(channelId) };
+            onReaction({ ...event, placed: () => event });
+          }
+        : null;
+      adapter.reactAt = onReaction ?? null;
       adapter.change = onMessageChange
-        ? ({ channelId, movedToChannelId, ...ev }) => onMessageChange({ ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) })
+        ? ({ channelId, movedToChannelId, ...ev }) => {
+            const change = { ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) };
+            const kind = change.kind === 'edit' && (change.previousTopic !== null || change.movedToKey !== null) ? 'move' : change.kind;
+            const entry: ChangeEntry = {
+              key: change.key,
+              messageIds: change.messageIds.map(Number),
+              kind,
+              ready: async (only) => (only ? { ...change, messageIds: change.messageIds.filter((id) => only.includes(Number(id))) } : change),
+            };
+            changeOf.set(entry, change);
+            onMessageChange(entry);
+          }
         : null;
     },
-    stopEvents() { adapter.emit = null; },
+    stopEvents() { adapter.emit = null; adapter.enter = null; adapter.enterChange = null; },
   } as unknown as FakeAdapter;
   Object.defineProperty(adapter, 'discoverChannels', {
     get: () => async () => learn(await discover()),
@@ -210,7 +253,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
 
 const KEY_LISTS = new Set(['watermarkedChannels', 'heldChannels', 'lastOpenChannels', 'talliedChannels']);
 
-function byChannelId(delivery: ZulipMcplServer['delivery'], adapter: FakeAdapter): ZulipMcplServer['delivery'] {
+function byChannelId(delivery: DeliveryState, adapter: FakeAdapter): DeliveryState {
   return new Proxy(delivery, {
     get(target, prop) {
       const value = Reflect.get(target, prop, target);
@@ -230,9 +273,14 @@ const fakeTools = {
   onSent: null as null | ((sent: { messageId: string; channelId: string; content: string }) => void),
   /** Set by the server; the real runtime reports streams `listen` subscribed to. */
   onSubscribed: null as null | ((streams: string[]) => unknown),
+  hold: null as Promise<unknown> | null,
   async handleToolCall(name: string, args: Record<string, unknown>) {
     fakeTools.calls.push({ name, args });
     if (name === 'explode') throw new Error('boom');
+    if (name === 'slow') {
+      await fakeTools.hold;
+      fakeTools.calls.push({ name: 'slow:end', args });
+    }
     if (name === 'send_message') fakeTools.onSent?.({ messageId: '99', channelId: 'zulip:general', content: String(args.content ?? '') });
     if (name === 'listen') {
       // The real runtime subscribes, then awaits onSubscribed and reports it.
@@ -252,7 +300,7 @@ const fakeTools = {
 
 interface Harness {
   server: ZulipMcplServer;
-  delivery: ZulipMcplServer['delivery'];
+  delivery: DeliveryState;
   adapter: FakeAdapter;
   host: McplConnection;
   /** Server→host requests the host reactor answered, in order. */
@@ -260,9 +308,11 @@ interface Harness {
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   served: Promise<void>;
+  serverSide: McplConnection;
+  serverRead: string[];
   /** How the host answers channels/incoming: per-message rejections (for
    *  good, or once), and whole batches that error out (counted down per batch). */
-  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string> };
+  policy: { rejectIds: Set<string>; rejectOnce: Set<string>; failIncomingBatches: number; changedAnswer: 'accept' | 'refuse' | 'error' | 'reconcile' | 'held'; reconcileOpens: { channelId: string; ok: boolean; detail: string }[]; rejectPushes: Set<string>; heldChanged: (() => void)[]; holdPushes: boolean; heldPushes: (() => void)[]; holdRegister: boolean; heldRegister: (() => void)[] };
   close(): Promise<void>;
 }
 
@@ -277,6 +327,11 @@ interface HarnessOptions {
   batchWindowMs?: number;
   attributeDelivery?: boolean;
   announceTimeoutMs?: number;
+  shutdownGraceMs?: number;
+  maxWaitingMessages?: number;
+  catchupLimit?: number;
+  readRetryWait?: (ms: number) => Promise<void>;
+  now?: () => number;
   /** A second connection to a server that already served one (the TCP case). */
   reuse?: { server: ZulipMcplServer; adapter: FakeAdapter };
   visible?: ChannelDescriptor[];
@@ -287,6 +342,13 @@ function harness(opts: HarnessOptions = {}): Harness {
   const toHost = new PassThrough();
   const serverConn = McplConnection.fromStreams(toServer, toHost);
   const host = McplConnection.fromStreams(toHost, toServer);
+  const serverRead: string[] = [];
+  const next = serverConn.nextMessage.bind(serverConn);
+  serverConn.nextMessage = async () => {
+    const message = await next();
+    if (message.type === 'request') serverRead.push(message.request.method);
+    return message;
+  };
 
   const adapter = opts.reuse?.adapter ?? fakeAdapter(opts.typing ?? true);
   if (opts.history) adapter.history = opts.history;
@@ -298,9 +360,13 @@ function harness(opts: HarnessOptions = {}): Harness {
     contextHistorySize: 3,
     stateDir: opts.stateDir ?? null,
     sessionId: opts.sessionId ?? 'test',
-    catchupLimit: 100,
+    catchupLimit: opts.catchupLimit ?? 100,
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 100,
+    shutdownGraceMs: opts.shutdownGraceMs,
+    maxWaitingMessages: opts.maxWaitingMessages,
+    readRetryWait: opts.readRetryWait,
+    now: opts.now,
     filters: opts.filters,
     attachments: opts.attachments,
     attributeDelivery: opts.attributeDelivery,
@@ -316,16 +382,23 @@ function harness(opts: HarnessOptions = {}): Harness {
     rejectIds: new Set<string>(),
     rejectOnce: new Set<string>(),
     failIncomingBatches: 0,
-    changedAnswer: 'accept' as 'accept' | 'refuse' | 'error' | 'reconcile',
+    changedAnswer: 'accept' as 'accept' | 'refuse' | 'error' | 'reconcile' | 'held',
     reconcileOpens: [] as { channelId: string; ok: boolean; detail: string }[],
     rejectPushes: new Set<string>(),
+    heldChanged: [] as (() => void)[],
+    holdPushes: false,
+    heldPushes: [] as (() => void)[],
+    holdRegister: false,
+    heldRegister: [] as (() => void)[],
   };
   // The host reactor: answer every server→host Request the way conhost does.
   host.on('request', (req) => {
     hostSaw.push(req);
     if (req.method === method.CHANNELS_REGISTER) {
       const p = req.params as ChannelsRegisterParams;
-      host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
+      const answer = () => host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
+      if (policy.holdRegister) policy.heldRegister.push(answer);
+      else answer();
     } else if (req.method === method.CHANNELS_INCOMING) {
       const p = req.params as ChannelsIncomingParams;
       if (policy.failIncomingBatches > 0) {
@@ -339,18 +412,22 @@ function harness(opts: HarnessOptions = {}): Harness {
     } else if (req.method === method.PUSH_EVENT) {
       const p = req.params as PushEventParams;
       pushed.push(p);
-      host.sendResponse(req.id, { accepted: !policy.rejectPushes.has(String((p.origin as { messageId?: unknown }).messageId)) });
+      const answer = () => host.sendResponse(req.id, { accepted: !policy.rejectPushes.has(String((p.origin as { messageId?: unknown }).messageId)) });
+      if (policy.holdPushes) policy.heldPushes.push(answer);
+      else answer();
     } else if (req.method === method.CHANNELS_CHANGED) {
       const p = req.params as { added?: ChannelDescriptor[] };
       // 'error' stands for every host that does not answer this Request:
       // a transport drop, a timeout, or one that treats it as a Notification.
       if (policy.changedAnswer === 'error') host.sendError(req.id, -32601, 'channels/changed unsupported');
+      else if (policy.changedAnswer === 'held') policy.heldChanged.push(() => host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) }));
       else if (policy.changedAnswer === 'reconcile') {
-        // agent-framework's handleChanged: reconcile (a blocking channels/open
-        // per descriptor) BEFORE answering. This server answers one request at
-        // a time, so while it waits for this answer it cannot serve that open.
+        // agent-framework's handleChanged in 0.18.0 and older: reconcile (a
+        // blocking channels/open per descriptor) BEFORE answering.
         void (async () => {
           for (const c of p.added ?? []) {
+            // As over a real transport, the open comes in a later turn of the event loop.
+            await new Promise((resolve) => setImmediate(resolve));
             try {
               const opened = (await host.sendRequest(method.CHANNELS_OPEN, { channelId: c.id, type: c.type, address: {} })) as { channel?: ChannelDescriptor };
               policy.reconcileOpens.push({ channelId: c.id, ok: Boolean(opened?.channel), detail: 'opened' });
@@ -374,13 +451,15 @@ function harness(opts: HarnessOptions = {}): Harness {
   const served = server.serve(serverConn);
   return {
     server,
-    delivery: byChannelId(server.delivery, adapter),
+    delivery: byChannelId(server.delivery as DeliveryState, adapter),
     adapter,
     host,
     hostSaw,
     incoming,
     pushed,
     served,
+    serverSide: serverConn,
+    serverRead,
     policy,
     async close() {
       // EOF on the server's stdin analog: readline closes on 'end', not on
@@ -426,8 +505,8 @@ async function until(predicate: () => boolean, what: string, ms = 2000): Promise
 }
 
 /** Registration completes only once the host's answer reaches the server;
- *  channels/list is the observable that it did. Live delivery follows the
- *  catch-up sweep, which is what most cases go on to exercise. */
+ *  channels/list is the observable that it did. Each channel's catch-up
+ *  follows it, and most cases go on once the server is quiet after them. */
 async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
   await until(() => h.adapter.emit !== null, 'event delivery to start');
   const deadline = Date.now() + 2000;
@@ -437,7 +516,7 @@ async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
     if (Date.now() > deadline) throw new Error('timed out waiting for registration');
     await new Promise((r) => setTimeout(r, 5));
   }
-  if (andLive) await until(() => h.server.isLive, 'live delivery');
+  if (andLive) await h.server.quiet();
 }
 
 // --- plain MCP ---------------------------------------------------------------
@@ -482,6 +561,39 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   // Events are never started for a plain-MCP client.
   assert.equal(h.adapter.emit, null);
   await h.close();
+});
+
+test('without MCPL, tool calls are served one at a time, in the order they arrive', async () => {
+  const h = harness({ mcpl: false });
+  await initialize(h, false);
+  fakeTools.calls.length = 0;
+  let release!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { release = resolve; });
+  const first = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+  const second = h.host.sendRequest('tools/call', { name: 'send_message', arguments: { content: 'two' } });
+  await until(() => h.serverRead.filter((m) => m === 'tools/call').length === 2, 'the server to read both calls');
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow'], 'the second call waits while the first is held');
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow', 'slow:end', 'send_message']);
+  await h.close();
+});
+
+test('when the connection ends, the request being served finishes before serve returns, and one waiting behind it is not carried out', async () => {
+  const h = harness({ mcpl: false });
+  await initialize(h, false);
+  fakeTools.calls.length = 0;
+  let release!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { release = resolve; });
+  void h.host.sendRequest('tools/call', { name: 'slow', arguments: {} }).catch(() => {});
+  await until(() => fakeTools.calls.length === 1, 'the first call to begin');
+  void h.host.sendRequest('tools/call', { name: 'send_message', arguments: { content: 'late' } }).catch(() => {});
+  await until(() => h.serverRead.filter((m) => m === 'tools/call').length === 2, 'the server to read the second call');
+  h.serverSide.once('close', () => setTimeout(release, 50));
+  const atServed = h.served.then(() => fakeTools.calls.map((c) => c.name));
+  await h.close();
+  assert.deepEqual(await atServed, ['slow', 'slow:end']);
 });
 
 test('tools/list carries each tool\'s RFC-008 class and leaves the model-facing definition alone', async () => {
@@ -621,7 +733,7 @@ test('open → incoming with tags → publish routes to the topic of the convers
     content: [{ type: 'text', text: 'before open' }],
     tags: ['chat:ambient'],
   });
-  await new Promise((r) => setTimeout(r, 20));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 0);
 
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} })) as {
@@ -698,7 +810,6 @@ test('context/beforeInference injects history for open channels under zulip.cont
 
   // Disabling the feature set by Notification is a reduction, honoured at once.
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.context'] });
-  await new Promise((r) => setTimeout(r, 10));
   const reduced = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, params)) as { contextInjections: unknown[] };
   assert.deepEqual(reduced.contextInjections, []);
   await h.close();
@@ -756,7 +867,7 @@ test('a mention on a closed channel is pushed, ambient is tallied, and channel_m
 
   h.adapter.emit!(streamMsg(2, { text: 'chatter' }));
   h.adapter.emit!(streamMsg(3, { text: 'more chatter' }));
-  await new Promise((r) => setTimeout(r, 20));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 1, 'ambient on a closed channel is not delivered');
   assert.equal(h.pushed.length, 0);
   assert.equal(h.delivery.watermark('zulip:general'), 1, 'a dropped message does not advance the watermark');
@@ -1154,7 +1265,7 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
 
     h.adapter.emit!(streamMsg(1, { mentioned: true, text: '@bot?' }));
     h.adapter.emit!(streamMsg(2));
-    await new Promise((r) => setTimeout(r, 25));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0, 'muted: not even a mention on an open channel gets through');
     assert.equal(h.pushed.length, 0);
 
@@ -1253,6 +1364,1446 @@ test('attachments on live delivery are inlined from the configured source', asyn
   await h.close();
 });
 
+test("a message whose attachment fetches never answer goes at its one deadline, with a note for each", { timeout: 5000 }, async () => {
+  const fetched: string[] = [];
+  const deadline = new AbortController();
+  const h = harness({
+    attachments: {
+      source: { fetch(path) { fetched.push(path); return new Promise(() => {}); } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+      deadline: () => deadline.signal,
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  h.adapter.emit!({
+    ...streamMsg(1, { text: 'see attached' }),
+    metadata: {
+      topic: 'deploys', mentioned: false, isDM: false,
+      attachments: [
+        { path: '/user_uploads/1/a/shot.png', name: 'shot.png', mimeType: 'image/png', isImage: true },
+        { path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false },
+      ],
+    },
+  });
+  await until(() => fetched.length === 1, 'the first fetch to start');
+  deadline.abort();
+  await until(() => h.incoming.length === 1, 'delivery at the deadline');
+  const notes = h.incoming[0].content.slice(1).map((b) => (b as { text: string }).text);
+  assert.deepEqual(notes, [
+    "[attachment: shot.png — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/shot.png]",
+    "[attachment: run.log — could not fetch (out of time for this message's attachments); fetch_attachment /user_uploads/1/a/run.log]",
+  ]);
+  await h.close();
+});
+
+test("with no deadline given, a message's attachment fetch starts under the server's own deadline, still live", { timeout: 5000 }, async () => {
+  const signals: AbortSignal[] = [];
+  let release!: () => void;
+  const answered = new Promise<void>((resolve) => { release = resolve; });
+  const h = harness({
+    attachments: {
+      source: {
+        async fetch(_path, _maxBytes, signal) {
+          signals.push(signal);
+          await answered;
+          return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+        },
+      },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => signals.length === 1, 'the fetch to start');
+  assert.equal(signals[0].aborted, false);
+  release();
+  await until(() => h.incoming.length === 1, 'delivery');
+  assert.equal((h.incoming[0].content.at(-1) as { text: string }).text, '[attachment: run.log (8B)]\nlog line');
+  await h.close();
+});
+
+function heldFetches(ms?: number) {
+  const started: string[] = [];
+  let release!: () => void;
+  const gate = ms === undefined ? new Promise<void>((resolve) => { release = resolve; }) : null;
+  return {
+    started,
+    release: () => release(),
+    options: {
+      source: {
+        async fetch(path: string) {
+          started.push(path);
+          await (gate ?? new Promise((resolve) => setTimeout(resolve, ms)));
+          return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+        },
+      },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  };
+}
+
+function heldFlushes(h: Harness, ids: string[]) {
+  const manager = h.server.channelManager as unknown as {
+    flushBatch(): Promise<void>;
+    batchBuffer: Map<ChannelKey, { message: KeyedMessage }[]>;
+  };
+  const flush = manager.flushBatch.bind(manager);
+  let release!: () => void;
+  const opened = new Promise<void>((resolve) => { release = resolve; });
+  let reached = false;
+  manager.flushBatch = async () => {
+    if ([...manager.batchBuffer.values()].some((queued) => queued.some((q) => ids.includes(q.message.messageId)))) {
+      reached = true;
+      await opened;
+    }
+    return flush();
+  };
+  return { reached: () => reached, release: () => release() };
+}
+
+async function settledYet(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void promise.then(() => { settled = true; }, () => { settled = true; });
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  return settled;
+}
+
+function withLog(m: IncomingChannelMessage): IncomingChannelMessage {
+  return { ...m, metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.log`, name: 'run.log', mimeType: 'text/plain', isImage: false }] } };
+}
+
+test("an ambient message with an attachment on a closed channel fetches nothing, and is counted as missed", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted on the open channel');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  h.adapter.emit!(withLog(streamMsg(2, { text: 'see the log' })));
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => fetches.started.length > 0 || h.pushed.length > 0, "the ambient message's fetch, or the mention's push");
+  const started = [...fetches.started];
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(started, [], 'nothing fetched for the ambient message');
+  assert.deepEqual(h.pushed.map((p) => (p.origin as { messageId?: unknown }).messageId), ['3']);
+  assert.equal(h.delivery.tally('zulip:general')?.messages, 1, 'the ambient message counted as missed');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  await h.close();
+});
+
+test('a close waits only for the job running on its channel, and the messages behind that job are handled as on a closed channel', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3));
+  h.adapter.emit!(streamMsg(4));
+  let closed = false;
+  const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' }).then(() => { closed = true; });
+  await h.host.sendRequest('ping');
+  assert.equal(closed, false, 'the close waits for the job that is running');
+  fetches.release();
+  await close;
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => ['2', '3', '4'].includes(m.messageId)), []);
+  assert.equal(h.pushed.length, 0);
+  const missed = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'channel_missed', arguments: { channel: '#general' } })) as { content: { text: string }[] }).content[0].text);
+  assert.equal(missed.missedMessages, 3, 'the three that waited are counted, and the one whose job was running is not');
+  await h.close();
+});
+
+test('an open\'s page holds no message that waits in its lane, and each waiting message follows the open once, as a message', async () => {
+  const fetches = heldFetches();
+  const gates: (() => void)[] = [];
+  const attachments = {
+    ...fetches.options,
+    source: {
+      async fetch(path: string) {
+        fetches.started.push(path);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+      },
+    },
+  };
+  const h = harness({ attachments, history: [1, 2, 3, 4, 5].map((n) => streamMsg(n)) });
+  await initialize(h, true);
+  await settled(h);
+  const open = async (history: { limit: number; sinceLastSeen?: boolean }) =>
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history }) as Promise<{ history?: { messageId: string }[] }>;
+
+  h.adapter.emit!(withLog(streamMsg(3, { mentioned: true })));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(4));
+  h.adapter.emit!(streamMsg(5));
+  const newest = open({ limit: 2 });
+  await h.host.sendRequest('ping');
+  gates.shift()!();
+  assert.deepEqual((await newest).history?.map((m) => m.messageId), ['2', '3']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5']);
+
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  h.adapter.history.push(...[6, 7, 8].map((n) => streamMsg(n)));
+  h.adapter.emit!(withLog(streamMsg(6, { mentioned: true })));
+  await until(() => fetches.started.length === 2, 'the second fetch to start');
+  h.adapter.emit!(streamMsg(7));
+  h.adapter.emit!(streamMsg(8));
+  const since = open({ limit: 10, sinceLastSeen: true });
+  await h.host.sendRequest('ping');
+  gates.shift()!();
+  assert.deepEqual((await since).history?.map((m) => m.messageId), ['6']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5', '7', '8']);
+
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  let letRead!: () => void;
+  const gate = new Promise<void>((resolve) => { letRead = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await gate;
+    return read(key, query);
+  };
+  const during = open({ limit: 2 });
+  await until(() => reading, 'the page read to start');
+  h.adapter.history.push(streamMsg(9));
+  h.adapter.emit!(streamMsg(9));
+  letRead();
+  assert.deepEqual((await during).history?.map((m) => m.messageId), ['8']);
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['4', '5', '7', '8', '9']);
+  await h.close();
+});
+
+test('a message whose event arrives after an open\'s since-last-seen page handed it is dropped, and reaches the host once', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2), streamMsg(3)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'the first message accepted');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 10, sinceLastSeen: true },
+  })) as { history?: { messageId: string }[] };
+  assert.deepEqual(opened.history?.map((m) => m.messageId), ['2', '3']);
+  h.adapter.emit!(streamMsg(3));
+  h.adapter.emit!(streamMsg(4));
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '4'], 'the page\'s 3 isn\'t delivered again');
+  assert.equal(h.delivery.watermark('zulip:general'), 4);
+  await h.close();
+});
+
+test('an open with a page on a channel with no watermark gives it one, and the next connection\'s catch-up starts above the page', async () => {
+  const first = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+  assert.equal(first.delivery.watermark('zulip:general'), 2);
+  await first.close();
+  first.adapter.history.push(streamMsg(3));
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.equal(second.pushed.length, 1, 'the catch-up block');
+  const block = (second.pushed[0].payload.content[0] as { text: string }).text;
+  assert.match(block, /id=3\]/);
+  assert.doesNotMatch(block, /id=2\]/);
+  await second.close();
+});
+
+test('a message waiting for its attachments reaches the host before a later message of its channel', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  h.adapter.emit!(streamMsg(2));
+  fetches.release();
+  await until(() => h.incoming.length === 2, 'both messages');
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2']);
+  await h.close();
+});
+
+test('the host refuses a message that waited for its attachments and accepts the next: the refused one is offered again', async () => {
+  const h = harness({ attachments: heldFetches(50).options, history: [withLog(streamMsg(1)), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withLog(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '1'), 'the refused message, offered again');
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['2', '1']);
+  assert.equal((h.incoming[1].metadata as { recovered?: boolean }).recovered, true);
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the watermark past both');
+  await h.close();
+});
+
+test('a reaction and an edit to a message waiting for its attachments reach the host after it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-lane-order-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+
+    h.adapter.emit!(withLog(streamMsg(1)));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '1', emoji: 'eyes',
+      reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: 'msg 1', timestamp: new Date(1_700_000_002_000),
+    });
+    h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:general', messageId: '1', messageIds: ['1'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'msg 1, fixed', previousContent: 'msg 1',
+      mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_003_000),
+    });
+    fetches.release();
+    await until(() => h.incoming.length === 3, 'the message, the reaction and the edit');
+    assert.deepEqual(h.incoming.map((m) => m.messageId.split(':')[0]), ['1', 'reaction', 'edit']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a message still waiting in its channel when the connection ends is offered by the next connection', async () => {
+  const fetches = heldFetches();
+  const first = harness({ attachments: fetches.options, history: [withLog(streamMsg(1, { mentioned: true })), streamMsg(2, { mentioned: true })] });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
+  await until(() => fetches.started.length === 1, 'the fetch to start');
+  first.adapter.emit!(streamMsg(2, { mentioned: true }));
+  first.serverSide.once('close', () => setTimeout(fetches.release, 50));
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  const offered = (h: Harness) => h.pushed.map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
+  await until(() => /id=2\]/.test(offered(second)), 'the waiting mention, offered by the next connection');
+  assert.doesNotMatch(offered(first), /id=2\]/, 'the first connection never offered it');
+  await second.close();
+});
+
+const BO_DM: ChannelDescriptor = {
+  id: 'zulip:dm:42',
+  type: 'zulip',
+  label: 'DM: Bo',
+  direction: 'bidirectional',
+  address: { dm: true, user_ids: [42], emails: ['bo@example.com'] },
+  metadata: { channelType: 'dm', recipientName: 'Bo', recipientId: '42' },
+};
+
+function boDm(id: number, text = `dm ${id}`): IncomingChannelMessage {
+  return {
+    channelId: 'zulip:dm:42',
+    messageId: String(id),
+    author: { id: '42', name: 'Bo' },
+    timestamp: new Date(1_700_000_000_000 + id * 1000).toISOString(),
+    content: [{ type: 'text', text }],
+    tags: ['chat:dm', 'chat:private', 'chat:from-human'],
+    metadata: { isDM: true, mentioned: false },
+  };
+}
+
+const firstText = (p: PushEventParams) => (p.payload.content[0] as { text: string }).text;
+const incomingIds = (h: Harness) => h.hostSaw
+  .filter((r) => r.method === method.CHANNELS_INCOMING)
+  .flatMap((r) => (r.params as unknown as ChannelsIncomingParams).messages.map((m) => m.messageId));
+
+test('a first message the host refused, on a channel where it had accepted nothing, is offered again after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-first-refused-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'fr' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.policy.rejectIds.add('5');
+    first.adapter.emit!(streamMsg(5));
+    await first.server.quiet();
+    assert.equal(first.incoming.length, 0, 'the host refused it');
+    assert.deepEqual(incomingIds(first), ['5'], 'the host was offered it');
+    const onDisk = JSON.parse(readFileSync(join(dir, 'fr.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
+    assert.equal(onDisk.watermarks['zulip:general'], 4, 'on disk before the connection ends');
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'fr', history: [streamMsg(5)] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next start offers it');
+    assert.match(firstText(second.pushed[0]), /id=5\]/);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a message that enters its channel after the host left, while a request is still served, is held and nothing runs it, and the next start offers it once; an event for a message its channel has dealt with makes no hold", async () => {
+  const DEV = { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } };
+  const late = streamMsg(20, { channelId: 'zulip:dev', mentioned: true, text: '@bot after the host left' });
+  const first = harness({ visible: [DESCRIPTOR, DEV], history: [streamMsg(11), streamMsg(12), late] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.policy.rejectIds.add('11');
+  first.adapter.emit!(streamMsg(11));
+  first.adapter.emit!(streamMsg(12));
+  await until(() => first.incoming.some((m) => m.messageId === '12'), 'the host accepting 12');
+  await first.server.quiet();
+  assert.deepEqual(first.delivery.heldIds('zulip:general'), [11], 'the refused 11 keeps the watermark below 12');
+
+  fakeTools.calls.length = 0;
+  let releaseTool!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseTool = resolve; });
+  void first.host.sendRequest('tools/call', { name: 'slow', arguments: {} }).catch(() => {});
+  await until(() => fakeTools.calls.length === 1, 'the slow tool call on the chain');
+  const sawClose = new Promise((resolve) => first.serverSide.once('close', resolve));
+  const closing = first.close();
+  await sawClose;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let ran = false;
+  const enter = (m: IncomingChannelMessage) => {
+    const { channelId, ...rest } = m;
+    const key = first.adapter.keyOf(channelId);
+    first.adapter.enter!({ key, messageId: m.messageId, ready: async () => { ran = true; return { message: { ...rest, key } as KeyedMessage }; } });
+  };
+  enter(late);
+  enter(streamMsg(12));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ran, false, 'nothing runs a message that enters after the host left');
+  releaseTool();
+  await closing;
+  assert.deepEqual(first.delivery.heldIds('zulip:general'), [11], 'the late event for 12 made no hold');
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  const offered = second.pushed.map(firstText).filter((t) => /id=20\]/.test(t));
+  assert.equal(offered.length, 1, 'the next start offers it');
+  assert.equal(offered[0].match(/id=20\]/g)?.length, 1, 'once');
+  await second.close();
+});
+
+test('a message still waiting when the connection ends, on a channel where the host had accepted nothing, is offered after a restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-first-waiting-'));
+  try {
+    const fetches = heldFetches();
+    const first = harness({ stateDir: dir, sessionId: 'fw', attachments: fetches.options });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(withLog(streamMsg(5, { mentioned: true })));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    first.adapter.emit!(streamMsg(6, { mentioned: true }));
+    first.serverSide.once('close', () => setTimeout(fetches.release, 50));
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'fw', history: [withLog(streamMsg(5, { mentioned: true })), streamMsg(6, { mentioned: true })] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next start offers it');
+    assert.match(firstText(second.pushed[0]), /id=6\]/);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a first message the host refused, on a channel where it had accepted nothing, is offered once by the next connection', async () => {
+  const first = harness({ history: [streamMsg(5)] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.policy.rejectIds.add('5');
+  first.adapter.emit!(streamMsg(5));
+  await first.server.quiet();
+  assert.equal(first.incoming.length, 0, 'the host refused it');
+  assert.deepEqual(incomingIds(first), ['5'], 'the host was offered it');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.deepEqual(second.pushed.map((p) => /id=5\]/.test(firstText(p))), [true], 'offered once');
+  await second.close();
+});
+
+test('two DMs that arrive close together in a new conversation both carry the first-message note', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(boDm(500), BO_DM);
+  h.adapter.emit!(boDm(501), BO_DM);
+  await until(() => h.pushed.length === 2, 'both pushes');
+  for (const p of h.pushed) assert.match(firstText(p), /^<system>Direct message from Bo/);
+  await h.close();
+});
+
+test('after the host refuses a DM conversation\'s first message, the next DM carries no first-message note', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.policy.rejectPushes.add('500');
+  h.adapter.emit!(boDm(500), BO_DM);
+  await until(() => h.pushed.length === 1, 'the first push');
+  await h.server.quiet();
+  h.adapter.emit!(boDm(501));
+  await until(() => h.pushed.length === 2, 'the second push');
+  assert.equal(firstText(h.pushed[1]), '[T id=501] [DM] Bo: dm 501');
+  await h.close();
+});
+
+test('a message that arrives while zulip.messaging is disabled is offered once it is enabled again', async () => {
+  const h = harness({ history: [streamMsg(1, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await h.host.sendRequest('ping');
+  assert.equal(h.pushed.length, 0, 'nothing under a disabled feature set');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.equal(h.pushed.length, 1, 'offered once it is enabled again');
+  assert.match(firstText(h.pushed[0]), /id=1\]/);
+  await h.close();
+});
+
+async function heldAcrossDisable(h: Harness, m: IncomingChannelMessage, disable: () => Promise<unknown>): Promise<void> {
+  const key = h.adapter.keyOf(m.channelId);
+  const { channelId, ...rest } = m;
+  let release!: () => void;
+  const running = new Promise<void>((r) => { release = r; });
+  h.adapter.enter!({ key, messageId: m.messageId, ready: async () => { await running; return { message: { ...rest, key } as KeyedMessage }; } });
+  await h.host.sendRequest('ping');
+  await disable();
+  release();
+  await until(() => h.delivery.heldIds(channelId, { replayable: true }).includes(Number(m.messageId)), `${m.messageId} held as its job meets the disabled feature set`);
+}
+
+const disableMessaging = async (h: Harness) => {
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+};
+
+const recoveredFlags = (h: Harness) => h.incoming.map((m) => (m.metadata as { recovered?: boolean }).recovered === true);
+
+test('messages that arrive on an open channel while zulip.messaging is disabled come as ordinary messages, in order, once it is enabled', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  await h.host.sendRequest('ping');
+  assert.equal(h.incoming.length, 0, 'nothing under a disabled feature set');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.length === 2, 'both messages');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2']);
+  assert.deepEqual(recoveredFlags(h), [false, false], 'as ordinary messages, not read again from history');
+  await h.close();
+});
+
+test('a message whose job runs when zulip.messaging goes off is held, and once it is enabled it comes before the messages that waited', async () => {
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  await heldAcrossDisable(h, streamMsg(1), () => disableMessaging(h));
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.length === 3, 'all three');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3']);
+  assert.deepEqual(recoveredFlags(h), [true, false, false], 'the held 1 read again from history, then the two that waited');
+  await h.close();
+});
+
+test('a break of the event queue while zulip.messaging is disabled is recovered once it is enabled: the lost messages, then what came after the break, then the notice', async () => {
+  const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(4));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', '4', 'notice']);
+  await h.close();
+});
+
+test("a break whose read for held ids is still out when zulip.messaging is disabled reads the rest of the hole too, and the enable brings it before the message that waited", async () => {
+  const h = harness({ history: [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.policy.rejectOnce.add('2');
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(2), '2 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => {
+    h.adapter.fetchHistory = real;
+    reading = true;
+    await readHeld;
+    return real(key, query);
+  };
+  const lane = (h.server as unknown as { lanes: { lane(key: string): { running: boolean } } }).lanes.lane('zulip:general');
+  breakQueue(h);
+  await until(() => reading, "the break's read for 2");
+  await disableMessaging(h);
+  releaseRead();
+  await until(() => !lane.running, "the break's read to end while zulip.messaging is disabled");
+  h.adapter.emit!(streamMsg(7));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h).filter((id) => /^\d+$/.test(id)), ['1', '2', '2', '3', '4', '5', '6', '7']);
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 7);
+  await h.close();
+});
+
+test("a connection that starts with zulip.messaging disabled makes each channel's catch-up once it is enabled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-start-disabled-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'sd' });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 1, '1 accepted');
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'sd', history: [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })] });
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'] });
+    await awaitRegistered(second, false);
+    await second.host.sendRequest('ping');
+    assert.equal(second.pushed.length, 0, 'nothing under a disabled feature set');
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => second.pushed.length === 1, "general's catch-up");
+    await second.server.quiet();
+    assert.match(firstText(second.pushed[0]), /id=2\]/);
+    assert.equal(second.delivery.watermark('zulip:general'), 2);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lane that gives up twice while zulip.messaging is disabled brings every given-up message once, in order, once it is enabled', async () => {
+  const h = harness({ maxWaitingMessages: 2, history: [1, 2, 3, 4, 5, 6, 7, 8].map((id) => streamMsg(id)) });
+  const original = console.error;
+  const logged: string[] = [];
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    const key = h.adapter.keyOf('zulip:general');
+    const { channelId: _c, ...rest } = streamMsg(2);
+    let release!: () => void;
+    const running = new Promise<void>((r) => { release = r; });
+    h.adapter.enter!({ key, messageId: '2', ready: async () => { await running; return { message: { ...rest, key } as KeyedMessage }; } });
+    await h.host.sendRequest('ping');
+    h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await h.host.sendRequest('ping');
+    for (const id of [3, 4, 5, 6, 7, 8]) h.adapter.emit!(streamMsg(id));
+    release();
+    await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(2), '2 held as its job meets the disabled feature set');
+    await h.host.sendRequest('ping');
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.incoming.some((m) => m.messageId === '8'), 'the last given-up message');
+    await h.server.quiet();
+    assert.equal(logged.filter((line) => /waiting message\(s\) given up/.test(line)).length, 2, 'two give-ups');
+    assert.deepEqual(seenIds(h), ['1', '2', '3', '4', '5', '6', '7', '8']);
+    await h.close();
+  } finally {
+    console.error = original;
+  }
+});
+
+for (const form of ['with the catch-up limit at 0', 'on a closed channel that the host holds no id for', 'on a closed channel that the host holds an id for'] as const) {
+  test(`a give-up's log line says whether a read from history brings the given-up messages back: ${form}`, async () => {
+    const h = harness({ maxWaitingMessages: 2, ...(form === 'with the catch-up limit at 0' ? { catchupLimit: 0 } : {}) });
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+      await h.host.sendRequest('ping');
+      const late: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
+      for (const id of [1, 2, 3]) {
+        if (form === 'on a closed channel that the host holds no id for') h.adapter.emit!(streamMsg(id, { channelId: 'zulip:late-stream' }), late);
+        else h.adapter.emit!(streamMsg(id));
+      }
+      await until(() => lines.some((l) => l.includes('given up')), 'the give-up');
+      const line = lines.find((l) => l.includes('given up'))!;
+      const said = form === 'with the catch-up limit at 0'
+        ? 'with the catch-up limit at 0, no read from history brings them back'
+        : form === 'on a closed channel that the host holds no id for'
+          ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
+          : 'a read from history is entered to take their place';
+      assert.ok(line.endsWith(`3 waiting message(s) given up; ${said}`), line);
+      await h.close();
+    } finally {
+      console.error = original;
+    }
+  });
+}
+
+test("while zulip.messaging is disabled, the edit of a message that waits is applied to it, so it comes once with its new text and no line, and the edit of any other message isn't told", async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER], history: [streamMsg(10, { channelId: 'zulip:other' }), streamMsg(11)] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(10, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:other') === 10, '10 accepted');
+  await disableMessaging(h);
+  h.adapter.emit!(streamMsg(11));
+  const edit = (channelId: string, id: string) => h.adapter.change!({
+    kind: 'edit', channelId, messageId: id, messageIds: [id], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+    topic: 'deploys', previousTopic: null, movedToChannelId: null, content: `msg ${id}, fixed`, previousContent: `msg ${id}`,
+    mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_020_000),
+  });
+  edit('zulip:general', '11');
+  edit('zulip:other', '10');
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.some((m) => m.messageId === '11'), '11');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => `${m.channelId} ${m.messageId.split(':').slice(0, 2).join(':')}`),
+    ['zulip:other 10', 'zulip:general 11']);
+  assert.match((h.incoming[1].content[0] as TextContent).text, /msg 11, fixed \(edited\)$/);
+  await h.close();
+});
+
+const deletion = (channelId: string, id: string, mentioned: boolean): MessageChangeEvent & { channelId: string; movedToChannelId: null } => ({
+  kind: 'delete', key: '' as ChannelKey, channelId, messageId: id, messageIds: [id], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: null,
+  topic: 'deploys', previousTopic: null, movedToKey: null, movedToChannelId: null, content: null, previousContent: `msg ${id}`,
+  mentioned, previouslyMentioned: mentioned, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_020_000),
+});
+
+for (const form of ['behind a slow job on an open channel', 'while zulip.messaging is disabled, on an open channel', 'while zulip.messaging is disabled, a mention on a closed channel'] as const) {
+  test(`a message that waits and is deleted reaches the host as nothing, and its hold goes: ${form}`, async () => {
+    const fetches = heldFetches();
+    const h = harness({ attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    const closed = form.endsWith('closed channel');
+    if (!closed) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    if (form.startsWith('behind')) {
+      h.adapter.emit!(withLog(streamMsg(10)));
+      await until(() => fetches.started.length === 1, "10's attachment fetch");
+    } else await disableMessaging(h);
+    h.adapter.emit!(streamMsg(11, { mentioned: closed }));
+    await until(() => h.delivery.heldIds('zulip:general').includes(11), "11's hold");
+    h.adapter.change!(deletion('zulip:general', '11', closed));
+    h.adapter.emit!(streamMsg(12, { mentioned: closed }));
+    await h.host.sendRequest('ping');
+    if (form.startsWith('behind')) fetches.release();
+    else await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    const handed = () => [...h.incoming.map((m) => m.messageId), ...h.pushed.map((p) => String((p.origin as { messageId?: unknown }).messageId))];
+    await until(() => handed().includes('12'), 'the message after it');
+    await h.server.quiet();
+    assert.deepEqual(handed().filter((id) => id.includes('11')), []);
+    assert.equal(h.delivery.heldIds('zulip:general').includes(11), false);
+    await h.close();
+  });
+}
+
+test('a message that waits with a reaction and a move behind it, and is deleted: neither line reaches the host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-taken-out-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.emit!(withLog(streamMsg(10)));
+    await until(() => fetches.started.length === 1, "10's attachment fetch");
+    h.adapter.emit!(streamMsg(11));
+    h.adapter.react!({ action: 'add', channelId: 'zulip:general', messageId: '11', emoji: 'eyes', reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: 'msg 11', timestamp: new Date(1_700_000_010_000) });
+    h.adapter.change!({ ...deletion('zulip:general', '11', false), kind: 'move', topic: 'elsewhere', previousTopic: 'deploys', previousContent: null, actorId: '9' });
+    h.adapter.change!(deletion('zulip:general', '11', false));
+    h.adapter.emit!(streamMsg(12));
+    fetches.release();
+    await until(() => h.incoming.some((m) => m.messageId === '12'), 'the message after it');
+    await h.server.quiet();
+    assert.deepEqual(h.incoming.map((m) => m.messageId.split(':')[0]), ['10', '12']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("while zulip.messaging is disabled, an edit that takes a held row's quote of the bot out forgets its reply verdict, and tells nothing", async () => {
+  for (const edited of [true, false]) {
+    const h = harness({ history: [streamMsg(5)] });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    await heldAcrossDisable(h, streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }), () => disableMessaging(h));
+    if (edited) {
+      h.adapter.change!({
+        ...deletion('zulip:general', '5', false), kind: 'edit', actorId: '9', content: 'no quote now', previousContent: 'msg 5', replyToSelf: false, replyToSelfVerified: true,
+      });
+    }
+    await h.host.sendRequest('ping');
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.incoming.some((m) => m.messageId === '5'), '5, read again');
+    await h.server.quiet();
+    const five = h.incoming.find((m) => m.messageId === '5')!;
+    assert.equal(five.tags?.includes('chat:reply'), !edited, edited ? 'the edit forgot the verdict' : 'the held verdict tags the history row');
+    assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('edit:')), []);
+    await h.close();
+  }
+});
+
+test('while zulip.messaging is disabled, a change to an accepted message whose lookup is still out when it is enabled tells nothing', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await disableMessaging(h);
+  const key = h.adapter.keyOf('zulip:general');
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let looking = false;
+  h.adapter.enterChange!({ key, messageIds: [1], kind: 'edit', ready: async () => {
+    looking = true;
+    await lookup;
+    return { ...deletion('zulip:general', '1', false), key, kind: 'edit', actorId: '9', content: 'msg 1, fixed', previousContent: 'msg 1' };
+  } });
+  await until(() => looking, "the edit's lookup");
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  answer();
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'a message after the enable');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('edit:')), []);
+  await h.close();
+});
+
+test('while zulip.messaging is disabled, a move of an accepted message that its turn places in another channel tells nothing on either channel', async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:aaa', label: '#aaa', address: { stream_name: 'aaa', stream_id: 6 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:aaa']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await disableMessaging(h);
+  const general = h.adapter.keyOf('zulip:general');
+  const aaa = h.adapter.keyOf('zulip:aaa');
+  let placed = false;
+  h.adapter.enterChange!({ key: general, messageIds: [1], kind: 'move', ready: async () => {
+    placed = true;
+    return { ...deletion('zulip:general', '1', true), key: aaa, kind: 'move', actorId: '9', previousContent: null, topic: 'elsewhere', previousTopic: 'deploys' };
+  } });
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'a message after the enable');
+  await h.server.quiet();
+  assert.equal(placed, true, "the move's turn came, and placed it in #aaa");
+  assert.deepEqual(h.incoming.filter((m) => m.messageId.startsWith('move:')), []);
+  await h.close();
+});
+
+test("a reaction on a stream that the directory doesn't name yet, while zulip.messaging is disabled, waits in no lane", { timeout: 5000 }, async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await disableMessaging(h);
+  const reaction = {
+    key: streamKey(99), action: 'add' as const, messageId: '1', emoji: 'eyes',
+    reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_000_000),
+  };
+  h.adapter.reactAt!({ ...reaction, placed: () => reaction });
+  await h.server.quiet();
+  await h.close();
+});
+
+test('the first DM of a new conversation that waits while zulip.messaging is disabled sets a watermark just below it on disk, and a new process offers it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-dm-waits-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'dw' });
+    await initialize(first, true);
+    await settled(first);
+    first.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await first.host.sendRequest('ping');
+    first.adapter.emit!(boDm(501), BO_DM);
+    await first.host.sendRequest('ping');
+    const onDisk = JSON.parse(readFileSync(join(dir, 'dw.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
+    assert.equal(onDisk.watermarks['zulip:dm:42'], 500, 'on disk while the DM waits');
+
+    const second = harness({ stateDir: dir, sessionId: 'dw', history: [boDm(501)], visible: [DESCRIPTOR, BO_DM] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next process offers it');
+    assert.match(firstText(second.pushed[0]), /id=501\]/);
+    await second.close();
+    await first.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stream muted while an addressed message of its closed channel waits for its attachments pushes nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-mute-mid-fetch-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options });
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
+    await until(() => fetches.started.length === 1, 'the fetch to start');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
+    fetches.release();
+    await h.server.quiet();
+    assert.equal(h.pushed.length, 0, 'muted while it waited: nothing reaches the agent');
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'and nothing stays held');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [label, message, channelId, narrow] of [
+  ['a stream taken out of the allowlist', withLog(streamMsg(1, { mentioned: true })), 'zulip:general', (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
+  ['a DM sender taken out of the DM allowlist', withLog(boDm(1)), 'zulip:dm:42', (f: ZulipFilters) => ({ ...f, dmUsers: ['7'] })],
+] as const) {
+  test(`${label} while an addressed message of its closed channel waits for its attachments pushes nothing`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-allow-mid-fetch-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const fetches = heldFetches();
+      const h = harness({ filters: plane, attachments: fetches.options });
+      await initialize(h, true);
+      await settled(h);
+      h.adapter.emit!(message, channelId === 'zulip:dm:42' ? BO_DM : undefined);
+      await until(() => fetches.started.length === 1, 'the fetch to start');
+      assert.equal(plane.update(narrow).ok, true);
+      fetches.release();
+      await h.server.quiet();
+      assert.equal(h.pushed.length, 0, 'narrowed while it waited: nothing reaches the agent');
+      assert.equal(h.delivery.floor(channelId), undefined, 'and nothing stays held');
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a catch-up block the host refuses keeps the watermark below it, and is offered again once the host accepts a later message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-refused-block-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'rb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'rb', history: [streamMsg(4, { mentioned: true }), streamMsg(5)] });
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the catch-up block, refused');
+    assert.match(firstText(second.pushed[0]), /id=4\]/);
+
+    second.policy.holdPushes = true;
+    second.adapter.history.push(streamMsg(6, { mentioned: true }));
+    second.adapter.emit!(streamMsg(6, { mentioned: true }));
+    await until(() => second.pushed.length === 2, 'the live mention');
+    second.policy.heldPushes.shift()!();
+    await until(() => second.pushed.length === 3, 'the refused block, offered again');
+    assert.equal(second.delivery.watermark('zulip:general'), 3, 'below the refused block while it is offered again');
+    assert.match(firstText(second.pushed[2]), /id=4\]/);
+    second.policy.holdPushes = false;
+    second.policy.heldPushes.shift()!();
+    await second.server.quiet();
+    assert.equal(second.delivery.watermark('zulip:general'), 6);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+
+function withImage(m: IncomingChannelMessage): IncomingChannelMessage {
+  return {
+    ...m,
+    content: [...m.content, { type: 'text', text: '[attachments: 1]\n- shot.png' }],
+    metadata: { ...(m.metadata as object), attachments: [{ path: `/user_uploads/1/a/${m.messageId}.png`, name: 'shot.png', mimeType: 'image/png', isImage: true }] },
+  };
+}
+
+test("a message offered again from history on an open channel keeps its attachment's reference note, and nothing is fetched for it", async () => {
+  const fetched: string[] = [];
+  const h = harness({
+    history: [withImage(streamMsg(1)), streamMsg(2)],
+    attachments: {
+      source: { async fetch(path: string) { fetched.push(path); return { buf: PNG_1X1, mimeType: 'image/png', overflow: false }; } },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withImage(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '1'), 'the refused message, offered again');
+  const again = h.incoming.find((m) => m.messageId === '1')!;
+  assert.equal((again.metadata as { recovered?: boolean }).recovered, true);
+  assert.equal(again.content.some((b) => b.type === 'image'), false, 'no image inline');
+  assert.equal(fetched.length, 1, "only the live offer's fetch");
+  await h.close();
+});
+
+test('the filters file changing on disk to mute a stream lets go of what is held for it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-mute-on-disk-'));
+  try {
+    const path = join(dir, 'filters.json');
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.policy.rejectIds.add('1');
+    h.adapter.emit!(streamMsg(1));
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), 1, 'the refused message is held');
+    writeFileSync(path, JSON.stringify({ ...plane.current(), mutedStreams: ['general'] }));
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(path, later, later);
+    plane.tick();
+    assert.deepEqual(plane.current().mutedStreams, ['general']);
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'the hold goes');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a catch-up block refused after its stream was muted leaves nothing held', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-block-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane, history: [streamMsg(5, { mentioned: true })] });
+    await initialize(h, true);
+    await settled(h);
+    await heldAcrossDisable(h, streamMsg(5, { mentioned: true }), () => disableMessaging(h));
+    await h.server.quiet();
+    h.policy.holdPushes = true;
+    h.policy.rejectPushes.add('5');
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.pushed.length === 1, 'the catch-up block for the held mention');
+    assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
+    h.policy.holdPushes = false;
+    h.policy.heldPushes.shift()!();
+    await h.server.quiet();
+    assert.equal(h.delivery.floor('zulip:general'), undefined, 'muted: nothing stays held');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a message refused at its offer and again at its replay is offered no third time when a later message is accepted, and is offered a third time after a break of the event queue', async () => {
+  const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const offers = () => h.hostSaw
+    .filter((r) => r.method === method.CHANNELS_INCOMING)
+    .flatMap((r) => (r.params as unknown as ChannelsIncomingParams).messages)
+    .filter((m) => m.messageId === '2').length;
+  h.policy.rejectIds.add('2');
+  for (const id of [1, 2, 3]) h.adapter.emit!(streamMsg(id));
+  await until(() => offers() === 2, 'refused again at its replay');
+  await h.server.quiet();
+  h.policy.rejectIds.delete('2');
+  h.adapter.emit!(streamMsg(4));
+  await until(() => h.incoming.some((m) => m.messageId === '4'), '4 accepted');
+  await h.server.quiet();
+  assert.equal(offers(), 2, 'no third offer from an accepted message');
+  h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+  await until(() => h.incoming.some((m) => m.messageId === '2'), 'offered after the break');
+  assert.equal(offers(), 3);
+  await h.close();
+});
+
+const gapNoticeIn = (h: Harness) => h.incoming.some((m) => (m.metadata as { kind?: string }).kind === 'gap');
+const seenIds = (h: Harness) => h.incoming.map((m) => (m.messageId.startsWith('system:') ? 'notice' : m.messageId));
+const breakQueue = (h: Harness) => h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+
+test('a break of the event queue offers again what the host hasn\'t accepted, before what the break lost, and nothing it accepted', async () => {
+  const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const offered = () => h.hostSaw
+    .filter((r) => r.method === method.CHANNELS_INCOMING)
+    .flatMap((r) => (r.params as unknown as ChannelsIncomingParams).messages)
+    .map((m) => (m.messageId.startsWith('system:') ? 'notice' : m.messageId));
+  h.policy.rejectIds.add('2');
+  for (const id of [1, 2, 3]) h.adapter.emit!(streamMsg(id));
+  await until(() => offered().filter((id) => id === '2').length === 2, 'refused again at its replay');
+  await h.server.quiet();
+  const before = offered().length;
+  breakQueue(h);
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(offered().slice(before), ['2', '4', 'notice'], 'the refused 2, then the lost 4, then the notice; the accepted 3 isn\'t offered again');
+  await h.close();
+});
+
+test('after a break of the event queue, the lost message is recovered, a message already waiting follows it once, and the gap notice follows both', async () => {
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3));
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  assert.equal((h.incoming[1].metadata as { recovered?: boolean }).recovered, true, '2 is recovered');
+  assert.equal((h.incoming[2].metadata as { recovered?: boolean }).recovered, undefined, '3 comes as a message');
+  assert.equal((h.incoming[3].metadata as { recoveredMessages: number }).recoveredMessages, 1);
+  await h.close();
+});
+
+for (const open of [true, false]) {
+  test(`a message whose event arrives after a read after a break handed it is dropped at entry on ${open ? 'an open' : 'a closed'} channel, and the watermark passes it once the host accepts the read`, async () => {
+    const h = harness({ batchWindowMs: 50, history: [1, 2, 3].map((id) => streamMsg(id, { mentioned: !open })) });
+    await initialize(h, true);
+    await settled(h);
+    if (open) {
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      h.adapter.emit!(streamMsg(1));
+      await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    } else {
+      h.delivery.advance('zulip:general', 1);
+      h.policy.holdPushes = true;
+    }
+    breakQueue(h);
+    if (open) await until(() => h.delivery.heldIds('zulip:general').includes(3), 'the read handed 3');
+    else await until(() => h.pushed.length === 1, 'the read\'s block');
+    h.adapter.emit!(streamMsg(3, { mentioned: !open }));
+    h.policy.holdPushes = false;
+    for (const answer of h.policy.heldPushes.splice(0)) answer();
+    await h.server.quiet();
+    if (open) assert.deepEqual(seenIds(h).filter((id) => id === '3'), ['3']);
+    else assert.equal(h.pushed.length, 1, 'the block alone');
+    assert.equal(h.delivery.watermark('zulip:general'), 3);
+    await h.close();
+  });
+}
+
+test('a message whose event arrives while a closed channel\'s read after a break is at Zulip is left out of the block, and reaches the host once', async () => {
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id, { mentioned: true })) });
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  let letRead!: () => void;
+  const gate = new Promise<void>((resolve) => { letRead = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await gate;
+    return read(key, query);
+  };
+  breakQueue(h);
+  await until(() => reading, 'the read at Zulip');
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  letRead();
+  await until(() => h.pushed.length === 2, 'the block and the message');
+  await h.server.quiet();
+  const texts = h.pushed.map((p) => (p.payload.content[0] as { text: string }).text);
+  assert.match(texts[0], /id=2\]/);
+  assert.doesNotMatch(texts[0], /id=3\]/);
+  assert.equal(texts.filter((t) => /id=3\]/.test(t)).length, 1);
+  assert.equal(h.pushed.length, 2);
+  await h.close();
+});
+
+test('a read after a break whose scan passes a waiting message and ends on the bot\'s own sends a block whose newest id is below the waiting message', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2, { mentioned: true }), streamMsg(3, { mentioned: true }), streamMsg(4)] });
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    const page = await read(key, query);
+    return { ...page, messages: page.messages.filter((m) => m.messageId !== '4') };
+  };
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => h.pushed.length === 2, 'the block and the message');
+  await h.server.quiet();
+  const block = h.pushed.find((p) => (p.origin as { missed?: boolean }).missed === true)!;
+  assert.equal((block.origin as { messageId: string }).messageId, '2');
+  const texts = h.pushed.map((p) => (p.payload.content[0] as { text: string }).text);
+  assert.equal(texts.filter((t) => /id=3\]/.test(t)).length, 1);
+  assert.equal(h.pushed.length, 2);
+  await h.close();
+});
+
+test('after an open whose since-last-seen page its limit cut, a break of the event queue brings nothing from below the channel\'s place', async () => {
+  const h = harness({ history: [1, 2, 3, 4, 5].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  for (const id of [2, 3, 4, 5]) h.adapter.emit!(streamMsg(id));
+  await h.server.quiet();
+  assert.equal(h.delivery.tally('zulip:general')?.messages, 4, 'the four counted as missed');
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2, sinceLastSeen: true },
+  })) as { history?: { messageId: string }[] };
+  assert.deepEqual(opened.history?.map((m) => m.messageId), ['2', '3']);
+  breakQueue(h);
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', 'notice'], 'the counted 4 and 5 don\'t arrive as recovered');
+  await h.close();
+});
+
+test('a mention that enters a closed channel while its read after a break is at Zulip keeps its hold: refused after a later mention was accepted, it is offered again', async () => {
+  const h = harness({ history: [streamMsg(1)] });
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  let letRead!: () => void;
+  const gate = new Promise<void>((resolve) => { letRead = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    const page = await read(key, query);
+    reading = true;
+    await gate;
+    return page;
+  };
+  const offersOf = (id: string) => h.pushed.filter((p) =>
+    (p.origin as { messageId?: unknown }).messageId === id ||
+    p.payload.content.some((c) => new RegExp(`id=${id}\\]`).test((c as { text?: string }).text ?? ''))).length;
+  h.policy.holdPushes = true;
+  h.policy.rejectPushes.add('3');
+  breakQueue(h);
+  await until(() => reading, 'the read at Zulip');
+  h.adapter.history.push(streamMsg(3, { mentioned: true }), streamMsg(4, { mentioned: true }));
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  h.adapter.emit!(streamMsg(4, { mentioned: true }));
+  letRead();
+  await until(() => h.policy.heldPushes.length === 2, 'the pushes of 3 and 4');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), [3, 4], 'both held while their pushes are out');
+  h.policy.heldPushes[1]();
+  await until(() => !h.delivery.heldIds('zulip:general').includes(4), "4's acceptance");
+  h.policy.heldPushes[0]();
+  h.policy.holdPushes = false;
+  h.policy.heldPushes.length = 0;
+  await h.server.quiet();
+  assert.equal(h.delivery.watermark('zulip:general'), 2, 'the refused 3 keeps the watermark below it');
+  h.adapter.history.push(streamMsg(5, { mentioned: true }));
+  h.adapter.emit!(streamMsg(5, { mentioned: true }));
+  await h.server.quiet();
+  assert.equal(offersOf('3'), 2, '3 is offered again once the host accepts 5');
+  await h.close();
+});
+
+test('the gap notice counts a closed channel whose block the host accepted', async () => {
+  const both = [DESCRIPTOR, { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } }];
+  const h = harness({ history: [streamMsg(60, { channelId: 'zulip:dev', mentioned: true })] });
+  h.adapter.discoverChannels = async () => both;
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.delivery.advance('zulip:dev', 50);
+  h.policy.holdPushes = true;
+  breakQueue(h);
+  await until(() => h.pushed.length === 1, 'the block');
+  h.policy.holdPushes = false;
+  for (const answer of h.policy.heldPushes.splice(0)) answer();
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  const notice = h.incoming.find((m) => (m.metadata as { kind?: string }).kind === 'gap')!;
+  assert.match((notice.content[0] as { text: string }).text, /Addressed messages on 1 closed channel\(s\) were delivered as catch-up events\./);
+  assert.equal((notice.metadata as { closedChannelsCaughtUp: number }).closedChannelsCaughtUp, 1);
+  await h.close();
+});
+
+test('quiet() settles once what the server was handed has reached the host: delivery jobs, the batch window, a replay, and a request being served', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await readHeld;
+    return read(key, query);
+  };
+  const flushes = heldFlushes(h, ['1', '2']);
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(withLog(streamMsg(1)));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  const delivered = h.server.quiet();
+  assert.equal(await settledYet(delivered), false, 'quiet() waits for the delivery job');
+  fetches.release();
+  await until(() => flushes.reached(), 'the batch at its flush');
+  assert.equal(await settledYet(delivered), false, 'quiet() waits for the batch');
+  flushes.release();
+  await until(() => reading, 'the read for the refused 1');
+  assert.equal(await settledYet(delivered), false, 'quiet() waits for the replay');
+  releaseRead();
+  await delivered;
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['2', '1']);
+
+  fakeTools.calls.length = 0;
+  let releaseCall!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseCall = resolve; });
+  try {
+    void h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    await until(() => fakeTools.calls.length === 1, 'the call to begin');
+    const served = h.server.quiet();
+    assert.equal(await settledYet(served), false, 'quiet() waits for the request being served');
+    releaseCall();
+    await served;
+    assert.deepEqual(fakeTools.calls.map((c) => c.name), ['slow', 'slow:end']);
+  } finally {
+    releaseCall();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
+
+test('a push the host hasn\'t answered holds back no later message, reaction or edit of its channel, and quiet() waits for the answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-push-answer-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.policy.holdPushes = true;
+
+    h.adapter.emit!(streamMsg(1, { mentioned: true, text: '@bot one' }));
+    await until(() => h.pushed.length === 1, "the first message's push");
+    h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '1', emoji: 'eyes',
+      reactorId: '9', reactorName: 'Ann', onOwnMessage: true, messageSnippet: 'one', timestamp: new Date(1_700_000_002_000),
+    });
+    await until(() => h.pushed.length === 2, "the reaction's push, the first unanswered");
+    h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:general', messageId: '3', messageIds: ['3'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: '@bot three', previousContent: 'three',
+      mentioned: true, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_003_000),
+    });
+    await until(() => h.pushed.length === 3, "the edit's push, two unanswered");
+    h.adapter.emit!(streamMsg(4, { mentioned: true, text: '@bot four' }));
+    await until(() => h.pushed.length === 4, "the last message's push, three unanswered");
+    assert.deepEqual(h.pushed.map((p) => p.eventId.split('_')[1]), ['msg', 'reaction', 'edit', 'msg']);
+
+    h.policy.holdPushes = false;
+    const answered = h.server.quiet();
+    assert.equal(await settledYet(answered), false, 'quiet() waits for the answers');
+    for (const answer of h.policy.heldPushes.splice(0)) answer();
+    await answered;
+    assert.equal(h.delivery.watermark('zulip:general'), 4, 'both messages accepted');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-wire-'));
   const original = console.error;
@@ -1274,7 +2825,7 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
 
     // Default off: nothing surfaces.
     reaction();
-    await new Promise((r) => setTimeout(r, 20));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0);
 
     const on = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } })) as { content: { text: string }[] }).content[0].text);
@@ -1298,7 +2849,7 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
     // codepoints a glyph-shaped baseline entry is matched on.
     reaction({ emoji: 'biohazard' });
     reaction({ emoji: 'octagonal_sign', emojiCode: '1f6d1', emojiType: 'unicode_emoji' });
-    await new Promise((r) => setTimeout(r, 20));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 2);
 
     // Closed channel with visibility on → push/event.
@@ -1384,7 +2935,7 @@ test('messaging tools mint checkpoints the host can roll back to; publishes and 
   // Streaming notifications are accepted and deliver nothing.
   h.host.sendNotification(method.CHANNELS_OUTGOING_CHUNK, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', index: 0, delta: 'never sent' });
   h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'never sent' }] });
-  await new Promise((r) => setTimeout(r, 20));
+  await h.host.sendRequest('ping');
   assert.equal(h.adapter.published.length, 3);
   await h.close();
 });
@@ -1437,7 +2988,7 @@ test('the watermark never passes an undelivered message: a refusal or a lost bat
     // Shutdown on a live connection pushes the last window out instead of
     // cancelling it.
     h.adapter.emit!(streamMsg(7));
-    assert.equal(h.server.channelManager.pendingCount(), 1);
+    await until(() => h.server.channelManager.pendingCount() === 1, '7 in the batch window');
     await h.server.shutdown();
     assert.equal(h.incoming[h.incoming.length - 1].messageId, '7');
     assert.equal(h.delivery.watermark('zulip:general'), 7);
@@ -1577,7 +3128,7 @@ test('a mention in a stream created after startup registers it, so the invitatio
   await h.close();
 });
 
-test('live events received before the catch-up sweep are held, so a live delivery cannot jump the watermark over the offline gap', async () => {
+test("a message that arrives while the registration is unanswered reaches the host after its channel's catch-up block, as a message", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-prelive-'));
   try {
     const first = harness({ stateDir: dir, sessionId: 'pl' });
@@ -1589,31 +3140,64 @@ test('live events received before the catch-up sweep are held, so a live deliver
     await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
     await first.close();
 
-    // Session 2: the sweep's history fetch is slow; a live mention (6) and a
-    // duplicate of something the sweep will deliver (5) arrive meanwhile.
     const second = harness({ stateDir: dir, sessionId: 'pl', history: [streamMsg(4), streamMsg(5, { mentioned: true })] });
-    let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    second.adapter.fetchHistory = async (channelId, query) => { await gate; return realFetch(channelId, query); };
+    second.policy.holdRegister = true;
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => second.policy.heldRegister.length === 1 && second.adapter.emit !== null, 'the registration to be with the host');
+    second.adapter.history.push(streamMsg(6, { mentioned: true, text: 'live @bot' }));
+    second.adapter.emit!(streamMsg(6, { mentioned: true, text: 'live @bot' }));
+    await second.host.sendRequest('ping');
+    assert.equal(second.pushed.length, 0, 'nothing goes while the registration is with the host');
+    second.policy.heldRegister.shift()!();
+    await second.server.quiet();
+    assert.deepEqual(second.pushed.map((p) => p.eventId), ['zulip_missed_zulip:general_5', 'zulip_msg_6'], 'the block, then the message');
+    const block = (second.pushed[0].payload.content[0] as { text: string }).text;
+    assert.match(block, /id=4\]/);
+    assert.match(block, /id=5\]/);
+    assert.doesNotMatch(block, /id=6\]/);
+    assert.equal(second.delivery.watermark('zulip:general'), 6);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("at a connection's start, a channel with nothing to catch up goes on while another channel's catch-up read waits", async () => {
+  const DEV = { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } };
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-start-own-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'own', visible: [DESCRIPTOR, DEV] });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.incoming.length === 1, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const mention = streamMsg(20, { channelId: 'zulip:dev', mentioned: true, text: '@bot meanwhile' });
+    const second = harness({ stateDir: dir, sessionId: 'own', visible: [DESCRIPTOR, DEV], history: [streamMsg(4, { mentioned: true }), mention] });
+    let letRead!: () => void;
+    const gate = new Promise<void>((resolve) => { letRead = resolve; });
+    let readingGeneral = false;
+    const read = second.adapter.fetchHistory!.bind(second.adapter);
+    second.adapter.fetchHistory = async (key, query) => {
+      if (second.adapter.wireOf(key) === 'zulip:general') {
+        readingGeneral = true;
+        await gate;
+      }
+      return read(key, query);
+    };
     await initialize(second, true);
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
-    assert.equal(second.server.isLive, false);
-    second.adapter.emit!(streamMsg(6, { mentioned: true, text: 'live @bot' }));
-    second.adapter.emit!(streamMsg(5, { mentioned: true }));
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(second.pushed.length, 0, 'held until the sweep has run');
-    release();
-    await until(() => second.pushed.length === 2, 'the sweep block, then the live mention');
-    const block = (second.pushed[0].payload.content[0] as { text: string }).text;
-    assert.match(block, /^<missed /);
-    assert.match(block, /id=4\]/);
-    assert.match(block, /id=5\]/);
-    assert.equal(second.pushed[1].eventId, 'zulip_msg_6');
-    assert.equal(second.delivery.watermark('zulip:general'), 6);
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(second.pushed.length, 2, 'the duplicate of 5 was dropped, not pushed twice');
+    await until(() => readingGeneral, "general's catch-up read to start");
+    second.adapter.emit!(mention);
+    await until(() => second.pushed.some((p) => p.eventId === 'zulip_msg_20'), "dev's mention while general's catch-up read waits");
+    assert.equal(second.pushed.some((p) => p.eventId.startsWith('zulip_missed_zulip:general')), false, "general's block waits for its read");
+    letRead();
+    await until(() => second.pushed.some((p) => p.eventId === 'zulip_missed_zulip:general_4'), "general's block once its read answers");
     await second.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1680,20 +3264,20 @@ test('disabling zulip.messaging stops incoming delivery and its tools until re-e
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
 
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
-  await new Promise((r) => setTimeout(r, 10));
+  await h.host.sendRequest('ping');
   h.adapter.emit!(streamMsg(1));
   h.adapter.emit!(streamMsg(2, { mentioned: true }));
-  await new Promise((r) => setTimeout(r, 25));
+  await h.host.sendRequest('ping');
   assert.equal(h.incoming.length, 0, 'no channels/incoming under a disabled feature set');
   assert.equal(h.pushed.length, 0);
-  assert.equal(h.delivery.watermark('zulip:general'), undefined, 'and nothing is pretended forwarded');
+  assert.equal(h.delivery.watermark('zulip:general'), 0, 'just below the held messages: nothing is pretended forwarded');
   const refresh = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { isError?: boolean; content: { text: string }[] };
   assert.equal(refresh.isError, true);
   assert.match(refresh.content[0].text, /not enabled/);
   await h.close();
 });
 
-test('a live message landing mid-drain queues behind the held ones instead of burying them', async () => {
+test("messages that arrive before their channel's catch-up keep their order behind it, and a later one waits behind one fetching its attachments", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-drain-'));
   try {
     const first = harness({ stateDir: dir, sessionId: 'dr' });
@@ -1704,45 +3288,43 @@ test('a live message landing mid-drain queues behind the held ones instead of bu
     await until(() => first.incoming.length === 1, 'delivery');
     await first.close();
 
-    // Session 2: the sweep is slow, and the first held message carries an
-    // attachment whose fetch stalls once the drain reaches it.
-    let releaseSweep!: () => void;
-    const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((r) => { releaseRead = r; });
+    let reading = false;
     let releaseFetch!: () => void;
     const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
+    let fetchStarted = false;
     const second = harness({
       stateDir: dir, sessionId: 'dr',
       attachments: {
-        source: { async fetch() { await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
+        source: { async fetch() { fetchStarted = true; await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
         inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
       },
     });
     const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    second.adapter.fetchHistory = async (channelId, query) => { await sweepGate; return realFetch(channelId, query); };
+    second.adapter.fetchHistory = async (channelId, query) => { reading = true; await readGate; return realFetch(channelId, query); };
     await initialize(second, true);
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
-    // The host reopens the channel at boot (without history, as AF does).
-    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await until(() => reading, "the channel's catch-up read");
+    const opened = second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
     second.adapter.emit!({
       ...streamMsg(20, { text: 'see the log' }),
       metadata: { topic: 'deploys', mentioned: false, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
     });
     second.adapter.emit!(streamMsg(21));
-    assert.equal(second.server.isLive, false);
-    releaseSweep();
-    // The drain is now stalled on 20's attachment fetch when a live message lands.
-    await new Promise((r) => setTimeout(r, 25));
-    assert.equal(second.server.isLive, false, 'delivery stays gated until the buffer is empty');
+    await second.host.sendRequest('ping');
+    releaseRead();
+    await opened;
+    await until(() => fetchStarted, "20's attachment fetch");
     second.adapter.emit!(streamMsg(22));
-    await new Promise((r) => setTimeout(r, 25));
-    assert.equal(second.incoming.length, 0, 'nothing overtakes the held messages');
+    await second.host.sendRequest('ping');
+    assert.equal(second.incoming.length, 0, 'nothing overtakes the message fetching its attachments');
     releaseFetch();
-    await until(() => second.incoming.length === 3, 'all three, in order');
+    await second.server.quiet();
     assert.deepEqual(second.incoming.map((m) => m.messageId), ['20', '21', '22']);
     assert.ok(second.incoming[0].content.some((c) => c.type === 'text' && /run\.log/.test(c.text)), 'the stalled attachment was inlined');
-    await until(() => second.delivery.watermark('zulip:general') === 22, 'watermark 22');
-    assert.equal(second.server.isLive, true);
+    assert.equal(second.delivery.watermark('zulip:general'), 22);
     await second.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1775,7 +3357,7 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
     // Live: dropped; a mention: not pushed; nothing tallied or watermarked.
     h.adapter.emit!(streamMsg(2, { mentioned: true }));
     h.adapter.emit!(streamMsg(3));
-    await new Promise((r) => setTimeout(r, 25));
+    await h.server.quiet();
     assert.equal(h.incoming.length, 1);
     assert.equal(h.pushed.length, 0);
     assert.equal(h.delivery.watermark('zulip:general'), 1);
@@ -1832,7 +3414,7 @@ test('a narrowed allowlist is enforced on every surface: live, push, backscroll,
       },
     ];
     second.adapter.emit!(...dmFrom(7));
-    await new Promise((r) => setTimeout(r, 25));
+    await second.server.quiet();
     assert.equal(second.pushed.length, 1, 'a DM from an excluded sender goes nowhere');
     assert.ok(!second.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED && JSON.stringify(r.params).includes('zulip:dm:7')), 'and is not even announced');
     second.adapter.emit!(...dmFrom(42));
@@ -1856,9 +3438,10 @@ test('a feature set disabled while a message waits in the batch window withholds
 
     h.adapter.emit!(streamMsg(1));
     h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
-    await new Promise((r) => setTimeout(r, 200));
+    await h.host.sendRequest('ping');
+    await h.server.quiet();
     assert.equal(h.incoming.length, 0, 'withheld at send time, not only at enqueue');
-    assert.equal(h.delivery.watermark('zulip:general'), undefined);
+    assert.equal(h.delivery.watermark('zulip:general'), 0, 'just below the withheld message');
     assert.equal(h.delivery.floor('zulip:general'), 1, 'held, not forgotten: not heard is not the same as heard');
 
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
@@ -1872,42 +3455,223 @@ test('a feature set disabled while a message waits in the batch window withholds
   }
 });
 
-test('a channel_open with backscroll during the sweep window does not hide the offline gap from the sweep', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'zulip-sweep-anchor-'));
-  try {
-    const first = harness({ stateDir: dir, sessionId: 'sa' });
-    await initialize(first, true);
-    await settled(first);
-    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-    first.adapter.emit!(streamMsg(3));
-    await until(() => first.incoming.length === 1, 'delivery');
-    await first.close();
+const AAA: ChannelDescriptor = { id: 'zulip:aaa', type: 'zulip', label: '#aaa', direction: 'bidirectional', address: { stream_name: 'aaa', stream_id: 6 } };
 
-    // Session 2: the sweep's fetch (the first one) is slow; meanwhile the
-    // agent opens the channel asking for the two newest messages.
-    const second = harness({ stateDir: dir, sessionId: 'sa', history: [4, 5, 6, 7, 8].map((id) => streamMsg(id)) });
-    let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-    let calls = 0;
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    second.adapter.fetchHistory = async (channelId, query) => { if (calls++ === 0) await gate; return realFetch(channelId, query); };
-    await initialize(second, true);
-    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    await awaitRegistered(second, false);
-    await until(() => calls === 1, 'the sweep to start fetching');
-    const opened = (await second.host.sendRequest(method.CHANNELS_OPEN, {
-      channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 },
-    })) as { history?: IncomingChannelMessage[] };
+function aaaHoldsTheTurn(h: Harness): { reading: () => boolean; release: () => void } {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let reading = false;
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:aaa') {
+      reading = true;
+      await gate;
+    }
+    return real(key, query);
+  };
+  return { reading: () => reading, release: () => release() };
+}
+
+async function openedWhileAaaReads(dir: string, sessionId: string, history: IncomingChannelMessage[], open: Record<string, unknown>): Promise<{ second: Harness; turn: ReturnType<typeof aaaHoldsTheTurn>; opened: { history?: IncomingChannelMessage[] } }> {
+  const first = harness({ stateDir: dir, sessionId, visible: [AAA, DESCRIPTOR] });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(3));
+  await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+  first.delivery.advance('zulip:aaa', 1);
+  await first.close();
+
+  const second = harness({ stateDir: dir, sessionId, visible: [AAA, DESCRIPTOR], history });
+  const turn = aaaHoldsTheTurn(second);
+  await initialize(second, true);
+  await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(turn.reading, "#aaa's catch-up read to hold Zulip's turn");
+  const opened = (await second.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, ...open,
+  })) as { history?: IncomingChannelMessage[] };
+  return { second, turn, opened };
+}
+
+const generalBlock = (h: Harness) => {
+  const blocks = h.pushed.filter((p) => (p.origin as { mcplChannelId?: string }).mcplChannelId === 'zulip:general' && p.tags?.includes('zulip:missed'));
+  return blocks.map((p) => (p.payload.content[0] as { text: string }).text);
+};
+
+test("a page of the newest rows, opened before its channel's catch-up read, counts nothing below it as seen, and the catch-up block brings every unread row", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-page-before-read-'));
+  try {
+    const unread = [streamMsg(4, { mentioned: true }), ...[5, 6, 7, 8].map((id) => streamMsg(id))];
+    const { second, turn, opened } = await openedWhileAaaReads(dir, 'pr', unread, { history: { limit: 2 } });
     assert.deepEqual(opened.history!.map((m) => m.messageId), ['7', '8']);
-    assert.equal(second.delivery.watermark('zulip:general'), 8, 'the backscroll moved the live watermark');
-    release();
-    await until(() => second.pushed.length === 1, 'the sweep still delivers from where the connection began');
-    const block = (second.pushed[0].payload.content[0] as { text: string }).text;
-    for (const id of [4, 5, 6]) assert.match(block, new RegExp(`id=${id}\\]`));
+    assert.equal(second.delivery.watermark('zulip:general'), 3, 'a page of the newest rows counts nothing below it as seen');
+    turn.release();
+    await second.server.quiet();
+    const blocks = generalBlock(second);
+    assert.equal(blocks.length, 1);
+    for (const id of [4, 5, 6, 7, 8]) assert.match(blocks[0], new RegExp(`id=${id}\\]`));
+    assert.equal(second.delivery.watermark('zulip:general'), 8, 'the watermark moves once the host accepts the block');
     await second.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a page of the newest rows, answered before the catch-up block, loses nothing below it when the connection ends before the block', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-page-before-block-'));
+  try {
+    const unread = () => [streamMsg(4, { mentioned: true }), ...[5, 6, 7, 8].map((id) => streamMsg(id))];
+    const { second, turn } = await openedWhileAaaReads(dir, 'pb', unread(), { history: { limit: 2 } });
+    const closing = second.close();
+    await second.server.quiet();
+    turn.release();
+    await closing;
+
+    const third = harness({ stateDir: dir, sessionId: 'pb', visible: [AAA, DESCRIPTOR], history: unread() });
+    await initialize(third, true);
+    await settled(third);
+    const blocks = generalBlock(third);
+    assert.equal(blocks.length, 1, 'the catch-up block');
+    for (const id of [4, 5, 6, 7, 8]) assert.match(blocks[0], new RegExp(`id=${id}\\]`));
+    await third.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a sinceLastSeen page opened before its channel's catch-up read isn't repeated in the catch-up block", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-since-before-read-'));
+  try {
+    const unread = [4, 5, 6, 7, 8].map((id) => streamMsg(id));
+    const { second, turn, opened } = await openedWhileAaaReads(dir, 'sr', unread, { history: { limit: 2, sinceLastSeen: true } });
+    assert.deepEqual(opened.history!.map((m) => m.messageId), ['4', '5']);
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
+    turn.release();
+    await second.server.quiet();
+    const blocks = generalBlock(second);
+    assert.equal(blocks.length, 1);
+    for (const id of [6, 7, 8]) assert.match(blocks[0], new RegExp(`id=${id}\\]`));
+    for (const id of [4, 5]) assert.doesNotMatch(blocks[0], new RegExp(`id=${id}\\]`));
+    assert.equal(second.delivery.watermark('zulip:general'), 8);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an open with a page gives a channel that has no watermark one, and the next connection's catch-up brings what was written after it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-open-gives-watermark-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'ow', history: [1, 2].map((id) => streamMsg(id)) });
+    await initialize(first, true);
+    await settled(first);
+    assert.equal(first.delivery.watermark('zulip:general'), undefined);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+    assert.equal(first.delivery.watermark('zulip:general'), 2);
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'ow', history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+    await initialize(second, true);
+    await settled(second);
+    const blocks = generalBlock(second);
+    assert.equal(blocks.length, 1);
+    for (const id of [3, 4]) assert.match(blocks[0], new RegExp(`id=${id}\\]`));
+    for (const id of [1, 2]) assert.doesNotMatch(blocks[0], new RegExp(`id=${id}\\]`));
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a break's job sends both its reads before it hands a row on, and its held rows reach the host before its own", async () => {
+  const timeline: string[] = [];
+  const h = harness({ history: [1, 2, 3, 4, 5].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectIds.add('2');
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3));
+  await until(() => h.incoming.some((m) => m.messageId === '3'), '3 accepted');
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), [2], '2 refused, and held');
+  h.policy.rejectIds.delete('2');
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general') timeline.push(`read after ${query.afterMessageId}`);
+    return read(key, query);
+  };
+  const channels = h.server.channelManager as unknown as { onIncomingMessage(key: string, message: { messageId: string }): void };
+  const handOn = channels.onIncomingMessage.bind(channels);
+  channels.onIncomingMessage = (key, message) => {
+    timeline.push(`hand ${message.messageId}`);
+    return handOn(key, message);
+  };
+  timeline.length = 0;
+  breakQueue(h);
+  await until(() => h.incoming.some((m) => m.messageId === '5'), '5, recovered');
+  await h.server.quiet();
+  assert.deepEqual(timeline.filter((e) => !e.startsWith('hand system')), ['read after 1', 'read after 3', 'hand 2', 'hand 4', 'hand 5']);
+  assert.deepEqual(h.incoming.map((m) => m.messageId).filter((id) => ['2', '4', '5'].includes(id)), ['2', '4', '5']);
+  await h.close();
+});
+
+test("an edit and a deletion that arrive while their message's move to another channel waits are handed in that channel's lane, after what waits there", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, visible: [DESCRIPTOR, AAA] });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(5, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 5, '5 accepted');
+  h.adapter.emit!(withLog(streamMsg(20, { channelId: 'zulip:aaa', mentioned: true })));
+  await until(() => fetches.started.length === 1, "aaa's 20 fetching its attachment");
+  const general = h.adapter.keyOf('zulip:general');
+  const aaa = h.adapter.keyOf('zulip:aaa');
+  const about5 = (over: Partial<MessageChangeEvent>): MessageChangeEvent => ({
+    kind: 'edit', key: general, messageId: '5', messageIds: ['5'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '12',
+    topic: 'deploys', previousTopic: null, movedToKey: null, content: null, previousContent: null,
+    mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    ...over,
+  });
+  h.adapter.enterChange!({ key: general, messageIds: [5], kind: 'move', ready: async () => about5({ kind: 'move', previousTopic: 'deploys', movedToKey: aaa }) });
+  h.adapter.enterChange!({ key: general, messageIds: [5], kind: 'edit', ready: async () => about5({ kind: 'edit', key: aaa, content: 'ship it @Bot', previousContent: 'ship it' }) });
+  h.adapter.enterChange!({ key: general, messageIds: [5], kind: 'delete', ready: async () => about5({ kind: 'delete', key: aaa, previousContent: 'ship it @Bot', actorId: null }) });
+  await until(() => h.pushed.some((p) => String((p.origin as { messageId?: unknown }).messageId).startsWith('move:')), 'the move line');
+  fetches.release();
+  await h.server.quiet();
+  const kinds = h.pushed.map((p) => String((p.origin as { messageId?: unknown }).messageId).split(':')[0]);
+  assert.deepEqual(kinds.filter((k) => k !== '5'), ['move', '20', 'edit', 'delete']);
+  await h.close();
+});
+
+test("after a reconnect within one process, the watermark follows what the new connection's host accepts", async () => {
+  const first = harness({ visible: [AAA, DESCRIPTOR], history: [1, 2, 3, 4, 5].map((id) => streamMsg(id)) });
+  await initialize(first, true);
+  await settled(first);
+  first.delivery.advance('zulip:aaa', 1);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(1));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'delivery');
+  first.policy.rejectIds.add('2');
+  for (const id of [2, 3, 4, 5]) first.adapter.emit!(streamMsg(id));
+  await first.server.quiet();
+  assert.equal(first.delivery.watermark('zulip:general'), 1, 'the refused message holds the watermark below it');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  const turn = aaaHoldsTheTurn(second);
+  await initialize(second, true);
+  await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(turn.reading, "#aaa's catch-up read to hold Zulip's turn");
+  const opened = (await second.host.sendRequest(method.CHANNELS_OPEN, {
+    channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 1, sinceLastSeen: true },
+  })) as { history?: IncomingChannelMessage[] };
+  assert.deepEqual(opened.history!.map((m) => m.messageId), ['2']);
+  assert.equal(second.delivery.watermark('zulip:general'), 2, "the page's newest row, not what the earlier connection's host accepted");
+  turn.release();
+  await second.server.quiet();
+  await second.close();
 });
 
 test('a second connection to the same server starts from a fresh grant, registration and sweep', async () => {
@@ -1935,7 +3699,7 @@ test('a second connection to the same server starts from a fresh grant, registra
   await two.close();
 });
 
-test('a host that leaves while the go-live drain waits on an attachment leaves the next host\'s live delivery to its own start', async () => {
+test('a host that leaves while a delivery waits on an attachment leaves the next host\'s delivery to its own start', async () => {
   let releaseFetch!: () => void;
   let fetching = false;
   const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
@@ -1944,6 +3708,7 @@ test('a host that leaves while the go-live drain waits on an attachment leaves t
       source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
       inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
     },
+    shutdownGraceMs: 20,
   });
   await initialize(one, true);
   await until(() => one.adapter.emit !== null, 'event delivery started before the policy');
@@ -1952,14 +3717,14 @@ test('a host that leaves while the go-live drain waits on an attachment leaves t
     metadata: { topic: 'deploys', mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
   });
   await one.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-  await until(() => fetching, 'the go-live drain waiting on the attachment');
+  await until(() => fetching, 'the delivery waiting on the attachment');
   await one.close();
   const two = harness({ reuse: { server: one.server, adapter: one.adapter } });
   try {
     await initialize(two, true);
     releaseFetch();
     await new Promise((r) => setTimeout(r, 100));
-    assert.equal(two.server.isLive, false, 'no live delivery before the second host\'s policy');
+    assert.deepEqual([...two.pushed.map((p) => p.origin.messageId), ...two.incoming.map((m) => m.messageId)], [], 'nothing reaches the second host before its policy');
   } finally {
     releaseFetch();
     await two.close();
@@ -1969,9 +3734,10 @@ test('a host that leaves while the go-live drain waits on an attachment leaves t
 test('shutdown waits for a delivery still fetching its attachment, then flushes it', async () => {
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
+  let fetchStarted = false;
   const h = harness({
     attachments: {
-      source: { async fetch() { await gate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
+      source: { async fetch() { fetchStarted = true; await gate; return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false }; } },
       inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
     },
   });
@@ -1982,15 +3748,32 @@ test('shutdown waits for a delivery still fetching its attachment, then flushes 
     ...streamMsg(1, { text: 'see the log' }),
     metadata: { topic: 'deploys', mentioned: false, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
   });
-  await new Promise((r) => setTimeout(r, 10));
+  await until(() => fetchStarted, 'the fetch to start');
   assert.equal(h.server.channelManager.pendingCount(), 0, 'still building its content');
   const done = h.server.shutdown();
-  await new Promise((r) => setTimeout(r, 20));
   assert.equal(h.incoming.length, 0);
   release();
   await done;
   assert.equal(h.incoming.length, 1);
   assert.equal(h.delivery.watermark('zulip:general'), 1);
+  await h.close();
+});
+
+test('a batch answer that comes while its channel waits on an attachment still counts when the server shuts down first', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(withLog(streamMsg(2)));
+  await until(() => fetches.started.length === 1 && h.incoming.some((m) => m.messageId === '1'), '1 delivered while 2 waits on its attachment');
+  await h.host.sendRequest('ping');
+  const done = h.server.shutdown();
+  fetches.release();
+  await done;
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2']);
+  assert.equal(h.delivery.watermark('zulip:general'), 2, 'the host accepted both, so the next start offers neither');
   await h.close();
 });
 
@@ -2123,31 +3906,34 @@ test('a channel the host never answered for stays usable here and is re-announce
   await h.close();
 });
 
-test('a host that opens or closes a pending channel has confirmed it; the backlog does not grow forever (#20)', async () => {
-  // Against agent-framework the answer to an announcement made inside a tool
-  // call can never arrive (it reconciles first, and this server serves one
-  // request at a time). The host acting on the channel is the only
-  // confirmation available, so it has to count as one.
-  const h = harness({ announceTimeoutMs: 80 });
-  await initialize(h, true);
-  await settled(h);
-  h.policy.changedAnswer = 'reconcile';
-  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+for (const act of ['opens', 'closes'] as const) {
+  test(`a host that ${act} a pending channel has confirmed it; the backlog does not grow forever (#20)`, async () => {
+    // A host that takes channels/changed as a notification never answers it.
+    // The host acting on the channel is the only confirmation available, so
+    // it has to count as one.
+    const h = harness({ announceTimeoutMs: 80 });
+    await initialize(h, true);
+    await settled(h);
+    h.policy.changedAnswer = 'error';
+    h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
 
-  const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
-    { pendingAnnouncement?: string[] };
-  assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'the answer could not arrive in time');
-  await until(() => h.policy.reconcileOpens.length > 0, "the host's reconcile-time open is served");
+    const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+      { pendingAnnouncement?: string[] };
+    assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'no answer came');
+    if (act === 'opens') await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} });
+    else await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' });
+    h.policy.changedAnswer = 'accept';
 
-  // Second call: nothing pending, no second announcement, no stall.
-  const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
-  const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
-    { added: string[]; pendingAnnouncement?: string[]; note: string };
-  assert.equal(second.pendingAnnouncement, undefined, 'the host proved it knows the channel by opening it');
-  assert.deepEqual(second.added, []);
-  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, announcements, 'and it is not announced again');
-  await h.close();
-});
+    // Second call: nothing pending, no second announcement, no stall.
+    const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
+    const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+      { added: string[]; pendingAnnouncement?: string[]; note: string };
+    assert.equal(second.pendingAnnouncement, undefined, `the host proved it knows the channel when it ${act === 'opens' ? 'opened' : 'closed'} it`);
+    assert.deepEqual(second.added, []);
+    assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, announcements, 'and it is not announced again');
+    await h.close();
+  });
+}
 
 test('a channel the host itemizes as refused is not registered, and refresh_channels says so (#20)', async () => {
   const h = harness();
@@ -2181,24 +3967,44 @@ test('listen registers what it subscribed the bot to and reports how the host an
   const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
   assert.equal(opened.channel.id, 'zulip:ops');
 
-  // A host that cannot answer in time: the tool says so rather than logging it.
-  h.policy.changedAnswer = 'reconcile';
+  h.policy.changedAnswer = 'error';
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM, { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } }];
   const stalled = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'listen', arguments: { channels: ['infra'] } })) as { content: { text: string }[] }).content[0].text) as
     { registration: { announced: string[]; local: string[] } };
   assert.deepEqual(stalled.registration.local, ['zulip:infra'], 'the tool result carries the outcome; the note is the runtime\'s (see toolRuntime tests)');
-  await until(() => h.policy.reconcileOpens.some((o) => o.channelId === 'zulip:infra'), "the host's reconcile-time open is served");
   await h.close();
 });
 
-test('a host that reconciles before it answers does not cost the channel — the reported failure (#20)', async () => {
-  // agent-framework answers channels/register BEFORE reconciling and
-  // channels/changed AFTER, and this server serves one request at a time. So
-  // an announcement made inside a tool call cannot be answered until the tool
-  // returns: the host waits for a channels/open this server cannot reach, and
-  // the announcement times out. That is why restarting fixed the reported
-  // streams and refresh_channels never did.
-  const h = harness({ announceTimeoutMs: 80 });
+test('an open whose grant loses channels.lifecycle while it reads its page is refused, and no row of the page counts as seen', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reading = false;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    reading = true;
+    await gate;
+    return read(key, query);
+  };
+  const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2 } });
+  await until(() => reading, 'the page read to start');
+  let updated = false;
+  void h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.lifecycle') }).then(() => { updated = true; });
+  try {
+    await until(() => updated, 'the grant to change while the open reads its page');
+  } finally {
+    release();
+  }
+  await assert.rejects(open, (err: Error) => /Capability denied: channels\.lifecycle/.test(err.message));
+  assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
+  assert.equal(h.delivery.watermark('zulip:general'), undefined, 'no row of the page counts as seen');
+  await h.close();
+});
+
+test('a host that opens a channel before it answers its announcement gets the open served while a tool call waits for that answer', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
   await initialize(h, true);
   await settled(h);
   h.policy.changedAnswer = 'reconcile';
@@ -2206,18 +4012,10 @@ test('a host that reconciles before it answers does not cost the channel — the
 
   const report = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
     { added: string[]; pendingAnnouncement?: string[]; note: string };
-  assert.deepEqual(report.added, [], 'the answer never arrived in time');
-  assert.deepEqual(report.pendingAnnouncement, ['zulip:ops'], 'and the agent is told exactly that');
-
-  // The channel is usable anyway: the agent can open what it was told about.
-  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
-  assert.equal(opened.channel.id, 'zulip:ops');
-
-  // And the host's own reconcile-time open is answered once the tool call
-  // returns, because the descriptor was recorded before the announcement went
-  // out rather than after the answer came back.
-  await until(() => h.policy.reconcileOpens.length > 0, "the host's own channels/open is served");
   assert.deepEqual(h.policy.reconcileOpens, [{ channelId: 'zulip:ops', ok: true, detail: 'opened' }]);
+  assert.deepEqual(report.added, ['zulip:ops'], 'the host answered the announcement');
+  assert.equal(report.pendingAnnouncement, undefined);
+  assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
   await h.close();
 });
 
@@ -2242,6 +4040,65 @@ test('channels/open re-discovery settles against a host that reconciles before i
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 1);
   assert.equal(h.server.channelManager.isOpen('zulip:ops'), true);
+  await h.close();
+});
+
+test('a new stream\'s first message arrives on its channel when the host opens it before it answers the announcement, and as on a closed channel when it answers first', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.emit!(streamMsg(20, { channelId: 'zulip:ops', text: 'first in ops' }), LATE_STREAM);
+  await until(() => h.incoming.length === 1, 'the message on the opened channel');
+  assert.deepEqual(h.incoming.map((m) => [m.channelId, m.messageId]), [['zulip:ops', '20']]);
+
+  h.policy.changedAnswer = 'accept';
+  const infra: ChannelDescriptor = { ...LATE_STREAM, id: 'zulip:infra', label: '#infra', address: { stream_name: 'infra', stream_id: 13 } };
+  h.adapter.emit!(streamMsg(21, { channelId: 'zulip:infra', text: 'first in infra' }), infra);
+  await h.server.quiet();
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:infra', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:infra');
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['20'], 'the infra message was handled as on a closed channel');
+  await h.close();
+});
+
+test('an edit from a new stream arrives on its channel when the host opens it before it answers the announcement', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+  h.policy.changedAnswer = 'reconcile';
+  h.adapter.change!({
+    kind: 'edit', channelId: 'zulip:ops', messageId: '900', messageIds: ['900'], authorId: '9', authorName: 'Ann',
+    authorEmail: 'ann@example.com', actorId: '9', topic: 'incidents', previousTopic: null, movedToChannelId: null,
+    content: '@bot look at this', previousContent: 'look at this', mentioned: true, previouslyMentioned: false,
+    vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+  });
+  await until(() => h.incoming.length === 1, 'the edit on the opened channel');
+  assert.equal(h.incoming[0].channelId, 'zulip:ops');
+  assert.match((h.incoming[0].content[0] as TextContent).text, /^\[edited\]/);
+  assert.equal(h.pushed.length, 0);
+  await h.close();
+});
+
+test('an open and then a close for a channel id the directory does not hold yet are served in that order', async () => {
+  const h = harness({ announceTimeoutMs: 5_000 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+  h.policy.changedAnswer = 'held';
+  const answered: string[] = [];
+  const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }).then(() => answered.push('open'));
+  await until(() => h.policy.heldChanged.length === 1, "the open's re-discovery to announce the stream");
+  const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' }).then(() => answered.push('close'));
+  await until(() => h.serverRead.includes(method.CHANNELS_CLOSE), 'the server to read the close');
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(answered, [], 'nothing answered while the open waits for its announcement');
+  h.policy.heldChanged.shift()!();
+  await Promise.all([open, close]);
+  assert.deepEqual(answered, ['open', 'close']);
+  assert.equal(h.server.channelManager.isOpen('zulip:ops'), false);
   await h.close();
 });
 
@@ -2286,7 +4143,7 @@ test('an edit, move or deletion is as visible as its message: open channels see 
 
   // A message the host never accepted: its edit is noise.
   h.adapter.change!(change({ messageId: '11', messageIds: ['11'] }));
-  await new Promise((r) => setTimeout(r, 30));
+  await h.server.quiet();
   assert.equal(h.incoming.length, 2);
 
   // ...unless the edit now mentions the bot, or the message is the bot's own.
@@ -2299,14 +4156,14 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   assert.equal((h.incoming[3].content[0] as { text: string }).text, '[deleted] [T id=12] [#general > deploys] Ann: message deleted — was: "my own line"');
   assert.deepEqual(h.incoming[3].tags, ['chat:deleted', 'chat:ambient']);
 
-  // A message offered but not yet accepted (held) counts as seen: "post,
-  // then fix the typo" lands before the host's acceptance round trip.
+  // A message the host refused, and so holds, counts as seen: its edit
+  // comes through as an edit.
   h.policy.rejectIds.add('13');
   h.adapter.emit!({
     channelId: 'zulip:general', messageId: '13', author: { id: '9', name: 'Ann' }, timestamp: new Date(1_700_000_070_000).toISOString(),
     content: [{ type: 'text', text: 'shp it' }], tags: ['chat:ambient'], metadata: { topic: 'deploys', mentioned: false, isDM: false },
   });
-  await until(() => h.delivery.heldIds('zulip:general').includes(13), 'the refused message is held');
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(13), 'the refused message is held');
   h.adapter.change!(change({ messageId: '13', messageIds: ['13'], content: 'ship it', previousContent: 'shp it' }));
   await until(() => h.incoming.length === 5, 'an edit of a held message');
   assert.equal((h.incoming[4].content[0] as { text: string }).text, '[edited] [T id=13] [#general > deploys] Ann: ship it');
@@ -2324,7 +4181,7 @@ test('an edit, move or deletion is as visible as its message: open channels see 
   // Closed channel: an ambient edit is dropped, an addressed one is pushed.
   await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
   h.adapter.change!(change());
-  await new Promise((r) => setTimeout(r, 30));
+  await h.server.quiet();
   assert.equal(h.pushed.length, 0);
   h.adapter.change!(change({ mentioned: true, content: 'ship it @Bot' }));
   await until(() => h.pushed.length === 1, 'an addressed edit on a closed channel');
@@ -2444,7 +4301,7 @@ test('a refused quote-reply push is redelivered from classified history when ano
   } finally { await h.close(); }
 });
 
-test('a quote reply received in the sweep window survives history deduplication exactly once', async () => {
+test("a quote reply received during its channel's catch-up reaches the host once, as itself, with reply tags", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-quote-sweep-'));
   let second: Harness | undefined;
   let release!: () => void;
@@ -2459,25 +4316,27 @@ test('a quote reply received in the sweep window survives history deduplication 
     second = harness({ stateDir: dir, sessionId: 'quote-sweep' });
     const history = quoteHistory();
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reading = false;
     second.adapter.fetchHistory = async (channelId, query) => {
+      reading = true;
       await gate;
       return history.fetchHistory(channelId, query);
     };
     await initialize(second, true);
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
-    assert.equal(second.server.isLive, false);
+    await until(() => reading, 'the catch-up read');
     const reply = (await history.fetchHistory(streamKey(7), { limit: 100 })).messages[0];
     second.adapter.emit!(reply);
     release();
-    await until(() => second!.server.isLive && second!.delivery.watermark('zulip:general') === 5, 'sweep acceptance and go-live');
+    await second.server.quiet();
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
     assert.equal(second.pushed.length, 1);
+    assert.equal(second.pushed[0].eventId, 'zulip_msg_5', 'the reply waited for the catch-up and went as itself');
     assert.ok(second.pushed[0].tags?.includes('chat:reply'));
     assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
     assert.ok(!second.pushed[0].tags?.includes('chat:mention'));
     const text = (second.pushed[0].payload.content[0] as { text: string }).text;
-    assert.match(text, /^<missed /);
-    assert.match(text, /id=5\]/);
     assert.doesNotMatch(text, /\(mention\)/);
   } finally {
     release?.();
@@ -2648,120 +4507,67 @@ test('the reconnect catch-up and the missed-tally backfill wait 90 s for each hi
   }
 });
 
-for (const refuse of [false, true]) {
-  test(`a buffered live reply keeps its verdict when the history quote lookup fails${refuse ? ', including after refusal' : ''}`, async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zulip-live-reply-'));
-    let second: Harness | undefined;
-    let release!: () => void;
-    try {
-      const first = harness({ stateDir: dir, sessionId: 'live-reply' });
-      try {
-        await initialize(first, true);
-        await settled(first);
-        first.adapter.emit!(streamMsg(3, { mentioned: true }));
-        await until(() => first.delivery.watermark('zulip:general') === 3, 'initial acceptance');
-      } finally { await first.close(); }
-      second = harness({ stateDir: dir, sessionId: 'live-reply' });
-      const history = quoteHistory(false);
-      const gate = new Promise<void>((resolve) => { release = resolve; });
-      second.adapter.fetchHistory = async (channelId, query) => {
-        await gate;
-        return history.fetchHistory(channelId, query);
-      };
-      const refusedAtWatermarks: number[] = [];
-      if (refuse) second.policy.rejectPushes.has = (id) => {
-        if (id !== '5' || refusedAtWatermarks.length >= 2) return false;
-        refusedAtWatermarks.push(second!.delivery.watermark('zulip:general') ?? 0);
-        return true;
-      };
-      await initialize(second, true);
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-      await awaitRegistered(second, false);
-      // A separate live lookup succeeded, but history cannot GET the off-page
-      // target after watermark 3. Its raw reply row has no mention flag.
-      const liveHistory = quoteHistory();
-      const liveReply = (await liveHistory.fetchHistory(streamKey(7), { limit: 100 })).messages[0];
-      second.adapter.emit!(liveReply);
-      release();
-      await until(() => second!.server.isLive, 'go-live');
-      await until(() => second!.delivery.watermark('zulip:general') === 5, 'live-verified reply accepted');
-      if (refuse) {
-        assert.equal(refusedAtWatermarks.length, 2);
-        assert.ok(refusedAtWatermarks.every((watermark) => watermark < 5));
-      }
-      const replyPushes = second.pushed.filter((p) => p.tags?.includes('chat:reply'));
-      assert.ok(replyPushes.length > 0);
-      if (!refuse) assert.equal(replyPushes.length, 1, 'accepted sweep delivery deduplicates the buffered copy');
-      assert.ok(replyPushes.every((p) => (p.origin as { isReplyToBot: boolean }).isReplyToBot));
-      assert.deepEqual(second.delivery.heldIds('zulip:general'), []);
-    } finally {
-      release?.();
-      await second?.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-}
-
-for (const rejectOnce of [false, true]) {
-  test(`go-live does not deduplicate a live reply against a scan that never delivered it${rejectOnce ? ', even after a refused push' : ''}`, async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'zulip-live-after-scan-'));
-  let second: Harness | undefined;
-  let release!: () => void;
+test('a reply the event path verified, refused by the host, comes again as a reply when the lookup in its history fails', async () => {
+  const h = harness();
   try {
-    const first = harness({ stateDir: dir, sessionId: 'after-scan' });
-    try {
-      await initialize(first, true);
-      await settled(first);
-      first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
-      first.adapter.emit!(streamMsg(2));
-      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
-    } finally { await first.close(); }
-    second = harness({ stateDir: dir, sessionId: 'after-scan', history: [streamMsg(5)] });
-    let refused = false;
-    if (rejectOnce) second.policy.rejectPushes.has = (id) => {
-      if (id !== '5' || refused) return false;
-      assert.ok((second!.delivery.watermark('zulip:general') ?? 0) < 5);
-      refused = true;
-      return true;
-    };
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    let calls = 0;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    second.adapter.fetchHistory = async (channelId, query) => {
-      if (++calls === 2) await gate; // Hold tally backfill after the sweep scan.
-      return realFetch(channelId, query);
-    };
-    await initialize(second, true);
-    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    await awaitRegistered(second, false);
-    await until(() => calls === 2, 'backfill to hold go-live');
-    assert.equal(second.delivery.watermark('zulip:general'), 1, 'while connected and pre-live, scans await reconciliation; shutdown or reconnect also commits them');
-    second.adapter.emit!(streamMsg(5, {
-      metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
-    }));
-    release();
-    await until(() => second!.server.isLive && second!.delivery.watermark('zulip:general') === 5, 'buffered reply acceptance');
-    assert.equal(second.pushed.length, rejectOnce ? 2 : 1);
-    assert.equal(refused, rejectOnce);
-    assert.equal(second.pushed[0].eventId, 'zulip_msg_5');
-    assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
-  } finally {
-    release?.();
-    await second?.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(3, { mentioned: true }));
+    await until(() => h.delivery.watermark('zulip:general') === 3, 'acceptance above the quoted message, so a read from here leaves it off the page');
+    const reply = (await quoteHistory().fetchHistory(streamKey(7), { limit: 100 })).messages[0];
+    const unreadable = quoteHistory(false);
+    h.adapter.fetchHistory = unreadable.fetchHistory.bind(unreadable);
+    h.policy.rejectPushes.add('5');
+    h.adapter.emit!(reply);
+    await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'refused reply held');
+    h.policy.rejectPushes.delete('5');
+    h.pushed.length = 0;
+    const other = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    h.adapter.emit!(streamMsg(6, { channelId: other.id, mentioned: true }), other);
+    await h.server.quiet();
+    assert.equal(h.delivery.watermark('zulip:general'), 5);
+    const again = h.pushed.find((p) => (p.origin as { mcplChannelId?: string }).mcplChannelId === 'zulip:general')!;
+    assert.ok(again, 'offered again');
+    assert.ok(again.tags?.includes('chat:reply'));
+    assert.equal((again.origin as { isReplyToBot: boolean }).isReplyToBot, true);
+    assert.match((again.payload.content[0] as { text: string }).text, /id=5\]/);
+  } finally { await h.close(); }
 });
-}
+
+test('a reply the event path verified, refused by the host, comes again as a reply after a reconnect when the lookup in its history fails', async () => {
+  const first = harness();
+  let second: Harness | undefined;
+  try {
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(3, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'acceptance above the quoted message, so a read from here leaves it off the page');
+    const reply = (await quoteHistory().fetchHistory(streamKey(7), { limit: 100 })).messages[0];
+    first.policy.rejectPushes.add('5');
+    first.adapter.emit!(reply);
+    await until(() => first.delivery.heldIds('zulip:general').includes(5), 'refused reply held');
+    await first.server.quiet();
+    await first.close();
+
+    const unreadable = quoteHistory(false);
+    first.adapter.fetchHistory = unreadable.fetchHistory.bind(unreadable);
+    second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(second.pushed.length, 1, 'offered again');
+    assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+    assert.equal((second.pushed[0].origin as { isReplyToBot: boolean }).isReplyToBot, true);
+    assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=5\]/);
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
+  } finally { await (second ?? first).close(); }
+});
 
 for (const reconnect of [false, true]) {
-  test(`an accepted sweep catch-up survives ${reconnect ? 'reconnecting' : 'shutdown'} before go-live`, async () => {
+  test(`an accepted catch-up block survives ${reconnect ? 'reconnecting' : 'shutdown'} while its channel's lane still runs a job`, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-staged-'));
   let second: Harness | undefined;
   let third: Harness | undefined;
-  let release!: () => void;
+  const fetches = heldFetches();
   try {
     const first = harness({ stateDir: dir, sessionId: 'probe' });
     try {
@@ -2775,23 +4581,20 @@ for (const reconnect of [false, true]) {
       await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
     } finally { await first.close(); }
 
-    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5, { mentioned: true })] });
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    let calls = 0;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    second.adapter.fetchHistory = async (channelId, query) => {
-      if (++calls === 2) await gate; // hang the tally backfill: go-live never happens
-      return realFetch(channelId, query);
-    };
+    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5, { mentioned: true })], shutdownGraceMs: 20, attachments: fetches.options });
+    second.policy.holdPushes = true;
     await initialize(second, true);
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
-    await until(() => second!.pushed.some((p) => p.tags?.includes('zulip:missed')), 'catch-up block pushed and accepted');
-    assert.equal(second.server.isLive, false, 'still pre-live');
+    await until(() => second!.policy.heldPushes.length === 1, 'catch-up block pushed');
+    second.adapter.emit!(withLog(streamMsg(6, { mentioned: true })));
+    await until(() => fetches.started.length === 1, "6's attachment fetch running on the channel's lane");
+    second.policy.holdPushes = false;
+    for (const answer of second.policy.heldPushes.splice(0)) answer();
+    await second.host.sendRequest('ping');
 
     if (reconnect) {
       await second.close();
-      second.adapter.fetchHistory = realFetch;
       third = harness({ reuse: { server: second.server, adapter: second.adapter } });
       await initialize(third, true);
       await settled(third);
@@ -2804,80 +4607,9 @@ for (const reconnect of [false, true]) {
     assert.equal(persisted.watermarks['zulip:general'], 5,
       `host accepted the catch-up through id 5 but the persisted watermark is ${persisted.watermarks['zulip:general']}: the next start re-delivers it`);
   } finally {
-    release?.();
     await third?.close();
     await second?.close().catch(() => {});
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-}
-
-for (const reconnect of [false, true]) {
-  test(`R2-1: a buffered pending reply survives ${reconnect ? 'reconnecting' : 'shutdown'} before go-live`, async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-staged-'));
-  let second: Harness | undefined;
-  let third: Harness | undefined;
-  let release!: () => void;
-  try {
-    const first = harness({ stateDir: dir, sessionId: 'probe' });
-    try {
-      await initialize(first, true);
-      await settled(first);
-      first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
-      first.adapter.emit!(streamMsg(2));
-      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
-    } finally { await first.close(); }
-
-    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5)] });
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    let calls = 0;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    second.adapter.fetchHistory = async (channelId, query) => {
-      if (++calls === 2) await gate; // hang the tally backfill: go-live never happens
-      return realFetch(channelId, query);
-    };
-    await initialize(second, true);
-    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    await awaitRegistered(second, false);
-    await until(() => calls === 2, 'tally backfill holds go-live after scanning ambient id 5');
-    second.adapter.emit!(streamMsg(5, {
-      metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
-    }));
-    assert.equal(second.server.isLive, false);
-    assert.equal(second.pushed.length, 0, 'buffered reply has not been offered');
-
-    if (reconnect) {
-      await second.close();
-      const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8'));
-      const history = quoteHistory();
-      second.adapter.fetchHistory = history.fetchHistory.bind(history);
-      third = harness({ reuse: { server: second.server, adapter: second.adapter } });
-      await initialize(third, true);
-      await settled(third);
-      assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must not persist past the unoffered reply');
-      assert.equal(third.pushed.length, 1, 'fresh sweep recovers the unoffered reply');
-      assert.ok(third.pushed[0].tags?.includes('chat:reply'));
-      assert.equal(third.delivery.watermark('zulip:general'), 5);
-    } else {
-      await second.server.shutdown();
-    }
-    if (!reconnect) {
-      const persisted = JSON.parse(readFileSync(join(dir, 'probe.delivery.json'), 'utf8'));
-      assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must not persist past the unoffered reply');
-      // Exercise beginConnection independently of quiesce: it must cap its own commit too.
-      const staged = second.server as unknown as { beginConnection(): void; preLiveScanned: Map<string, number> };
-      staged.preLiveScanned.set(second.adapter.keyOf('zulip:general'), 5);
-      staged.beginConnection();
-      assert.ok(second.delivery.watermark('zulip:general')! < 5);
-    }
-  } finally {
-    release?.();
-    if (second) await until(() => second!.server.isLive, 'released sweep finishes before closing its transport');
-    await third?.close();
-    await second?.close().catch(() => {});
+    fetches.release();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -2938,7 +4670,7 @@ for (const verified of [false, true]) {
       await settled(h);
       h.policy.rejectPushes.add('5');
       h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
-      await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply refused and held');
+      await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(5), 'reply refused and held');
       h.adapter.change!({
         kind: 'edit', channelId: 'zulip:general', messageId: '5', messageIds: ['5'],
         authorId: '101', authorName: 'User', authorEmail: 'user@example.invalid', actorId: '102',
@@ -2959,11 +4691,12 @@ for (const verified of [false, true]) {
   });
 }
 
-test('releasing a muted channel clears pending reply overlays before it is unmuted', async () => {
+test("a reply verdict goes with its hold when a mute lets the hold go: after the unmute, a reconnect's catch-up reads the message as history has it", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-pending-release-'));
   const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
   plane.start();
   const h = harness({ filters: plane });
+  let second: Harness | undefined;
   try {
     await initialize(h, true);
     await settled(h);
@@ -2974,15 +4707,19 @@ test('releasing a muted channel clears pending reply overlays before it is unmut
     await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply held');
     assert.equal(plane.update((f) => ({ ...f, mutedStreams: ['general'] })).ok, true);
     await until(() => h.delivery.heldIds('zulip:general').length === 0, 'muted channel released');
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
     assert.equal(plane.update((f) => ({ ...f, mutedStreams: [] })).ok, true);
-    h.policy.rejectPushes.delete('5');
-    h.pushed.length = 0;
-    h.adapter.history = [streamMsg(5)];
-    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
-    await until(() => h.delivery.watermark('zulip:general') === 5, 'ambient history scanned');
-    assert.equal(h.pushed.length, 0, 'released verdict does not turn ambient history into a reply');
-  } finally {
+    await h.server.quiet();
     await h.close();
+
+    h.adapter.history = [streamMsg(5)];
+    second = harness({ reuse: { server: h.server, adapter: h.adapter } });
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(second.pushed.length, 0, 'history reads 5 as ambient, and nothing makes it a reply');
+    assert.equal(second.delivery.watermark('zulip:general'), 5);
+  } finally {
+    await (second ?? h).close();
     plane.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -3003,8 +4740,7 @@ test('a reply missing from replay history releases both its hold and pending ver
     h.adapter.emit!(streamMsg(6));
     await until(() => h.delivery.watermark('zulip:general') === 6, 'missing reply released');
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
-    const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5) ?? false, false);
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
   } finally { await h.close(); }
 });
 
@@ -3216,295 +4952,136 @@ test('R2-7: closed-channel catch-up forgets a held reply missing from history', 
       metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'],
     }));
     await until(() => h.delivery.heldIds('zulip:general').includes(5), 'reply held');
-    const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5), true);
+    await h.server.quiet();
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), true);
     h.adapter.history = [streamMsg(6)];
     h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
     await until(() => h.delivery.watermark('zulip:general') === 6, 'catch-up releases missing reply hold');
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
-    assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5) ?? false, false);
+    assert.equal(h.delivery.verifiedReply('zulip:general', 5), false);
   } finally { await h.close(); }
 });
 
-for (const beforeGrant of [false, true]) {
-  test(`R3-1: ${beforeGrant ? 'a reply emitted before featureSets/update is delivered' : 'shutdown during an earlier buffered route preserves the unoffered reply'}`, async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
-    let second: Harness | undefined;
-    let releaseSweep = () => {};
-    let releaseFetch = () => {};
-    try {
-      const first = harness({ stateDir: dir, sessionId: 'r3' });
-      await initialize(first, true);
-      await settled(first);
-      first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
-      first.adapter.emit!(streamMsg(2));
-      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
-      await first.close();
-      let fetching = false;
-      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
-      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
-      second = harness({
-        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
-        attachments: {
-          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
-          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
-        },
-      });
-      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-      let reads = 0;
-      second.adapter.fetchHistory = async (channelId, query) => {
-        if (beforeGrant || ++reads === 2) await sweepGate;
-        return realFetch(channelId, query);
-      };
-      await initialize(second, true);
-      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
-      if (beforeGrant) {
-        await until(() => second!.adapter.emit !== null, 'events started before grant');
-        second.adapter.emit!(reply);
-      }
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-      await awaitRegistered(second, false);
-      if (!beforeGrant) {
-        await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
-        second.adapter.emit!({
-          ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
-          metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-        }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
-        second.adapter.emit!(reply);
-      }
-      releaseSweep();
-      if (beforeGrant) {
-        await until(() => second!.server.isLive, 'go-live complete');
-        assert.equal(second.pushed.length, 1, 'the pre-grant reply must not be deduplicated as ambient');
-        assert.ok(second.pushed[0].tags?.includes('chat:reply'));
-      } else {
-        await until(() => fetching, 'earlier buffered route waits on attachment');
-        assert.equal(second.pushed.length, 0);
-        await second.server.shutdown();
-        const persisted = JSON.parse(readFileSync(join(dir, 'r3.delivery.json'), 'utf8'));
-        assert.ok(persisted.watermarks['zulip:general'] < 5, 'shutdown must cap below the unoffered reply during drain');
-      }
-    } finally {
-      releaseSweep();
-      releaseFetch();
-      if (second) await until(() => second!.server.isLive, 'released drain completes');
-      await second?.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-}
+test('R3-1: a reply emitted before featureSets/update is delivered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
+  let second: Harness | undefined;
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'r3' });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    first.adapter.emit!(streamMsg(2));
+    await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
+    await first.close();
+    second = harness({ stateDir: dir, sessionId: 'r3', history: [streamMsg(5)] });
+    await initialize(second, true);
+    await until(() => second!.adapter.emit !== null, 'events started before grant');
+    second.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second);
+    assert.equal(second.pushed.length, 1, 'the pre-grant reply must not be deduplicated as ambient');
+    assert.ok(second.pushed[0].tags?.includes('chat:reply'));
+  } finally {
+    await second?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
-for (const slowPart of ['history HTTP', 'prefix acceptance'] as const) {
-  test(`R3-3: slow ${slowPart} does not spend the quote-GET wait allowance`, async (t) => {
-    let now = 0;
-    t.mock.method(performance, 'now', () => now);
-    const h = harness();
-    try {
-      await initialize(h, true);
-      await settled(h);
-      h.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => h.delivery.watermark('zulip:general') === 1, 'seed watermark');
-      h.pushed.length = 0;
-      let gets = 0;
-      const row: ZulipRawMessage = {
-        id: 3, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
-        display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
-        content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
-      };
-      const history = new ZulipAdapter(standInApi({
-        'GET /messages': async ({ anchor }: { anchor: number }) => {
-          if (slowPart === 'history HTTP') now += 3100;
-          const rows = slowPart === 'prefix acceptance'
-            ? [{ ...row, id: 2, content: 'explicit mention', flags: ['mentioned'] }, row] : [row];
-          return { messages: rows.filter((m) => m.id > anchor), found_newest: true };
-        },
-        'GET /messages/:id': async () => {
-          if (++gets === 1 && slowPart === 'prefix acceptance') return { result: 'error', code: 'RATE_LIMIT_HIT' };
-          return { message: { ...row, id: 500, sender_id: 100 } };
-        },
-      }).api, 100, 'session', { directory: historyStreams() });
-      h.adapter.fetchHistory = history.fetchHistory.bind(history);
-      const respond = h.host.sendResponse.bind(h.host);
-      t.mock.method(h.host, 'sendResponse', (...args: Parameters<typeof h.host.sendResponse>) => {
-        if (slowPart === 'prefix acceptance' && (args[1] as { accepted?: boolean })?.accepted) now += 7000;
-        return respond(...args);
-      });
-      h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
-      await until(() => h.delivery.watermark('zulip:general') === 3, 'catch-up complete');
-      assert.equal(gets, slowPart === 'history HTTP' ? 1 : 2, 'unrelated waits must not starve quote verification');
-      assert.ok(h.pushed.some((p) => p.tags?.includes('chat:reply')), 'verified quote reaches the host');
-    } finally { await h.close(); }
-  });
-}
+test('R3-3: slow history HTTP does not spend the quote-GET wait allowance', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const h = harness();
+  try {
+    await initialize(h, true);
+    await settled(h);
+    h.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => h.delivery.watermark('zulip:general') === 1, 'seed watermark');
+    h.pushed.length = 0;
+    let gets = 0;
+    const row: ZulipRawMessage = {
+      id: 3, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+      display_recipient: 'general', subject: 'topic', timestamp: 1_700_000_000, type: 'stream', flags: [],
+      content: '[said](/#narrow/near/500):\n\n```quote\noriginal\n```\nreply',
+    };
+    const history = new ZulipAdapter(standInApi({
+      'GET /messages': async ({ anchor }: { anchor: number }) => {
+        now += 3100;
+        return { messages: [row].filter((m) => m.id > anchor), found_newest: true };
+      },
+      'GET /messages/:id': async () => {
+        gets++;
+        return { message: { ...row, id: 500, sender_id: 100 } };
+      },
+    }).api, 100, 'session', { directory: historyStreams() });
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Gap.', metadata: {} });
+    await until(() => h.delivery.watermark('zulip:general') === 3, 'catch-up complete');
+    assert.equal(gets, 1, 'unrelated waits must not starve quote verification');
+    assert.ok(h.pushed.some((p) => p.tags?.includes('chat:reply')), 'verified quote reaches the host');
+  } finally { await h.close(); }
+});
 
-for (const failure of ['messaging disable', 'attributed exception'] as const) {
-  test(`R3-1 follow-up: ${failure} during drain preserves persistence and later delivery`, async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
-    let second: Harness | undefined;
-    let releaseSweep = () => {};
-    let releaseFetch = () => {};
+test('R3-1 follow-up: a message whose delivery job throws stays held, and the next start offers it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-throw-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'r3t' });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+    const internal = first.server as unknown as { attributed(message: IncomingChannelMessage): IncomingChannelMessage };
+    const original = internal.attributed.bind(internal);
+    internal.attributed = (message) => {
+      if (message.messageId === '5') throw new Error('injected attribution failure');
+      return original(message);
+    };
+    first.adapter.emit!(streamMsg(5, { mentioned: true }));
+    await first.server.quiet();
+    assert.deepEqual(first.delivery.heldIds('zulip:general'), [5], 'its hold stays');
+    assert.equal(first.pushed.length, 1);
+    await first.close();
+    const persisted = JSON.parse(readFileSync(join(dir, 'r3t.delivery.json'), 'utf8'));
+    assert.ok(persisted.watermarks['zulip:general'] < 5, 'the watermark on disk stays below it');
+    const restarted = harness({ stateDir: dir, sessionId: 'r3t', history: [streamMsg(5, { mentioned: true })] });
     try {
-      const first = harness({ stateDir: dir, sessionId: 'r3' });
-      await initialize(first, true);
-      await settled(first);
-      first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
-      first.adapter.emit!(streamMsg(2));
-      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
-      await first.close();
-      let fetching = false;
-      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
-      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
-      second = harness({
-        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
-        attachments: {
-          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
-          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
-        },
-      });
-      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-      let reads = 0;
-      second.adapter.fetchHistory = async (channelId, query) => {
-        if (++reads === 2) await sweepGate;
-        return realFetch(channelId, query);
-      };
-      await initialize(second, true);
-      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-      await awaitRegistered(second, false);
-      await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
-      second.adapter.emit!({
-        ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
-        metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
-      second.adapter.emit!(reply);
-      releaseSweep();
-      await until(() => fetching, 'earlier buffered route waits on attachment');
-      assert.equal(second.pushed.length, 0);
-
-      if (failure === 'messaging disable') {
-        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
-          effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
-        });
-      } else {
-        const internal = second.server as unknown as {
-          attributed(message: IncomingChannelMessage): IncomingChannelMessage;
-        };
-        const original = internal.attributed.bind(internal);
-        internal.attributed = (message) => {
-          if (message.messageId === '5') throw new Error('injected attribution failure before route hold');
-          return original(message);
-        };
-        // Any automatic healing attempt is refused until persistence is checked.
-        second.policy.rejectPushes.add('5');
-      }
-      releaseFetch();
-      await until(() => second!.server.isLive, 'settled route leaves the drain');
-      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
-      await second.server.shutdown();
-      const persisted = JSON.parse(readFileSync(join(dir, 'r3.delivery.json'), 'utf8'));
-      assert.ok(persisted.watermarks['zulip:general'] < 5, 'settled but unaccepted reply must remain below the persisted watermark');
-      assert.ok(second.delivery.heldIds('zulip:general', { replayable: failure === 'messaging disable' }).includes(5),
-        'dequeued reply retains existing hold ownership for recovery');
-      if (failure === 'messaging disable') {
-        // History still says ambient. Only the retained pending verdict plus
-        // replayable hold can deliver it on the same connection.
-        await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await until(() => second!.delivery.watermark('zulip:general') === 5, 'reenabling messaging delivers the pending reply');
-        assert.ok(second.pushed.some((push) => push.tags?.includes('chat:reply')));
-      } else {
-        await second.close();
-        second = undefined;
-        const restarted = harness({ stateDir: dir, sessionId: 'r3' });
-        try {
-          const history = quoteHistory();
-          restarted.adapter.fetchHistory = history.fetchHistory.bind(history);
-          await initialize(restarted, true);
-          await settled(restarted);
-          assert.equal(restarted.pushed.length, 1, 'the next startup sweep redelivers the unaccepted reply');
-          assert.ok(restarted.pushed[0].tags?.includes('chat:reply'));
-          assert.equal(restarted.delivery.watermark('zulip:general'), 5);
-        } finally { await restarted.close(); }
-      }
-    } finally {
-      releaseSweep();
-      releaseFetch();
-      if (second) await until(() => second!.server.isLive, 'released drain completes');
-      await second?.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-}
+      await initialize(restarted, true);
+      await settled(restarted);
+      assert.equal(restarted.pushed.length, 1, 'the next start offers it');
+      assert.match((restarted.pushed[0].payload.content[0] as { text: string }).text, /id=5\]/);
+      assert.equal(restarted.delivery.watermark('zulip:general'), 5);
+    } finally { await restarted.close(); }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'request-error'] as const) {
   test(`R3-1 healing: ${mode}`, async (t) => {
-    const dir = mkdtempSync(join(tmpdir(), 'zulip-r3-buffer-'));
-    let second: Harness | undefined;
-    let releaseSweep = () => {};
-    let releaseFetch = () => {};
+    const second = harness({ history: [streamMsg(5)] });
     let releaseHeal = () => {};
     try {
-      const first = harness({ stateDir: dir, sessionId: 'r3' });
-      await initialize(first, true);
-      await settled(first);
-      first.adapter.emit!(streamMsg(1, { mentioned: true }));
-      await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-      await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
-      first.adapter.emit!(streamMsg(2));
-      await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'seed tally backfill');
-      await first.close();
-      let fetching = false;
-      const sweepGate = new Promise<void>((r) => { releaseSweep = r; });
-      const fetchGate = new Promise<void>((r) => { releaseFetch = r; });
-      second = harness({
-        stateDir: dir, sessionId: 'r3', history: [streamMsg(5)],
-        attachments: {
-          source: { async fetch() { fetching = true; await fetchGate; return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false }; } },
-          inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
-        },
-      });
-      const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-      let reads = 0;
-      second.adapter.fetchHistory = async (channelId, query) => {
-        if (++reads === 2) await sweepGate;
-        return realFetch(channelId, query);
-      };
       await initialize(second, true);
-      const reply = streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] });
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-      await awaitRegistered(second, false);
-      await until(() => reads === 2, 'ambient scan complete, tally backfill pending');
-      second.adapter.emit!({
-        ...streamMsg(4, { channelId: 'zulip:other', mentioned: true }),
-        metadata: { mentioned: true, isDM: false, attachments: [{ path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false }] },
-      }, { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } });
-      second.adapter.emit!(reply);
-      releaseSweep();
-      await until(() => fetching, 'earlier buffered route waits on attachment');
-      assert.equal(second.pushed.length, 0);
+      await settled(second);
+      second.adapter.emit!(streamMsg(1, { mentioned: true }));
+      await until(() => second.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+      await heldAcrossDisable(second, streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }), () =>
+        second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'] }));
+      await second.server.quiet();
 
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
-        effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
-      });
-      releaseFetch();
-      await until(() => second!.server.isLive, 'settled route leaves the drain');
-      await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'automatic healing settles');
-
-      assert.equal(second.delivery.watermark('zulip:general'), 4);
+      assert.equal(second.delivery.watermark('zulip:general'), 1);
       assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5));
       let healReads = 0;
+      let healRead = false;
       const healGate = new Promise<void>((r) => { releaseHeal = r; });
       const originalHistory = second.adapter.fetchHistory!.bind(second.adapter);
       second.adapter.fetchHistory = async (channel, query) => {
         if (second!.adapter.wireOf(channel) === 'zulip:general') {
           healReads++;
           await healGate;
+          healRead = true;
         }
         return originalHistory(channel, query);
       };
@@ -3533,34 +5110,29 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
         });
       }
       releaseHeal();
-      const healing = () => (second!.server as unknown as { healing: boolean }).healing;
-      await until(() => !healing(), 'first healing settles');
       if (mode === 'disable-during-heal') {
+        await until(() => healRead, "the heal's read");
+        await second.host.sendRequest('ping');
         assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 0, 'local policy refusal sends nothing');
         assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5),
           'a never-offered reply must remain replayable');
         await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await until(() => !healing(), 'reenabled healing settles');
       }
+      await second.server.quiet();
       const accepted = mode === 'disable-during-heal' || mode === 'no-duplicate';
-      assert.equal(second.delivery.watermark('zulip:general'), accepted ? 5 : 4);
+      assert.equal(second.delivery.watermark('zulip:general'), accepted ? 5 : 1);
       assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1, 'exactly one actual reply offer');
       assert.deepEqual(second.delivery.heldIds('zulip:general'), accepted ? [] : [5]);
       assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), []);
       for (let i = 0; i < 3; i++) {
         await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
       }
-      await until(() => !healing(), 'repeated grants settle');
+      await second.server.quiet();
       assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1,
         'accepted, refused and ambiguous offers must not loop');
     } finally {
       releaseHeal();
-      releaseSweep();
-      releaseFetch();
-      if (second) await until(() => second!.server.isLive, 'released drain completes');
-      if (second) await until(() => !(second!.server as unknown as { healing: boolean }).healing, 'released healing completes');
-      await second?.close();
-      rmSync(dir, { recursive: true, force: true });
+      await second.close();
     }
   });
 }
@@ -3569,7 +5141,6 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
   for (const acceptTail of [false, true]) {
     test(`R3-1 ceiling: ${outcome}, tail ${acceptTail ? 'accepted' : 'refused'}`, async (t) => {
       const h = harness({ history: Array.from({ length: 101 }, (_, i) => streamMsg(i + 5)) });
-      const healing = () => (h.server as unknown as { healing: boolean }).healing;
       try {
         await initialize(h, true);
         await settled(h);
@@ -3595,12 +5166,12 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
           });
         }
         await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await until(() => !healing(), 'prefix offer settles');
+        await h.server.quiet();
         assert.deepEqual(h.delivery.heldIds('zulip:general'), [5, 105], 'unaccepted prefix and uncovered tail retain ownership');
         assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [105], 'only uncovered tail stays eligible');
         for (let i = 0; i < 3; i++) {
           await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-          await until(() => !healing(), 'subsequent grant settles');
+          await h.server.quiet();
         }
         const offers = h.pushed.map((push) => (push.origin as { messageId: string }).messageId);
         assert.equal(offers.filter((id) => id === '104').length, 1, 'consumed healing prefix is never re-offered on later grants');
@@ -3608,90 +5179,215 @@ for (const outcome of ['refusal', 'RPC error'] as const) {
         assert.deepEqual(h.delivery.heldIds('zulip:general'), acceptTail ? [5] : [5, 105]);
         assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), []);
         assert.ok(h.delivery.watermark('zulip:general')! < 5, 'accepting the tail must not erase the refused prefix floor');
-        const pending = (h.server as unknown as { pendingReplies: Map<ChannelKey, Set<number>> }).pendingReplies;
-        assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(5), true, 'unaccepted prefix verdict remains owned');
-        assert.equal(pending.get(h.adapter.keyOf('zulip:general'))?.has(105) ?? false, !acceptTail);
+        assert.equal(h.delivery.verifiedReply('zulip:general', 5), true, 'unaccepted prefix verdict remains owned');
+        assert.equal(h.delivery.verifiedReply('zulip:general', 105), !acceptTail);
       } finally { await h.close(); }
     });
   }
 }
-test('R4-1: a held buffered reply preserves scanned progress through 20 across restart', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'zulip-r4-progress-'));
-  const h = harness({ stateDir: dir, sessionId: 'r4' });
-  let next: Harness | undefined;
-  try {
-    await initialize(h, true);
-    await settled(h);
-    h.delivery.advance('zulip:general', 1);
-    const internal = h.server as unknown as { live: boolean; conn: unknown; catchUpClosedChannel(c: string, all: boolean): Promise<boolean>; goLive(conn: unknown): Promise<void> };
-    internal.live = false;
-    h.adapter.history = [streamMsg(5), streamMsg(20, { mentioned: true })];
-    await internal.catchUpClosedChannel(h.adapter.keyOf('zulip:general'), false);
-    h.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
-    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-    await internal.goLive(internal.conn);
-    await until(() => h.incoming.some((m) => m.messageId === '5'), 'accepted buffered reply');
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(h.delivery.watermark('zulip:general'), 20);
-    await h.close();
-    next = harness({ stateDir: dir, sessionId: 'r4', history: h.adapter.history });
-    await initialize(next, true);
-    await settled(next);
-    assert.equal(next.pushed.length, 0, '20 must not be redelivered');
-  } finally { if (next) await next.close(); else await h.close(); rmSync(dir, { recursive: true, force: true }); }
+
+test("a delivery still fetching its attachments when shutdown's grace runs out sends nothing when the fetch ends, and the next connection offers its message once", async () => {
+  const fetches = heldFetches();
+  const first = harness({ attachments: fetches.options, shutdownGraceMs: 20 });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  first.adapter.history = [streamMsg(1, { mentioned: true }), withLog(streamMsg(2, { mentioned: true }))];
+  first.adapter.emit!(withLog(streamMsg(2, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  fetches.release();
+  await second.host.sendRequest('ping');
+  await second.server.quiet();
+  const offersOf2 = second.pushed.filter((p) => p.eventId === 'zulip_msg_2' || (p.tags?.includes('zulip:missed') && /id=2\]/.test((p.payload.content[0] as { text: string }).text)));
+  assert.equal(offersOf2.length, 1);
+  assert.equal(second.delivery.watermark('zulip:general'), 2);
+  await second.close();
 });
 
-test('R4-2: concurrent connection drains route buffered 20 once', async () => {
-  let next: Harness | undefined;
-  let releaseOld = () => {};
-  let releaseNew = () => {};
-  const oldGate = new Promise<void>((r) => { releaseOld = r; });
-  const newGate = new Promise<void>((r) => { releaseNew = r; });
-  let oldWaiting = false;
-  let newWaiting = false;
-  let fetches20 = 0;
-  const h = harness({
-    attachments: {
-      source: { async fetch(path) {
-        if (path.includes('old.log')) { oldWaiting = true; await oldGate; }
-        else { fetches20++; newWaiting = true; await newGate; }
-        return { buf: Buffer.from('log'), mimeType: 'text/plain', overflow: false };
-      } },
-      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
-    },
-  });
-  const attached = (id: number, name: string) => streamMsg(id, {
-    mentioned: true,
-    metadata: { mentioned: true, isDM: false, attachments: [
-      { path: `/user_uploads/1/a/${name}.log`, name: `${name}.log`, mimeType: 'text/plain', isImage: false },
-    ] },
-  });
+test('a message that the adapter finds is not for the host holds nothing: the next message the host accepts moves the watermark past it', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  h.adapter.enter!({ key: h.adapter.keyOf('zulip:general'), messageId: '2', ready: async () => null });
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 3, 'the watermark past 2');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  await h.close();
+});
+
+test("a message whose quote lookup outlasts its connection's shutdown sends nothing when the lookup answers, and the next connection offers it once", async () => {
+  const first = harness({ shutdownGraceMs: 20 });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  first.adapter.history = [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })];
+  const { channelId, ...two } = streamMsg(2, { mentioned: true });
+  const key = first.adapter.keyOf(channelId);
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let looking = false;
+  first.adapter.enter!({ key, messageId: '2', ready: async () => { looking = true; await lookup; return { message: { ...two, key } as KeyedMessage }; } });
+  await until(() => looking, "2's quote lookup");
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  answer();
+  await second.host.sendRequest('ping');
+  await second.server.quiet();
+  const offersOf2 = second.pushed.filter((p) => p.eventId === 'zulip_msg_2' || (p.tags?.includes('zulip:missed') && /id=2\]/.test((p.payload.content[0] as { text: string }).text)));
+  assert.equal(offersOf2.length, 1);
+  assert.equal(second.delivery.watermark('zulip:general'), 2);
+  await second.close();
+});
+
+test("a change still being placed when its connection's shutdown grace runs out goes to no connection, as on main", async () => {
+  const first = harness({ shutdownGraceMs: 20 });
+  await initialize(first, true);
+  await settled(first);
+  first.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  const key = first.adapter.keyOf('zulip:general');
+  let answer!: () => void;
+  const lookup = new Promise<void>((resolve) => { answer = resolve; });
+  let placing = false;
+  first.adapter.enterChange!({ key, messageIds: [1], kind: 'edit', ready: async () => {
+    placing = true;
+    await lookup;
+    return {
+      kind: 'edit', key, messageId: '1', messageIds: ['1'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com',
+      actorId: '9', topic: 'deploys', previousTopic: null, movedToKey: null, content: '@bot fixed', previousContent: '@bot',
+      mentioned: true, previouslyMentioned: true, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+    };
+  } });
+  await until(() => placing, 'the edit being placed');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  answer();
+  await second.host.sendRequest('ping');
+  await second.server.quiet();
+  assert.deepEqual([...second.pushed.map((p) => p.eventId), ...second.incoming.map((m) => m.messageId)].filter((id) => /edit|changed/.test(String(id))), []);
+  await second.close();
+});
+
+test("an open whose connection ends while it reads its page counts nothing of the page as seen, and the next connection's catch-up offers the page's rows", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-open-ends-'));
   try {
-    await initialize(h, true);
-    await settled(h);
-    const internal = h.server as unknown as { live: boolean; conn: unknown; goLive(conn: unknown): Promise<void> };
-    internal.live = false;
-    h.adapter.emit!(attached(10, 'old'));
-    const oldDrain = internal.goLive(internal.conn);
-    await until(() => oldWaiting, 'old attachment fetch');
-    await h.close();
-    next = harness({ reuse: { server: h.server, adapter: h.adapter } });
-    await initialize(next, true);
-    await until(() => next!.adapter.emit !== null, 'new events');
-    next.adapter.emit!(attached(20, 'new'));
-    await next.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-    await until(() => newWaiting, 'new attachment fetch');
-    releaseOld();
-    // Let the old route finish while the new drain is still suspended.
-    await until(() => next!.pushed.some((p) => p.origin.messageId === '10'), 'old route settles on new connection (#40)');
-    await new Promise((r) => setTimeout(r, 30));
-    releaseNew();
-    await oldDrain;
-    await until(() => next!.pushed.some((p) => p.origin.messageId === '20'), '20 pushed');
-    await new Promise((r) => setTimeout(r, 30));
-    assert.equal(fetches20, 1);
-    assert.equal(next.pushed.filter((p) => p.origin.messageId === '20').length, 1);
-  } finally { releaseOld(); releaseNew(); if (next) await next.close(); else await h.close(); }
+    const unread = () => [streamMsg(4, { mentioned: true }), streamMsg(5, { mentioned: true })];
+    const first = harness({ stateDir: dir, sessionId: 'oe', history: unread() });
+    await initialize(first, true);
+    await settled(first);
+    first.delivery.advance('zulip:general', 3);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let reading = false;
+    const real = first.adapter.fetchHistory!.bind(first.adapter);
+    first.adapter.fetchHistory = async (key, query) => { reading = true; await gate; return real(key, query); };
+    void first.host.sendRequest(method.CHANNELS_OPEN, {
+      channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 2, sinceLastSeen: true },
+    }).catch(() => {});
+    await until(() => reading, 'the open to read its page');
+    const closing = first.close();
+    await until(() => first.serverSide.isClosed, 'the server to see the connection end');
+    release();
+    await closing;
+    assert.equal(first.delivery.watermark('zulip:general'), 3);
+
+    const second = harness({ stateDir: dir, sessionId: 'oe', history: unread() });
+    await initialize(second, true);
+    await settled(second);
+    const blocks = generalBlock(second);
+    assert.equal(blocks.length, 1);
+    for (const id of [4, 5]) assert.match(blocks[0], new RegExp(`id=${id}\\]`));
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a catch-up block the host refuses at a connection's start isn't offered again before the host accepts something", async () => {
+  const first = harness();
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(1));
+  await until(() => first.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  first.policy.rejectPushes.add('2');
+  first.adapter.emit!(streamMsg(2, { mentioned: true }));
+  await first.server.quiet();
+  assert.ok(first.delivery.heldIds('zulip:general', { replayable: true }).includes(2), 'refused, and replayable');
+  await first.close();
+
+  first.adapter.history = [streamMsg(1), streamMsg(2, { mentioned: true })];
+  const real = first.adapter.fetchHistory!.bind(first.adapter);
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let calls = 0;
+  first.adapter.fetchHistory = async (key, query) => {
+    if (++calls === 2) await gate;
+    return real(key, query);
+  };
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  second.policy.rejectPushes.add('2');
+  await initialize(second, true);
+  await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => calls === 2, "the tally's backfill reading");
+  await second.host.sendRequest('ping');
+  release();
+  await second.server.quiet();
+  const offersOf2 = second.pushed.filter((p) => /id=2\]/.test((p.payload.content[0] as { text: string }).text));
+  assert.equal(offersOf2.length, 1, 'the catch-up block, once');
+  assert.equal(second.delivery.watermark('zulip:general'), 1);
+  await second.close();
+});
+
+test("on a closed channel, an ambient message that waits while the tally's backfill reads past it is counted as missed once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-tally-once-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'tb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(1));
+    await until(() => first.delivery.watermark('zulip:general') === 1, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'tb', history: [streamMsg(2)] });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let calls = 0;
+    const real = second.adapter.fetchHistory!.bind(second.adapter);
+    second.adapter.fetchHistory = async (key, query) => {
+      if (++calls === 2) await gate;
+      return real(key, query);
+    };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => calls === 2, "the tally's backfill to be reading");
+    second.adapter.history.push(streamMsg(3));
+    second.adapter.emit!(streamMsg(3));
+    release();
+    await second.server.quiet();
+    assert.equal(second.delivery.tally('zulip:general')?.messages, 2, '2 and 3, each once');
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 for (const outcome of ['empty', 'error', 'ambient'] as const) {
@@ -3711,7 +5407,7 @@ for (const outcome of ['empty', 'error', 'ambient'] as const) {
       };
       for (let i = 0; i < 5; i++) {
         await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await new Promise((r) => setTimeout(r, 15));
+        await h.server.quiet();
       }
       assert.equal(reads, 1);
     } finally { await h.close(); }
@@ -3742,3 +5438,1311 @@ for (const kind of ['edit', 'move', 'delete'] as const) {
   });
 }
 
+
+test("two streams renamed in one pass: the job running on the first stream's lane hands its message under the old id before the line, and one channels/changed names both", async () => {
+  const fetches = heldFetches();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ attachments: fetches.options, visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  h.adapter.visible = [
+    { ...DESCRIPTOR, id: 'zulip:lobby', label: '#lobby', address: { stream_name: 'lobby', stream_id: 7 } },
+    { ...OTHER, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } },
+  ];
+  h.server.directory.registration([{ stream_id: 7, name: 'lobby' }, { stream_id: 8, name: 'dev' }]);
+  const isLine = (m: IncomingChannelMessage) => (m.metadata as { kind?: string } | undefined)?.kind === 'stream-renamed';
+  await until(() => h.incoming.some((m) => m.channelId === 'zulip:other' && isLine(m)), "the idle stream's line");
+  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, 0, 'no announcement while the first stream\'s job runs');
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.channelId === 'zulip:general').map((m) => (isLine(m) ? 'line' : m.messageId)), ['1', 'line']);
+  const changed = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED);
+  assert.equal(changed.length, 1);
+  assert.deepEqual([...((changed[0].params as { removed?: string[] }).removed ?? [])].sort(), ['zulip:general', 'zulip:other']);
+  const lineBatch = h.hostSaw.findIndex((r) => r.method === method.CHANNELS_INCOMING &&
+    (r.params as ChannelsIncomingParams).messages.some((m) => m.channelId === 'zulip:general' && isLine(m)));
+  assert.ok(lineBatch >= 0 && lineBatch < h.hostSaw.indexOf(changed[0]), 'the line reaches the host before the announcement');
+  await h.close();
+});
+
+const offeredIds = (h: Harness) => h.pushed.flatMap((p) => p.tags?.includes('zulip:missed')
+  ? [...(p.payload.content[0] as { text: string }).text.matchAll(/id=(\d+)\]/g)].map((m) => m[1])
+  : [(p.origin as { messageId: string }).messageId]);
+
+test('messages past the cap that wait while the registration is unanswered each reach the host once, in order', async () => {
+  const h = harness({ maxWaitingMessages: 3 });
+  h.policy.holdRegister = true;
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.policy.heldRegister.length === 1 && h.adapter.emit !== null, 'the registration to be with the host');
+  const all = [1, 2, 3, 4, 5].map((id) => streamMsg(id, { mentioned: true }));
+  h.adapter.history = all;
+  for (const m of all) h.adapter.emit!(m);
+  await h.host.sendRequest('ping');
+  assert.equal(h.pushed.length, 0);
+  h.policy.heldRegister.shift()!();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['1', '2', '3', '4', '5']);
+  await h.close();
+});
+
+test('past the cap, a lane gives its waiting messages up, and they reach the host by a read, in order and marked recovered, before a message that arrived after them', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2', '3', '4', '5', '6']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
+test('a lane that gives up more rows than the catch-up ceiling, twice before its read runs, reads them in passes of at most the ceiling, with another lane read between two passes', async () => {
+  const fetches = heldFetches();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 60, visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:other') === 500, "#other's watermark, so a break reads it");
+  const ids = Array.from({ length: 124 }, (_, i) => i + 1);
+  h.adapter.history = ids.map((id) => streamMsg(id));
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let broke = false;
+  h.adapter.fetchHistory = async (key, query) => {
+    if (!broke && h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '1') {
+      broke = true;
+      breakQueue(h);
+    }
+    return real(key, query);
+  };
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of ids.slice(1)) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.filter((m) => m.channelId === 'zulip:general' && !m.messageId.startsWith('system:')).map((m) => Number(m.messageId)), ids, 'each once, in order');
+  const reads = h.adapter.historyCalls.map((c, i) => ({ ...c, i }));
+  const general = reads.filter((c) => c.channelId === 'zulip:general');
+  assert.ok(general.every((c) => c.query.limit <= 100), 'no pass asks for more than the ceiling');
+  const first = general.find((c) => c.query.afterMessageId === '1')!;
+  const second = general.find((c) => c.query.afterMessageId === '101')!;
+  assert.ok(first && second, 'a second pass from where the first stopped');
+  const other = reads.find((c) => c.channelId === 'zulip:other')!;
+  assert.ok(other && other.i > first.i && other.i < second.i, "another lane's read runs between two passes");
+  await h.close();
+});
+
+test('on a closed channel, a lane that gives up more rows than the ceiling at once pushes an addressed row past it in a later pass\'s block, and no block of that read says the ceiling was reached', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 110 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, 'initial acceptance');
+  const ids = Array.from({ length: 112 }, (_, i) => i + 2);
+  const rows = ids.map((id) => streamMsg(id, { mentioned: id === 50 || id === 105 }));
+  h.adapter.history = [streamMsg(1, { mentioned: true }), ...rows];
+  h.adapter.emit!(withLog(streamMsg(2, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  for (const m of rows.slice(1)) h.adapter.emit!(m);
+  fetches.release();
+  await h.server.quiet();
+  const blocks = h.pushed.filter((p) => p.tags?.includes('zulip:missed'));
+  assert.ok(blocks.some((p) => /id=50\]/.test((p.payload.content[0] as { text: string }).text)), 'the first pass, cut at the ceiling, sends its block');
+  assert.ok(blocks.some((p) => /id=105\]/.test((p.payload.content[0] as { text: string }).text)), 'the mention past the ceiling, in a later block');
+  assert.ok(blocks.every((p) => !/catch-up ceiling was reached/.test((p.payload.content[0] as { text: string }).text)));
+  assert.ok(blocks.every((p) => (p.origin as { truncated?: boolean }).truncated !== true));
+  assert.equal(offeredIds(h).filter((id) => id === '105').length, 1);
+  assert.equal(offeredIds(h).filter((id) => id === '50').length, 1);
+  assert.equal(h.delivery.watermark('zulip:general'), 113);
+  await h.close();
+});
+
+async function reactionsHarness(dir: string, fetches: ReturnType<typeof heldFetches>) {
+  const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+  plane.start();
+  const h = harness({ filters: plane, attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  const react = (emoji: string) => h.adapter.react!({
+    action: 'add', channelId: 'zulip:general', messageId: '1', emoji,
+    reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_000_000),
+  });
+  const show = (visible: boolean) => h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible } });
+  const handed = () => h.incoming.map((m) => (m.metadata as { emoji?: string }).emoji ?? m.messageId);
+  return { plane, h, react, show, handed };
+}
+
+test("while its lane is busy, a reaction that its channel doesn't show doesn't wait in the lane, and one that it shows waits there and goes after the message ahead of it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-lane-'));
+  try {
+    const fetches = heldFetches();
+    const { plane, h, react, show, handed } = await reactionsHarness(dir, fetches);
+    h.adapter.emit!(withLog(streamMsg(1)));
+    await until(() => fetches.started.length === 1, "1's attachment fetch");
+    react('eyes');
+    await show(true);
+    react('thumbs_up');
+    await h.host.sendRequest('ping');
+    assert.deepEqual(handed(), [], 'nothing passes the message ahead');
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(handed(), ['1', 'thumbs_up']);
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [label, hidden, expected] of [
+  ['its channel stopped showing reactions meanwhile, and nothing goes', true, ['1']],
+  ['its channel still shows them, and it goes after the message', false, ['1', 'thumbs_up']],
+] as const) {
+  test(`a reaction that waits in its lane is checked again at its turn: ${label}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-turn-'));
+    try {
+      const fetches = heldFetches();
+      const { plane, h, react, show, handed } = await reactionsHarness(dir, fetches);
+      await show(true);
+      h.adapter.emit!(withLog(streamMsg(1)));
+      await until(() => fetches.started.length === 1, "1's attachment fetch");
+      react('thumbs_up');
+      if (hidden) await show(false);
+      fetches.release();
+      await h.server.quiet();
+      assert.deepEqual(handed(), expected);
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('at a give-up, a waiting move of the first given-up message leaves with it, and nothing of the second, deleted while it waited, comes; an edit of an accepted message and a shown reaction to the first stay, and the reaction follows its row', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-give-up-changes-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const h = harness({ filters: plane, attachments: fetches.options, maxWaitingMessages: 2, visible: [DESCRIPTOR, OTHER] });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    h.adapter.emit!(withLog(streamMsg(2)));
+    await until(() => fetches.started.length === 1, "2's attachment fetch");
+    h.adapter.emit!(streamMsg(3));
+    h.adapter.emit!(streamMsg(4, { mentioned: true, text: '@bot four' }));
+    const change = (over: Partial<MessageChangeEvent>): MessageChangeEvent => ({
+      kind: 'edit', channelId: 'zulip:general', messageId: '3', messageIds: ['3'], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+      topic: 'deploys', previousTopic: null, movedToChannelId: null, content: 'msg 3, edited', previousContent: 'msg 3',
+      mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_060_000),
+      ...over,
+    });
+    h.adapter.change!(change({ kind: 'move', content: null, previousContent: null, topic: 'elsewhere', previousTopic: 'deploys' }));
+    h.adapter.change!(change({ kind: 'delete', messageId: '4', messageIds: ['4'], content: null, previousContent: '@bot four', mentioned: true, previouslyMentioned: true, actorId: null }));
+    h.adapter.change!(change({ messageId: '1', messageIds: ['1'], content: 'msg 1, edited', previousContent: 'msg 1' }));
+    h.adapter.react!({ action: 'add', channelId: 'zulip:general', messageId: '3', emoji: 'thumbs_up', reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_070_000) });
+    h.adapter.history = [streamMsg(1), streamMsg(2), streamMsg(3, { text: 'msg 3, moved' })];
+    h.adapter.emit!(streamMsg(600, { channelId: 'zulip:other' }));
+    fetches.release();
+    await h.server.quiet();
+    const handed = h.incoming.map((m) => m.messageId.startsWith('reaction:') ? m.messageId.split(':').slice(0, 3).join(':') : m.messageId.split(':').slice(0, 2).join(':'));
+    assert.deepEqual(handed, ['1', '2', '3', 'edit:1', 'reaction:add:3']);
+    const three = h.incoming.find((m) => m.messageId === '3')!;
+    assert.match((three.content[0] as TextContent).text, /msg 3, moved$/);
+    assert.equal((three.metadata as { recovered?: boolean }).recovered, true);
+    assert.equal(h.pushed.length, 0, 'no line for the deleted mention goes as a push either');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lane gives its messages up, and the first of them is deleted before the read: the read lets its hold go, so the watermark passes it with no read for held ids', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '3', '4', '5', '6']);
+  assert.deepEqual(h.incoming.filter((m) => (m.metadata as { recovered?: boolean }).recovered === true).map((m) => m.messageId), ['3', '4', '5'], 'the read brought what history still has');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  assert.deepEqual(h.adapter.historyCalls.filter((c) => c.channelId === 'zulip:general').map((c) => c.query.afterMessageId), ['1'], 'one read, the one that fills the hole');
+  await h.close();
+});
+
+test('on a closed channel, a lane gives its messages up and history has nothing after its place: the read lets their hold go, and the next message the host accepts reaches it once and moves the watermark', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 2 });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(1, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.adapter.history = [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })];
+  h.adapter.emit!(withLog(streamMsg(2, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  for (const id of [3, 4, 5]) h.adapter.emit!(streamMsg(id));
+  fetches.release();
+  await h.server.quiet();
+  assert.ok(h.adapter.historyCalls.some((c) => c.channelId === 'zulip:general' && c.query.afterMessageId === '2'), 'the read after the give-up ran');
+  h.adapter.history = [...h.adapter.history, streamMsg(6, { mentioned: true })];
+  h.adapter.emit!(streamMsg(6, { mentioned: true }));
+  await until(() => h.delivery.watermark('zulip:general') === 6 || offeredIds(h).length > 3, '6 offered and accepted');
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['1', '2', '6']);
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
+function failReads(h: Harness, channelId: string, errors: unknown[]): void {
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === channelId && query.afterMessageId !== undefined && errors.length > 0) throw errors.shift();
+    return real(key, query);
+  };
+}
+const noAnswer = () => new ZulipNoAnswer('network', 'GET', '/messages', false, 'The connection to Zulip failed during GET /messages.');
+const refusal = (code: string, retryAfter?: number) => new ZulipRefused('history of stream 7', {
+  result: 'error', msg: code === 'RATE_LIMIT_HIT' ? 'API usage exceeded rate limit' : 'Invalid narrow', code, ...(retryAfter !== undefined ? { 'retry-after': retryAfter } : {}),
+});
+function heldWaits() {
+  const asked: number[] = [];
+  const pending: (() => void)[] = [];
+  return {
+    asked,
+    release: () => { for (const resolve of pending.splice(0)) resolve(); },
+    wait: (ms: number) => { asked.push(ms); return new Promise<void>((resolve) => pending.push(resolve)); },
+  };
+}
+
+test("a start whose catch-up's second pass gets no answer hands nothing before it tries again, and then offers each row once", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [2, 3, 4, 5].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait });
+  h.delivery.advance('zulip:general', 1);
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let secondFailures = 1;
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '1') {
+      const page = await real(key, query);
+      return { ...page, unverifiedMessageIds: ['4'] };
+    }
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '3' && secondFailures > 0) {
+      secondFailures--;
+      throw noAnswer();
+    }
+    return real(key, query);
+  };
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await awaitRegistered(h, false);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await h.host.sendRequest('ping');
+  assert.deepEqual(offeredIds(h), [], 'nothing offered while the read waits');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['2', '3', '4', '5']);
+  await h.close();
+});
+
+test("after a break of the event queue, a read that gets no answer is tried again after a wait, and a message behind it isn't handed over: the hole's rows reach the host first, then the message", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3));
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await h.host.sendRequest('ping');
+  assert.deepEqual(seenIds(h), ['1'], 'nothing is handed over while the read waits');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  assert.equal((h.incoming[1].metadata as { recovered?: boolean }).recovered, true, '2 is recovered');
+  await h.close();
+});
+
+for (const rateLimited of [false, true]) {
+  test(`after a break of the event queue, a read that Zulip refuses ${rateLimited
+    ? 'by its rate limit is tried again, as one that gets no answer'
+    : 'for another reason ends the hole, as on main: the message behind it is handed over'}`, async () => {
+    const waits = heldWaits();
+    const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    failReads(h, 'zulip:general', [refusal(rateLimited ? 'RATE_LIMIT_HIT' : 'BAD_REQUEST')]);
+    breakQueue(h);
+    h.adapter.emit!(streamMsg(3));
+    if (rateLimited) {
+      await until(() => waits.asked.length === 1, 'the wait before the second try');
+      waits.release();
+    }
+    await until(() => gapNoticeIn(h), 'the gap notice');
+    await h.server.quiet();
+    assert.deepEqual(seenIds(h), rateLimited ? ['1', '2', '3', 'notice'] : ['1', '3', 'notice']);
+    assert.deepEqual(waits.asked, rateLimited ? [2000] : []);
+    await h.close();
+  });
+}
+
+test('after a break of the event queue, a read that Zulip refuses by its rate limit, through the Zulip adapter, is tried again after the wait Zulip asks for', async () => {
+  const waits = heldWaits();
+  const h = harness({ readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const row = (id: number): ZulipRawMessage => ({
+    id, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+    display_recipient: 'general', subject: 'deploys', timestamp: 1_700_000_000 + id, type: 'stream', flags: [], content: `msg ${id}`,
+  });
+  let refusals = 1;
+  const history = new ZulipAdapter(standInApi({
+    'GET /messages': async ({ anchor }: { anchor: number }) => {
+      if (refusals > 0) {
+        refusals--;
+        return { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'API usage exceeded rate limit', 'retry-after': 5 };
+      }
+      return { messages: [row(2), row(3)].filter((m) => m.id > anchor), found_newest: true };
+    },
+  }).api, 100, 'session', { directory: historyStreams() });
+  h.adapter.fetchHistory = history.fetchHistory.bind(history);
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(3));
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  assert.deepEqual(waits.asked, [5000], 'the wait is the retry-after Zulip gave');
+  waits.release();
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  await h.close();
+});
+
+test('after a break of the event queue, an open lane whose read gets no answer holds back only itself: the other open lanes get the gap notice, and it gets its recovered rows and then the notice once its read answers', async () => {
+  const waits = heldWaits();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({
+    visible: [DESCRIPTOR, OTHER],
+    readRetryWait: waits.wait,
+    history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  const on = (channelId: string) => h.incoming.filter((m) => m.channelId === channelId).map((m) => (m.messageId.startsWith('system:') ? 'notice' : m.messageId));
+  breakQueue(h);
+  await until(() => waits.asked.length === 1 && on('zulip:other').includes('notice'), "general's wait and other's notice");
+  assert.deepEqual(on('zulip:other'), ['500', '501', 'notice']);
+  assert.deepEqual(on('zulip:general'), ['1']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(on('zulip:general'), ['1', '2', 'notice']);
+  await h.close();
+});
+
+test("after a break of the event queue, each lane's notice is built at its turn: on the other open lanes it says that one channel still waits, and on the retried lane it counts that read's rows", async () => {
+  const waits = heldWaits();
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({
+    visible: [DESCRIPTOR, OTHER],
+    readRetryWait: waits.wait,
+    history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+  failReads(h, 'zulip:general', [noAnswer()]);
+  const noticeOn = (channelId: string) => h.incoming.find((m) => m.channelId === channelId && m.messageId.startsWith('system:'));
+  breakQueue(h);
+  await until(() => noticeOn('zulip:other') !== undefined, "other's notice");
+  const other = noticeOn('zulip:other')!;
+  assert.equal((other.metadata as { channelsWaitingForHistory?: number }).channelsWaitingForHistory, 1);
+  assert.match((other.content[0] as { text: string }).text, /1 channel\(s\) still wait for a read of their history/);
+  assert.equal((other.metadata as { recoveredMessages?: number }).recoveredMessages, 1, '501 only');
+  waits.release();
+  await until(() => noticeOn('zulip:general') !== undefined, "general's notice");
+  await h.server.quiet();
+  const general = noticeOn('zulip:general')!;
+  assert.equal((general.metadata as { recoveredMessages?: number }).recoveredMessages, 2, '501 and the retried read\'s 2');
+  assert.equal((general.metadata as { channelsWaitingForHistory?: number }).channelsWaitingForHistory, 0);
+  await h.close();
+});
+
+test("a connection that ends while a lane waits to try its read again makes no try, and the next connection's catch-up covers the hole", async () => {
+  const waits = heldWaits();
+  const first = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(1));
+  await until(() => first.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(first, 'zulip:general', [noAnswer()]);
+  breakQueue(first);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await first.close();
+  const reads = first.adapter.historyCalls.length;
+  waits.release();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  assert.equal(first.adapter.historyCalls.length - reads, 1, "the next connection's catch-up is the one read");
+  assert.equal(second.pushed.length, 1, 'the catch-up block');
+  assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=2\]/);
+  await second.close();
+});
+
+test("a read that gets no answer is tried again after 2 s, doubling to at most 60 s, and after a refusal by the rate limit after the longer of that step and Zulip's retry-after", async () => {
+  const asked: number[] = [];
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: async (ms) => { asked.push(ms); } });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReads(h, 'zulip:general', [...Array.from({ length: 7 }, noAnswer), refusal('RATE_LIMIT_HIT', 90), refusal('RATE_LIMIT_HIT', 0.5)]);
+  breakQueue(h);
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(asked, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 90000, 60000]);
+  assert.deepEqual(seenIds(h), ['1', 'notice', '2', 'notice', 'notice']);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, "the 90 s retry-after sets the channel's wait to reach 90 s");
+  assert.equal(readWaitLines(h, 'history-answered').length, 1);
+  await h.close();
+});
+
+test("a connection's catch-up read that gets no answer is tried again, and a mention that arrives meanwhile follows the catch-up's block", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait });
+  h.delivery.advance('zulip:general', 1);
+  failReads(h, 'zulip:general', [noAnswer()]);
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await awaitRegistered(h, false);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await h.host.sendRequest('ping');
+  assert.equal(h.pushed.length, 0, 'the mention waits behind the read');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['2', '3']);
+  await h.close();
+});
+
+test('a give-up whose read Zulip refuses other than by its rate limit keeps every given-up message held, and the read for held ids that a later acceptance starts offers each of them, after the later message', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  failReads(h, 'zulip:general', [refusal('BAD_REQUEST')]);
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '6', '2', '3', '4', '5']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  assert.equal(h.delivery.watermark('zulip:general'), 6);
+  await h.close();
+});
+
+test("a give-up whose read and the later read for held ids Zulip both refuse leaves the given-up messages to the next connection's catch-up", async () => {
+  const fetches = heldFetches();
+  const first = harness({ attachments: fetches.options, maxWaitingMessages: 3 });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  first.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) first.adapter.emit!(streamMsg(id));
+  failReads(first, 'zulip:general', [refusal('BAD_REQUEST'), refusal('BAD_REQUEST')]);
+  fetches.release();
+  await first.server.quiet();
+  assert.deepEqual(first.incoming.map((m) => m.messageId), ['1', '6']);
+  assert.equal(first.delivery.watermark('zulip:general'), 1, 'the watermark stays below the first given-up message');
+  await first.close();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  const offered = (h: Harness) => h.pushed.map((p) => (p.payload.content[0] as { text: string }).text).join('\n');
+  await until(() => [2, 3, 4, 5].every((id) => offered(second).includes(`id=${id}]`)), "the given-up messages, in the next connection's catch-up");
+  await second.close();
+});
+
+test('a read after a give-up that gets no answer is tried again, and the given-up messages still come by it, in order, before a later message', async () => {
+  const waits = heldWaits();
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, maxWaitingMessages: 3, readRetryWait: waits.wait });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.history = [1, 2, 3, 4, 5, 6].map((id) => streamMsg(id));
+  h.adapter.emit!(withLog(streamMsg(1)));
+  await until(() => fetches.started.length === 1, "1's attachment fetch");
+  for (const id of [2, 3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+  failReads(h, 'zulip:general', [noAnswer()]);
+  fetches.release();
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '2', '3', '4', '5', '6']);
+  for (const m of h.incoming) {
+    assert.equal((m.metadata as { recovered?: boolean }).recovered === true, ['2', '3', '4', '5'].includes(m.messageId), m.messageId);
+  }
+  await h.close();
+});
+
+const readWaitLines = (h: Harness, kind: 'history-waiting' | 'history-answered') =>
+  h.incoming.filter((m) => (m.metadata as { kind?: string }).kind === kind);
+
+async function sentinelThrough(h: Harness, channels: number): Promise<void> {
+  const text = `sentinel ${Math.random()}`;
+  h.adapter.systemEvent!({ kind: 'degraded', text, metadata: { platform: 'zulip' } });
+  await until(() => h.incoming.filter((m) => (m.content[0] as TextContent).text === text).length === channels, 'the sentinel line');
+}
+
+function failReadsAt(h: Harness, clock: { t: number }, failures: Record<string, ({ ms: number; error?: unknown })[]>): void {
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    const left = failures[h.adapter.wireOf(key)];
+    if (query.afterMessageId !== undefined && left && left.length > 0) {
+      const { ms, error } = left.shift()!;
+      clock.t += ms;
+      throw error ?? noAnswer();
+    }
+    return real(key, query);
+  };
+}
+
+test('a try that fails after its read has waited 90 s tells every open channel once, its own included, naming the waiting channel; a second lane that waits as long adds no line; once both reads have answered, one line says so, after the recovered rows', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({
+    visible: [DESCRIPTOR, OTHER],
+    readRetryWait: waits.wait,
+    now: () => clock.t,
+    history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 90_000 }], 'zulip:other': [{ ms: 90_000 }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 2, 'both lanes wait');
+  await sentinelThrough(h, 2);
+  const waiting = readWaitLines(h, 'history-waiting');
+  assert.deepEqual(waiting.map((m) => m.channelId).sort(), ['zulip:general', 'zulip:other'], 'one line on each open channel');
+  for (const m of waiting) {
+    const text = (m.content[0] as TextContent).text;
+    assert.match(text, /zulip:general/);
+    assert.doesNotMatch(text, /zulip:other/);
+  }
+  waits.release();
+  await h.server.quiet();
+  assert.equal(readWaitLines(h, 'history-waiting').length, 2, 'no line was added');
+  const answered = readWaitLines(h, 'history-answered');
+  assert.deepEqual(answered.map((m) => m.channelId).sort(), ['zulip:general', 'zulip:other']);
+  for (const [channelId, row] of [['zulip:general', '2'], ['zulip:other', '501']]) {
+    const on = h.incoming.filter((m) => m.channelId === channelId);
+    const rowAt = on.findIndex((m) => m.messageId === row);
+    assert.ok(rowAt >= 0, `${channelId}: ${row} is recovered`);
+    assert.ok(rowAt < on.findIndex((m) => (m.metadata as { kind?: string }).kind === 'history-answered'), `${channelId}: the line follows ${row}`);
+  }
+  await h.close();
+});
+
+test('a read that waits while no channel is open tells a channel opened during the wait, at its next failed try', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ readRetryWait: waits.wait, now: () => clock.t, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 90_000 }, { ms: 90_000 }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the first wait');
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  await sentinelThrough(h, 1);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no channel was open at the first failed try');
+  waits.release();
+  await until(() => waits.asked.length === 2, 'the second wait');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(readWaitLines(h, 'history-waiting').map((m) => m.channelId), ['zulip:general']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(readWaitLines(h, 'history-answered').map((m) => m.channelId), ['zulip:general']);
+  await h.close();
+});
+
+test('a read that waits through a disable of zulip.messaging tells the open channels at its first failed try after the enable', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ readRetryWait: waits.wait, now: () => clock.t, history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let tries = 0;
+  let failFirst!: () => void;
+  const first = new Promise<void>((resolve) => { failFirst = resolve; });
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId !== undefined && tries < 2) {
+      tries++;
+      if (tries === 1) await first;
+      clock.t += 90_000;
+      throw noAnswer();
+    }
+    return real(key, query);
+  };
+  breakQueue(h);
+  await until(() => tries === 1, "the break's first try at Zulip");
+  await disableMessaging(h);
+  failFirst();
+  await until(() => waits.asked.length === 1, 'the wait after the first failed try');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await sentinelThrough(h, 1);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'nothing told while zulip.messaging was disabled');
+  waits.release();
+  await until(() => waits.asked.length === 2, 'the wait after the second failed try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(readWaitLines(h, 'history-waiting').map((m) => m.channelId), ['zulip:general']);
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(readWaitLines(h, 'history-answered').map((m) => m.channelId), ['zulip:general']);
+  await h.close();
+});
+
+for (const [label, narrowOther, narrowGeneral] of [
+  ['muted', (f: ZulipFilters) => ({ ...f, mutedStreams: ['other'] }), (f: ZulipFilters) => ({ ...f, mutedStreams: ['general'] })],
+  ['left out of the allowlist', (f: ZulipFilters) => ({ ...f, streams: ['general'] }), (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
+] as const) {
+  test(`the line about reads that wait doesn't name a channel ${label} by the time the line is built`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-wait-line-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const waits = heldWaits();
+      const clock = { t: 0 };
+      const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+      const h = harness({
+        filters: plane,
+        visible: [DESCRIPTOR, OTHER],
+        readRetryWait: waits.wait,
+        now: () => clock.t,
+        history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+      });
+      await initialize(h, true);
+      await settled(h);
+      for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+      h.adapter.emit!(streamMsg(1));
+      h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+      await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+      failReadsAt(h, clock, { 'zulip:general': [{ ms: 1 }, { ms: 90_000 }], 'zulip:other': [{ ms: 1 }] });
+      breakQueue(h);
+      await until(() => waits.asked.length === 2, 'both lanes wait');
+      await sentinelThrough(h, 2);
+      assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no line while neither wait is set to reach 90 s');
+      assert.equal(plane.update(narrowOther).ok, true);
+      waits.release();
+      await until(() => readWaitLines(h, 'history-waiting').length > 0, "the line at general's second failure");
+      for (const m of readWaitLines(h, 'history-waiting')) {
+        const text = (m.content[0] as TextContent).text;
+        assert.match(text, /zulip:general/);
+        assert.doesNotMatch(text, /zulip:other/);
+        assert.deepEqual((m.metadata as { channels?: string[] }).channels, ['zulip:general']);
+      }
+      waits.release();
+      await h.server.quiet();
+      assert.ok(readWaitLines(h, 'history-answered').length > 0, 'the line that no read waits follows the one that went');
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test(`a read that waits on a channel ${label} by the time the line is built, with no other read waiting, sends no line, and none follows when its wait ends`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-wait-line-alone-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const waits = heldWaits();
+      const clock = { t: 0 };
+      const h = harness({ filters: plane, history: [1, 2].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait, now: () => clock.t });
+      await initialize(h, true);
+      await settled(h);
+      h.delivery.advance('zulip:general', 1);
+      const real = h.adapter.fetchHistory!.bind(h.adapter);
+      let failed = false;
+      h.adapter.fetchHistory = async (key, query) => {
+        if (query.afterMessageId !== undefined && !failed) {
+          failed = true;
+          clock.t += 90_000;
+          assert.equal(plane.update(narrowGeneral).ok, true);
+          throw noAnswer();
+        }
+        return real(key, query);
+      };
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+      try {
+        breakQueue(h);
+        await until(() => waits.asked.length === 1, 'the wait before the second try');
+        waits.release();
+        await h.server.quiet();
+      } finally {
+        console.error = original;
+      }
+      assert.ok(failed, 'the read failed once');
+      assert.deepEqual(logs.filter((l) => l.includes("Zulip isn't serving reads of the history")), []);
+      assert.deepEqual(logs.filter((l) => l.includes('No channel waits for a read of its history')), []);
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('with no channel open, the line that a read waits and the line that it no longer does go to the log', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(h, true);
+  await settled(h);
+  h.delivery.advance('zulip:general', 1);
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 90_000 }] });
+  const logs: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+  try {
+    breakQueue(h);
+    await until(() => waits.asked.length === 1, 'the wait before the second try');
+    assert.equal(logs.filter((l) => l.includes("Zulip isn't serving reads of the history of zulip:general") && l.includes('(no open channel to tell)')).length, 1);
+    waits.release();
+    await until(() => h.pushed.length === 1, "the read's block");
+    await h.server.quiet();
+  } finally {
+    console.error = original;
+  }
+  assert.equal(logs.filter((l) => l.includes('No channel waits for a read of its history from Zulip any more.') && l.includes('(no open channel to tell)')).length, 1);
+  assert.equal(h.incoming.length, 0);
+  await h.close();
+});
+
+test("a try after which a channel's wait isn't set to reach 90 s adds no line, and one after which it is does", async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 87_999 }, { ms: 1 }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(waits.asked, [2_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no line: 87.999 s waited, and 2 s to the next try');
+  waits.release();
+  await until(() => waits.asked.length === 2, 'the wait before the third try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(waits.asked, [2_000, 4_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, 'a line: 88 s waited, and 4 s to the next try');
+  waits.release();
+  await h.server.quiet();
+  await h.close();
+});
+
+test('a try that runs out its bound tells at its first failure, whatever the clock says', async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  const ranOut = new ZulipNoAnswer('timeout', 'GET', '/messages', false, 'Zulip gave no answer to GET /messages within 90 s.');
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 0, error: ranOut }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await until(() => readWaitLines(h, 'history-waiting').length === 1, 'the line at the first failure');
+  waits.release();
+  await h.server.quiet();
+  assert.equal(readWaitLines(h, 'history-answered').length, 1);
+  await h.close();
+});
+
+test("the lines belong to their connection: after a connection ended while the agent was told a read waits, the next connection's wait is told again", async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const first = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(first, true);
+  await settled(first);
+  await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  first.adapter.emit!(streamMsg(1));
+  await until(() => first.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReadsAt(first, clock, { 'zulip:general': [{ ms: 90_000 }] });
+  breakQueue(first);
+  await until(() => waits.asked.length === 1 && readWaitLines(first, 'history-waiting').length === 1, 'the first connection told');
+  await first.close();
+  waits.release();
+
+  const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
+  await initialize(second, true);
+  await settled(second);
+  await second.server.quiet();
+  await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  failReadsAt(second, clock, { 'zulip:general': [{ ms: 90_000 }] });
+  breakQueue(second);
+  await until(() => waits.asked.length === 2, "the second connection's wait");
+  await until(() => readWaitLines(second, 'history-waiting').length === 1, 'told again');
+  waits.release();
+  await second.server.quiet();
+  await second.close();
+});
+
+test("an earlier message that enters its lane behind a later one, while the later one's attachment is fetched, is offered after it", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(withLog(streamMsg(2)));
+  await until(() => fetches.started.length === 1, "2's attachment fetch");
+  h.adapter.emit!(streamMsg(1));
+  fetches.release();
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h), ['2', '1']);
+  await h.close();
+});
+
+test("an earlier message that enters its lane after a later one was dealt with isn't offered", async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(2));
+  await h.server.quiet();
+  h.adapter.emit!(streamMsg(1));
+  await h.server.quiet();
+  assert.deepEqual(incomingIds(h), ['2']);
+  await h.close();
+});
+
+test("a refused message that a held read brings while zulip.messaging is disabled is offered again once it is enabled", async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => { reading = true; await readHeld; return real(key, query); };
+  h.adapter.emit!(streamMsg(2));
+  await until(() => reading, 'the read for the refused message');
+  await disableMessaging(h);
+  h.adapter.fetchHistory = real;
+  releaseRead();
+  await h.server.quiet();
+  const offersOfOne = () => incomingIds(h).filter((id) => id === '1').length;
+  assert.equal(offersOfOne(), 1, 'nothing offered while zulip.messaging is disabled');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.equal(offersOfOne(), 2, 'offered again once it is enabled');
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 2);
+  await h.close();
+});
+
+test("a refused message that a held read hands on just before zulip.messaging is disabled, and that waits in the batch window meanwhile, is offered again once it is enabled", async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  const flushes = heldFlushes(h, ['1']);
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.incoming.some((m) => m.messageId === '2'), '2 accepted, which starts the read for 1');
+  await until(() => flushes.reached(), "the read's try of 1, at its batch's flush");
+  await disableMessaging(h);
+  flushes.release();
+  await h.server.quiet();
+  assert.equal(h.incoming.some((m) => m.messageId === '1'), false, 'withheld in the batch window');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.some((m) => m.messageId === '1'), '1 offered again once enabled');
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+  assert.equal(h.delivery.watermark('zulip:general'), 2);
+  await h.close();
+});
+
+test("a read for held ids that the connection's end cuts short marks none of them offered", async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(1), '1 refused, and held');
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let reading = false;
+  let releaseRead!: () => void;
+  const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+  h.adapter.fetchHistory = async (key, query) => { reading = true; await readHeld; return real(key, query); };
+  h.adapter.emit!(streamMsg(2));
+  await until(() => reading, 'the read for the refused message');
+  void h.served.then(releaseRead);
+  await h.close();
+  assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1]);
+});
+
+test("a read for held ids of a closed channel that the connection's end cuts short, and whose fetch then fails, marks none of them offered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-held-read-ended-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'hre' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'hre', history: [streamMsg(4, { mentioned: true }), streamMsg(5)] });
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), [4], 'the refused block');
+    let reading = false;
+    let releaseRead!: () => void;
+    const readHeld = new Promise<void>((resolve) => { releaseRead = resolve; });
+    second.adapter.fetchHistory = async () => { reading = true; await readHeld; throw refusal('BAD_REQUEST'); };
+    second.adapter.history.push(streamMsg(6, { mentioned: true }));
+    second.adapter.emit!(streamMsg(6, { mentioned: true }));
+    await until(() => reading, 'the read for the refused block');
+    void second.served.then(releaseRead);
+    await second.close();
+    assert.deepEqual(second.delivery.heldIds('zulip:general', { replayable: true }), [4]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a catch-up block that the host refuses while its stream is muted lets go of the holds in its own range only: a message that still waits keeps its hold", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-refused-muted-block-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'rmb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const second = harness({
+      stateDir: dir, sessionId: 'rmb', filters: plane, visible: [DESCRIPTOR, OTHER],
+      history: [streamMsg(4, { mentioned: true }), streamMsg(5), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+    });
+    second.policy.holdPushes = true;
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => second.pushed.length === 1, "general's catch-up block, with the host");
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:other', type: 'zulip', address: {} });
+    second.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+    await until(() => second.delivery.watermark('zulip:other') === 500, "other's message accepted");
+    const real = second.adapter.fetchHistory!.bind(second.adapter);
+    let otherReading = false;
+    let releaseOther!: () => void;
+    const otherRead = new Promise<void>((resolve) => { releaseOther = resolve; });
+    second.adapter.fetchHistory = async (key, query) => {
+      if (second.adapter.wireOf(key) === 'zulip:other') { otherReading = true; await otherRead; }
+      return real(key, query);
+    };
+    try {
+      breakQueue(second);
+      await until(() => otherReading, "other's read, holding the turn");
+      second.adapter.history.push(streamMsg(7, { mentioned: true }));
+      second.adapter.emit!(streamMsg(7, { mentioned: true }));
+      await until(() => second.delivery.heldIds('zulip:general').includes(7), 'the mention, waiting behind general\'s read');
+      await second.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+      second.policy.heldPushes.shift()!();
+      await until(() => !second.delivery.heldIds('zulip:general').includes(4), "the block's hold, let go");
+      assert.deepEqual(second.delivery.heldIds('zulip:general'), [7], 'the mention that still waits keeps its hold');
+    } finally {
+      releaseOther();
+      second.policy.holdPushes = false;
+      for (const answer of second.policy.heldPushes.splice(0)) answer();
+    }
+    plane.stop();
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a close by id waits for an earlier open of its channel by type and address that waits on the chain', async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { type: 'zulip', address: { stream_name: 'general' } });
+    let closed = false;
+    const closing = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' }).then(() => { closed = true; });
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:other', type: 'zulip', address: {} });
+    assert.equal(closed, false, 'the close waits for the open before it');
+    releaseSlow();
+    await Promise.all([slow, opening, closing]);
+    assert.equal(h.server.channelManager.isOpen('zulip:general'), false, "the host's last word was the close");
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
+
+test('an open that comes after a featureSets/update waiting on the chain is judged under the updated grant', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const update = h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.lifecycle') });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    const onChain = () => (h.server as unknown as { requestsWaiting: number }).requestsWaiting;
+    await until(() => onChain() === 3, 'the update and the open waiting on the chain behind the tool call');
+    releaseSlow();
+    await Promise.all([slow, update]);
+    await assert.rejects(opening, /channels\.lifecycle/);
+    assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
+
+test("a close by id waits for an earlier open by type and address whose channel the server couldn't name when the open came", async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { type: 'zulip', address: { stream_name: 'other' } });
+    const onChain = () => (h.server as unknown as { requestsWaiting: number }).requestsWaiting;
+    await until(() => onChain() === 2, 'the open waiting on the chain behind the tool call');
+    h.adapter.visible.push(OTHER);
+    await h.server.channelManager.registerAdditional([OTHER]);
+    let closed = false;
+    const closing = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:other' }).then(() => { closed = true; });
+    await until(() => onChain() === 3, 'the close waiting on the chain behind the open');
+    assert.equal(closed, false, 'the close waits for the open before it');
+    releaseSlow();
+    await Promise.all([slow, opening, closing]);
+    assert.equal(h.server.channelManager.isOpen('zulip:other'), false, "the host's last word was the close");
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
+
+test("a rate limit whose retry-after carries a channel's wait past 90 s tells at its first failure", async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 1, error: refusal('RATE_LIMIT_HIT', 300) }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(waits.asked, [300_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, 'a line at the first failure');
+  waits.release();
+  await h.server.quiet();
+  assert.equal(readWaitLines(h, 'history-answered').length, 1);
+  await h.close();
+});
+
+test('after a break, a closed channel that has no watermark, and whose first message waits for its attachments, has its hole read too', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [withLog(streamMsg(1, { mentioned: true })), streamMsg(2, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  assert.equal(h.delivery.watermark('zulip:general'), undefined);
+  h.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "the first message's attachment fetch");
+  breakQueue(h);
+  await new Promise((r) => setImmediate(r));
+  fetches.release();
+  await until(() => h.pushed.some((p) => /id=2\]/.test((p.payload.content[0] as { text: string }).text)), 'the mention lost in the break, offered');
+  await h.close();
+});
+
+test("a muted channel's read for held ids lets go of every hold but those of messages that wait in its lane: a message whose job waits on its lookup keeps its hold", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-held-read-'));
+  try {
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({
+      filters: plane, visible: [DESCRIPTOR, OTHER],
+      history: [streamMsg(1), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+    });
+    await initialize(h, true);
+    await settled(h);
+    for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+    h.policy.rejectIds.add('1');
+    h.adapter.emit!(streamMsg(1));
+    h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+    await until(() => h.delivery.heldIds('zulip:general').includes(1) && h.delivery.watermark('zulip:other') === 500, '1 refused, 500 accepted');
+    const real = h.adapter.fetchHistory!.bind(h.adapter);
+    let otherReading = false;
+    let releaseOther!: () => void;
+    const otherRead = new Promise<void>((resolve) => { releaseOther = resolve; });
+    h.adapter.fetchHistory = async (key, query) => {
+      if (h.adapter.wireOf(key) === 'zulip:other' && query.afterMessageId !== undefined) { otherReading = true; await otherRead; }
+      return real(key, query);
+    };
+    let releaseLookup!: () => void;
+    const lookup = new Promise<void>((resolve) => { releaseLookup = resolve; });
+    try {
+      breakQueue(h);
+      await until(() => otherReading, "other's read, holding the turn");
+      await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+      const key = h.adapter.keyOf('zulip:general');
+      const { channelId: _c, ...rest } = streamMsg(2);
+      h.adapter.enter!({ key, messageId: '2', ready: async () => { await lookup; return { message: { ...rest, key } as KeyedMessage }; } });
+      await until(() => h.delivery.heldIds('zulip:general').includes(2), "2's hold");
+      releaseOther();
+      await until(() => !h.delivery.heldIds('zulip:general').includes(1), "the muted read's hand, letting 1 go");
+      assert.deepEqual(h.delivery.heldIds('zulip:general'), [2], 'the message whose job waits on its lookup keeps its hold');
+    } finally {
+      releaseOther();
+      releaseLookup();
+    }
+    await h.server.quiet();
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a muted channel's read for held ids lets go of a give-up's hold, whose messages no longer wait", async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-muted-give-up-'));
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const fetches = heldFetches();
+    const h = harness({ filters: plane, attachments: fetches.options, maxWaitingMessages: 3, history: [1, 2, 3, 4, 5, 6, 7].map((id) => (id === 2 ? withLog(streamMsg(2)) : streamMsg(id))) });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    h.adapter.emit!(withLog(streamMsg(2)));
+    await until(() => fetches.started.length === 1, "2's attachment fetch");
+    for (const id of [3, 4, 5, 6]) h.adapter.emit!(streamMsg(id));
+    await until(() => logged.some((line) => /waiting message\(s\) given up/.test(line)), 'the give-up');
+    assert.deepEqual(h.delivery.heldIds('zulip:general'), [2, 3, 4, 5, 6], "the give-up's hold on 3 to 6");
+    await h.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+    fetches.release();
+    await h.server.quiet();
+    assert.deepEqual(h.delivery.heldIds('zulip:general'), [], 'every given-up message goes with the mute');
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -50,11 +50,20 @@ export interface RoutingHints {
 }
 
 /**
- * Delivery callback. `newChannel` is set when the message belongs to a
- * channel the adapter has not described before (a DM from a new
- * conversation) — the server registers it with the host before routing.
+ * A message from the event stream, placed in its channel when it arrives.
+ * The server runs `ready` in the channel's turn: it does what may wait on
+ * the platform, and answers null for a message that isn't for the host.
+ * `newChannel` describes the message's channel wherever the adapter can
+ * describe it, on every message; the server registers it with the host
+ * when it routes the message, if the host holds no id for that channel.
  */
-export type OnIncomingMessage = (message: KeyedMessage, newChannel?: ChannelDescriptor) => void;
+export interface IncomingEntry {
+  key: ChannelKey;
+  messageId: string;
+  ready(changes?: readonly ChangeEntry[]): Promise<{ message: KeyedMessage; newChannel?: ChannelDescriptor } | null>;
+}
+
+export type OnIncomingMessage = (entry: IncomingEntry) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -100,7 +109,11 @@ export interface ReactionEvent {
   timestamp: Date;
 }
 
-export type OnReaction = (event: ReactionEvent) => void;
+export interface ReactionEntry extends ReactionEvent {
+  placed(): ReactionEvent;
+}
+
+export type OnReaction = (entry: ReactionEntry) => void;
 
 /**
  * A message the agent may have seen was edited, moved to another topic or
@@ -155,7 +168,14 @@ export interface MessageChangeEvent {
   timestamp: Date;
 }
 
-export type OnMessageChange = (event: MessageChangeEvent) => void;
+export interface ChangeEntry {
+  key: ChannelKey;
+  messageIds: number[];
+  kind: 'edit' | 'move' | 'delete';
+  ready(only?: readonly number[]): Promise<MessageChangeEvent | null>;
+}
+
+export type OnMessageChange = (entry: ChangeEntry) => void;
 
 /** History request against one channel. */
 export interface ChannelHistoryQuery {
@@ -241,8 +261,8 @@ export interface PlatformAdapter {
 
   /**
    * Channel history as incoming-shaped messages, oldest first. Optional —
-   * without it channels/open cannot return backscroll and the reconnect
-   * sweep has nothing to scan.
+   * without it channels/open cannot return backscroll and no catch-up
+   * has anything to read.
    */
   fetchHistory?(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 

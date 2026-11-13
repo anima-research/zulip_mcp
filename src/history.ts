@@ -1,6 +1,6 @@
 /**
  * Zulip message history — one fetch shape for every reader (context
- * injection, channel-open backscroll, the reconnect sweep, and the
+ * injection, channel-open backscroll, the catch-up reads, and the
  * fetch_history / fetch_around tools), and one conversion from a Zulip
  * message to the MCPL incoming shape so history and live delivery render
  * identically.

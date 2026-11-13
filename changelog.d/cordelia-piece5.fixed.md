@@ -1,0 +1,149 @@
+- On live delivery, a message whose attachments were still being fetched could
+  reach the host after a later message of its channel. If the host then
+  refused it, having accepted the later one, it was not offered again. Each
+  channel's messages, reactions and changes are now handled one at a time, in
+  the order the server received them, so a reaction follows the message it is
+  about, and so does an edit that arrives once that message is being handled.
+  An edit that doesn't move the message, or a deletion, that arrives while the
+  message still waits is applied to it: the message comes once with its new
+  text, or doesn't come. A change or a reaction to a message that arrives
+  while the message's move to another stream still waits is handed on in the
+  new stream's channel, after what waits there. A message waiting for its
+  attachments holds back only its own channel. A reaction is checked against
+  the filters when it is placed in its channel and again at its turn. One
+  whose stream the server doesn't know yet is checked at its turn only.
+- A host's `channels/open` or `channels/close` that names by its id a
+  channel the server already knows no longer waits for the requests ahead of
+  it, such as a tool call that waits for the host. It waits for the job
+  running on its own channel, such as one message being handled. It still
+  waits for the requests ahead of it while one of them is a
+  `featureSets/update`, an open or close of the same channel, or an open or
+  close whose channel the server couldn't name when it came. An open by type
+  and address waits for the requests ahead of it, as before. So a host that
+  opens a channel before it answers that channel's announcement, as
+  agent-framework 0.18.0 and older did, no longer stalls for 5 s behind a
+  tool call that announced the channel.
+- A message still waiting for its attachments when the host opened its
+  channel came both in the open's history and again as a message. The
+  history an open returns now ends below the first message that waits in
+  its channel's lane, and each such message follows the open's answer once,
+  as a message.
+- After a restart, a message the host hadn't accepted wasn't offered again
+  when the host had accepted nothing on its channel before it, such as one
+  the host refused, or one that was waiting or on its way when the
+  connection ended. Such a channel had no watermark on disk. It now gets one
+  just below that message, so the next start's catch-up offers it, as it
+  offers any message above the watermark, if Zulip's history still has it
+  there.
+- A message that arrived while the host had `zulip.messaging` disabled was
+  dropped, unless it was already waiting in the batch. It now waits in its
+  channel until the host enables `zulip.messaging` again. An edit of it that
+  arrived meanwhile and didn't move it is applied to it, so it comes once
+  with its new text, and one deleted meanwhile doesn't come. A message
+  already being handled when `zulip.messaging` was disabled is held, and a
+  read from history brings it first once it is enabled. The first message of
+  a channel that the host has never been told of isn't brought by that read:
+  it stays held until that channel is registered. Where that read
+  fails, later messages go first, and until it comes, an edit, a move or a
+  deletion of one of them sends no line, unless that message addresses the
+  agent or is the agent's own. A message that the batch withheld while
+  `zulip.messaging` was disabled can come after its channel's later
+  messages, where the enable comes while a message, change or read of that
+  channel is still being handled.
+- A catch-up at a connection's start, or a recovery after Zulip's event
+  queue broke, that fell while `zulip.messaging` was disabled was skipped. It
+  is now made once the host enables `zulip.messaging`.
+- A stream muted, or left out of the allowlist, while an addressed message
+  of its closed channel waited for its attachments no longer has that
+  message pushed: the mute and the allowlist are checked again when the
+  attachments are in.
+- A message could reach the host twice when its event arrived after an
+  open's `sinceLastSeen` history had already returned it: once in the
+  history, and again as a message. An event for a message that its channel
+  has already dealt with is now dropped.
+- An open whose history was a channel's newest messages counted every
+  message below that history as seen, including ones the server hadn't
+  handed on yet, such as at a connection's start before the channel's
+  catch-up. If the connection ended before the catch-up, those messages were
+  never offered. Such an open now counts as seen only what its channel had
+  already dealt with, and the catch-up block moves the watermark when the
+  host accepts it.
+- A catch-up block the host refused was lost once the host accepted a later
+  message of its channel: the watermark moved past the block. The block's
+  first message is now held, so the watermark stays below it, and the block
+  is offered again when the host next accepts something. Where the channel
+  is open by then, only the block's first message is offered again, and the
+  others aren't, as before.
+- An offer that the host refused, or that was lost, after its stream was
+  muted or left out of the allowlist was held again, so the channel's
+  watermark stayed below it until the host accepted something else there.
+  Such an offer is now let go.
+- After Zulip's event queue broke, a message could reach the host twice
+  when both its event and the recovery's read of its channel's history
+  brought it: once recovered, and once as a message. The recovery now reads
+  only up to the first message that waits on its channel, and an event for a
+  message that the recovery already handed on is dropped.
+- After Zulip's event queue broke, the recovery read from the watermark, so
+  it offered again the messages the host had accepted above one that it
+  refused. It now offers again only what the host hasn't accepted.
+- After an open whose `sinceLastSeen` history its limit cut, a break of
+  Zulip's event queue handed the channel, as recovered, the messages above
+  that history, if the host had accepted nothing there since. Those messages
+  had been counted as missed while the channel was closed. The recovery now
+  starts above the newest message its channel has dealt with.
+- At a connection's start, every channel waited until all channels' catch-up
+  was done, and a message that arrived meanwhile could arrive inside its
+  channel's catch-up block instead of as itself. Each channel's catch-up now
+  reads only up to the first message waiting on that channel, that message
+  follows the block as itself (past 5,000 waiting messages, it can be given
+  up to a read from history in its place), and each channel goes on as soon
+  as its own catch-up is done.
+- A `sinceLastSeen` open at a connection's start, before its channel's
+  catch-up, had its history repeated in the catch-up block. The catch-up now
+  starts above what the open returned.
+- At a connection's start, an ambient message of a closed channel that
+  arrived after the channel's catch-up read, and before the read of its
+  missed count, was counted as missed twice. It is now counted once.
+- An open whose connection ended while it read its history counted that
+  history as seen, so the next connection didn't offer it. It now counts
+  nothing, and the next connection's catch-up offers it.
+- A message whose attachments were still being fetched when shutdown's
+  grace ran out could reach the next connection's host twice: in that
+  connection's catch-up, and again when the fetch ended. It now reaches it
+  once, in the catch-up.
+- A reply that the server had verified as it arrived, and that the host
+  hadn't accepted, lost that verdict at a reconnect. If history could then
+  not verify the quote, the catch-up offered it without its reply tag, or on
+  a closed channel didn't offer it. The verdict now lasts as long as the
+  message is held, within one process.
+- Past 5,000 messages received while a connection started, the oldest were
+  offered again later, after newer ones. Now, past 5,000 messages waiting in
+  all channels together, the channel with the most gives them up, and a read
+  from history brings them in order, in passes of at most the catch-up limit,
+  before the messages that arrived after them. A move that was waiting about
+  given-up messages only isn't sent, and an edit or a deletion applied to one
+  of them goes with it: the read brings each of those messages as Zulip has
+  it then, or doesn't bring it. With the catch-up limit at 0, or on a closed
+  channel that the host holds no id for when the read runs, that read brings
+  none of them, and the log says so where the give-up already sees it. A
+  read that Zulip refuses for a reason other than its rate limit brings none
+  of them either, and the log gives the refusal. They stay held, up to the
+  50,000 holds a channel keeps, so on an open channel a later read of held
+  messages offers them, after messages that arrived after them. Until they
+  come, an edit, a move or a deletion of one of those later messages sends
+  no line, unless that message addresses the agent or is the agent's own. If
+  that read is refused too, the next connection's catch-up brings them. A
+  reaction, or a change about another message, that was waiting stays, and
+  its turn comes after the read. On a closed channel, the given-up messages
+  that don't address the agent aren't counted as missed. A later such
+  message of that connection moves the count past them, and then nothing
+  counts them. With none before the next connection, its start counts them.
+- A reaction to a message the server hadn't seen could reach the host after
+  a later reaction, since it waited for its own lookup alone. Events that
+  only a lookup can place are now placed one at a time, in the order Zulip
+  sent them, and the reactions, and the changes and stream messages without
+  a stream id, that arrive meanwhile wait behind them. A direct message
+  doesn't wait. On a queue that sends a stream's
+  id with one message and not with another, a message without the id can
+  enter its channel behind a later message that has it. It then comes after
+  that message, or doesn't come where that message was already dealt with.
