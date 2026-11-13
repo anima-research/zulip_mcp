@@ -4,6 +4,7 @@ export interface JobInfo {
   kind: 'message' | 'change' | 'reaction' | 'other';
   id?: number;
   about?: number[];
+  started?: boolean;
 }
 
 export interface JobContext<W> {
@@ -122,8 +123,8 @@ export class Lane<W> {
     this.lanes.changed(this);
   }
 
-  waitingMessages(): number[] {
-    return this.otherQueue.filter((e) => e.info.kind === 'message').map((e) => e.info.id ?? NaN);
+  waitingMessages(opts: { unstarted?: boolean } = {}): number[] {
+    return this.otherQueue.filter((e) => e.info.kind === 'message' && !(opts.unstarted && e.info.started)).map((e) => e.info.id ?? NaN);
   }
 
   changeWaitsAbout(ids: readonly number[]): boolean {
@@ -353,6 +354,14 @@ export class Lanes<W> {
     this.waitingMessageCount -= n;
   }
 
+  // One read from history at a time, across all lanes. Before lanes, each of
+  // the server's catch-up, recovery and replay loops read one channel after
+  // another. Zulip limits each user's API requests, the agent's own among
+  // them ("Every user is limited to 200 total API requests per minute" by
+  // default, and the rules "can vary by server":
+  // https://zulip.com/api/http-headers). A read on every lane at once would
+  // send one request a lane at each start and each break. The width of one
+  // isn't derived from Zulip's number, and nothing here was measured.
   takeTurn(lane: Lane<W>): boolean {
     const at = this.turnWaiters.indexOf(lane);
     const longer = at < 0 ? this.turnWaiters : this.turnWaiters.slice(0, at);

@@ -48,9 +48,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   event that only a lookup can place waits for it, such as a
   reaction to a message the server hasn't seen, and the reactions, changes and
   messages after it that carry no stream id wait behind it. When delivery
-  stops, a message the server already holds is offered at the next connection
-  if Zulip's history still has it there; one still waiting for the lookup that
-  places it is dropped, and the next catch-up recovers what it can.
+  stops, a message the server already holds is offered by the next
+  connection's catch-up, as any message above the watermark is, if Zulip's
+  history still has it there; one still waiting for the lookup that places
+  it is dropped, and the next catch-up recovers what it can.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -113,12 +114,15 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). It never advances past a message the host was offered but did not
-  accept — a refusal, a batch lost to a transport failure — which is
-  replayed from history once the host answers again. On the next connection
-  one or more `<missed>` blocks per channel deliver what arrived meanwhile (full
-  backscroll for channels the host had open, addressed message ± 7 for the
-  rest). Deferred quote verification can split a channel into an accepted
+  `push/event`). A channel the host has accepted nothing on gets one just
+  below its first message that isn't accepted, and while `zulip.messaging`
+  is disabled, as that message comes in. It never advances past a message
+  the host was offered but did not accept — a refusal, a batch lost to a
+  transport failure — which is replayed from history once the host answers
+  again. On the next connection one or more `<missed>` blocks per channel
+  deliver what arrived meanwhile (full backscroll for channels the host had
+  open, addressed message ± 7 for the rest). Deferred quote verification
+  can split a channel into an accepted
   prefix block and a retry block; consumers must not assume one block per
   channel. Closed-DM catch-up uses `chat:dm` and `chat:private`, not a
   synthesized `chat:mention`; unmentioned DMs have `metadata.mentioned: false`
@@ -225,9 +229,9 @@ its delivery (incoming and push) and its tools at once. A message that
 arrives meanwhile waits in its channel until it is enabled again. An edit or
 a deletion of it that arrives meanwhile is applied to it, unless the change
 also moves it, and a change that moves it is offered after it. A change about
-no message that waits, and any reaction, that arrives meanwhile isn't told. A
-catch-up, and a recovery after a break of Zulip's event queue, wait too, and
-are made once it is enabled.
+no message that waits, and any reaction placed in its channel meanwhile,
+isn't told. A catch-up, and a recovery after a break of Zulip's event queue,
+wait too, and are made once it is enabled.
 
 **Wake policy.** Closed-channel mentions, quote replies and DMs, new-DM
 announcements and `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
@@ -274,9 +278,15 @@ one line in the shared shape, carrying the message's own id:
 
 On a closed channel only an addressed change is pushed — the mention the
 agent is about to answer was rewritten or deleted, a quote reply changed,
-or a DM it is reading changed — the same rule as for messages. A change to a message the host was
-never offered is dropped, unless it arrives while that message still waits
-for its turn: the delivery model above says what then happens to it.
+or a DM it is reading changed — the same rule as for messages. On an open
+channel, a change goes when its message is at or below the channel's
+watermark or held, when the change addresses the agent, or when the
+message is the bot's own. A change to any other message is dropped, unless
+it arrives while that message still waits for its turn: the delivery model
+above says what then happens to it. While `zulip.messaging` is disabled, a
+channel's first message can set the watermark just below it, so once it is
+enabled again, a change to an older message that the host never received
+goes too.
 Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits and deletions (rollback,
 `delete_message`) are its own doing and don't surface either. A deletion's
@@ -339,16 +349,18 @@ the next `channels/changed` also removes each id the unanswered one added,
 unless a stream holds that id now. The watermark, the missed tally and
 the filters entries carry to the new name. Where the filters file can't be
 read or written at the rename, the old name stays in it, and the log says
-so. Once the host answers, a request
-for the old id is refused, and the refusal names the new id, unless another
-stream has taken the old name, as in a swap. With MCPL, `send_message`,
-`listen` and `unlisten` given the old name are refused the same way, and
-send nothing to Zulip. A stream that was open at last sight and was renamed
-while the server was down, or while no host was connected, gets one push
-from its new channel when a host next connects, if the allowlist holds the
-stream then, and then its backlog, as any stream open at last sight does.
-An archived stream, or one the bot lost access to, is removed at the host
-the same way, with nothing added.
+so. Once the host answers, `channels/open`, `channels/publish`,
+`channels/typing`, `channel_missed` and, with MCPL, `fetch_history` refuse
+the old id, and the refusal names the new id, unless another stream has
+taken the old name, as in a swap. A `channels/acknowledge` adds its
+reaction whatever channel id it names, since Zulip takes a reaction by the
+message's id. With MCPL, `send_message`, `listen` and `unlisten` given the old name are refused
+the same way, and send nothing to Zulip. A stream that was open at last
+sight and was renamed while the server was down, or while no host was
+connected, gets one push from its new channel when a host next connects, if
+the allowlist holds the stream then, and then its backlog, as any stream
+open at last sight does. An archived stream, or one the bot lost access to,
+is removed at the host the same way, with nothing added.
 
 A `channels/changed` announcement the host never confirms is not a refusal:
 the channel stays usable here and is re-announced on the next explicit

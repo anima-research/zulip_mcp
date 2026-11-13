@@ -8,7 +8,10 @@
   because the host refused it, the connection ended first, or
   `zulip.messaging` was disabled. So a later direct message of that
   conversation carries no reply note, and a `sinceLastSeen` open reads
-  forward from that message, where it read the newest messages.
+  forward from that message, where it read the newest messages. While
+  `zulip.messaging` is disabled the watermark comes as the message comes in,
+  so a conversation's first direct message then carries no reply note
+  either.
 - After a reconnect within one process, a channel's watermark follows only
   what the new connection's host accepts. It used to jump, once a held
   message was settled, to the newest message that an earlier connection's
@@ -36,7 +39,8 @@
   refuses for another reason still ends the hole, as before. Once a
   channel's wait for its history is set to reach 90 s, every open channel
   gets one line naming the channels whose reads wait then, and one more line
-  when no read waits any more. With no channel open, both lines go to the
-  log. After a break, each open channel's notice of the break counts what
-  had come when the notice reached that channel, and says how many channels
-  still wait for a read of their history.
+  when no read waits any more. The first line names no channel that is muted
+  or outside the allowlist, and goes only if it names one. With no channel
+  open, both lines go to the log. After a break, each open channel's notice
+  of the break counts what had come when the notice reached that channel,
+  and says how many channels still wait for a read of their history.

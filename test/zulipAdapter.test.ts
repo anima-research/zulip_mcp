@@ -227,6 +227,38 @@ test('a message without a stream_id is placed by its exact name, and its descrip
   assert.deepEqual(seen, [{ id: 'zulip:ops', address: { stream_name: 'ops', stream_id: 12 } }]);
 });
 
+test("an edit that also moves a later message, of a first message the cache doesn't hold, is read from Zulip and told as that message's edit", async () => {
+  const events = [
+    { id: 1, type: 'message', flags: [], message: raw(6) },
+    { id: 2, type: 'update_message', message_id: 5, message_ids: [5, 6], user_id: 7, edit_timestamp: 1_700_000_905, orig_content: 'm5', content: 'm5 fixed', orig_subject: 'deploys', subject: 'elsewhere', flags: [], stream_id: 7 },
+  ];
+  let polls = 0;
+  const got: unknown[] = [];
+  const client = standInApi({
+    'GET /streams': async () => ({ result: 'success', streams: [{ name: 'general', stream_id: 7, subscriber_count: 2 }] }),
+    'GET /messages': async () => ({ result: 'success', messages: [], found_newest: true, found_oldest: true }),
+    'GET /messages/:id': async (_p: unknown, call: { id?: number }) => { got.push(`GET /messages/${call.id}`); return { result: 'success', message: raw(call.id!) }; },
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => { polls++; if (polls === 1) return { events }; return new Promise(() => {}); },
+  }).api;
+  const filters: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters, dmDiscoveryLimit: 0 });
+  await adapter.discoverChannels();
+  const original = console.error;
+  console.error = () => {};
+  try {
+    adapter.startEvents(inTurn(() => {}), undefined, undefined, (entry) => {
+      void entry.ready().then((c) => { got.push(c && { kind: c.kind, messageId: c.messageId, content: c.content, topic: c.topic }); });
+    });
+    const deadline = Date.now() + 2000;
+    while (!got.some((g) => typeof g !== 'string') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    adapter.stopEvents();
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(got, ['GET /messages/5', { kind: 'edit', messageId: '5', content: 'm5 fixed', topic: 'elsewhere' }]);
+});
+
 test('two moves of one cached message, the second arriving while the first waits, leave the cache at the second\'s stream', async () => {
   const first = [
     { id: 1, type: 'message', flags: [], message: raw(5) },

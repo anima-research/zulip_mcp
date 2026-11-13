@@ -230,7 +230,8 @@ test("a lane that a host's job reaches as the turn comes back to it doesn't keep
   assert.deepEqual(log, ['C', 'A host', 'B', 'A']);
 });
 
-test("a lane that a host's job reaches just as its hold ends doesn't keep the turn from the next lane that can read, with the host's job 0 to 6 microtasks after the holds end", async () => {
+test("a lane that a host's job reaches before it reads, just as its hold ends, doesn't keep the turn from the next lane that can read, wherever a host job 0 to 6 microtasks after the holds end comes ahead of both reads", async () => {
+  let reached = 0;
   for (let k = 0; k <= 6; k++) {
     const l = lanes();
     const log: string[] = [];
@@ -250,18 +251,26 @@ test("a lane that a host's job reaches just as its hold ends doesn't keep the tu
     readC.open();
     await new Promise((r) => setImmediate(r));
     const hostJobAfter = (hops: number): void => {
-      if (hops === 0) l.lane(A).host(async () => { log.push('A host'); await hostA.opened; });
-      else queueMicrotask(() => hostJobAfter(hops - 1));
+      if (hops === 0) {
+        log.push('A host entered');
+        l.lane(A).host(async () => { log.push('A host'); await hostA.opened; });
+      } else queueMicrotask(() => hostJobAfter(hops - 1));
     };
     holdB.open();
     queueMicrotask(() => hostJobAfter(k));
     holdA.open();
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
-    assert.ok(log.includes('B'), `${k} hops: B didn't read while A's host job ran: ${log.join(', ')}`);
+    const entered = log.indexOf('A host entered');
+    const readB = log.indexOf('B');
+    if (!log.includes('A') && (readB === -1 || entered < readB)) {
+      reached++;
+      assert.ok(readB !== -1, `${k} hops: B didn't read while A's host job waited ahead of A's read: ${log.join(', ')}`);
+    }
     hostA.open();
     await l.quiet();
-    assert.deepEqual([...log].sort(), ['A', 'A host', 'B', 'C'], `${k} hops`);
+    assert.deepEqual([...log].sort(), ['A', 'A host', 'A host entered', 'B', 'C'], `${k} hops`);
   }
+  assert.ok(reached > 0, 'no hop count put the host job ahead of both reads');
 });
 
 test('ending the lanes drops what waits, tells a running job, waits for it within the grace, and takes nothing after', async () => {

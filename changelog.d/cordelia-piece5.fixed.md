@@ -12,24 +12,29 @@
   attachments holds back only its own channel. A reaction is checked against
   the filters when it is placed in its channel and again at its turn. One
   whose stream the server doesn't know yet is checked at its turn only.
-- A host's `channels/open` or `channels/close` of a channel the server
-  already knows no longer waits for the requests ahead of it, such as a tool
-  call that waits for the host. It waits for the job running on its own
-  channel, such as one message being handled. So a host that opens a channel
-  before it answers that channel's announcement, as agent-framework 0.18.0
-  and older did, no longer stalls for 5 s behind a tool call that announced
-  the channel.
+- A host's `channels/open` or `channels/close` that names by its id a
+  channel the server already knows no longer waits for the requests ahead of
+  it, such as a tool call that waits for the host. It waits for the job
+  running on its own channel, such as one message being handled. It still
+  waits for the requests ahead of it while one of them is a
+  `featureSets/update`, an open or close of the same channel, or an open or
+  close whose channel the server couldn't name when it came. An open by type
+  and address waits for the requests ahead of it, as before. So a host that
+  opens a channel before it answers that channel's announcement, as
+  agent-framework 0.18.0 and older did, no longer stalls for 5 s behind a
+  tool call that announced the channel.
 - A message still waiting for its attachments when the host opened its
   channel came both in the open's history and again as a message. The
-  history an open returns now ends below the first message of its channel
-  that the server hasn't handed on yet, and each such message follows the
-  open's answer once, as a message.
+  history an open returns now ends below the first message that waits in
+  its channel's lane, and each such message follows the open's answer once,
+  as a message.
 - After a restart, a message the host hadn't accepted wasn't offered again
   when the host had accepted nothing on its channel before it, such as one
   the host refused, or one that was waiting or on its way when the
   connection ended. Such a channel had no watermark on disk. It now gets one
-  just below that message, so the next start offers it if Zulip's history
-  still has it there.
+  just below that message, so the next start's catch-up offers it, as it
+  offers any message above the watermark, if Zulip's history still has it
+  there.
 - A message that arrived while the host had `zulip.messaging` disabled was
   dropped, unless it was already waiting in the batch. It now waits in its
   channel until the host enables `zulip.messaging` again. An edit of it that
@@ -110,8 +115,13 @@
   of them goes with it: the read brings each of those messages as Zulip has
   it then, or doesn't bring it. With the catch-up limit at 0, or on a closed
   channel that the host holds no id for when the read runs, that read brings
-  none of them, and the log says so. A reaction that was waiting stays, and
-  its turn comes after the read.
+  none of them, and the log says so where the give-up already sees it. A
+  read that Zulip refuses for a reason other than its rate limit brings none
+  of them either, and the log gives the refusal. A later read of held
+  messages then offers the first of them, and once the host accepts it, the
+  rest aren't offered again, after a restart either. A reaction, or a change
+  about another message, that was waiting stays, and its turn comes after
+  the read.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip

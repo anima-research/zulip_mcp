@@ -6,7 +6,9 @@
  *   watermarks   channelId → highest message id forwarded to the host. A
  *                channel the host has accepted nothing on gets one just
  *                below its lowest held message once a hold there is no
- *                longer on its way (`hold`, `refuse`, `failQueued`). The
+ *                longer on its way (`hold`, `refuse`, `failQueued`), and,
+ *                while `zulip.messaging` is disabled, as a message comes in
+ *                (`watermarkBelowHolds`). The
  *                "since when" anchor for a channel's catch-up at a
  *                connection's start, for gap
  *                recovery after a Zulip event-queue expiry, and for
@@ -369,7 +371,7 @@ export class DeliveryState {
       .sort((a, b) => a - b);
   }
 
-  /** A held read has offered these ids again: no later held read asks for them until `clearReplayed`. */
+  /** A held read has tried these ids again: no later held read asks for them until `clearReplayed`. */
   markReplayed(key: ChannelKey, ids: number[]): void {
     const held = this.held.get(key);
     if (!held) return;
