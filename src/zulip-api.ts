@@ -2,6 +2,7 @@ export type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 export interface RequestOptions {
   timeoutMs?: number;
+  needsSelfId?: boolean;
 }
 
 export interface ZulipRefusal {
@@ -45,7 +46,7 @@ export class ZulipNoAnswer extends Error {
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
-      : method === 'GET' ? '' : 'The request was not sent.'}`.trim());
+      : method === 'GET' && kind !== 'no-self-id' ? '' : 'The request was not sent.'}`.trim());
     this.name = 'ZulipNoAnswer';
   }
 }
@@ -142,7 +143,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
     get selfUserId() { return selfUserId; },
     read,
     transport: async (method, path, params, opts) => {
-      if (selfUserId === null && !refused) {
+      if (selfUserId === null && !refused && opts?.needsSelfId !== false) {
         const failure = await read();
         if (failure) {
           throw new ZulipNoAnswer('no-self-id', method, path, false,

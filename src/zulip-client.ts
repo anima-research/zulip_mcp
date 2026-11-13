@@ -100,7 +100,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   // actually accept rather than a guess. Fail-open: unknown → null.
   let maxUploadBytes: number | null = null;
   try {
-    const settings = await zulipApi(transport).requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS });
+    const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS, needsSelfId: false });
     const mib = settings.result === "success" ? settings.max_file_upload_size_mib : undefined;
     if (typeof mib === "number" && Number.isFinite(mib) && mib > 0) maxUploadBytes = Math.floor(mib * 1024 * 1024);
     else if (isRefusal(settings)) {
@@ -140,7 +140,7 @@ export async function subscribeConfigured(api: ZulipApi, directory: StreamDirect
   try {
     const result = await api.requestAnswer<{ subscribed?: unknown; already_subscribed?: unknown }>("POST", "/users/me/subscriptions", {
       subscriptions: streams.map((name) => ({ name })),
-    });
+    }, { needsSelfId: false });
     if (isRefusal(result)) {
       console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]: Zulip refused POST /users/me/subscriptions: ${refusalText(result)}`);
       return;

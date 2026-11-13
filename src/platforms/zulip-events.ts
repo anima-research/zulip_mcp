@@ -246,7 +246,7 @@ export class ZulipEventLoop {
       all_public_streams: true,
       apply_markdown: false,
       client_capabilities: { notification_settings_null: false, bulk_message_deletion: true },
-    });
+    }, { needsSelfId: false });
 
     // A refused registration comes back as a value, not a throw. Without
     // this check the loop went on polling queue "undefined" and logged only
