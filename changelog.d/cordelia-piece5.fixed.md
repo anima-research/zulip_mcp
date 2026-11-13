@@ -141,7 +141,7 @@
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip
-  sent them, and the reactions and changes, and the stream messages without
+  sent them, and the reactions, and the changes and stream messages without
   a stream id, that arrive meanwhile wait behind them. A direct message
   doesn't wait. On a queue that sends a stream's
   id with one message and not with another, a message without the id can

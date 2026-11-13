@@ -46,8 +46,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   can follow a message the server received after it. A message waiting for
   its quote lookup or its attachments holds back only its own channel. An
   event that only a lookup can place waits for it, such as a
-  reaction to a message the server hasn't seen, and the reactions and changes
-  after it, and the stream messages after it that carry no stream id, wait
+  reaction to a message the server hasn't seen, and the reactions after it,
+  and the changes and stream messages after it that carry no stream id, wait
   behind it. A direct message doesn't wait. When delivery
   stops, a message the server already holds is offered by the next
   connection's catch-up, as any message above the watermark is, if Zulip's

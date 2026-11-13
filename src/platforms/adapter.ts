@@ -55,7 +55,7 @@ export interface RoutingHints {
  * the platform, and answers null for a message that isn't for the host.
  * `newChannel` describes the message's channel wherever the adapter can
  * describe it, on every message; the server registers it with the host
- * before routing when the host holds no id for that channel.
+ * when it routes the message, if the host holds no id for that channel.
  */
 export interface IncomingEntry {
   key: ChannelKey;
