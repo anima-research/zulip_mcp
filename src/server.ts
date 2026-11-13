@@ -321,7 +321,7 @@ export class ZulipMcplServer {
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
     this.tools.answerHints = {
       followed: (key) => this.channelManager.hintsFrom(key),
-      follow: (key, from, topic) => this.followOwnMove(key, from, topic),
+      follow: (key, from, topic) => this.followInLane(key, from, topic),
     };
   }
 
@@ -2021,7 +2021,7 @@ export class ZulipMcplServer {
     }));
   }
 
-  private followOwnMove(key: ChannelKey, from: number, topic: string): Promise<void> {
+  private followInLane(key: ChannelKey, from: number, topic: string): Promise<void> {
     const lane = this.lanes?.lane(key);
     if (!lane) return Promise.resolve();
     return new Promise((ran) => lane.answer((ctx) => {

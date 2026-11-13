@@ -1196,7 +1196,7 @@ for (const [label, answer] of [
   });
 }
 
-async function movedWhileLaneBusy(h: Harness, realm: ReturnType<typeof movingRealm>, fetches: ReturnType<typeof heldFetches>, open: boolean) {
+async function laneBusyAfterThree(h: Harness, fetches: ReturnType<typeof heldFetches>, open: boolean) {
   await initialize(h, true);
   await settled(h);
   if (open) {
@@ -1209,6 +1209,9 @@ async function movedWhileLaneBusy(h: Harness, realm: ReturnType<typeof movingRea
   if (!open) h.policy.rejectPushes.add('4');
   h.adapter.emit!(withLog(streamMsg(4, { mentioned: !open })));
   await until(() => fetches.started.length === 1, "message 4's attachment holds the lane");
+}
+
+async function moveThree(realm: ReturnType<typeof movingRealm>) {
   let done = false;
   const call = realm.tools.handleToolCall('move_messages', { message_id: 3, topic: 'releases', scope: 'one' }).finally(() => { done = true; });
   await until(() => realm.calls.some((c) => c.method === 'GET' && c.path === '/messages/3'), 'the read back');
@@ -1222,7 +1225,8 @@ test("move_messages still answers where the channel's lane ends while its job wa
   const h = harness({ tools: realm.tools, attachments: fetches.options, shutdownGraceMs: 50 });
   let closed = false;
   try {
-    const moving = await movedWhileLaneBusy(h, realm, fetches, false);
+    await laneBusyAfterThree(h, fetches, false);
+    const moving = await moveThree(realm);
     assert.equal(moving.done(), false, 'the tool waits for its job');
     closed = true;
     await h.close();
@@ -1242,7 +1246,8 @@ test("move_messages answers once its job has run, and the job leaves a plain ans
   const realm = movingRealm({ 3: 'deploys', 4: 'deploys' });
   const h = harness({ tools: realm.tools, attachments: fetches.options });
   try {
-    const moving = await movedWhileLaneBusy(h, realm, fetches, true);
+    await laneBusyAfterThree(h, fetches, true);
+    const moving = await moveThree(realm);
     assert.equal(moving.done(), false, 'the tool waits for its job');
     fetches.release();
     assert.deepEqual(await moving.call, { channelId: 'zulip:general', channel: 'general', topic: 'releases' });
@@ -1262,8 +1267,9 @@ test('move_messages waits for its job up to 5 s, then answers with the note, and
   const h = harness({ tools: realm.tools, attachments: fetches.options });
   const original = globalThis.setTimeout;
   try {
+    await laneBusyAfterThree(h, fetches, false);
     globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 5_000 ? 50 : ms, ...rest)) as typeof setTimeout;
-    const moving = await movedWhileLaneBusy(h, realm, fetches, false);
+    const moving = await moveThree(realm);
     const result = await moving.call;
     globalThis.setTimeout = original;
     assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases', note: 'To answer this message where it is now, use send_message with reply_to.' });

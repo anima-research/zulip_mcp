@@ -118,11 +118,8 @@ const MOVE_NOTE = "To answer this message where it is now, use send_message with
 // to three requests of 15 s each before this wait, so the call's bounds add up to 50 s (anima-research/zulip_mcp#60).
 const FOLLOW_WAIT_MS = 5_000;
 
-/** What the MCPL server lends the tools about where a channel's plain answers go. */
 export interface AnswerHints {
-  /** The id of the message whose topic a channel's plain answers follow, if any. */
   followed(key: ChannelKey): number | undefined;
-  /** Settles once a job in the channel's lane has run that gives the answers `topic` where they still follow message `from`. */
   follow(key: ChannelKey, from: number, topic: string): Promise<void>;
 }
 
@@ -262,7 +259,6 @@ export class ZulipToolRuntime {
 
   channelIds: ChannelIds | null = null;
 
-  /** Set by the MCPL server, so that the agent's own move takes its channel's plain answers along before move_messages answers. */
   answerHints: AnswerHints | null = null;
 
   private async streamIdsByName(names: string[]): Promise<Map<string, number>> {
