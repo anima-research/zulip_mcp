@@ -20,8 +20,9 @@ import {
 import type { ZulipSession } from "./zulip-client.js";
 import { mayHaveBeenApplied, ZulipNoAnswer, type ZulipApi } from "./zulip-api.js";
 import { dmChannelIdFor, dmCounterparts, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage, type ZulipRecipient, editedTrailer } from './history.js';
-import { SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
+import { prepareOutgoing, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from "./outgoing.js";
 import type { SentRecord } from "./platforms/adapter.js";
+import { linkMessages, MessageLinkRefused, type Audience } from "./message-links.js";
 import { messageLineHead } from "./message-line.js";
 import { agentLineTimeFormatter } from "./timezone.js";
 import {
@@ -31,7 +32,6 @@ import {
   prepareAttachments,
   resolveUploadPolicy,
   uploadPrepared,
-  type UploadedFile,
   type UploadPolicy,
   type Uploader,
 } from "./uploads.js";
@@ -280,15 +280,17 @@ export class ZulipToolRuntime {
     this.reactionPolicy = policy;
   }
 
-  private async send(destination: Destination, content: string, uploaded: UploadedFile[], channelId: string) {
+  private async send(destination: Destination, content: string, args: Record<string, any>, channelId: string) {
     try {
       return await sendMessage(this.api, destination, content, {
         limit: this.maxMessageLength,
-        uploaded,
+        unlinkable: "refuse",
+        upload: () => this.uploadFor(args),
         onChunk: (chunk) => this.onSent?.({ messageId: String(chunk.id), channelId, content: chunk.content }),
       });
     } catch (err) {
       if (err instanceof SendRefused) throw new Error(err.answer.msg ?? "Zulip refused the message");
+      if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
       throw err;
     }
   }
@@ -706,11 +708,10 @@ export class ZulipToolRuntime {
         }
         const reply = args.reply_to !== undefined ? await this.replyDestination(args) : undefined;
         if (reply) args = { ...args, type: reply.type, to: reply.to, topic: reply.topic };
-        const uploaded = await this.uploadFor(args);
         const channelId = reply?.channelId ?? (args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
           ? dmChannelIdFor(args.to as number[])
           : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`);
-        const { chunks, last } = await this.send({ type: args.type, to: args.to, topic: args.topic }, hasText ? args.content : "", uploaded, channelId);
+        const { chunks, last, uploaded } = await this.send({ type: args.type, to: args.to, topic: args.topic }, hasText ? args.content : "", args, channelId);
         const ids = chunks.map((c) => c.id);
         return {
           ...last,
@@ -727,8 +728,7 @@ export class ZulipToolRuntime {
         const hasFiles = Array.isArray(args.attachments) && args.attachments.length > 0;
         if (!hasText && !hasFiles) throw new Error("content is required (or at least one attachment)");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
-        const uploaded = await this.uploadFor(args);
-        const { chunks, last: result } = await this.send({ type: "private", to: ids }, hasText ? args.content : "", uploaded, dmChannelIdFor(ids));
+        const { chunks, last: result, uploaded } = await this.send({ type: "private", to: ids }, hasText ? args.content : "", args, dmChannelIdFor(ids));
         const sent = chunks.map((c) => c.id);
         return {
           ...result,
@@ -753,11 +753,28 @@ export class ZulipToolRuntime {
       case "edit_message": {
         const messageId = positiveIdArg("message_id", args.message_id);
         if (typeof args.content !== "string") throw new Error("content must be a string");
-        const length = [...args.content].length;
-        if (length > this.maxMessageLength) {
-          throw new Error(`content is ${length} characters, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
+        const edited = async (): Promise<Audience> => {
+          const { message } = await api.request<{ message?: { type?: unknown; stream_id?: unknown } }>("GET", `/messages/${messageId}`, `reading message ${messageId}`, { apply_markdown: false, allow_empty_topic_name: true });
+          return message?.type === "stream" && typeof message.stream_id === "number" ? { kind: "stream", id: message.stream_id } : { kind: "direct" };
+        };
+        const tabled = prepareOutgoing(args.content);
+        let content: string;
+        try {
+          content = await linkMessages(api, tabled, edited, "refuse");
+        } catch (err) {
+          if (err instanceof MessageLinkRefused) throw new Error(`${err.message} The message wasn't edited.`);
+          throw err;
         }
-        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content: args.content });
+        const length = [...content].length;
+        if (length > this.maxMessageLength) {
+          const changes = [
+            ...(tabled === args.content ? [] : ["a blank line above each table under a line of text"]),
+            ...(content === tabled ? [] : ["each [[msg:ID]] as its link"]),
+          ];
+          const posted = changes.length === 0 ? "" : ` as it would be posted, with ${changes.join(" and ")} (${[...args.content].length} as written)`;
+          throw new Error(`content is ${length} characters${posted}, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
+        }
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content });
       }
 
       case "delete_message": {
