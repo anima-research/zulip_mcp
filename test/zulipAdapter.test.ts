@@ -877,6 +877,42 @@ test('while a change waits for the lookup that places it, later reactions and ch
   } finally { adapter.stopEvents(); }
 });
 
+test("a stopped event loop's events that still wait for their placement are not looked up, so the next loop's events don't wait behind them", async () => {
+  let releaseOld!: () => void;
+  const oldLookup = new Promise<void>((resolve) => { releaseOld = resolve; });
+  let registrations = 0;
+  const served = new Set<string>();
+  const reaction = (id: number, messageId: number) => ({ id, type: 'reaction', op: 'add', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: messageId, user_id: 42 });
+  const { api: client, calls } = standInApi({
+    'POST /register': async () => ({ queue_id: `q${++registrations}`, last_event_id: -1 }),
+    'GET /events': async (params) => {
+      const queue = String(params.queue_id);
+      if (served.has(queue)) return new Promise(() => {});
+      served.add(queue);
+      return { events: queue === 'q1' ? [reaction(1, 60), reaction(2, 61)] : [reaction(1, 62)] };
+    },
+    'GET /messages/:id': async (_params, call) => {
+      if (call.id === 60) await oldLookup;
+      if (call.id === 61) await new Promise(() => {}); // an answer that never comes
+      return { result: 'success', message: raw(call.id!) };
+    },
+  });
+  const adapter = new ZulipAdapter(client, SELF, 's', { dmDiscoveryLimit: 0, directory: directoryOf() });
+  const placed: string[] = [];
+  const deadline = Date.now() + 2000;
+  adapter.startEvents(() => {}, undefined, (r) => { placed.push(r.messageId); });
+  while (!calls.some((c) => c.path === '/messages/60') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  adapter.stopEvents();
+  adapter.startEvents(() => {}, undefined, (r) => { placed.push(r.messageId); });
+  try {
+    while (!served.has('q2') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    releaseOld();
+    while (!placed.includes('62') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(placed, ['62']);
+    assert.equal(calls.some((c) => c.path === '/messages/61'), false);
+  } finally { adapter.stopEvents(); }
+});
+
 test("a DM's row is built at its turn: an edit that arrived while it waited gives it the new text and \"(edited)\", and a deletion takes it out", async () => {
   const events = [
     { id: 1, type: 'message', flags: [], message: { ...dm(40, 7), content: 'first words' } },
