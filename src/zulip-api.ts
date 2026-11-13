@@ -146,7 +146,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
         const failure = await read();
         if (failure) {
           throw new ZulipNoAnswer('no-self-id', method, path, false,
-            `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. It reads it again before the next request.`,
+            `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. A later call reads it again.`,
             undefined, failure.retryAfterSeconds);
         }
       }

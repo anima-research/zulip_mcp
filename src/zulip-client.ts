@@ -89,7 +89,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
 
   const failure = await gate.read({ timeoutMs: LONG_TIMEOUT_MS });
   if (failure) {
-    console.error(`Failed to read the bot's own user id: ${failure.reason}. The server reads it again before its next request to Zulip, and that request fails if the read does.`);
+    console.error(`Failed to read the bot's own user id: ${failure.reason}. A later request reads it again, and fails if that read does.`);
   }
 
   // The realm's upload cap, so the outbound ceiling is what the server will

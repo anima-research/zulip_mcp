@@ -648,17 +648,25 @@ test("two requests at once while the bot's own user id is unknown make one read 
   } finally { s.done(); z.close(); }
 });
 
-test("where Zulip refuses the bot its profile with a client error, as it refuses an incoming-webhook bot, every request goes out as before, and the profile isn't read again", async () => {
+test("where Zulip refuses the bot its profile with a client error, as it refuses an incoming-webhook bot, every request goes out as before, the profile isn't read again, and one line says so", async () => {
   const z = await realm({
     'GET /users/me': { status: 400, json: { result: 'error', code: 'BAD_REQUEST', msg: 'This API is not available to incoming webhook bots.' } },
     'POST /messages': { json: { result: 'success', id: 501 } },
   });
-  const s = await serverOn(z.url);
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
   try {
-    for (const content of ['one', 'two']) await s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
+    const session = await initializeZulipClient({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+    const tools = new ZulipToolRuntime(session, dir);
+    for (const content of ['one', 'two']) await tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
     assert.deepEqual(z.requests.map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /server_settings', 'POST /messages', 'POST /messages']);
-    assert.equal(s.session.selfUserId, null);
-  } finally { s.done(); z.close(); }
+    assert.equal(session.selfUserId, null);
+  } finally { console.error = original; rmSync(dir, { recursive: true, force: true }); z.close(); }
+  assert.deepEqual(lines.filter((line) => line.includes('/users/me')), [
+    "Zulip refused the read of the bot's own user id: Zulip answered GET /users/me with HTTP 400: This API is not available to incoming webhook bots. (BAD_REQUEST). The server goes on without it for this run.",
+  ]);
 });
 
 test("a start whose read of the bot's profile fails still reads the realm's upload cap", async () => {
