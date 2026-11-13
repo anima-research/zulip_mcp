@@ -5815,3 +5815,21 @@ test('after a break, a closed channel that has no watermark, and whose first mes
   await until(() => h.pushed.some((p) => /id=2\]/.test((p.payload.content[0] as { text: string }).text)), 'the mention lost in the break, offered');
   await h.close();
 });
+
+test("a read for held ids that the connection's end cuts short partway marks offered only the rows it handed", async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [withLog(streamMsg(1)), streamMsg(2), streamMsg(3)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectOnce.add('1');
+  h.policy.rejectOnce.add('2');
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).length === 2, '1 and 2 refused, and held');
+  h.adapter.emit!(streamMsg(3));
+  await until(() => fetches.started.length === 1, "the read's row 1, waiting for its attachment");
+  void h.served.then(fetches.release);
+  await h.close();
+  assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1, 2]);
+});

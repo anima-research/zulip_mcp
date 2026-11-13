@@ -1261,7 +1261,7 @@ export class ZulipMcplServer {
     }
     return async (ctx) => {
       if (ctx.ended) return;
-      if (open) ctx.w.delivery.markReplayed(key, ids);
+      if (open && !hand) ctx.w.delivery.markReplayed(key, ids);
       try {
         await hand?.(ctx);
       } catch (err) {
@@ -1286,6 +1286,8 @@ export class ZulipMcplServer {
       for (const m of rows) {
         if (ctx.ended) return;
         await this.route(ctx, recovered(m), undefined, gap);
+        const id = numericId(m);
+        if (id !== null && !ctx.ended) ctx.w.delivery.markReplayed(key, [id]);
       }
       if (rows.length > 0) console.error(`[zulip-mcp] ${this.label(key)}: replaying ${rows.length} undelivered message(s) from history`);
     };
