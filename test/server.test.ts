@@ -32,7 +32,7 @@ import type { ChangeEntry, ChannelHistoryPage, ChannelHistoryQuery, MessageChang
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
-import { FiltersPlane } from '../src/filters.ts';
+import { FiltersPlane, type ZulipFilters } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
@@ -554,7 +554,7 @@ test('a plain-MCP client gets tools and resources, and no MCPL manifest', async 
   await h.close();
 });
 
-test('requests are served one at a time, in the order they arrive', async () => {
+test('without MCPL, tool calls are served one at a time, in the order they arrive', async () => {
   const h = harness({ mcpl: false });
   await initialize(h, false);
   fakeTools.calls.length = 0;
@@ -1664,6 +1664,9 @@ function boDm(id: number, text = `dm ${id}`): IncomingChannelMessage {
 }
 
 const firstText = (p: PushEventParams) => (p.payload.content[0] as { text: string }).text;
+const incomingIds = (h: Harness) => h.hostSaw
+  .filter((r) => r.method === method.CHANNELS_INCOMING)
+  .flatMap((r) => (r.params as unknown as ChannelsIncomingParams).messages.map((m) => m.messageId));
 
 test('a first message the host refused, on a channel where it had accepted nothing, is offered again after a restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-first-refused-'));
@@ -1676,6 +1679,7 @@ test('a first message the host refused, on a channel where it had accepted nothi
     first.adapter.emit!(streamMsg(5));
     await first.server.quiet();
     assert.equal(first.incoming.length, 0, 'the host refused it');
+    assert.deepEqual(incomingIds(first), ['5'], 'the host was offered it');
     const onDisk = JSON.parse(readFileSync(join(dir, 'fr.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
     assert.equal(onDisk.watermarks['zulip:general'], 4, 'on disk before the connection ends');
     await first.close();
@@ -1774,6 +1778,7 @@ test('a first message the host refused, on a channel where it had accepted nothi
   first.adapter.emit!(streamMsg(5));
   await first.server.quiet();
   assert.equal(first.incoming.length, 0, 'the host refused it');
+  assert.deepEqual(incomingIds(first), ['5'], 'the host was offered it');
   await first.close();
 
   const second = harness({ reuse: { server: first.server, adapter: first.adapter } });
@@ -2212,6 +2217,34 @@ test('a stream muted while an addressed message of its closed channel waits for 
   }
 });
 
+for (const [label, message, channelId, narrow] of [
+  ['a stream taken out of the allowlist', withLog(streamMsg(1, { mentioned: true })), 'zulip:general', (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
+  ['a DM sender taken out of the DM allowlist', withLog(boDm(1)), 'zulip:dm:42', (f: ZulipFilters) => ({ ...f, dmUsers: ['7'] })],
+] as const) {
+  test(`${label} while an addressed message of its closed channel waits for its attachments pushes nothing`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-allow-mid-fetch-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const fetches = heldFetches();
+      const h = harness({ filters: plane, attachments: fetches.options });
+      await initialize(h, true);
+      await settled(h);
+      h.adapter.emit!(message, channelId === 'zulip:dm:42' ? BO_DM : undefined);
+      await until(() => fetches.started.length === 1, 'the fetch to start');
+      assert.equal(plane.update(narrow).ok, true);
+      fetches.release();
+      await h.server.quiet();
+      assert.equal(h.pushed.length, 0, 'narrowed while it waited: nothing reaches the agent');
+      assert.equal(h.delivery.floor(channelId), undefined, 'and nothing stays held');
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('a catch-up block the host refuses keeps the watermark below it, and is offered again once the host accepts a later message', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-refused-block-'));
   try {
@@ -2335,7 +2368,7 @@ test('a catch-up block refused after its stream was muted leaves nothing held', 
   }
 });
 
-test('a message refused at its offer and again at its replay is offered a third time only after a break of the event queue', async () => {
+test('a message refused at its offer and again at its replay is offered no third time when a later message is accepted, and is offered a third time after a break of the event queue', async () => {
   const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
   await initialize(h, true);
   await settled(h);
@@ -3777,31 +3810,34 @@ test('a channel the host never answered for stays usable here and is re-announce
   await h.close();
 });
 
-test('a host that opens or closes a pending channel has confirmed it; the backlog does not grow forever (#20)', async () => {
-  // A host that takes channels/changed as a notification never answers it.
-  // The host acting on the channel is the only confirmation available, so
-  // it has to count as one.
-  const h = harness({ announceTimeoutMs: 80 });
-  await initialize(h, true);
-  await settled(h);
-  h.policy.changedAnswer = 'error';
-  h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
+for (const act of ['opens', 'closes'] as const) {
+  test(`a host that ${act} a pending channel has confirmed it; the backlog does not grow forever (#20)`, async () => {
+    // A host that takes channels/changed as a notification never answers it.
+    // The host acting on the channel is the only confirmation available, so
+    // it has to count as one.
+    const h = harness({ announceTimeoutMs: 80 });
+    await initialize(h, true);
+    await settled(h);
+    h.policy.changedAnswer = 'error';
+    h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
 
-  const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
-    { pendingAnnouncement?: string[] };
-  assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'no answer came');
-  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} });
-  h.policy.changedAnswer = 'accept';
+    const first = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+      { pendingAnnouncement?: string[] };
+    assert.deepEqual(first.pendingAnnouncement, ['zulip:ops'], 'no answer came');
+    if (act === 'opens') await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} });
+    else await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' });
+    h.policy.changedAnswer = 'accept';
 
-  // Second call: nothing pending, no second announcement, no stall.
-  const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
-  const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
-    { added: string[]; pendingAnnouncement?: string[]; note: string };
-  assert.equal(second.pendingAnnouncement, undefined, 'the host proved it knows the channel by opening it');
-  assert.deepEqual(second.added, []);
-  assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, announcements, 'and it is not announced again');
-  await h.close();
-});
+    // Second call: nothing pending, no second announcement, no stall.
+    const announcements = h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length;
+    const second = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { content: { text: string }[] }).content[0].text) as
+      { added: string[]; pendingAnnouncement?: string[]; note: string };
+    assert.equal(second.pendingAnnouncement, undefined, `the host proved it knows the channel when it ${act === 'opens' ? 'opened' : 'closed'} it`);
+    assert.deepEqual(second.added, []);
+    assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_CHANGED).length, announcements, 'and it is not announced again');
+    await h.close();
+  });
+}
 
 test('a channel the host itemizes as refused is not registered, and refresh_channels says so (#20)', async () => {
   const h = harness();
@@ -3957,11 +3993,19 @@ test('an open and then a close for a channel id the directory does not hold yet 
   h.adapter.visible = [DESCRIPTOR, LATE_STREAM];
   h.policy.changedAnswer = 'held';
   const answered: string[] = [];
+  const read: string[] = [];
+  const next = h.serverSide.nextMessage.bind(h.serverSide);
+  h.serverSide.nextMessage = async () => {
+    const message = await next();
+    if (message.type === 'request') read.push(message.request.method);
+    return message;
+  };
   const open = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:ops', type: 'zulip', address: {} }).then(() => answered.push('open'));
   await until(() => h.policy.heldChanged.length === 1, "the open's re-discovery to announce the stream");
   const close = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:ops' }).then(() => answered.push('close'));
-  // Keep this wait: a server that served the close first shows only within it.
-  await new Promise((r) => setTimeout(r, 50));
+  await until(() => read.includes(method.CHANNELS_CLOSE), 'the server to read the close');
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(answered, [], 'nothing answered while the open waits for its announcement');
   h.policy.heldChanged.shift()!();
   await Promise.all([open, close]);
   assert.deepEqual(answered, ['open', 'close']);
@@ -6231,20 +6275,22 @@ test('after a break, a closed channel that has no watermark, and whose first mes
 
 test("a read for held ids that the connection's end cuts short partway marks offered only the rows it handed", async () => {
   const fetches = heldFetches();
-  const h = harness({ attachments: fetches.options, history: [withLog(streamMsg(1)), streamMsg(2), streamMsg(3)] });
+  const h = harness({ attachments: fetches.options, history: [streamMsg(1), withLog(streamMsg(2)), streamMsg(3)] });
   await initialize(h, true);
   await settled(h);
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
-  h.policy.rejectOnce.add('1');
+  h.policy.rejectIds.add('1');
   h.policy.rejectOnce.add('2');
   h.adapter.emit!(streamMsg(1));
   h.adapter.emit!(streamMsg(2));
   await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).length === 2, '1 and 2 refused, and held');
   h.adapter.emit!(streamMsg(3));
-  await until(() => fetches.started.length === 1, "the read's row 1, waiting for its attachment");
+  await until(() => fetches.started.length === 1, "the read's row 2, waiting for its attachment");
+  await until(() => incomingIds(h).filter((id) => id === '1').length === 2, 'the read handed row 1, and the host was offered it again');
   void h.served.then(fetches.release);
   await h.close();
-  assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [1, 2]);
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), [1, 2], 'both stay held');
+  assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [2], 'only the row it handed is marked offered');
 });
 
 test("a muted channel's read for held ids lets go of every hold but those of messages that wait in its lane: a message whose job waits on its lookup keeps its hold", async () => {
