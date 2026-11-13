@@ -25,9 +25,11 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Every stream and DM conversation the bot can see is a channel the host can
   open and close. Opening a channel subscribes the bot to the stream first
-  (Zulip only delivers events to subscribers) — a stream the bot cannot
-  subscribe to fails the open rather than opening onto silence — and can
-  return backscroll atomically.
+  (without a subscription, a public stream sends the bot a message's edits
+  and reactions only when the message mentions it, and a private stream sends
+  at most the messages that mention it) — a stream the bot cannot subscribe
+  to fails the open rather than opening without it — and can return
+  backscroll atomically.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
   `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
@@ -527,8 +529,11 @@ environment). Under connectome-host, point it into the data volume, e.g.
 
 ## Notes for operators
 
-- **Subscription is not optional.** Zulip delivers stream events only to
-  subscribers, even with `all_public_streams` on the event queue. Opening a
+- **Subscription is not optional.** Even with `all_public_streams` on the
+  event queue, a public stream sends a bot that isn't subscribed its new
+  messages, with mentions of the bot flagged, but a message's edits and
+  reactions only when the message mentions the bot. A private stream sends
+  it at most the messages that mention it. Opening a
   channel subscribes the bot (and fails if it cannot — a private stream the
   bot was not invited to answers `success` with the stream under
   `unauthorized`, which this server treats as a refusal); `ZULIP_SUBSCRIBE`
