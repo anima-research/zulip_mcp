@@ -1749,6 +1749,81 @@ scenario('71. under a disabled zulip.messaging, an edit runs after an older edit
   } finally { release(); await run.close(); }
 });
 
+scenario('72. once the host has answered a rename, an acknowledge under the old id, or under an id of no known format, adds its reaction, and a publish under the old id is still refused', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  try {
+    const posted = r.post(17, 'to acknowledge');
+    await renameWhileOpen(r, run);
+    await tookRename(run);
+    const ack = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: String(posted), value: 'eyes' });
+    assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
+    assert.deepEqual(r.calls.filter((c) => c.path.endsWith('/reactions')).map((c) => [c.method, c.path, c.params.emoji_name]), [['POST', `/messages/${posted}/reactions`, 'eyes']]);
+    const unformed = await run.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'nonsense-general', messageId: String(posted), value: 'tada' });
+    assert.deepEqual(unformed, { acknowledged: true, representation: ':tada:' }, 'an id of no known format adds the reaction too');
+    await assert.rejects(publish(run, 'zulip:general', 'hello?'), /zulip:lobby/);
+  } finally { await run.close(); }
+});
+
+scenario('73. a host that leaves before it answers the push about a rename leaves the stream open at last sight: the next host gets its ambient messages in the backscroll', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const before = await start(r, dir);
+  let left: Run | undefined;
+  try {
+    await before.open('zulip:general');
+    const seen = r.post(17, 'seen while open');
+    await until(() => before.incoming.some((m) => m.messageId === String(seen)), 'delivery on the open channel');
+  } finally { await before.end(); }
+  r.rename(17, 'lobby');
+  try {
+    left = await start(r, dir, { reuse: before, noWait: true, beforePushAnswer: () => new Promise<void>(() => {}) });
+    await until(() => toldRename(left!).length > 0, 'the push');
+  } finally { await left?.end(); }
+  r.post(17, 'ambient after the rename');
+  const next = await start(r, dir, { reuse: left, noWait: true });
+  try {
+    await until(() => next.pushed.some((p) => payloadText(p).includes('ambient after the rename')), "the ambient message, in an open channel's backscroll");
+  } finally { await next.close(); }
+});
+
+scenario("74. a deletion of a new stream's first message that comes while the message waits for the stream's announcement follows the message as a line", async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });
+  const polls = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/events').length;
+  try {
+    const fresh = r.create('fresh');
+    const first = r.post(fresh, '@bot hello', { mentioned: true });
+    await until(() => run.changed.some((c) => c.added?.some((d) => d.id === 'zulip:fresh')), 'the held announcement');
+    const read = polls();
+    r.remove([first]);
+    await until(() => polls() > read, 'the deletion read');
+    run.releaseChanged();
+    await until(() => named(run, first), 'the message');
+    await run.server.quiet();
+    assert.equal(pushesAbout(run, 'delete', first).length, 1);
+  } finally { run.releaseChanged(); await run.close(); }
+});
+
+scenario('77. a move of a waiting message and a message the host has, whose waiting message is then deleted, reaches the host as a line about the other message', async (dir) => {
+  const r = realm({ 17: 'general' });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  try {
+    const had = r.post(17, '@bot first', { mentioned: true });
+    await until(() => named(run, had), 'the first mention');
+    await busyGeneral(r);
+    const waiting = r.post(17, '@bot second', { mentioned: true });
+    r.moveTopic([waiting, had], 'elsewhere');
+    r.remove([waiting]);
+    const after = r.post(17, '@bot after it', { mentioned: true });
+    release();
+    await until(() => named(run, after), 'the mention after it');
+    await run.server.quiet();
+    assert.equal(named(run, waiting), false);
+    assert.equal(pushesAbout(run, 'move', had).length, 1);
+  } finally { release(); await run.close(); }
+});
+
 scenario('75. while the host holds a renamed stream\'s old id, the history tools give a new stream under the old name no channel id', async (dir) => {
   const r = realm({ 17: 'general' });
   const run = await start(r, dir, { holdChanged: true, announceTimeoutMs: 60_000 });

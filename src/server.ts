@@ -210,7 +210,7 @@ export class ZulipMcplServer {
   private requestsWaiting = 0;
   private readonly hostRequestsOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
-  private grantUpdatesOnChain = 0;
+  private lifecycleWaitsOnChain = 0;
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private messagingHold: (() => void) | null = null;
   private readonly changesOnTurn = new Map<number, ChangeEntry[]>();
@@ -419,8 +419,10 @@ export class ZulipMcplServer {
         if (msg.type === 'request' && this.enterHostQueue(conn, msg.request)) continue;
         const lifecycleId = msg.type === 'request' ? this.lifecycleTarget(msg.request) : null;
         if (lifecycleId !== null) this.lifecycleOnChain.set(lifecycleId, (this.lifecycleOnChain.get(lifecycleId) ?? 0) + 1);
-        const grantUpdate = msg.type === 'request' && msg.request.method === method.FEATURE_SETS_UPDATE;
-        if (grantUpdate) this.grantUpdatesOnChain++;
+        const called = msg.type === 'request' ? msg.request.method : null;
+        const holdsLifecycle = called === method.FEATURE_SETS_UPDATE
+          || (lifecycleId === null && (called === method.CHANNELS_OPEN || called === method.CHANNELS_CLOSE));
+        if (holdsLifecycle) this.lifecycleWaitsOnChain++;
         this.requestsWaiting++;
         this.requestTail = this.requestTail.then(async () => {
           try {
@@ -430,7 +432,7 @@ export class ZulipMcplServer {
               : this.handleNotification(conn, msg.notification));
           } finally {
             this.requestsWaiting--;
-            if (grantUpdate) this.grantUpdatesOnChain--;
+            if (holdsLifecycle) this.lifecycleWaitsOnChain--;
             if (lifecycleId !== null) {
               const left = (this.lifecycleOnChain.get(lifecycleId) ?? 1) - 1;
               if (left > 0) this.lifecycleOnChain.set(lifecycleId, left);
@@ -474,7 +476,7 @@ export class ZulipMcplServer {
 
   private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {
     const channelId = lifecycleChannelId(req);
-    if (channelId === null || !this.mcplActive || !this.lanes || this.lifecycleOnChain.has(channelId) || this.grantUpdatesOnChain > 0) return false;
+    if (channelId === null || !this.mcplActive || !this.lanes || this.lifecycleOnChain.has(channelId) || this.lifecycleWaitsOnChain > 0) return false;
     if (!this.grant.has('channels.lifecycle')) return false;
     const answer = this.ids.resolve(channelId);
     if (!answer || !('key' in answer)) return false;
@@ -556,14 +558,17 @@ export class ZulipMcplServer {
       else this.renamedUnannounced.delete(key);
     }
     const keys = new Set([...this.delivery.watermarkedChannels(), ...this.delivery.talliedChannels(), ...this.delivery.lastOpenChannels()]);
+    const renamePushes = new Map<ChannelKey, Promise<boolean>[]>([...renamed].map((key) => [key, []]));
     for (const key of keys) {
       const lane = lanes.lane(key);
       const answers: Promise<boolean>[] = [];
-      lane.enterReadFirst((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readStart(r2, key, renamed.has(key), answers))));
+      lane.enterReadFirst((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readStart(r2, key, renamePushes.get(key) ?? null, answers))));
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
-        if (!ctx.ended && !conn.isClosed) this.pushRenamed(key);
+        if (ctx.ended || conn.isClosed) return;
+        const pushed = this.pushRenamed(key);
+        if (pushed) renamePushes.get(key)?.push(pushed);
       });
     }
     openLanes();
@@ -740,10 +745,8 @@ export class ZulipMcplServer {
             conn.sendResponse(req.id, { acknowledged: false, reason: 'this surface has no acknowledgment representation' });
             break;
           }
-          const ackKey = await this.ids.keyOf(ack.channelId);
-          if ('refusal' in ackKey) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, ackKey.refusal, { channelId: ack.channelId });
           try {
-            const representation = await this.adapter.acknowledge('key' in ackKey ? ackKey.key : null, ack.messageId, ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), ack.messageId, ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
             conn.sendResponse(req.id, { acknowledged: false, reason: (error as Error).message });
@@ -1107,7 +1110,7 @@ export class ZulipMcplServer {
       const ready = await entry.ready(changes);
       if (ctx.ended) return;
       const placeNow = this.placeOf(key);
-      if (id !== null && placeNow !== undefined && id <= placeNow) return;
+      if (id !== null && placeNow !== undefined && id <= placeNow) return this.letGo(ctx.w, key, id);
       if (ready === null) {
         if (id === null) return;
         ctx.decide(id);
@@ -1165,7 +1168,7 @@ export class ZulipMcplServer {
     if (newChannel && this.ids.heldIdOf(key) === undefined) {
       void this.channelManager.registerAdditional([newChannel]);
       const entryId = numericId(message);
-      ctx.lane.enterFirst((c) => this.route(c, message), { kind: 'message', ...(entryId !== null ? { id: entryId } : {}) });
+      ctx.lane.enterFirst((c) => this.route(c, message), { kind: 'message', started: true, ...(entryId !== null ? { id: entryId } : {}) });
       return;
     }
 
@@ -1319,9 +1322,10 @@ export class ZulipMcplServer {
       const rows = this.projectHistoryReactions(msgs);
       for (const m of rows) {
         if (ctx.ended) return;
+        const offered = this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
         await this.route(ctx, recovered(m), undefined, gap);
         const id = numericId(m);
-        if (id !== null && !ctx.ended) ctx.w.delivery.markReplayed(key, [id]);
+        if (id !== null && offered && !ctx.ended) ctx.w.delivery.markReplayed(key, [id]);
       }
       if (rows.length > 0) console.error(`[zulip-mcp] ${this.label(key)}: replaying ${rows.length} undelivered message(s) from history`);
     };
@@ -1408,7 +1412,7 @@ export class ZulipMcplServer {
    * Deferred quote verification can split a channel into multiple
    * `<missed>` pushes. On a closed channel the tally's backfill follows.
    */
-  private async readStart(r: Reading, key: ChannelKey, renamed: boolean, answers: Promise<boolean>[]): Promise<Hand> {
+  private async readStart(r: Reading, key: ChannelKey, renamePushes: Promise<boolean>[] | null, answers: Promise<boolean>[]): Promise<Hand> {
     let catchUp: Hand | void;
     let backfill: Hand | void;
     if (this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
@@ -1429,14 +1433,15 @@ export class ZulipMcplServer {
           if (oks.includes(true)) console.error(`[zulip-mcp] Reconnect catch-up: delivered missed messages on ${this.label(key)}`);
         });
       }
-      if (renamed) {
+      if (renamePushes) {
         const closeUnlessOpen = (c: Ctx) => {
           if (c.ended || this.channelManager.isKeyOpen(key)) return;
           c.w.delivery.markClosed(key);
           this.delivery.save();
         };
-        if (answers.length === 0) closeUnlessOpen(ctx);
-        else void Promise.all(answers).then(() => ctx.lane.answer(closeUnlessOpen));
+        const waits = [...answers, ...renamePushes];
+        if (waits.length === 0) closeUnlessOpen(ctx);
+        else void Promise.all(waits).then(() => ctx.lane.answer(closeUnlessOpen));
       }
       this.delivery.save();
     };
@@ -1680,11 +1685,11 @@ export class ZulipMcplServer {
    * A Zulip event queue died and its replacement starts from "now". Each
    * channel's lane offers again what it holds, then reads the hole from
    * history, from its place up to the first message that waits in it, and
-   * the gap marker follows on each open channel once every lane's read is
-   * done, so the agent gets the messages, not advice to go looking for
-   * them: open channels get them as recovered messages; every other
-   * watermarked channel gets its addressed messages as a `<missed>` push,
-   * as after a restart.
+   * the gap marker follows on each open channel once every lane's read has
+   * handed what it read or waits to try again, so the agent gets the
+   * messages, not advice to go looking for them: open channels get them as
+   * recovered messages; every other watermarked channel gets its addressed
+   * messages as a `<missed>` push, as after a restart.
    */
   private onSystemEvent(event: PlatformSystemEvent): void {
     const lanes = this.lanes;
@@ -1769,7 +1774,7 @@ export class ZulipMcplServer {
       ? 'with the catch-up limit at 0, no read from history brings them back'
       : !this.channelManager.isKeyOpen(key) && this.ids.heldIdOf(key) === undefined
         ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
-        : 'a read from history takes their place';
+        : 'a read from history is entered to take their place';
     console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; ${read}`);
   }
 
@@ -1821,8 +1826,10 @@ export class ZulipMcplServer {
   }
 
   private tellReadWait(): void {
+    const keys = [...this.readWaits].filter((key) => !this.isMuted(key) && this.isAllowed(key));
+    if (keys.length === 0) return;
     this.toldReadWait = true;
-    const channels = [...this.readWaits].map((key) => this.ids.channelIdOf(key) ?? this.label(key));
+    const channels = keys.map((key) => this.ids.channelIdOf(key) ?? this.label(key));
     this.tellOpen(
       `Zulip isn't serving reads of the history of ${channels.join(', ')}, and they are tried again. ` +
         'A channel whose read waits is silent until Zulip answers it; its messages then arrive in order.',
@@ -2061,7 +2068,7 @@ export class ZulipMcplServer {
       : `zulip:${oldName} is gone`;
   }
 
-  private pushRenamed(key: ChannelKey): void {
+  private pushRenamed(key: ChannelKey): Promise<boolean> | undefined {
     const note = this.renamedUnannounced.get(key);
     const fresh = this.ids.channelIdOf(key);
     if (note === undefined || fresh === null) return;
@@ -2069,7 +2076,7 @@ export class ZulipMcplServer {
     const { from, to } = note;
     const text = `Zulip stream #${from} was renamed #${to} since its channel was last open. Its channel is now ${fresh}, and ${this.oldIdNow(key, from)}. ` +
       `Open ${fresh} to keep hearing it. What you had read stays read.`;
-    void this.pushEvent({
+    return this.pushEvent({
       key,
       messageId: `system:stream-renamed:${Date.now()}`,
       author: { id: 'system', name: 'zulip connection' },
@@ -2078,6 +2085,7 @@ export class ZulipMcplServer {
       metadata: { system: true, kind: 'stream-renamed', from: `zulip:${from}`, to: fresh },
     }, `zulip_stream_renamed_${key}_${to}`, { kind: 'stream-renamed', from: `zulip:${from}`, to: fresh }).then((pushed) => {
       if (!pushed) console.error(`[zulip-mcp] ${fresh} (was zulip:${from}) was open at last sight; the push saying so did not land`);
+      return pushed;
     });
   }
 
@@ -2435,7 +2443,8 @@ export class ZulipMcplServer {
         const lane = this.lanes?.lane(entry.key);
         if (!lane) return;
         const waiting = new Set(lane.waitingMessages());
-        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => waiting.has(id));
+        const unstarted = new Set(lane.waitingMessages({ unstarted: true }));
+        const applied = entry.kind === 'move' ? [] : entry.messageIds.filter((id) => unstarted.has(id));
         for (const id of applied) this.changesOnTurn.set(id, [...(this.changesOnTurn.get(id) ?? []), entry]);
         if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
