@@ -405,7 +405,7 @@ export class ZulipMcplServer {
       while (!conn.isClosed) {
         const msg = await conn.nextMessage();
         if (msg.type === 'request' && this.enterHostQueue(conn, msg.request)) continue;
-        const lifecycleId = msg.type === 'request' ? lifecycleChannelId(msg.request) : null;
+        const lifecycleId = msg.type === 'request' ? this.lifecycleTarget(msg.request) : null;
         if (lifecycleId !== null) this.lifecycleOnChain.set(lifecycleId, (this.lifecycleOnChain.get(lifecycleId) ?? 0) + 1);
         this.requestsWaiting++;
         this.requestTail = this.requestTail.then(async () => {
@@ -451,6 +451,16 @@ export class ZulipMcplServer {
 
   private isQuiet(): boolean {
     return this.starting === null && (this.lanes?.isQuiet() ?? true) && this.requestsWaiting === 0 && this.hostRequestsOut.size === 0 && this.channelManager.isIdle();
+  }
+
+  private lifecycleTarget(req: JsonRpcRequest): string | null {
+    const channelId = lifecycleChannelId(req);
+    if (channelId !== null || (req.method !== method.CHANNELS_OPEN && req.method !== method.CHANNELS_CLOSE)) return channelId;
+    try {
+      return this.channelManager.findChannel(req.params as unknown as ChannelsOpenParams).id;
+    } catch {
+      return null;
+    }
   }
 
   private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {

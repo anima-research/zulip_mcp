@@ -5683,3 +5683,27 @@ test("a catch-up block that the host refuses while its stream is muted lets go o
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a close by id waits for an earlier open of its channel by type and address that waits on the chain', async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER] });
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { type: 'zulip', address: { stream_name: 'general' } });
+    let closed = false;
+    const closing = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' }).then(() => { closed = true; });
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:other', type: 'zulip', address: {} });
+    assert.equal(closed, false, 'the close waits for the open before it');
+    releaseSlow();
+    await Promise.all([slow, opening, closing]);
+    assert.equal(h.server.channelManager.isOpen('zulip:general'), false, "the host's last word was the close");
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
