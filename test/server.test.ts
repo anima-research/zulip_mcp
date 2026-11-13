@@ -1057,6 +1057,28 @@ test("the bot's own move takes a plain answer to the new topic, and nothing abou
   await h.close();
 });
 
+test('a rename while zulip.messaging is disabled waits behind an older rename of its message, so a plain answer goes to the newer topic after the enable', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.emit!(streamMsg(2, { mentioned: true, text: '@bot ship it?' }));
+  await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let busyDone = false;
+  h.adapter.enterChange!({ key: h.adapter.keyOf('zulip:general'), messageIds: [1], kind: 'edit', ready: async () => { await gate; busyDone = true; return null; } });
+
+  changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
+  await disableMessaging(h);
+  changeTo(h, { messageIds: ['2'], previousTopic: 'releases', topic: 'archive', mentioned: true });
+  release();
+  await until(() => busyDone, 'the job ahead of the older rename ended');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await h.server.quiet();
+  assert.deepEqual(await answerGoesTo(h), { threadId: 'archive', topic: 'archive' }, 'after the enable');
+  await h.close();
+});
+
 test('a rename while the channel is muted moves where a plain answer goes after the unmute, and tells the host nothing', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-hints-muted-'));
   try {
