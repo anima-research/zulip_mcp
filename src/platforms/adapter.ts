@@ -290,7 +290,10 @@ export interface PlatformAdapter {
   noteSelfDeleted?(messageId: number): void;
   /** That deletion failed: the message still exists. */
   forgetSelfDeleted?(messageId: number): void;
-  placeOf?(messageId: string): { key: ChannelKey; topic: string } | null;
+  /** Null for a message that left for a stream the adapter doesn't know:
+   *  Zulip's move event leaves its cached entry under the old stream with the
+   *  new topic. */
+  whereSeen?(messageId: string): { key: ChannelKey; topic: string } | null;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
