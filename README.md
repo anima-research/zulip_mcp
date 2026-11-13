@@ -15,8 +15,8 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 **Plain MCP (Claude Code, Cursor, any MCP client)**
 
-- 29 tools: stream/topic history with natural dates or id cursors,
-  `fetch_around`, sending to streams and DMs, editing, deleting, reactions,
+- 31 tools: stream/topic history with natural dates or id cursors,
+  `fetch_around`, sending to streams and DMs, editing, moving, deleting, reactions,
   user lookup, attachments, and a persistent read/unread monitor.
 - Resources: `zulip://unread/summary`, `zulip://monitoring/status`,
   `zulip://channel/{stream}/unread`.
@@ -228,7 +228,8 @@ before inference for open channels).
 
 Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
-tool sends and `channels/publish` alike. Disabling `zulip.messaging` stops
+tool sends and `channels/publish` alike. It doesn't undo an edit or a move.
+Disabling `zulip.messaging` stops
 its delivery (incoming and push) and its tools at once. A message that
 arrives meanwhile waits in its channel until it is enabled again. An edit or
 a deletion of it that arrives meanwhile is applied to it, unless the change
@@ -292,8 +293,8 @@ channel's first message can set the watermark just below it, so once it is
 enabled again, a change to an older message that the host never received
 goes too.
 Zulip re-renders (a link preview arriving) are
-not edits and never surface; the bot's own edits and deletions (rollback,
-`delete_message`) are its own doing and don't surface either. A deletion's
+not edits and never surface; the bot's own edits, moves and deletions (rollback,
+`move_messages`, `delete_message`) are its own doing and don't surface either. A deletion's
 mark lasts 10 minutes and holds the bot's latest 500 deletes, so one whose
 event comes later can surface. A moved
 message is reported on the channel it left, naming where it went.
@@ -310,9 +311,10 @@ add `"tagsNone": ["chat:edited", "chat:deleted"]` to it if that is unwanted.
 `previousTopic`, `movedToChannelId`, `actorId`, `mentioned` and
 `previouslyMentioned`, plus `replyToSelf` and `previouslyReplyToSelf` for
 quote addressing (previous verdicts are absent when only the post-change
-state could be read). A change line never sets `threadId` and never moves
-this server's reply routing: a moderator archiving an old message does not retarget the
-reply the agent is composing. A move into a stream the bot cannot see
+state could be read). A change line never sets `threadId`. Of the changes,
+only a move of the message a plain answer follows, to another topic in its
+stream, moves reply routing: a moderator archiving an older message does not
+retarget the reply the agent is composing. A move into a stream the bot cannot see
 arrives from Zulip as a deletion and is reported as "no longer visible". Synthetic ids (`edit:77:…`) never advance the
 delivery watermark; the message's own id in the line is what `fetch_around`
 takes (a deleted id can no longer be fetched). History and backscroll
@@ -458,7 +460,8 @@ file, or remove it to re-seed from the environment.
 
 **Writing**
 `send_message`, `send_dm` (by name, email, or id), `upload_file`,
-`edit_message`, `delete_message`, `add_reaction`, `remove_reaction`.
+`edit_message`, `move_messages`, `delete_message`, `add_reaction`,
+`remove_reaction`.
 
 `send_message` accepts an integer `reply_to` message ID (integer-valued strings also work): `{"reply_to":12345,"content":"Thanks!"}`.
 Replies use the message's current stream/topic or complete DM recipient list, without quoting it.

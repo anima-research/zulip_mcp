@@ -160,6 +160,7 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'send_dm':
     case 'upload_file':
     case 'edit_message':
+    case 'move_messages':
     case 'delete_message':
     case 'add_reaction':
     case 'remove_reaction':

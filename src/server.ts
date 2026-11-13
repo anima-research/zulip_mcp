@@ -75,7 +75,7 @@ import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
-import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
+import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
@@ -155,7 +155,7 @@ interface GapRead {
 
 interface DeliveryWriter {
   readonly delivery: DeliveryState;
-  readonly channels: Pick<ChannelManager, 'noteConversation' | 'onIncomingMessage'>;
+  readonly channels: Pick<ChannelManager, 'noteConversation' | 'onIncomingMessage' | 'followMove'>;
 }
 
 type Ctx = JobContext<DeliveryWriter>;
@@ -194,7 +194,7 @@ export class ZulipMcplServer {
   readonly adapters: Map<string, PlatformAdapter>;
   readonly grant: CapabilityGrant;
   readonly manifestTracker: ManifestTracker;
-  readonly channelManager: Omit<ChannelManager, 'noteConversation' | 'onIncomingMessage'>;
+  readonly channelManager: Omit<ChannelManager, 'noteConversation' | 'onIncomingMessage' | 'followMove'>;
   readonly contextProvider: ContextProvider;
   readonly delivery: DeliveryReader;
   readonly directory: StreamDirectory;
@@ -319,6 +319,10 @@ export class ZulipMcplServer {
     // without an actor; the adapter recognises its own.
     this.tools.onDeleted = (messageId) => this.adapter.noteSelfDeleted?.(Number(messageId));
     this.tools.onDeleteFailed = (messageId) => this.adapter.forgetSelfDeleted?.(Number(messageId));
+    this.tools.answerHints = {
+      followed: (key) => this.channelManager.hintsOf(key),
+      follow: (key, from, readTopic, topic) => this.followInLane(key, from, readTopic, topic),
+    };
   }
 
   /** True when the connected peer negotiated MCPL. */
@@ -1214,7 +1218,7 @@ export class ZulipMcplServer {
         if (delivered) {
           // The agent's answer goes back through channels/publish, so it goes
           // to this message's topic, as an answer on an open channel does.
-          w.channels.noteConversation(key, message);
+          w.channels.noteConversation(key, this.asLastSeen(key, message));
           if (this.accepted(w, key, id)) this.delivery.save();
           this.enterHeldReads();
         } else {
@@ -1228,6 +1232,12 @@ export class ZulipMcplServer {
 
     this.letGo(ctx.w, key, id);
     if (ctx.w.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
+  }
+
+  private asLastSeen<M extends Pick<KeyedMessage, 'messageId' | 'threadId' | 'metadata'>>(key: ChannelKey, message: M): M {
+    const place = isDmKey(key) ? null : this.adapter.whereSeen?.(message.messageId) ?? null;
+    if (place === null || place.key !== key) return message;
+    return { ...message, threadId: place.topic || undefined, metadata: { ...(message.metadata as Record<string, unknown> | undefined), topic: place.topic } };
   }
 
   private messagingChanged(): void {
@@ -1634,7 +1644,7 @@ export class ZulipMcplServer {
         // channel's deliveries would have left it.
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
-          if (w.channels.noteConversation(key, msgs[i])) break;
+          if (w.channels.noteConversation(key, this.asLastSeen(key, msgs[i]))) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
         for (const id of w.delivery.heldIds(key)) if (id > after && id <= newestId) w.delivery.release(key, id);
@@ -2018,6 +2028,18 @@ export class ZulipMcplServer {
         line();
       }
       ran();
+    }));
+  }
+
+  private followInLane(key: ChannelKey, from: number, readTopic: string | undefined, topic: string): Promise<FollowSeen> {
+    const lane = this.lanes?.lane(key);
+    if (!lane) return Promise.resolve("sure");
+    return new Promise((ran) => lane.answer((ctx) => {
+      const now = this.channelManager.hintsOf(key);
+      if (now?.from !== from) return ran({ follows: now?.from });
+      if (now.topic === readTopic) ctx.w.channels.followMove(key, [String(from)], topic);
+      else if (now.topic !== topic) return ran("unsure");
+      ran(ctx.lane.changeWaitsAbout([from]) ? "unsure" : "sure");
     }));
   }
 
@@ -2509,6 +2531,8 @@ export class ZulipMcplServer {
    * watermark; the line carries the message's own id for fetch_around.
    */
   private async onMessageChange(ctx: Ctx, ev: MessageChangeEvent, announce = true, silent = false): Promise<void> {
+    if (ev.previousTopic !== null && !ev.leftChannel) ctx.w.channels.followMove(ev.key, ev.messageIds, ev.topic);
+    if (ev.byBot) return;
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
     if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
     if (silent || !this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
