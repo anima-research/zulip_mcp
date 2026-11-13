@@ -383,7 +383,8 @@ export class ZulipAdapter implements PlatformAdapter {
 
   private remember(key: ChannelKey, m: ZulipMessage): void {
     this.failedQuoteLookups.delete(m.id);
-    if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
+    this.movedAway.delete(m.id);
+    if (!this.seen.has(m.id) && this.seen.size >= ZulipAdapter.SEEN_CAP) {
       const oldest = this.seen.keys().next().value;
       if (oldest !== undefined) this.seen.delete(oldest);
     }
@@ -623,6 +624,8 @@ export class ZulipAdapter implements PlatformAdapter {
         const now = Date.now();
         for (const [id, at] of this.movedAway) if (now - at > MOVED_AWAY_TTL_MS) this.movedAway.delete(id);
         for (const id of change.messageIds) this.movedAway.set(id, now);
+      } else if (movedToKey !== null) {
+        for (const id of change.messageIds) this.movedAway.delete(id);
       }
       return {
         kind: content !== null ? 'edit' : 'move',

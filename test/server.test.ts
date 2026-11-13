@@ -1070,14 +1070,18 @@ test('a rename while zulip.messaging is disabled waits behind an older rename of
   await until(() => h.delivery.watermark('zulip:general') === 2, 'the mention accepted');
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
+  let entered = false;
   let busyDone = false;
-  h.adapter.enterChange!({ key: h.adapter.keyOf('zulip:general'), messageIds: [1], kind: 'edit', ready: async () => { await gate; busyDone = true; return null; } });
+  h.adapter.enterChange!({ key: h.adapter.keyOf('zulip:general'), messageIds: [1], kind: 'edit', ready: async () => { entered = true; await gate; busyDone = true; return null; } });
+  await until(() => entered, 'the job ahead holds the lane');
 
   changeTo(h, { messageIds: ['2'], previousTopic: 'deploys', topic: 'releases', mentioned: true });
   await disableMessaging(h);
   changeTo(h, { messageIds: ['2'], previousTopic: 'releases', topic: 'archive', mentioned: true });
   release();
   await until(() => busyDone, 'the job ahead of the older rename ended');
+  await h.host.sendRequest('ping');
+  assert.deepEqual(h.adapter.whereSeen!('2'), { key: h.adapter.keyOf('zulip:general'), topic: 'deploys' }, 'the newer rename waits behind the older one, held until the enable');
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await h.server.quiet();
   assert.deepEqual(await answerGoesTo(h), { threadId: 'archive', topic: 'archive' }, 'after the enable');
