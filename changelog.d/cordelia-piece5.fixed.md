@@ -108,8 +108,10 @@
   before the messages that arrived after them. A move that was waiting about
   given-up messages only isn't sent, and an edit or a deletion applied to one
   of them goes with it: the read brings each of those messages as Zulip has
-  it then, or doesn't bring it. A reaction that was waiting stays, and its
-  turn comes after the read.
+  it then, or doesn't bring it. With the catch-up limit at 0, or on a closed
+  channel that the host holds no id for when the read runs, that read brings
+  none of them, and the log says so. A reaction that was waiting stays, and
+  its turn comes after the read.
 - A reaction to a message the server hadn't seen could reach the host after
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip

@@ -1753,7 +1753,12 @@ export class ZulipMcplServer {
       w.delivery.hold(key, first, 'failed');
       this.delivery.save();
     }
-    console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; a read from history takes their place`);
+    const read = this.catchupLimit === 0
+      ? 'with the catch-up limit at 0, no read from history brings them back'
+      : !this.channelManager.isKeyOpen(key) && this.ids.heldIdOf(key) === undefined
+        ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
+        : 'a read from history takes their place';
+    console.error(`[zulip-mcp] ${this.label(key)}: ${ids.length} waiting message(s) given up; ${read}`);
   }
 
   private async readGivenUp(r: Reading, key: ChannelKey): Promise<Hand> {
