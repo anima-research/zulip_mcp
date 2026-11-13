@@ -155,7 +155,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination; after 'reply_to' the result says where the message went. Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -170,11 +170,11 @@ export const toolDefinitions: ToolDefinition[] = [
         },
         topic: {
           type: "string",
-          description: "Required for streams without reply_to. Omit with reply_to. To see a stream's recent topics first, call get_stream_topics.",
+          description: "Required for a stream message without reply_to. With reply_to on a stream message, optional: it sends to that message's stream in this topic. To see a stream's recent topics first, call get_stream_topics.",
         },
         reply_to: {
           type: "integer",
-          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to/topic; supplied destinations or unreadable IDs fail before uploads or sends. Does not quote the message.",
+          description: "Message ID to reply to using its current stream/topic or full DM recipient list. Omit to; a supplied to, a topic on a direct message, or an unreadable ID fails before uploads or sends. Does not quote the message.",
         },
         content: {
           type: "string",
