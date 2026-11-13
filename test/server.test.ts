@@ -6282,6 +6282,34 @@ test('an open that comes after a featureSets/update waiting on the chain is judg
   await h.close();
 });
 
+test("a close by id waits for an earlier open by type and address whose channel the server couldn't name when the open came", async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { type: 'zulip', address: { stream_name: 'other' } });
+    const onChain = () => (h.server as unknown as { requestsWaiting: number }).requestsWaiting;
+    await until(() => onChain() === 2, 'the open waiting on the chain behind the tool call');
+    h.adapter.visible.push(OTHER);
+    await h.server.channelManager.registerAdditional([OTHER]);
+    let closed = false;
+    const closing = h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:other' }).then(() => { closed = true; });
+    await Promise.race([closing, new Promise((r) => setTimeout(r, 300))]);
+    assert.equal(closed, false, 'the close waits for the open before it');
+    releaseSlow();
+    await Promise.all([slow, opening, closing]);
+    assert.equal(h.server.channelManager.isOpen('zulip:other'), false, "the host's last word was the close");
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});
+
 test("a rate limit whose retry-after carries a channel's wait past 90 s tells at its first failure", async () => {
   const waits = heldWaits();
   const clock = { t: 0 };
