@@ -1148,6 +1148,22 @@ for (const [label, move] of [
   });
 }
 
+test('move_messages with later from a newer message leaves a plain answer with the older message it follows', async () => {
+  const realm = movingRealm({ 3: 'deploys', 5: 'deploys' });
+  const h = harness({ tools: realm.tools });
+  try {
+    await mentionedOn(h, 3);
+    const before = realm.calls.length;
+    const result = await moveBy(h, { message_id: 5, topic: 'releases', scope: 'later' });
+    assert.equal('note' in result, false);
+    assert.deepEqual(realm.calls.slice(before).map((c) => `${c.method} ${c.path}`), ['PATCH /messages/5', 'GET /messages/5', 'GET /messages/3']);
+    assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' });
+  } finally {
+    await h.close();
+    rmSync(realm.dir, { recursive: true, force: true });
+  }
+});
+
 test("move_messages with one on another message reads nothing more and leaves a plain answer where it was, and so does a call that names the message's own stream", async () => {
   const realm = movingRealm({ 1: 'deploys', 3: 'deploys' });
   const h = harness({ tools: realm.tools });
@@ -1223,9 +1239,11 @@ async function laneBusyAfterThree(h: Harness, fetches: ReturnType<typeof heldFet
 
 async function moveThree(realm: ReturnType<typeof movingRealm>) {
   let done = false;
+  let asked = false;
+  const hints = realm.tools.answerHints!;
+  realm.tools.answerHints = { followed: (key) => hints.followed(key), follow: (...args) => { asked = true; return hints.follow(...args); } };
   const call = realm.tools.handleToolCall('move_messages', { message_id: 3, topic: 'releases', scope: 'one' }).finally(() => { done = true; });
-  await until(() => realm.calls.some((c) => c.method === 'GET' && c.path === '/messages/3'), 'the read back');
-  await new Promise((resolve) => setImmediate(resolve));
+  await until(() => asked, 'the tool asked the server for its job');
   return { call, done: () => done };
 }
 
@@ -1278,10 +1296,16 @@ test('move_messages waits for its job up to 5 s, then answers with the note, and
   const original = globalThis.setTimeout;
   try {
     await laneBusyAfterThree(h, fetches, false);
-    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 5_000 ? 50 : ms, ...rest)) as typeof setTimeout;
+    let waitedFiveSeconds = false;
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (ms === 5_000) waitedFiveSeconds = true;
+      return original(fn, ms === 5_000 ? 50 : ms, ...rest);
+    }) as typeof setTimeout;
     const moving = await moveThree(realm);
+    assert.equal(moving.done(), false, 'the tool waits for its job');
     const result = await moving.call;
     globalThis.setTimeout = original;
+    assert.ok(waitedFiveSeconds, 'the wait is 5 s');
     assert.deepEqual(result, { channelId: 'zulip:general', channel: 'general', topic: 'releases', note: 'To answer this message where it is now, use send_message with reply_to.' });
     assert.deepEqual(await answerGoesTo(h), { threadId: 'deploys', topic: 'deploys' }, "before the job's turn");
     fetches.release();
