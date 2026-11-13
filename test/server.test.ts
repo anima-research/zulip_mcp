@@ -3039,6 +3039,67 @@ test("an open with a page gives a channel that has no watermark one, and the nex
   }
 });
 
+test("after a break, another open channel's read goes to Zulip and its rows arrive while one channel's recovered row fetches its attachment", async () => {
+  const fetches = heldFetches();
+  const h = harness({
+    attachments: fetches.options,
+    visible: [DESCRIPTOR, AAA],
+    history: [streamMsg(1), withLog(streamMsg(2)), streamMsg(11, { channelId: 'zulip:aaa' }), streamMsg(12, { channelId: 'zulip:aaa' })],
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:aaa', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(11, { channelId: 'zulip:aaa' }));
+  await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:aaa') === 11, 'both accepted');
+  breakQueue(h);
+  await until(() => fetches.started.length === 1, "general's recovered 2 fetching its attachment");
+  await until(() => h.incoming.some((m) => m.messageId === '12'), "aaa's recovered 12 while general's fetch waits");
+  assert.equal(h.incoming.some((m) => m.messageId === '2'), false);
+  fetches.release();
+  await until(() => h.incoming.some((m) => m.messageId === '2'), "general's recovered 2");
+  await h.server.quiet();
+  await h.close();
+});
+
+test("a break's job sends both its reads before it hands a row on, and its held rows reach the host before its own", async () => {
+  const timeline: string[] = [];
+  const attachments = {
+    source: {
+      async fetch(path: string) {
+        timeline.push(`fetch ${path.split('/').pop()}`);
+        return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+      },
+    },
+    inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+  };
+  const h = harness({ attachments, history: [streamMsg(1), withLog(streamMsg(2)), streamMsg(3), streamMsg(4), streamMsg(5)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.policy.rejectIds.add('2');
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(withLog(streamMsg(2)));
+  h.adapter.emit!(streamMsg(3));
+  await until(() => h.incoming.some((m) => m.messageId === '3'), '3 accepted');
+  await h.server.quiet();
+  assert.deepEqual(h.delivery.heldIds('zulip:general'), [2], '2 refused, and held');
+  h.policy.rejectIds.delete('2');
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general') timeline.push(`read after ${query.afterMessageId}`);
+    return read(key, query);
+  };
+  timeline.length = 0;
+  breakQueue(h);
+  await until(() => h.incoming.some((m) => m.messageId === '5'), '5, recovered');
+  await h.server.quiet();
+  assert.deepEqual(timeline, ['read after 1', 'read after 3', 'fetch 2.log']);
+  assert.deepEqual(h.incoming.map((m) => m.messageId).filter((id) => ['2', '4', '5'].includes(id)), ['2', '4', '5']);
+  await h.close();
+});
+
 test("after a reconnect within one process, the watermark follows what the new connection's host accepts", async () => {
   const first = harness({ visible: [AAA, DESCRIPTOR], history: [1, 2, 3, 4, 5].map((id) => streamMsg(id)) });
   await initialize(first, true);
@@ -3952,11 +4013,11 @@ test('a reply the event path verified, refused by the host, comes again as a rep
 });
 
 for (const reconnect of [false, true]) {
-  test(`an accepted catch-up block survives ${reconnect ? 'reconnecting' : 'shutdown'} while its channel's catch-up is still running`, async () => {
+  test(`an accepted catch-up block survives ${reconnect ? 'reconnecting' : 'shutdown'} while its channel's lane still runs a job`, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-probe-staged-'));
   let second: Harness | undefined;
   let third: Harness | undefined;
-  let release!: () => void;
+  const fetches = heldFetches();
   try {
     const first = harness({ stateDir: dir, sessionId: 'probe' });
     try {
@@ -3970,23 +4031,20 @@ for (const reconnect of [false, true]) {
       await until(() => first.delivery.tally('zulip:general')?.talliedThrough === 2, 'tally seeded');
     } finally { await first.close(); }
 
-    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5, { mentioned: true })], shutdownGraceMs: 20 });
-    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
-    let calls = 0;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    second.adapter.fetchHistory = async (channelId, query) => {
-      if (++calls === 2) await gate;
-      return realFetch(channelId, query);
-    };
+    second = harness({ stateDir: dir, sessionId: 'probe', history: [streamMsg(5, { mentioned: true })], shutdownGraceMs: 20, attachments: fetches.options });
+    second.policy.holdPushes = true;
     await initialize(second, true);
     await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(second, false);
-    await until(() => second!.pushed.some((p) => p.tags?.includes('zulip:missed')) && calls === 2, 'catch-up block pushed, the tally backfill still reading');
+    await until(() => second!.policy.heldPushes.length === 1, 'catch-up block pushed');
+    second.adapter.emit!(withLog(streamMsg(6, { mentioned: true })));
+    await until(() => fetches.started.length === 1, "6's attachment fetch running on the channel's lane");
+    second.policy.holdPushes = false;
+    for (const answer of second.policy.heldPushes.splice(0)) answer();
     await second.host.sendRequest('ping');
 
     if (reconnect) {
       await second.close();
-      second.adapter.fetchHistory = realFetch;
       third = harness({ reuse: { server: second.server, adapter: second.adapter } });
       await initialize(third, true);
       await settled(third);
@@ -3999,9 +4057,9 @@ for (const reconnect of [false, true]) {
     assert.equal(persisted.watermarks['zulip:general'], 5,
       `host accepted the catch-up through id 5 but the persisted watermark is ${persisted.watermarks['zulip:general']}: the next start re-delivers it`);
   } finally {
-    release?.();
     await third?.close();
     await second?.close().catch(() => {});
+    fetches.release();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -4745,7 +4803,7 @@ test("a catch-up block the host refuses at a connection's start isn't offered ag
   second.policy.rejectPushes.add('2');
   await initialize(second, true);
   await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-  await until(() => calls === 2 && second.pushed.length === 1, "the catch-up block refused, the tally's backfill reading");
+  await until(() => calls === 2, "the tally's backfill reading");
   await second.host.sendRequest('ping');
   release();
   await second.server.quiet();

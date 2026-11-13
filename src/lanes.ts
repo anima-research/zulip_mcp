@@ -5,8 +5,6 @@ export interface JobInfo {
   /** A message counts against the cap on waiting messages; `id` is its Zulip id. */
   kind: 'message' | 'other';
   id?: number;
-  /** The job reads from Zulip, and takes a turn: one such job runs at a time across all lanes. */
-  turn?: boolean;
   /** The messages a change is about: it leaves the queue with them when all of them are given up. */
   about?: number[];
 }
@@ -23,6 +21,23 @@ export interface JobContext<W> {
 }
 
 export type Job<W> = (ctx: JobContext<W>) => void | Promise<void>;
+
+/** What a job that reads from Zulip has while it holds the turn. It writes nothing. */
+export interface ReadContext<W> {
+  /** The lane the job runs on. */
+  readonly lane: Lane<W>;
+  /** True once the lane's connection has ended. */
+  readonly ended: boolean;
+  /** True while the job holds the turn. A read from Zulip that the job sends once it is false fails. */
+  readonly reading: boolean;
+}
+
+/**
+ * A job that reads from Zulip. It runs holding the turn, which one such job
+ * holds at a time across all lanes, and returns what it hands on: a job
+ * that runs on the same lane once the turn is given back.
+ */
+export type ReadJob<W> = (ctx: ReadContext<W>) => Job<W> | void | Promise<Job<W> | void>;
 
 /**
  * The writes the lanes make outside any job, each at a moment that they own,
@@ -42,11 +57,7 @@ export interface Moments<W> {
   end(w: W): void;
 }
 
-interface Entry<W> {
-  job: Job<W>;
-  info: JobInfo;
-  answer?: boolean;
-}
+type Entry<W> = { info: JobInfo; answer?: boolean } & ({ job: Job<W>; read?: undefined } | { read: ReadJob<W>; job?: undefined });
 
 /**
  * One channel's delivery work for one connection: one job at a time, the
@@ -57,7 +68,6 @@ export class Lane<W> {
   private readonly otherQueue: Entry<W>[] = [];
   private running = false;
   private holds = 0;
-  private waitingForTurn = false;
   private ended = false;
   private decidedThrough: number | undefined;
   readonly #w: W;
@@ -126,12 +136,26 @@ export class Lane<W> {
     this.lanes.changed(this);
   }
 
-  /** A job that goes ahead of everything waiting in the other queue, such as a read to try again. */
+  /** A job that goes ahead of everything waiting in the other queue. */
   enterFirst(job: Job<W>, info: JobInfo = { kind: 'other' }): void {
     if (info.kind === 'message' && info.id !== undefined) this.lanes.entered(this, info.id);
     if (this.ended) return;
     this.otherQueue.unshift({ job, info });
     if (info.kind === 'message') this.lanes.messageEntered(this);
+    this.lanes.changed(this);
+  }
+
+  /** A job that reads from Zulip, in the other queue, in the order it enters. */
+  enterRead(read: ReadJob<W>): void {
+    if (this.ended) return;
+    this.otherQueue.push({ read, info: { kind: 'other' } });
+    this.lanes.changed(this);
+  }
+
+  /** A job that reads from Zulip, ahead of everything waiting in the other queue, such as a read to try again. */
+  enterReadFirst(read: ReadJob<W>): void {
+    if (this.ended) return;
+    this.otherQueue.unshift({ read, info: { kind: 'other' } });
     this.lanes.changed(this);
   }
 
@@ -142,17 +166,17 @@ export class Lane<W> {
 
   /**
    * The waiting messages leave the queue, with each job that is about them
-   * alone, and `job` takes the place of the first of them. Returns their ids,
-   * oldest first.
+   * alone, and `read` takes the place of the first of them. Returns their
+   * ids, oldest first.
    */
-  replaceMessages(job: Job<W>, info: JobInfo): number[] {
+  replaceMessages(read: ReadJob<W>): number[] {
     const first = this.otherQueue.findIndex((e) => e.info.kind === 'message');
     if (first < 0) return [];
     const ids = this.waitingMessages();
     const given = new Set(ids);
     const aboutGiven = (e: Entry<W>) => e.info.about !== undefined && e.info.about.length > 0 && e.info.about.every((id) => given.has(id));
     const kept = this.otherQueue.filter((e, i) => (i < first || e.info.kind !== 'message') && !aboutGiven(e));
-    kept.splice(first, 0, { job, info });
+    kept.splice(first, 0, { read, info: { kind: 'other' } });
     this.otherQueue.length = 0;
     this.otherQueue.push(...kept);
     this.lanes.messagesLeft(ids.length);
@@ -176,7 +200,7 @@ export class Lane<W> {
     const answers = this.hostQueue.filter((e) => e.answer);
     this.hostQueue.length = 0;
     this.otherQueue.length = 0;
-    for (const { job } of answers) this.#runAnswer(job);
+    for (const { job } of answers) if (job) this.#runAnswer(job);
   }
 
   #runAnswer(job: Job<W>): void {
@@ -192,34 +216,50 @@ export class Lane<W> {
     if (this.running || this.ended) return null;
     let entry = this.hostQueue.shift();
     if (!entry && this.holds === 0 && this.otherQueue.length > 0) {
-      const next = this.otherQueue[0];
-      if (next.info.turn && !this.lanes.takeTurn(this)) {
-        this.waitingForTurn = true;
-        return null;
-      }
-      this.waitingForTurn = false;
+      if (this.otherQueue[0].read && !this.lanes.takeTurn(this)) return null;
       entry = this.otherQueue.shift()!;
       if (entry.info.kind === 'message') this.lanes.messagesLeft(1);
     }
     if (!entry) return null;
     this.running = true;
-    const ctx = this.#context();
-    const turn = entry.info.turn === true;
+    const run = entry;
     return (async () => {
       try {
-        await entry.job(ctx);
+        if (run.read) await this.#runRead(run.read);
+        else await run.job(this.#context());
       } catch (err) {
         console.error(`[zulip-mcp] a delivery job on ${this.key} failed:`, (err as Error).message ?? err);
       } finally {
         this.running = false;
-        if (turn) this.lanes.giveTurnBack(this);
         this.lanes.changed(this);
       }
     })();
   }
 
-  get isWaitingForTurn(): boolean {
-    return this.waitingForTurn;
+  async #runRead(read: ReadJob<W>): Promise<void> {
+    const lane = this;
+    let reading = true;
+    let hand: Job<W> | void;
+    try {
+      hand = await read({
+        lane,
+        get ended() {
+          return lane.ended;
+        },
+        get reading() {
+          return reading;
+        },
+      });
+    } finally {
+      reading = false;
+      this.lanes.giveTurnBack(this);
+    }
+    if (hand) await hand(this.#context());
+  }
+
+  /** The lane would start a job that reads from Zulip now, if it held the turn. */
+  get canStartRead(): boolean {
+    return !this.running && !this.ended && this.holds === 0 && this.hostQueue.length === 0 && this.otherQueue[0]?.read !== undefined;
   }
 }
 
@@ -238,6 +278,7 @@ export class Lanes<W> {
   private readonly lanes = new Map<ChannelKey, Lane<W>>();
   private readonly runningJobs = new Set<Promise<void>>();
   private turnHolder: Lane<W> | null = null;
+  private readonly turnWaiters: Lane<W>[] = [];
   private heldUntil: Promise<unknown> | null = null;
   private waitingMessageCount = 0;
   private quietWaiters: (() => void)[] = [];
@@ -355,16 +396,28 @@ export class Lanes<W> {
     this.waitingMessageCount -= n;
   }
 
+  /**
+   * A lane whose next job reads takes the turn when it is free and no lane
+   * that has waited for it longer could start its read now. Otherwise the
+   * lane waits for it, in the order the lanes began to wait.
+   */
   takeTurn(lane: Lane<W>): boolean {
-    if (this.turnHolder !== null && this.turnHolder !== lane) return false;
-    this.turnHolder = lane;
-    return true;
+    const at = this.turnWaiters.indexOf(lane);
+    const longer = at < 0 ? this.turnWaiters : this.turnWaiters.slice(0, at);
+    if (this.turnHolder === null && !longer.some((other) => other.canStartRead)) {
+      this.turnHolder = lane;
+      if (at >= 0) this.turnWaiters.splice(at, 1);
+      return true;
+    }
+    if (at < 0) this.turnWaiters.push(lane);
+    return false;
   }
 
   giveTurnBack(lane: Lane<W>): void {
     if (this.turnHolder !== lane) return;
     this.turnHolder = null;
-    for (const other of this.lanes.values()) if (other.isWaitingForTurn) this.changed(other);
+    const next = this.turnWaiters.find((other) => other.canStartRead);
+    if (next) this.changed(next);
   }
 
   /** No job runs or waits in any lane that hasn't ended. */

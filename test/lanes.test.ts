@@ -124,12 +124,12 @@ test('enterFirst goes ahead of what waits in the other queue', async () => {
   assert.deepEqual(log, ['running', 'again', 'waiting']);
 });
 
-test("one job with a turn runs at a time across lanes, and a lane waiting for the turn runs its host's queue", async () => {
+test("one job that reads runs at a time across lanes, and a lane waiting for the turn runs its host's queue", async () => {
   const l = lanes();
   const log: string[] = [];
   const readA = gate();
-  l.lane(A).enter(async () => { log.push('A read start'); await readA.opened; log.push('A read end'); }, { kind: 'other', turn: true });
-  l.lane(B).enter(() => { log.push('B read'); }, { kind: 'other', turn: true });
+  l.lane(A).enterRead(async () => { log.push('A read start'); await readA.opened; log.push('A read end'); });
+  l.lane(B).enterRead(() => { log.push('B read'); });
   await new Promise((r) => setImmediate(r));
   l.lane(B).host(() => { log.push('B open'); });
   await new Promise((r) => setImmediate(r));
@@ -137,6 +137,64 @@ test("one job with a turn runs at a time across lanes, and a lane waiting for th
   readA.open();
   await l.quiet();
   assert.deepEqual(log, ['A read start', 'B open', 'A read end', 'B read']);
+});
+
+test('a job that reads gives the turn back before what it hands on runs: another lane reads meanwhile, and the first job reads no more', async () => {
+  const l = lanes();
+  const log: string[] = [];
+  const handing = gate();
+  let readingWhileHanding: boolean | null = null;
+  l.lane(A).enterRead((r) => {
+    log.push('A read');
+    return async (ctx) => {
+      log.push(`A hands, with ${ctx.w}`);
+      readingWhileHanding = r.reading;
+      await handing.opened;
+      log.push('A handed');
+    };
+  });
+  l.lane(B).enterRead(() => { log.push('B read'); });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(log, ['A read', 'A hands, with writer', 'B read']);
+  assert.equal(readingWhileHanding, false);
+  handing.open();
+  await l.quiet();
+  assert.deepEqual(log, ['A read', 'A hands, with writer', 'B read', 'A handed']);
+});
+
+test('the turn goes to the lane that has waited longest for it', async () => {
+  const l = lanes();
+  const log: string[] = [];
+  for (const [name, key] of [['A', A], ['B', B], ['C', C]] as const) {
+    for (let i = 1; i <= 3; i++) {
+      l.lane(key).enterRead(async () => {
+        log.push(`${name}${i}`);
+        await new Promise((r) => setImmediate(r));
+      });
+    }
+  }
+  await l.quiet();
+  assert.deepEqual(log, ['A1', 'B1', 'C1', 'A2', 'B2', 'C2', 'A3', 'B3', 'C3']);
+});
+
+test("a lane that has waited longest but can't start its read when the turn comes back doesn't keep it from the next", async () => {
+  const l = lanes();
+  const log: string[] = [];
+  const readC = gate();
+  const holdA = gate();
+  l.lane(C).enterRead(async () => { log.push('C'); await readC.opened; });
+  await new Promise((r) => setImmediate(r));
+  l.lane(A).enterRead(() => { log.push('A'); });
+  await new Promise((r) => setImmediate(r));
+  l.lane(B).enterRead(() => { log.push('B'); });
+  await new Promise((r) => setImmediate(r));
+  l.lane(A).holdOtherUntil(holdA.opened);
+  readC.open();
+  for (let i = 0; i < 10 && log.length < 2; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(log, ['C', 'B']);
+  holdA.open();
+  await l.quiet();
+  assert.deepEqual(log, ['C', 'B', 'A']);
 });
 
 test('ending the lanes drops what waits, tells a running job, waits for it within the grace, and takes nothing after', async () => {
@@ -204,7 +262,7 @@ test('jobs get the writer and their lane, an answer after the end too', async ()
 
 test('the lanes write at four moments, with the writer: their making, a message with an id that enters, the cap, and the end after what settles it', async () => {
   const moments: string[] = [];
-  const l = lanes((lane) => { lane.replaceMessages(() => {}, { kind: 'other' }); }, 1, moments);
+  const l = lanes((lane) => { lane.replaceMessages(() => {}); }, 1, moments);
   assert.deepEqual(moments, ['writer start']);
   const running = gate();
   l.lane(A).enter(async () => { await running.opened; });
@@ -233,7 +291,7 @@ test('past the cap, the lane with the most waiting messages is given up: its mes
   let given: number[] = [];
   const l = lanes((lane) => {
     overflowed.push(String(lane.key));
-    given = lane.replaceMessages(() => { log.push('read'); }, { kind: 'other', turn: true });
+    given = lane.replaceMessages(() => { log.push('read'); });
   }, 3);
   l.lane(B).enter(async () => { await running.opened; log.push('B running'); });
   l.lane(B).enter(() => { log.push('B 20'); }, { kind: 'message', id: 20 });
@@ -255,7 +313,7 @@ test('past the cap, the lane with the most waiting messages is given up: its mes
 test('at a give-up, a job about given-up messages alone leaves with them, and one about a message that waits elsewhere, or about none, stays', async () => {
   const log: string[] = [];
   const running = gate();
-  const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }, { kind: 'other', turn: true }); }, 2);
+  const l = lanes((lane) => { lane.replaceMessages(() => { log.push('read'); }); }, 2);
   l.lane(A).enter(async () => { await running.opened; log.push('running'); });
   l.lane(A).enter(() => { log.push('10'); }, { kind: 'message', id: 10 });
   l.lane(A).enter(() => { log.push('about 10'); }, { kind: 'other', about: [10] });
