@@ -1675,11 +1675,11 @@ export class ZulipMcplServer {
    * A Zulip event queue died and its replacement starts from "now". Each
    * channel's lane offers again what it holds, then reads the hole from
    * history, from its place up to the first message that waits in it, and
-   * the gap marker follows on each open channel once every lane's read is
-   * done, so the agent gets the messages, not advice to go looking for
-   * them: open channels get them as recovered messages; every other
-   * watermarked channel gets its addressed messages as a `<missed>` push,
-   * as after a restart.
+   * the gap marker follows on each open channel once every lane's read has
+   * handed what it read or waits to try again, so the agent gets the
+   * messages, not advice to go looking for them: open channels get them as
+   * recovered messages; every other watermarked channel gets its addressed
+   * messages as a `<missed>` push, as after a restart.
    */
   private onSystemEvent(event: PlatformSystemEvent): void {
     const lanes = this.lanes;

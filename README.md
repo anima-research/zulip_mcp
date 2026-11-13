@@ -49,7 +49,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   reaction to a message the server hasn't seen, and the reactions, changes and
   messages after it that carry no stream id wait behind it. When delivery
   stops, a message the server already holds is offered at the next connection
-  if Zulip's history still has it there; one still waiting for the lookup that
+  if Zulip's history still has it there, the catch-up limit isn't 0, and its
+  stream is neither muted nor outside the allowlist then; one still waiting
+  for the lookup that
   places it is dropped, and the next catch-up recovers what it can.
 
   A stream quote reply counts as addressed when a message link ending in
@@ -113,7 +115,9 @@ Discord and Slack adapters that once lived here moved to those servers.
 
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). It never advances past a message the host was offered but did not
+  `push/event`). A channel the host has accepted nothing on gets one just
+  below its first message that isn't accepted, and while `zulip.messaging`
+  is disabled, as that message comes in. It never advances past a message the host was offered but did not
   accept — a refusal, a batch lost to a transport failure — which is
   replayed from history once the host answers again. On the next connection
   one or more `<missed>` blocks per channel deliver what arrived meanwhile (full
@@ -274,9 +278,11 @@ one line in the shared shape, carrying the message's own id:
 
 On a closed channel only an addressed change is pushed — the mention the
 agent is about to answer was rewritten or deleted, a quote reply changed,
-or a DM it is reading changed — the same rule as for messages. A change to a message the host was
-never offered is dropped, unless it arrives while that message still waits
-for its turn: the delivery model above says what then happens to it.
+or a DM it is reading changed — the same rule as for messages. On an open
+channel, a change to a message the host was never offered is dropped,
+unless the change addresses the agent, the message is the bot's own, or it
+arrives while that message still waits for its turn: the delivery model
+above says what then happens to it.
 Zulip re-renders (a link preview arriving) are
 not edits and never surface; the bot's own edits and deletions (rollback,
 `delete_message`) are its own doing and don't surface either. A deletion's

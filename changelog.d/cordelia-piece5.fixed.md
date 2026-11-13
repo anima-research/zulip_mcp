@@ -12,10 +12,14 @@
   attachments holds back only its own channel. A reaction is checked against
   the filters when it is placed in its channel and again at its turn. One
   whose stream the server doesn't know yet is checked at its turn only.
-- A host's `channels/open` or `channels/close` of a channel the server
-  already knows no longer waits for the requests ahead of it, such as a tool
-  call that waits for the host. It waits for the job running on its own
-  channel, such as one message being handled. So a host that opens a channel
+- A host's `channels/open` or `channels/close` that names by its id a
+  channel the server already knows no longer waits for the requests ahead of
+  it, such as a tool call that waits for the host. It waits for the job
+  running on its own channel, such as one message being handled. It still
+  waits for the requests ahead of it while one of them is a
+  `featureSets/update`, an open or close of the same channel, or an open or
+  close whose channel the server couldn't name when it came. An open by
+  type and address waits for the requests ahead of it, as before. So a host that opens a channel
   before it answers that channel's announcement, as agent-framework 0.18.0
   and older did, no longer stalls for 5 s behind a tool call that announced
   the channel.
