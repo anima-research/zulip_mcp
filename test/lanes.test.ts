@@ -55,9 +55,11 @@ test("a job held on one lane doesn't hold another lane", async () => {
   const l = lanes();
   const log: string[] = [];
   const held = gate();
-  l.lane(A).enter(async () => { await held.opened; log.push('A'); });
+  let started = false;
+  l.lane(A).enter(async () => { started = true; await held.opened; log.push('A'); });
   l.lane(B).enter(() => { log.push('B'); });
   await new Promise((r) => setImmediate(r));
+  assert.equal(started, true, "A's job runs, held at its gate");
   assert.deepEqual(log, ['B']);
   held.open();
   await l.quiet();
@@ -303,10 +305,12 @@ test('ending the lanes gives up waiting for a running job at the grace', async (
 test('quiet settles only when no lane runs or waits', async () => {
   const l = lanes();
   const running = gate();
-  l.lane(A).enter(async () => { await running.opened; });
+  let started = false;
+  l.lane(A).enter(async () => { started = true; await running.opened; });
   let quiet = false;
   void l.quiet().then(() => { quiet = true; });
   await new Promise((r) => setImmediate(r));
+  assert.equal(started, true, 'the job runs, held at its gate');
   assert.equal(quiet, false);
   running.open();
   await l.quiet();
