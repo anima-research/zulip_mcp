@@ -39,7 +39,12 @@
   dropped, unless it was already waiting in the batch. It now waits in its
   channel until the host enables `zulip.messaging` again. An edit of it that
   arrived meanwhile and didn't move it is applied to it, so it comes once
-  with its new text, and one deleted meanwhile doesn't come.
+  with its new text, and one deleted meanwhile doesn't come. A message
+  already being handled when `zulip.messaging` was disabled is held, and a
+  read from history brings it first once it is enabled. Where that read
+  fails, later messages go first, and until it comes, an edit or a deletion
+  of one of them sends no line, unless that message addresses the agent or
+  is the agent's own.
 - A catch-up at a connection's start, or a recovery after Zulip's event
   queue broke, that fell while `zulip.messaging` was disabled was skipped. It
   is now made once the host enables `zulip.messaging`.
@@ -119,7 +124,9 @@
   read that Zulip refuses for a reason other than its rate limit brings none
   of them either, and the log gives the refusal. They stay held, up to the
   50,000 holds a channel keeps, so on an open channel a later read of held
-  messages offers them, after messages that arrived after them. If that
+  messages offers them, after messages that arrived after them. Until they
+  come, an edit or a deletion of one of those later messages sends no line,
+  unless that message addresses the agent or is the agent's own. If that
   read is refused too, the next connection's catch-up brings them. A
   reaction, or a change about another message, that was waiting stays, and
   its turn comes after the read. On a closed channel, the given-up messages
@@ -130,4 +137,7 @@
   a later reaction, since it waited for its own lookup alone. Events that
   only a lookup can place are now placed one at a time, in the order Zulip
   sent them, and the reactions, changes and messages without a stream id
-  that arrive meanwhile wait behind them.
+  that arrive meanwhile wait behind them. On a queue that sends a stream's
+  id with one message and not with another, a message without the id can
+  enter its channel behind a later message that has it. It then comes after
+  that message, or doesn't come where that message was already dealt with.
