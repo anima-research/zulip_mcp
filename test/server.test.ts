@@ -5725,3 +5725,25 @@ test('a close by id waits for an earlier open of its channel by type and address
   }
   await h.close();
 });
+
+test('an open that comes after a featureSets/update waiting on the chain is judged under the updated grant', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  let releaseSlow!: () => void;
+  fakeTools.hold = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  try {
+    const slow = h.host.sendRequest('tools/call', { name: 'slow', arguments: {} });
+    const update = h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.lifecycle') });
+    const opening = h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    await Promise.race([opening.catch(() => {}), new Promise((r) => setTimeout(r, 300))]);
+    releaseSlow();
+    await Promise.all([slow, update]);
+    await assert.rejects(opening, /channels\.lifecycle/);
+    assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
+  } finally {
+    releaseSlow();
+    fakeTools.hold = null;
+  }
+  await h.close();
+});

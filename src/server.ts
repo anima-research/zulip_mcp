@@ -210,6 +210,7 @@ export class ZulipMcplServer {
   private requestsWaiting = 0;
   private readonly hostRequestsOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
+  private grantUpdatesOnChain = 0;
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
@@ -407,6 +408,8 @@ export class ZulipMcplServer {
         if (msg.type === 'request' && this.enterHostQueue(conn, msg.request)) continue;
         const lifecycleId = msg.type === 'request' ? this.lifecycleTarget(msg.request) : null;
         if (lifecycleId !== null) this.lifecycleOnChain.set(lifecycleId, (this.lifecycleOnChain.get(lifecycleId) ?? 0) + 1);
+        const grantUpdate = msg.type === 'request' && msg.request.method === method.FEATURE_SETS_UPDATE;
+        if (grantUpdate) this.grantUpdatesOnChain++;
         this.requestsWaiting++;
         this.requestTail = this.requestTail.then(async () => {
           try {
@@ -416,6 +419,7 @@ export class ZulipMcplServer {
               : this.handleNotification(conn, msg.notification));
           } finally {
             this.requestsWaiting--;
+            if (grantUpdate) this.grantUpdatesOnChain--;
             if (lifecycleId !== null) {
               const left = (this.lifecycleOnChain.get(lifecycleId) ?? 1) - 1;
               if (left > 0) this.lifecycleOnChain.set(lifecycleId, left);
@@ -465,7 +469,7 @@ export class ZulipMcplServer {
 
   private enterHostQueue(conn: McplConnection, req: JsonRpcRequest): boolean {
     const channelId = lifecycleChannelId(req);
-    if (channelId === null || !this.mcplActive || !this.lanes || this.lifecycleOnChain.has(channelId)) return false;
+    if (channelId === null || !this.mcplActive || !this.lanes || this.lifecycleOnChain.has(channelId) || this.grantUpdatesOnChain > 0) return false;
     if (!this.grant.has('channels.lifecycle')) return false;
     const answer = this.ids.resolve(channelId);
     if (!answer || !('key' in answer)) return false;
