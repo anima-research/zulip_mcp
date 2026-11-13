@@ -1,11 +1,3 @@
-/**
- * Context Provider — Handles context/beforeInference.
- *
- * Injects recent message history from open channels into the inference
- * context. History fetching/formatting is delegated to the owning
- * PlatformAdapter per channel.
- */
-
 import type {
   ContextBeforeInferenceParams,
   ContextBeforeInferenceResult,
@@ -25,7 +17,6 @@ const POSITION_CAPABILITY: Record<ContextInjection['position'], string> = {
 };
 
 export interface ContextProviderOptions {
-  /** Open channels for which nothing is injected (a muted stream). */
   excludeChannel?: (key: ChannelKey) => boolean;
 }
 
@@ -84,8 +75,6 @@ export class ContextProvider {
       }
     }
 
-    // Tag with the contributing platform's context feature set. When multiple
-    // (or no) platforms contributed, fall back to the first registered one.
     const type = contributingTypes.size === 1
       ? contributingTypes.values().next().value
       : this.channelManager.firstAdapterType();

@@ -30,12 +30,6 @@ export class SendRefused extends Error {
 /** Zulip's default `max_message_length` realm setting. */
 export const ZULIP_MAX_MESSAGE_LENGTH = 10000;
 
-/**
- * Split text into messages of at most `limit` characters, preferring
- * paragraph boundaries, then line boundaries, then a hard cut, which never
- * splits a character. Boundary whitespace at the split is dropped; nothing
- * else is.
- */
 export function chunkMessage(text: string, limit: number = ZULIP_MAX_MESSAGE_LENGTH): string[] {
   const out: string[] = [];
   let rest = text;
@@ -70,7 +64,6 @@ export function namePosted<E extends Error>(err: E, posted: readonly number[]): 
   return err;
 }
 
-/** A send with no text and nothing uploaded. */
 export class NothingToSend extends Error {
   constructor() {
     super('sendMessage was given no text and no files');

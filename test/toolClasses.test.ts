@@ -1,20 +1,10 @@
-/**
- * MCPL RFC-008 tool classes: every tool the server can list is classed (or
- * deliberately unclassed), classes come from the RFC vocabulary, and the
- * class merges into `_meta`. The wire case (tools/list) is in server.test.ts.
- *
- * Run: node --import tsx --test test/toolClasses.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES, TOOL_CLASS_VOCABULARY, UNCLASSED, withToolClasses } from '../src/tool-classes.ts';
 
-/** RFC-008 §1, pinned here so the module's own vocabulary cannot drift. */
 const RFC_008_VOCABULARY = ['comms', 'memory', 'notes', 'files', 'shell', 'web', 'computer', 'media', 'body', 'control'];
 
-// tools/list answers with every entry of `toolDefinitions`.
 const ALL_TOOLS = toolDefinitions.map((t) => t.name);
 
 test('every tool the server can list is in TOOL_CLASSES or UNCLASSED', () => {

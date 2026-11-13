@@ -16,7 +16,6 @@ export class McplRpcError extends Error {
   }
 }
 
-/** §14.6 / §5.4 — the method requires a capability not in the effective grant. */
 export function capabilityDenied(capability: string): McplRpcError {
   return new McplRpcError(ERR_CAPABILITY_DENIED, `Capability denied: ${capability}`, { capability });
 }

@@ -1,9 +1,3 @@
-/**
- * The shared message line and the history-tool lines built on it.
- *
- * Run: node --import tsx --test test/messageLine.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { headerField, messageLineHead } from '../src/message-line.ts';

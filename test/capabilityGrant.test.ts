@@ -7,8 +7,6 @@ import { CapabilityGrant } from '../src/grant.ts';
 import { McplRpcError } from '../src/errors.ts';
 import { buildFeatureSets, buildServerCapabilities } from '../src/feature-sets.ts';
 
-// --- §6.2: `uses` is a closed vocabulary ------------------------------------
-
 test('every declared `uses` value is in the SPEC §6.2 capability-path vocabulary', () => {
   const sets = buildFeatureSets({ typing: true });
   assert.ok(Object.keys(sets).length > 0);
@@ -55,8 +53,6 @@ test('the manifest advertises injection without observation (§10.1 write-withou
   });
   assert.equal(caps.version, '0.5');
 });
-
-// --- §5.3 / §5.4: absence is denial -----------------------------------------
 
 test('nothing is granted before the initial policy exchange (§5.3)', () => {
   const grant = new CapabilityGrant({
@@ -117,8 +113,6 @@ test('a path in both effectiveCapabilities and deniedCapabilities is rejected as
   }
   assert.ok(thrown instanceof McplRpcError, 'expected a typed JSON-RPC error');
   assert.equal((thrown as McplRpcError).code, -32602);
-  // Fail closed means closed: a malformed policy leaves nothing granted and
-  // no ready state. The previous, wider grant does not survive it.
   assert.equal(grant.isReady(), false);
   assert.equal(grant.has('channels.publish'), false);
   assert.equal(grant.has('channels.incoming'), false);
@@ -135,8 +129,6 @@ test('deniedCapabilities never participates in an authorization decision (§5.4)
   assert.equal(grant.has('contextHooks.beforeInference.inject.system'), false);
   assert.equal(grant.has('channels.publish'), true);
 });
-
-// --- §6.4 / §6.7: derivation and the degradation receipt ---------------------
 
 const DECLARATIONS = {
   'zulip.messaging': {
@@ -231,8 +223,6 @@ test('an `enabled` selection excludes what it does not name', () => {
   assert.equal(grant.isFeatureSetActive('zulip.context'), false);
 });
 
-// --- §6.7: a Notification cannot establish a ready state --------------------
-
 test('a featureSets/update Notification establishes nothing before the initial exchange (§6.7)', () => {
   const grant = new CapabilityGrant(declarations());
   const receipt = grant.apply({ effectiveCapabilities: ['channels.publish'] }, 'notification');
@@ -292,6 +282,5 @@ test('setDeclarations re-derives degradation without touching the grant (§17.5)
     'zulip.messaging': { description: 'x', uses: ['channels.register', 'channels.publish'] },
   });
   assert.equal(grant.isFeatureSetActive('zulip.messaging'), true);
-  // Unchanged: declarations are not authority.
   assert.equal(grant.has('channels.incoming'), false);
 });

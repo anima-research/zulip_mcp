@@ -74,11 +74,8 @@ interface StartOptions {
   backscroll?: Record<string, number>;
   reuse?: Run;
   beforePushAnswer?: (push: PushEventParams, host: McplConnection) => Promise<void>;
-  /** Send the host's policy now but don't wait for live delivery. */
   noWait?: boolean;
-  /** Hold the host's policy until `grant()`. */
   grantLater?: boolean;
-  /** Record channels/register but never answer it. */
   holdRegister?: boolean;
   beforeRegisterAnswer?: () => Promise<void>;
   shutdownGraceMs?: number;
@@ -127,7 +124,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
       registered.push(...p.channels);
       if (!opts.holdRegister) {
         void Promise.resolve(opts.beforeRegisterAnswer?.()).then(() => {
-          try { host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) }); } catch { /* closed */ }
+          try { host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) }); } catch { }
         });
       }
     } else if (req.method === method.CHANNELS_INCOMING) {
@@ -140,7 +137,7 @@ async function start(r: Realm, dir: string, opts: StartOptions = {}): Promise<Ru
     } else if (req.method === method.CHANNELS_CHANGED) {
       const p = req.params as Run['changed'][number];
       changed.push(p);
-      const answer = () => { try { host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) }); } catch { /* closed */ } };
+      const answer = () => { try { host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) }); } catch { } };
       if (holding) held.push(answer); else answer();
     } else {
       host.sendError(req.id, -32601, `unexpected ${req.method}`);

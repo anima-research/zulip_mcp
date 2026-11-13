@@ -98,8 +98,6 @@ test('find_user and list_emojis report a Zulip API error as an error, never as a
   }
 });
 
-// ── Outbound attachments ──
-
 function fakeUploader() {
   const uploaded: { name: string; bytes: string; mimeType?: string }[] = [];
   const uploader = {
@@ -225,8 +223,6 @@ test('without a realm there is no uploader: attachments error clearly and plain 
   }
 });
 
-// ── listen registers what it joined (#20) ──
-
 test('listen reports subscriptions to the server and carries the registration outcome back to the agent (#20)', async () => {
   const calls: unknown[] = [];
   const client = standInApi({
@@ -247,7 +243,6 @@ test('listen reports subscriptions to the server and carries the registration ou
     assert.deepEqual(out.registration, { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' });
     assert.match(out.note, /did not confirm zulip:ops \(timed out\)/, 'the agent is told, instead of it going to stderr');
 
-    // The hook is awaited: `listen` answers after registration, not before.
     let settled = false;
     tools.onSubscribed = async () => {
       await new Promise((r) => setTimeout(r, 20));
@@ -275,7 +270,6 @@ test('listen does not register anything when Zulip refused the subscription (#20
     assert.equal(out.registration, undefined);
     assert.deepEqual(out.unauthorized, ['secret']);
 
-    // An error from Zulip is reported as such, and registers nothing.
     const failing = runtime(standInApi({
       'POST /users/me/subscriptions': async () => { throw new Error('nope'); },
     }).api);
@@ -302,8 +296,6 @@ test('delete_message notes the id before the call and un-notes it when Zulip ref
   assert.deepEqual(noted, ['5', '7'], 'noted before the call on both');
   assert.deepEqual(failed, ['7'], 'only the refused one is un-noted');
 });
-
-// ── Replies derive their destination before any outbound side effect ──
 
 const replyStream = { type: 'stream', stream_id: 12, display_recipient: 'General', subject: 'Deploy status' };
 const replyParticipants = [

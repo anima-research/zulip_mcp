@@ -36,10 +36,6 @@ const R1: { name: string; streamId: number; stream: string; topic: string; id: n
 type Stream = { name: string; invite_only: boolean };
 type Message = { type: 'stream'; stream_id: number; display_recipient: string; subject: string } | { type: 'private'; display_recipient: { id: number }[] };
 
-/**
- * A Zulip that holds these streams and messages; a message or stream it doesn't hold is refused as Zulip refuses it.
- * `noAnswer` names messages whose read gets no answer, and `rateLimited` refuses every lookup of a stream's name.
- */
 function zulip(streams: Record<number, Stream>, messages: Record<number, Message>, limit?: number, opts: { noAnswer?: number[]; rateLimited?: boolean } = {}) {
   let posted = 0;
   const { api, calls } = standInApi({

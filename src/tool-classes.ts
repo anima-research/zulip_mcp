@@ -27,11 +27,9 @@ export const TOOL_CLASS_VOCABULARY = [
 export type ToolClass = (typeof TOOL_CLASS_VOCABULARY)[number];
 
 export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
-  // Sends that can carry files.
   send_message: ['comms', 'files'],
   send_dm: ['comms', 'files'],
   upload_file: ['comms', 'files'],
-  // Messages, and the people, streams and emoji around them.
   edit_message: ['comms'],
   move_messages: ['comms'],
   delete_message: ['comms'],
@@ -47,7 +45,6 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   get_stream_topics: ['comms'],
   list_streams: ['comms'],
   list_emojis: ['comms'],
-  // This server's own delivery state and the bot's own profile.
   get_user_profile: ['control'],
   start_monitoring: ['control'],
   stop_monitoring: ['control'],
@@ -63,11 +60,8 @@ export const TOOL_CLASSES: Record<string, readonly ToolClass[]> = {
   channel_missed: ['control'],
 };
 
-/** Tools deliberately left without a class. None today. */
 export const UNCLASSED: ReadonlySet<string> = new Set<string>();
 
-/** The tools with their class added to `_meta`, keeping any other `_meta`
- *  keys. Unclassed tools are returned as they are. */
 export function withToolClasses<T extends { name: string; _meta?: Record<string, unknown> }>(
   tools: readonly T[],
 ): T[] {

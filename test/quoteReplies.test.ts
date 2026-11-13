@@ -9,8 +9,6 @@ import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type ChannelKey } from '../src/channel-key.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
-// Isolate the process-wide limiter between tests, without bypassing it in
-// individual cases (including the multi-adapter saturation regression).
 beforeEach(() => {
   (ZulipAdapter as unknown as {
     quoteBudget: { tokens: number; updatedAt: number };
@@ -52,7 +50,6 @@ function quote(id = QUOTED, namedUser = SELF): string {
   return `@_**User|${namedUser}** [said](/#narrow/channel/1-general/near/${id}):\n\n\`\`\`quote\noriginal\n\`\`\`\nreply`;
 }
 
-/** Exercise the real queue -> adapter -> incoming-message path. */
 async function receive(
   rows: ZulipRawMessage[],
   getById: (params: Record<string, unknown>) => Promise<unknown>,
@@ -89,7 +86,6 @@ async function receive(
 
 test('own-message quote is tagged as a reply without changing the mention verdict', { timeout: 2000 }, async () => {
   const calls: Record<string, unknown>[] = [];
-  // The silent mention's id is deliberately not SELF: the quoted sender decides.
   const messages = await receive([raw(300, quote(QUOTED, 102))], async (params, { id }) => {
     calls.push({ id, ...params });
     return { result: 'success', message: raw(QUOTED, 'original', { sender_id: SELF }) };
@@ -221,7 +217,6 @@ test('R2-2: a live timeout bounds waiting without poisoning a later lookup', { t
     const messages = await Promise.race([
       receiving,
       new Promise<never>((_, reject) => {
-        // Allow scheduler overhead beyond the dedicated three-second budget.
         timer = setTimeout(() => reject(new Error('unrelated message blocked beyond quote budget')), 3500);
       }),
     ]);
@@ -584,7 +579,7 @@ test('sixteen history channels all verify off-page quote targets', async (t) => 
   let gets = 0;
   const adapter = new ZulipAdapter(standInApi({
     'GET /messages': async ({ narrow }: { narrow: { operand: number }[] }) => {
-      now += 300; // one ordinary history page round trip; no quote lookup waited
+      now += 300;
       return { messages: [raw(300, quote(500 + narrow[0].operand - 100))], found_newest: true };
     },
     'GET /messages/:id': async (_params: unknown, { id: message_id }: { id: number }) => { gets++; return { message: raw(message_id, 'original', { sender_id: SELF }) }; },
@@ -754,7 +749,6 @@ for (const malformed of ['wrong id', 'missing sender'] as const) {
     }).api, { selfUserId: SELF, sessionId: 'session' }, { directory: knownStreams() });
     const first = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.deepEqual(first.unverifiedMessageIds, ['300']);
-    // Invalid target objects must not enter either cache, including the wrong id.
     assert.equal((adapter as unknown as { seen: Map<number, unknown> }).seen.has(9999), false);
     const second = await adapter.fetchHistory(key('zulip:general'), { limit: 100 });
     assert.equal(second.messages[0].metadata?.replyToSelf, true);
@@ -790,13 +784,12 @@ for (const outcome of ['budget-skipped', 'unverified'] as const) {
     assert.equal(first.messages[0].metadata?.replyToSelf, true);
     initial = false;
     const internal = adapter as unknown as { seen: Map<number, { replyToSelf?: boolean }> };
-    internal.seen.delete(QUOTED); // Lose the target author, not the verified reply.
+    internal.seen.delete(QUOTED);
     content = quote().replace('reply', 'corrected reply');
-    // A typo edit missed during a gap keeps the same quote target.
     const query = { limit: 100, ...(outcome === 'budget-skipped' ? { quoteLookupBudget: { remainingMs: 0 } } : {}) };
     const unchanged = await adapter.fetchHistory(key('zulip:general'), query);
     assert.equal(unchanged.messages[0].metadata?.replyToSelf, true, 'unchanged targets retain the confident verdict');
-    content = quote(201); // A different, unresolved target is not a verified reply.
+    content = quote(201);
     const page = await adapter.fetchHistory(key('zulip:general'), query);
     assert.equal(internal.seen.get(300)?.replyToSelf, false, 'changed targets invalidate the cached verdict');
     assert.equal(page.messages[0].metadata?.replyToSelf, false);

@@ -1,9 +1,3 @@
-/**
- * Tests for ChannelManager adapter routing and in-thread publish hints.
- *
- * Run: node --import tsx --test test/channelManager.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelManager } from '../src/channels.ts';
@@ -144,7 +138,6 @@ function makeTypingManager() {
   return { manager, typed };
 }
 
-/** A message as the Zulip adapter delivers it, `metadata.topic` included. */
 function zulipMessage(channelId: string, over: Partial<ZulipRawMessage> = {}) {
   return toIncoming(fixtureKey(channelId), normalizeMessage({
     id: 42,
@@ -183,7 +176,7 @@ test('a newer message in another topic stops typing where it started before star
   deliver(manager, 'zulip:support', supportMessage('router A'));
   await manager.sendTyping('zulip:support');
   deliver(manager, 'zulip:support', { ...supportMessage('router B'), messageId: '43' });
-  await manager.sendTyping('zulip:support'); // the ~7s refresh
+  await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support');
   deliver(manager, 'zulip:support', { ...supportMessage('router A'), messageId: '44' });
   await manager.sendTyping('zulip:support', undefined, 'stop');
@@ -202,17 +195,14 @@ test('the newest message sets the topic: one older than the message it came from
   manager.openChannel({ type: 'zulip' });
   const at = (id: number, topic: string) => zulipMessage('zulip:support', { id, subject: topic });
   deliver(manager, 'zulip:support', at(50, 'router B'));
-  // A held message offered again, older than the one the topic came from.
   deliver(manager, 'zulip:support', at(42, 'router A'));
   await manager.sendTyping('zulip:support');
-  // A pushed mention accepted after a newer one's, as noteConversation hears of it.
   assert.equal(manager.noteConversation(fixtureKey('zulip:support'), at(45, 'router C')), false, 'older: the topic stays');
   await manager.sendTyping('zulip:support');
   assert.equal(manager.noteConversation(fixtureKey('zulip:support'), at(51, 'router D')), true, 'newer: it moves');
   await manager.sendTyping('zulip:support');
   await manager.sendTyping('zulip:support', undefined, 'stop');
   assert.deepEqual(typedOps(typed), [['router B', 'start'], ['router B', 'start'], ['router B', 'stop'], ['router D', 'start'], ['router D', 'stop']]);
-  // A new connection starts from no topic, so an older message held from before it sets one.
   manager.reset();
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
@@ -268,7 +258,6 @@ test('reset() forgets the topic a typing run started in', async () => {
   manager.openChannel({ type: 'zulip' });
   deliver(manager, 'zulip:support', supportMessage('router B'));
   await manager.sendTyping('zulip:support');
-  // A new connection's run: no stop for the old connection's topic.
   assert.deepEqual(typedOps(typed), [['router A', 'start'], ['router B', 'start']]);
   manager.destroy();
 });
@@ -340,7 +329,6 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
   await manager.registerChannels();
   manager.openChannel({ type: 'zulip' });
 
-  // Real conversation establishes thread routing.
   deliver(manager, 'zulip:general', {
     channelId: 'zulip:general',
     messageId: '7',
@@ -357,7 +345,7 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
     metadata: { expiredQueueId: 'q1', lastEventId: 42 },
   });
 
-  await new Promise(resolve => setTimeout(resolve, 30)); // let the 10ms batch flush
+  await new Promise(resolve => setTimeout(resolve, 30));
 
   const flushed = sent.flat();
   const marker = flushed.find(m => m.metadata?.system === true);
@@ -368,7 +356,6 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
   assert.equal(marker.metadata.lastEventId, 42);
   assert.match(marker.content[0].text, /missed/);
 
-  // The system marker must not steal publish thread routing.
   await manager.publish({
     conversationId: '',
     channelId: 'zulip:general',
@@ -385,8 +372,6 @@ test('broadcastSystemEvent with no open channels does not throw', () => {
   manager.destroy();
   assert.ok(true);
 });
-
-// --- Capability gating (SPEC 0.5 §5.4, §14.1, §14.5) ------------------------
 
 function ungatedManager(client: any = fakeMcplClient) {
   const desc: ChannelDescriptor = {
@@ -448,7 +433,6 @@ test('a descriptor the host rejects is not recorded as registered (§14.5)', asy
   const { manager } = makeManagerWith(client);
   await manager.registerChannels();
   assert.deepEqual(manager.listChannels().channels, []);
-  // ...and a channel that was never registered cannot then be opened.
   assert.throws(() => manager.openChannel({ type: 'zulip' }), /No channel found/);
   manager.destroy();
 });
@@ -508,7 +492,6 @@ function makeManagerWith(client: any) {
 
 test('incoming messages on unopened channels are ignored', () => {
   const { manager } = makeManager();
-  // Channel never opened by host — should not record hints or buffer.
   deliver(manager, 'zulip:C1', {
     channelId: 'zulip:C1',
     messageId: '1',
@@ -517,8 +500,6 @@ test('incoming messages on unopened channels are ignored', () => {
     content: [{ type: 'text', text: 'ignored' }],
   });
   manager.destroy();
-  // No assertion target beyond "doesn't throw" — hint state is private;
-  // covered indirectly by the publish-hints test requiring openChannel.
   assert.ok(true);
 });
 
@@ -555,14 +536,12 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
       timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: id }],
     });
 
-    // Queued while allowed, policy flips before the window closes: withheld, never sent.
     deliver(manager, 'zulip:C1', msg('1'));
     allow = false;
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(sent, []);
     assert.deepEqual(withheld, ['1']);
 
-    // Allowed again; the host fails the attempt and the retry: given up, not dropped silently.
     allow = true;
     fail = 2;
     deliver(manager, 'zulip:C1', msg('2'));
@@ -571,13 +550,11 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
     assert.deepEqual(givenUp, ['2']);
     assert.equal(manager.pendingCount(), 0);
 
-    // A healthy host: delivered and reported as such.
     deliver(manager, 'zulip:C1', msg('3'));
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(sent.map((b) => b.map((m: any) => m.messageId)), [['3']]);
     assert.deepEqual(delivered, ['3']);
 
-    // reset() forgets the connection's registrations, opens and buffer.
     deliver(manager, 'zulip:C1', msg('4'));
     assert.equal(manager.pendingCount(), 1);
     manager.reset();
@@ -589,14 +566,11 @@ test('policy is rechecked at send time: withheld messages are reported, and a ba
   }
 });
 
-// ── Announcing channels that appear after startup (#20) ──
-
 function desc(id: string): ChannelDescriptor {
   const name = id.slice('zulip:'.length);
   return { id, type: 'zulip', label: `#${name}`, direction: 'bidirectional', address: { stream_id: streamIdFor(name), stream_name: name } };
 }
 
-/** A ChannelManager whose host answers `channels/changed` however the test says. */
 function announcing(answer: () => unknown) {
   const sent: ChannelDescriptor[][] = [];
   const host = {
@@ -623,15 +597,12 @@ test('a host that never answers keeps the channel usable, retries it only when a
   assert.deepEqual(first, { announced: [], local: ['zulip:ops'], refused: [], reason: 'timed out' });
   assert.ok(manager.getChannel('zulip:ops'), 'usable here: the host never said no');
 
-  // The message path must not drag the backlog into a delivery-time request.
   await manager.registerAdditional([desc('zulip:dev')]);
   assert.deepEqual(sent[1].map((c) => c.id), ['zulip:dev'], 'only the new channel');
 
-  // An explicit refresh retries everything pending, in one request.
   await manager.registerAdditional([], { retryBacklog: true });
   assert.deepEqual(sent[2].map((c) => c.id).sort(), ['zulip:dev', 'zulip:ops']);
 
-  // Bounded: 200 unanswered channels do not grow the retry set past the cap.
   for (let i = 0; i < 200; i++) await manager.registerAdditional([desc(`zulip:s${i}`)]);
   const backlog = await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(backlog.local.length, 100, 'exactly the cap, oldest dropped');
@@ -654,12 +625,10 @@ test('an itemized refusal unregisters the channel, closes it, and is not asked a
   assert.equal(manager.getChannel('zulip:ops'), undefined);
   assert.equal(manager.isOpen('zulip:ops'), false, 'no registry/lifecycle split brain');
 
-  // Later messages from that stream carry the descriptor again; the host is not re-asked.
   await manager.registerAdditional([desc('zulip:ops')]);
   await manager.registerAdditional([desc('zulip:ops')]);
   assert.equal(sent.length, 1, 'the refusal is remembered');
 
-  // Until the agent explicitly refreshes.
   await manager.registerAdditional([desc('zulip:ops')], { retryRefused: true });
   assert.equal(sent.length, 2);
 });
@@ -682,10 +651,9 @@ test('the announcement backlog belongs to the connection that was there (#20)', 
   await manager.registerAdditional([desc('zulip:gone')]);
   assert.equal(manager.getChannel('zulip:gone') !== undefined, true);
 
-  manager.reset(); // the host disconnected
+  manager.reset();
   assert.equal(manager.getChannel('zulip:gone'), undefined);
 
-  // A new peer must not be told about a channel this server no longer sees.
   await manager.registerAdditional([desc('zulip:dev')], { retryBacklog: true });
   assert.deepEqual(sent[1].map((c) => c.id), ['zulip:dev']);
 });
@@ -780,8 +748,6 @@ test('a stream archived while its first announcement waits to be retried: a retr
 });
 
 test('a refusal that arrives on the retry is a refusal, not a contradiction (#20)', async () => {
-  // The descriptor is recorded before the announcement, so "already in
-  // allChannels" cannot mean "the host accepted it" — only a verdict can.
   let answer: unknown = new Error('timed out');
   const { manager } = announcing(() => answer);
   const first = await manager.registerAdditional([desc('zulip:ops')]);
@@ -806,7 +772,6 @@ test('retrying a refused channel does not forget the refusal when the retry goes
   assert.deepEqual(retried.local, []);
   assert.equal(manager.getChannel('zulip:ops'), undefined);
 
-  // Still refused: the automatic paths do not ask again.
   const after = sent.length;
   await manager.registerAdditional([desc('zulip:ops')]);
   assert.equal(sent.length, after);
@@ -815,7 +780,7 @@ test('retrying a refused channel does not forget the refusal when the retry goes
 test('a host that acts on a pending channel has confirmed it (#20)', async () => {
   const { manager, sent } = announcing(() => new Error('timed out'));
   await manager.registerAdditional([desc('zulip:ops')]);
-  manager.confirmAnnounced('zulip:ops'); // the host opened or closed it
+  manager.confirmAnnounced('zulip:ops');
   await manager.registerAdditional([], { retryBacklog: true });
   assert.equal(sent.length, 1, 'nothing left to re-announce');
 });

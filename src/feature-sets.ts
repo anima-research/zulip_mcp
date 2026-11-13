@@ -16,11 +16,6 @@ export const HISTORY_FEATURE_SET = 'zulip.history';
 export const CONTEXT_FEATURE_SET = 'zulip.context';
 
 export interface FeatureSetOptions {
-  /**
-   * Whether the adapter implements `sendTyping`. Derived from the adapter
-   * class at the call site rather than restated here, so the declaration
-   * cannot drift from the implementation.
-   */
   typing: boolean;
 }
 
@@ -73,8 +68,6 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     [MESSAGING_FEATURE_SET]: {
       description: 'Real-time Zulip message delivery and channel management',
       uses: messagingUses,
-      // §8.1: what this server sent since a checkpoint can be undone
-      // (state/rollback deletes the bot's own messages).
       rollback: true,
       tagOntology: ZULIP_TAG_ONTOLOGY,
     },
@@ -114,11 +107,6 @@ export function buildServerCapabilities(options: FeatureSetOptions): McplManifes
   };
 }
 
-/**
- * The feature set that owns a tool, for §6.7 selection: a host that disables
- * `zulip.messaging` disables its tools with it. Read-only lookups return
- * undefined and stay available under the plain `tools` capability.
- */
 export function featureSetForTool(toolName: string): string | undefined {
   switch (toolName) {
     case 'send_message':

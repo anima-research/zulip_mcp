@@ -1,8 +1,3 @@
-/**
- * Zulip client bootstrap — credentials, realm/auth capture for direct HTTP
- * (attachments), bot identity for the self-filter, and startup subscriptions.
- */
-
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
 import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, selfIdGate, zulipApi, type ZulipApi } from './zulip-api.js';
@@ -10,15 +5,10 @@ import type { StreamDirectory } from './stream-directory.js';
 
 export interface ZulipSession {
   api: ZulipApi;
-  /** Numeric bot user id when the profile fetch succeeded; null = no self-filter. */
   selfUserId: number | null;
-  /** Realm URL without trailing slash, for direct `/user_uploads/` fetches. */
   realm: string;
-  /** `Basic …` header for direct fetches; empty when credentials are unknown. */
   authHeader: string;
-  /** Persistent-state id (ZULIP_SESSION_ID, else the bot email, else 'default'). */
   sessionId: string;
-  /** The realm's advertised per-file upload cap (`max_file_upload_size_mib`), bytes; null when unknown. */
   maxUploadBytes?: number | null;
 }
 
@@ -86,9 +76,6 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   const gate = selfIdGate(transport);
   const api = zulipApi(gate.transport);
 
-  // Keys the persistent state files. The bot's identity is the natural
-  // default whichever way the credentials arrived (env or zuliprc); two
-  // sessions of one bot sharing a state dir must set ZULIP_SESSION_ID.
   const sessionId = env.ZULIP_SESSION_ID || email || env.ZULIP_USERNAME || "default";
 
   const failure = await gate.read({ timeoutMs: LONG_TIMEOUT_MS });
@@ -96,8 +83,6 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     console.error(`Failed to read the bot's own user id: ${failure.reason}. A later request reads it again, and fails if that read does.`);
   }
 
-  // The realm's upload cap, so the outbound ceiling is what the server will
-  // actually accept rather than a guess. Fail-open: unknown → null.
   let maxUploadBytes: number | null = null;
   try {
     const settings = await api.requestAnswer<{ max_file_upload_size_mib?: unknown }>("GET", "/server_settings", {}, { timeoutMs: LONG_TIMEOUT_MS, needsSelfId: false });

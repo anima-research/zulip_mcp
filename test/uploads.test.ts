@@ -1,11 +1,3 @@
-/**
- * Outbound uploads — the multipart POST against a local HTTP server, the
- * root-confined attachment loader (local file / base64, the size ceilings),
- * the message-body link form, and the content-block → upload mapping.
- *
- * Run: node --import tsx --test test/uploads.test.ts
- */
-
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -140,8 +132,6 @@ test('the part header cannot be injected through the name or the type', () => {
   assert.equal(isValidMimeType('noslash'), false);
 });
 
-// ── Roots ──
-
 test('parseUploadRoots takes name=path entries, canonicalises them, and refuses what does not exist', () => {
   const dir = tmp();
   try {
@@ -161,13 +151,11 @@ test('parseUploadRoots takes name=path entries, canonicalises them, and refuses 
 });
 
 test('with no roots, local files are refused outright; inline data still works', async () => {
-  // Off Linux the platform refusal comes first; either way nothing is opened.
   const refused = LOCAL_FILES_SUPPORTED ? /local-file attachments are disabled: no upload roots configured/ : /supported on Linux only/;
   await assert.rejects(prepareAttachmentArg({ file: 'notes/a.txt' }, policy()), refused);
   await assert.rejects(prepareAttachmentArg({ file: '/etc/passwd' }, policy()), refused);
   const inline = await prepareAttachmentArg({ data: b64('hi'), name: 'a.txt' }, policy());
   assert.equal((await inline.read()).toString(), 'hi');
-  // An empty array needs neither roots nor an uploader.
   assert.deepEqual(await prepareAttachments([], policy()), []);
 });
 
@@ -217,7 +205,7 @@ test('the per-file ceiling is enforced on the bytes read, not only on stat', lin
     writeFileSync(f, 'x'.repeat(100));
     const p = policy({ roots: new Map([['d', dir]]), maxBytes: 150 });
     const prepared = await prepareAttachmentArg({ file: 'd/grow.txt' }, p);
-    writeFileSync(f, 'x'.repeat(400)); // grows between the size check and the read
+    writeFileSync(f, 'x'.repeat(400));
     await assert.rejects(prepared.read(), /grew past the 150B upload ceiling/);
 
     writeFileSync(f, 'x'.repeat(151));
@@ -236,7 +224,6 @@ test('inline data is strict base64, measured before it is decoded', async () => 
   assert.throws(() => base64DecodedLength('!!!not base64!!!'), /not valid base64/);
   assert.throws(() => base64DecodedLength('aGk'), /not valid base64/);
 
-  // Over the ceiling: rejected from the length arithmetic, nothing allocated.
   await assert.rejects(prepareAttachmentArg({ data: b64('x'.repeat(9)), name: 'a.txt' }, p), /is 9B, over the 8B upload ceiling/);
   await assert.rejects(prepareAttachmentArg({ data: 'aGk', name: 'a.txt' }, p), /attachment "a.txt": data is not valid base64/);
   await assert.rejects(prepareAttachmentArg({ data: 'data:text/plain;base64,aGk=', name: 'a.txt' }, p), /not valid base64/);
@@ -250,7 +237,6 @@ test('inline data is strict base64, measured before it is decoded', async () => 
   assert.equal(bareMimeType('Image/PNG ; q=1'), 'Image/PNG');
   assert.equal(bareMimeType('; charset=utf-8'), undefined);
 
-  // Whitespace-wrapped base64 (as many encoders emit) is accepted.
   const wrapped = await prepareAttachmentArg({ data: 'aGVs\nbG8=\n', name: 'a.txt' }, p);
   assert.equal(wrapped.size, 5);
   assert.equal((await wrapped.read()).toString(), 'hello');
@@ -283,8 +269,6 @@ test('withAttachmentLinks appends Zulip-style links, or is just the links when t
   assert.equal(withAttachmentLinks('plain', []), 'plain');
 });
 
-// ── Lifecycle ──
-
 /** Open descriptors of this process (macOS and Linux both list them under /dev/fd). */
 function openFds(): number {
   return readdirSync('/dev/fd').length;
@@ -296,13 +280,10 @@ test('a refused batch releases every handle it opened without reading anything',
     for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, `${n}.txt`), 'x'.repeat(100));
     const p = policy({ roots: new Map([['d', dir]]), maxBytes: 100, maxTotalBytes: 250 });
     const before = openFds();
-    // Refused by the aggregate budget after three handles are open.
     await assert.rejects(prepareAttachments([{ file: 'd/a.txt' }, { file: 'd/b.txt' }, { file: 'd/c.txt' }], p), /per-message budget/);
     assert.equal(openFds(), before, 'handles released');
-    // Refused by a later invalid entry.
     await assert.rejects(prepareAttachments([{ file: 'd/a.txt' }, { data: 'aGk=' }], p), /need a `name`/);
     assert.equal(openFds(), before);
-    // close() is idempotent and read() afterwards refuses.
     const one = await prepareAttachmentArg({ file: 'd/a.txt' }, p);
     await one.close();
     await one.close();
@@ -324,7 +305,6 @@ test('uploadPrepared releases the remaining handles when an upload throws, and r
     await assert.rejects(uploadPrepared({ async upload() { throw new Error('quota'); } }, prepared, { ...p, maxTotalBytes: 300 }), /quota/);
     assert.equal(openFds(), before, 'the two unread handles are released too');
 
-    // Declared sizes fit the budget; one file grows before it is read.
     const { uploader, uploaded } = fakeUploader();
     const again = await prepareAttachments([{ file: 'd/a.txt' }, { file: 'd/b.txt' }, { file: 'd/c.txt' }], { ...p, maxTotalBytes: 300 });
     writeFileSync(join(dir, 'b.txt'), 'x'.repeat(150));
@@ -351,9 +331,7 @@ test('the containment check is bound to the opened object, not to the pathname',
     const unlinked = await open(join(root, 'in.txt'), 'r');
     try {
       assert.equal(await verifyOpenedInsideRoot(insideHandle, root), true);
-      // What was opened is outside the root although the pathname is inside: refused.
       assert.equal(await verifyOpenedInsideRoot(outsideHandle, root), false);
-      // A sibling literally named "<root> (deleted)" is not the root.
       assert.equal(await verifyOpenedInsideRoot(siblingHandle, root), false);
       // A file unlinked after open is still the file that was inside.
       rmSync(join(root, 'in.txt'));
@@ -384,8 +362,6 @@ test('off Linux, local files are refused with the base64 hint and nothing is ope
     rmSync(dir, { recursive: true, force: true });
   }
 });
-
-// ── Blocks ──
 
 const PNG_HEAD = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 
@@ -437,8 +413,6 @@ test('block uploads honour the same ceilings and budgets', async () => {
   await assert.rejects(prepareBlocks([{ type: 'image', data: 'not base64!' }], p), /not valid base64/);
   assert.deepEqual(await prepareBlocks([{ type: 'text', text: 'x' }], p), []);
 });
-
-// ── Policy ──
 
 test('the policy takes the per-file ceiling from the env, else the realm, else the Cloud default, and derives the budgets', () => {
   const none = resolveUploadPolicy({}, null);

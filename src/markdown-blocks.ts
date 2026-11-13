@@ -63,7 +63,6 @@ export const HEADING = /^#{1,6}\s/;
 export const RULE = /^[ ]{0,3}(?=((?:-+[ ]{0,2}){3,}|(?:_+[ ]{0,2}){3,}|(?:\*+[ ]{0,2}){3,}))\1[ ]*$/;
 export const CODE = /^ {4}/;
 
-/** For each line, the first line at or after it that `pattern` matches, or `lines.length`. */
 export function nextMatching(lines: string[], pattern: RegExp): number[] {
   const next = new Array<number>(lines.length + 1).fill(lines.length);
   for (let i = lines.length - 1; i >= 0; i -= 1) next[i] = pattern.test(lines[i]!) ? i : next[i + 1]!;

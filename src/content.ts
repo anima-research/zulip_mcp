@@ -1,12 +1,3 @@
-/**
- * Content helpers — Zulip message formatting and attachment handling.
- *
- * Pure functions shared by the MCP tool layer (index.ts) and the Zulip
- * adapter (src/platforms/zulip.ts). Kept free of client/SDK code so both
- * sides can import without cycles: it takes only a constant from zulip-api.ts,
- * which imports nothing.
- */
-
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TIMEOUT_MS } from "./zulip-api.js";
@@ -33,8 +24,6 @@ export function isMainModule(importMetaUrl: string, argv1: string | undefined): 
 // cap is within the first limit and over the second.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
-// MIME types we decode and return as `content_text` instead of base64,
-// so the agent can read them directly (CSVs, JSON, plain text, etc).
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
 
 export interface FetchedAttachment {
@@ -43,11 +32,6 @@ export interface FetchedAttachment {
   name: string;
 }
 
-/**
- * Authenticated GET with an enforced size cap. Checks Content-Length when the
- * server provides one, and streams with a running byte budget as defense in
- * depth so a missing or lying header can't OOM the process.
- */
 export async function fetchAttachmentBytes(
   url: string,
   fallbackName: string,
@@ -80,7 +64,6 @@ async function readAttachment(
   progressed();
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
-  // Pre-check Content-Length so an oversized declared body never starts buffering.
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
     const n = Number(declared);
@@ -92,7 +75,6 @@ async function readAttachment(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    // No streaming body: fall back to arrayBuffer with a post-read check.
     buf = Buffer.from(await resp.arrayBuffer());
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
@@ -121,11 +103,6 @@ async function readAttachment(
   return { buf, mimeType, name: fallbackName };
 }
 
-/**
- * Shape a successful fetch into the tool's response. Images return as native
- * MCP content blocks (via `_content`), text-ish MIME types return decoded
- * `content_text`, other binary returns `base64`.
- */
 export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Record<string, unknown> {
   if (mimeType.startsWith("image/")) {
     return {
@@ -185,9 +162,9 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
 }
 
 export interface AttachmentRef {
-  path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
-  name: string;       // basename for human display
-  mimeType: string;   // best-effort from extension
+  path: string;
+  name: string;
+  mimeType: string;
   isImage: boolean;
 }
 
@@ -238,13 +215,11 @@ export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
 export function cleanContent(html: string): string {
   let content = html;
 
-  // Extract Zulip mentions first
   content = content.replace(
     /<span class="user-mention"[^>]*data-user-id="(\d+)"[^>]*>@([^<]+)<\/span>/g,
     '@$2 (uid:$1)'
   );
 
-  // Handle silent mentions
   content = content.replace(
     /<span class="user-mention silent"[^>]*data-user-id="(\d+)"[^>]*>([^<]+)<\/span>/g,
     '$2 (uid:$1)'
@@ -261,9 +236,6 @@ export function cleanContent(html: string): string {
         if (hasImg) return `[image: ${href}]`;
         return text ? `[attachment: ${text} — ${href}]` : `[attachment: ${href}]`;
       }
-      // External anchors with an inline image preview: keep `[image: ...]` so
-      // the agent can choose to fetch. Plain external links keep the prior
-      // text-only behaviour (no scope creep on non-attachment links).
       if (hasImg) return `[image: ${href}]`;
       return text || href;
     }
@@ -275,7 +247,6 @@ export function cleanContent(html: string): string {
     '[image: $1]'
   );
 
-  // Clean up HTML
   content = content
     .replace(/<p>/gi, '\n')
     .replace(/<br\s*\/?>/gi, '\n')
