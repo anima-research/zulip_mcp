@@ -5962,6 +5962,99 @@ test('a try that fails after its read has waited 90 s tells every open channel o
   await h.close();
 });
 
+for (const [label, narrowOther, narrowGeneral] of [
+  ['muted', (f: ZulipFilters) => ({ ...f, mutedStreams: ['other'] }), (f: ZulipFilters) => ({ ...f, mutedStreams: ['general'] })],
+  ['left out of the allowlist', (f: ZulipFilters) => ({ ...f, streams: ['general'] }), (f: ZulipFilters) => ({ ...f, streams: ['ops'] })],
+] as const) {
+  test(`the line about reads that wait doesn't name a channel ${label} by the time the line is built`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-wait-line-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const waits = heldWaits();
+      const clock = { t: 0 };
+      const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+      const h = harness({
+        filters: plane,
+        visible: [DESCRIPTOR, OTHER],
+        readRetryWait: waits.wait,
+        now: () => clock.t,
+        history: [streamMsg(1), streamMsg(2), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+      });
+      await initialize(h, true);
+      await settled(h);
+      for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+      h.adapter.emit!(streamMsg(1));
+      h.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+      await until(() => h.delivery.watermark('zulip:general') === 1 && h.delivery.watermark('zulip:other') === 500, 'both accepted');
+      failReadsAt(h, clock, { 'zulip:general': [{ ms: 1 }, { ms: 90_000 }], 'zulip:other': [{ ms: 1 }] });
+      breakQueue(h);
+      await until(() => waits.asked.length === 2, 'both lanes wait');
+      await sentinelThrough(h, 2);
+      assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no line while neither wait is set to reach 90 s');
+      assert.equal(plane.update(narrowOther).ok, true);
+      waits.release();
+      await until(() => readWaitLines(h, 'history-waiting').length > 0, "the line at general's second failure");
+      for (const m of readWaitLines(h, 'history-waiting')) {
+        const text = (m.content[0] as TextContent).text;
+        assert.match(text, /zulip:general/);
+        assert.doesNotMatch(text, /zulip:other/);
+        assert.deepEqual((m.metadata as { channels?: string[] }).channels, ['zulip:general']);
+      }
+      waits.release();
+      await h.server.quiet();
+      assert.ok(readWaitLines(h, 'history-answered').length > 0, 'the line that no read waits follows the one that went');
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test(`a read that waits on a channel ${label} by the time the line is built, with no other read waiting, sends no line, and none follows when its wait ends`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-wait-line-alone-'));
+    try {
+      const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+      plane.start();
+      const waits = heldWaits();
+      const clock = { t: 0 };
+      const h = harness({ filters: plane, history: [1, 2].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait, now: () => clock.t });
+      await initialize(h, true);
+      await settled(h);
+      h.delivery.advance('zulip:general', 1);
+      const real = h.adapter.fetchHistory!.bind(h.adapter);
+      let failed = false;
+      h.adapter.fetchHistory = async (key, query) => {
+        if (query.afterMessageId !== undefined && !failed) {
+          failed = true;
+          clock.t += 90_000;
+          assert.equal(plane.update(narrowGeneral).ok, true);
+          throw noAnswer();
+        }
+        return real(key, query);
+      };
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+      try {
+        breakQueue(h);
+        await until(() => waits.asked.length === 1, 'the wait before the second try');
+        waits.release();
+        await h.server.quiet();
+      } finally {
+        console.error = original;
+      }
+      assert.ok(failed, 'the read failed once');
+      assert.deepEqual(logs.filter((l) => l.includes("Zulip isn't serving reads of the history")), []);
+      assert.deepEqual(logs.filter((l) => l.includes('No channel waits for a read of its history')), []);
+      plane.stop();
+      await h.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('with no channel open, the line that a read waits and the line that it no longer does go to the log', async () => {
   const waits = heldWaits();
   const clock = { t: 0 };
