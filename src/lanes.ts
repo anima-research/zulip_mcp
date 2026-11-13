@@ -318,6 +318,10 @@ export class Lanes<W> {
     until.then(release, release);
   }
 
+  keys(): IterableIterator<ChannelKey> {
+    return this.lanes.keys();
+  }
+
   /** True from `holdAll` until its promise settles. */
   get allHeld(): boolean {
     return this.heldUntil !== null;

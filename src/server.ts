@@ -1668,6 +1668,7 @@ export class ZulipMcplServer {
     }
     const keys = new Set<ChannelKey>(this.openKeys());
     for (const key of this.delivery.watermarkedChannels()) keys.add(key);
+    for (const key of lanes.keys()) keys.add(key);
     const reads: Promise<void>[] = [];
     for (const key of keys) {
       if (this.isMuted(key) || !this.isAllowed(key)) continue;

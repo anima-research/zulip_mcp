@@ -5772,3 +5772,18 @@ test("a rate limit whose retry-after carries a channel's wait past 90 s tells at
   assert.equal(readWaitLines(h, 'history-answered').length, 1);
   await h.close();
 });
+
+test('after a break, a closed channel that has no watermark, and whose first message waits for its attachments, has its hole read too', async () => {
+  const fetches = heldFetches();
+  const h = harness({ attachments: fetches.options, history: [withLog(streamMsg(1, { mentioned: true })), streamMsg(2, { mentioned: true })] });
+  await initialize(h, true);
+  await settled(h);
+  assert.equal(h.delivery.watermark('zulip:general'), undefined);
+  h.adapter.emit!(withLog(streamMsg(1, { mentioned: true })));
+  await until(() => fetches.started.length === 1, "the first message's attachment fetch");
+  breakQueue(h);
+  await new Promise((r) => setImmediate(r));
+  fetches.release();
+  await until(() => h.pushed.some((p) => /id=2\]/.test((p.payload.content[0] as { text: string }).text)), 'the mention lost in the break, offered');
+  await h.close();
+});
