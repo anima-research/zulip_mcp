@@ -308,7 +308,7 @@ export class DeliveryState {
     if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
   }
 
-  private watermarkBelowHolds(key: ChannelKey): boolean {
+  watermarkBelowHolds(key: ChannelKey): boolean {
     if (this.watermarks.has(key)) return false;
     const floor = this.floor(key);
     if (floor === undefined) return false;

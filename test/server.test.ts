@@ -80,6 +80,8 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   enterChange: OnMessageChange | null;
   systemEvent: OnSystemEvent | null;
   react: ((event: Omit<Parameters<OnReaction>[0], 'key' | 'placed'> & { channelId: string }) => void) | null;
+  /** The server's reaction handler as it is: for a key that `keyOf` would name, or a reaction placed elsewhere at its turn. */
+  reactAt: OnReaction | null;
   change: ((event: Omit<MessageChangeEvent, 'key' | 'movedToKey'> & { channelId: string; movedToChannelId: string | null }) => void) | null;
   /** The stream's messages, oldest first; fetchHistory pages over them by id. */
   history: IncomingChannelMessage[];
@@ -122,6 +124,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     enterChange: null,
     systemEvent: null,
     react: null,
+    reactAt: null,
     change: null,
     history: [],
     historyCalls: [],
@@ -204,6 +207,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
             onReaction({ ...event, placed: () => event });
           }
         : null;
+      adapter.reactAt = onReaction ?? null;
       adapter.change = onMessageChange
         ? ({ channelId, movedToChannelId, ...ev }) => {
             const change = { ...ev, key: adapter.keyOf(channelId), movedToKey: movedToChannelId === null ? null : adapter.keyOf(movedToChannelId) };
@@ -1795,13 +1799,213 @@ test('a message that arrives while zulip.messaging is disabled is offered once i
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
   await h.host.sendRequest('ping');
   h.adapter.emit!(streamMsg(1, { mentioned: true }));
-  await h.server.quiet();
+  await h.host.sendRequest('ping');
   assert.equal(h.pushed.length, 0, 'nothing under a disabled feature set');
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await h.server.quiet();
   assert.equal(h.pushed.length, 1, 'offered once it is enabled again');
   assert.match(firstText(h.pushed[0]), /id=1\]/);
   await h.close();
+});
+
+/** Enters `m` with a job that waits until the returned release; then `zulip.messaging` goes off, and the release lets the job meet it. Resolves once `m` is held. */
+async function heldAcrossDisable(h: Harness, m: IncomingChannelMessage, disable: () => Promise<unknown>): Promise<void> {
+  const key = h.adapter.keyOf(m.channelId);
+  const { channelId, ...rest } = m;
+  let release!: () => void;
+  const running = new Promise<void>((r) => { release = r; });
+  h.adapter.enter!({ key, messageId: m.messageId, ready: async () => { await running; return { message: { ...rest, key } as KeyedMessage }; } });
+  await h.host.sendRequest('ping');
+  await disable();
+  release();
+  await until(() => h.delivery.heldIds(channelId, { replayable: true }).includes(Number(m.messageId)), `${m.messageId} held as its job meets the disabled feature set`);
+}
+
+const disableMessaging = async (h: Harness) => {
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+};
+
+const recoveredFlags = (h: Harness) => h.incoming.map((m) => (m.metadata as { recovered?: boolean }).recovered === true);
+
+test('messages that arrive on an open channel while zulip.messaging is disabled come as ordinary messages, in order, once it is enabled', async () => {
+  const h = harness({ history: [streamMsg(1), streamMsg(2)] });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2));
+  await h.host.sendRequest('ping');
+  assert.equal(h.incoming.length, 0, 'nothing under a disabled feature set');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.length === 2, 'both messages');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2']);
+  assert.deepEqual(recoveredFlags(h), [false, false], 'as ordinary messages, not read again from history');
+  await h.close();
+});
+
+test('a message whose job runs when zulip.messaging goes off is held, and once it is enabled it comes before the messages that waited', async () => {
+  const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  await heldAcrossDisable(h, streamMsg(1), () => disableMessaging(h));
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.length === 3, 'all three');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3']);
+  assert.deepEqual(recoveredFlags(h), [true, false, false], 'the held 1 read again from history, then the two that waited');
+  await h.close();
+});
+
+test('a break of the event queue while zulip.messaging is disabled is recovered once it is enabled: the lost messages, then what came after the break, then the notice', async () => {
+  const h = harness({ history: [1, 2, 3, 4].map((id) => streamMsg(id)) });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await h.host.sendRequest('ping');
+  breakQueue(h);
+  h.adapter.emit!(streamMsg(4));
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => gapNoticeIn(h), 'the gap notice');
+  await h.server.quiet();
+  assert.deepEqual(seenIds(h), ['1', '2', '3', '4', 'notice']);
+  await h.close();
+});
+
+test("a connection that starts with zulip.messaging disabled makes each channel's catch-up once it is enabled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-start-disabled-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'sd' });
+    await initialize(first, true);
+    await settled(first);
+    first.adapter.emit!(streamMsg(1, { mentioned: true }));
+    await until(() => first.delivery.watermark('zulip:general') === 1, '1 accepted');
+    await first.close();
+
+    const second = harness({ stateDir: dir, sessionId: 'sd', history: [streamMsg(1, { mentioned: true }), streamMsg(2, { mentioned: true })] });
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'] });
+    await awaitRegistered(second, false);
+    await second.host.sendRequest('ping');
+    assert.equal(second.pushed.length, 0, 'nothing under a disabled feature set');
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => second.pushed.length === 1, "general's catch-up");
+    await second.server.quiet();
+    assert.match(firstText(second.pushed[0]), /id=2\]/);
+    assert.equal(second.delivery.watermark('zulip:general'), 2);
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lane that gives up twice while zulip.messaging is disabled brings every given-up message once, in order, once it is enabled', async () => {
+  const h = harness({ maxWaitingMessages: 2, history: [1, 2, 3, 4, 5, 6, 7, 8].map((id) => streamMsg(id)) });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    const key = h.adapter.keyOf('zulip:general');
+    const { channelId: _c, ...rest } = streamMsg(2);
+    let release!: () => void;
+    const running = new Promise<void>((r) => { release = r; });
+    h.adapter.enter!({ key, messageId: '2', ready: async () => { await running; return { message: { ...rest, key } as KeyedMessage }; } });
+    await h.host.sendRequest('ping');
+    h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await h.host.sendRequest('ping');
+    for (const id of [3, 4, 5, 6, 7, 8]) h.adapter.emit!(streamMsg(id));
+    release();
+    await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(2), '2 held as its job meets the disabled feature set');
+    await h.host.sendRequest('ping');
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await until(() => h.incoming.some((m) => m.messageId === '8'), 'the last given-up message');
+    await h.server.quiet();
+    assert.deepEqual(seenIds(h), ['1', '2', '3', '4', '5', '6', '7', '8']);
+    await h.close();
+  } finally {
+    console.error = original;
+  }
+});
+
+test("while zulip.messaging is disabled, the edit of a message that waits follows it once it is enabled, and the edit of any other message isn't told", async () => {
+  const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+  const h = harness({ visible: [DESCRIPTOR, OTHER], history: [streamMsg(10, { channelId: 'zulip:other' }), streamMsg(11)] });
+  await initialize(h, true);
+  await settled(h);
+  for (const channelId of ['zulip:general', 'zulip:other']) await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(10, { channelId: 'zulip:other' }));
+  await until(() => h.delivery.watermark('zulip:other') === 10, '10 accepted');
+  await disableMessaging(h);
+  h.adapter.emit!(streamMsg(11));
+  const edit = (channelId: string, id: string) => h.adapter.change!({
+    kind: 'edit', channelId, messageId: id, messageIds: [id], authorId: '9', authorName: 'Ann', authorEmail: 'ann@example.com', actorId: '9',
+    topic: 'deploys', previousTopic: null, movedToChannelId: null, content: `msg ${id}, fixed`, previousContent: `msg ${id}`,
+    mentioned: false, previouslyMentioned: false, vanished: false, isDM: false, onOwnMessage: false, timestamp: new Date(1_700_000_020_000),
+  });
+  edit('zulip:general', '11');
+  edit('zulip:other', '10');
+  await h.host.sendRequest('ping');
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await until(() => h.incoming.some((m) => m.messageId.startsWith('edit:')), "11's edit");
+  await h.server.quiet();
+  assert.deepEqual(h.incoming.map((m) => `${m.channelId} ${m.messageId.split(':').slice(0, 2).join(':')}`),
+    ['zulip:other 10', 'zulip:general 11', 'zulip:general edit:11']);
+  await h.close();
+});
+
+test("a reaction on a stream that the directory doesn't name yet, while zulip.messaging is disabled, waits in no lane", async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await disableMessaging(h);
+  const reaction = {
+    key: streamKey(99), action: 'add' as const, messageId: '1', emoji: 'eyes',
+    reactorId: '9', reactorName: 'Ann', onOwnMessage: false, messageSnippet: null, timestamp: new Date(1_700_000_000_000),
+  };
+  h.adapter.reactAt!({ ...reaction, placed: () => reaction });
+  await h.server.quiet();
+  await h.close();
+});
+
+test('the first DM of a new conversation that waits while zulip.messaging is disabled sets a watermark just below it on disk, and a new process offers it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-dm-waits-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'dw' });
+    await initialize(first, true);
+    await settled(first);
+    first.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await first.host.sendRequest('ping');
+    first.adapter.emit!(boDm(501), BO_DM);
+    await first.host.sendRequest('ping');
+    const onDisk = JSON.parse(readFileSync(join(dir, 'dw.delivery.json'), 'utf8')) as { watermarks: Record<string, number> };
+    assert.equal(onDisk.watermarks['zulip:dm:42'], 500, 'on disk while the DM waits');
+
+    const second = harness({ stateDir: dir, sessionId: 'dw', history: [boDm(501)], visible: [DESCRIPTOR, BO_DM] });
+    await initialize(second, true);
+    await settled(second);
+    await second.server.quiet();
+    assert.equal(second.pushed.length, 1, 'the next process offers it');
+    assert.match(firstText(second.pushed[0]), /id=501\]/);
+    await second.close();
+    await first.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a stream muted while an addressed message of its closed channel waits for its attachments pushes nothing', async () => {
@@ -1932,9 +2136,7 @@ test('a catch-up block refused after its stream was muted leaves nothing held', 
     const h = harness({ filters: plane, history: [streamMsg(5, { mentioned: true })] });
     await initialize(h, true);
     await settled(h);
-    h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
-    await h.host.sendRequest('ping');
-    h.adapter.emit!(streamMsg(5, { mentioned: true }));
+    await heldAcrossDisable(h, streamMsg(5, { mentioned: true }), () => disableMessaging(h));
     await h.server.quiet();
     h.policy.holdPushes = true;
     h.policy.rejectPushes.add('5');
@@ -2729,7 +2931,7 @@ test('disabling zulip.messaging stops incoming delivery and its tools until re-e
   await h.host.sendRequest('ping');
   h.adapter.emit!(streamMsg(1));
   h.adapter.emit!(streamMsg(2, { mentioned: true }));
-  await h.server.quiet();
+  await h.host.sendRequest('ping');
   assert.equal(h.incoming.length, 0, 'no channels/incoming under a disabled feature set');
   assert.equal(h.pushed.length, 0);
   assert.equal(h.delivery.watermark('zulip:general'), 0, 'just below the held messages: nothing is pretended forwarded');
@@ -4552,21 +4754,21 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
       await settled(second);
       second.adapter.emit!(streamMsg(1, { mentioned: true }));
       await until(() => second.delivery.watermark('zulip:general') === 1, 'initial acceptance');
-      await second.host.sendRequest(method.FEATURE_SETS_UPDATE, {
-        effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'],
-      });
-      second.adapter.emit!(streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }));
+      await heldAcrossDisable(second, streamMsg(5, { metadata: { mentioned: false, replyToSelf: true, isDM: false }, tags: ['chat:reply'] }), () =>
+        second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT, disabled: ['zulip.messaging'] }));
       await second.server.quiet();
 
       assert.equal(second.delivery.watermark('zulip:general'), 1);
       assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5));
       let healReads = 0;
+      let healRead = false;
       const healGate = new Promise<void>((r) => { releaseHeal = r; });
       const originalHistory = second.adapter.fetchHistory!.bind(second.adapter);
       second.adapter.fetchHistory = async (channel, query) => {
         if (second!.adapter.wireOf(channel) === 'zulip:general') {
           healReads++;
           await healGate;
+          healRead = true;
         }
         return originalHistory(channel, query);
       };
@@ -4595,14 +4797,15 @@ for (const mode of ['disable-during-heal', 'no-duplicate', 'host-refusal', 'requ
         });
       }
       releaseHeal();
-      await second.server.quiet();
       if (mode === 'disable-during-heal') {
+        await until(() => healRead, "the heal's read");
+        await second.host.sendRequest('ping');
         assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 0, 'local policy refusal sends nothing');
         assert.ok(second.delivery.heldIds('zulip:general', { replayable: true }).includes(5),
           'a never-offered reply must remain replayable');
         await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
-        await second.server.quiet();
       }
+      await second.server.quiet();
       const accepted = mode === 'disable-during-heal' || mode === 'no-duplicate';
       assert.equal(second.delivery.watermark('zulip:general'), accepted ? 5 : 1);
       assert.equal(second.pushed.filter((p) => p.tags?.includes('chat:reply')).length, 1, 'exactly one actual reply offer');

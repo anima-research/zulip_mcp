@@ -29,8 +29,12 @@
   just below that message, so the next start offers it if Zulip's history
   still has it there.
 - A message that arrived while the host had `zulip.messaging` disabled was
-  dropped, unless it was already waiting in the batch. It is now held, and
-  offered once the host enables `zulip.messaging` again.
+  dropped, unless it was already waiting in the batch. It now waits in its
+  channel, and goes once the host enables `zulip.messaging` again, followed
+  by an edit or a deletion of it that arrived meanwhile.
+- A catch-up at a connection's start, or a recovery after Zulip's event
+  queue broke, that fell while `zulip.messaging` was disabled was skipped. It
+  is now made once the host enables `zulip.messaging`.
 - A stream muted, or left out of the allowlist, while an addressed message
   of its closed channel waited for its attachments no longer has that
   message pushed: the mute and the allowlist are checked again when the

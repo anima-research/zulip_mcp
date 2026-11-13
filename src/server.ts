@@ -57,7 +57,7 @@ import { ChannelIds } from './channel-ids.js';
 import { ChannelManager, type HostClient, type RegisterAdditionalResult } from './channels.js';
 import { StreamDirectory, type DirectoryChange } from './stream-directory.js';
 import { ContextProvider } from './context.js';
-import { Lanes, type Job, type JobContext, type Lane, type Moments, type ReadContext } from './lanes.js';
+import { Lanes, type Job, type JobContext, type Lane, type Moments, type ReadContext, type ReadJob } from './lanes.js';
 import { DeliveryState, type DeliveryReader, attributeMessage, renderMissedBlock, selectMissed, viewOf, isAddressed, DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
@@ -212,6 +212,7 @@ export class ZulipMcplServer {
   private readonly lifecycleOnChain = new Map<string, number>();
   private grantUpdatesOnChain = 0;
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
+  private messagingHold: (() => void) | null = null;
   private readonly catchupLimit: number;
   private readonly missedBlockMaxChars: number;
   private readonly formatTime: (d: Date) => string;
@@ -293,7 +294,10 @@ export class ZulipMcplServer {
     this.channelManager = channels;
     const writer: DeliveryWriter = { delivery, channels };
     const moments: Moments<DeliveryWriter> = {
-      entry: (w, key, id, ended) => w.delivery.hold(key, id, ended ? 'failed' : 'queued'),
+      entry: (w, key, id, ended) => {
+        w.delivery.hold(key, id, ended ? 'failed' : 'queued');
+        if (this.messagingHold !== null && w.delivery.watermarkBelowHolds(key)) this.delivery.save();
+      },
       overflow: (w, lane) => this.giveUp(w, lane),
       start: (w) => w.delivery.restartReached(),
       end: (w) => w.delivery.failQueued(),
@@ -356,6 +360,7 @@ export class ZulipMcplServer {
     this.toldAgent.clear();
     this.readWaits.clear();
     this.toldReadWait = false;
+    this.messagingHold = null;
     this.lanes = this.makeLanes();
   }
 
@@ -384,6 +389,7 @@ export class ZulipMcplServer {
       // the offline gap.
       const lanes = this.lanes!;
       const openLanes = lanes.holdAll();
+      this.messagingChanged();
       void this.grant.whenReady().then(() => {
         if (conn.isClosed) return;
         const start = this.start(conn, lanes, openLanes);
@@ -669,6 +675,7 @@ export class ZulipMcplServer {
           this.requireMcpl();
           const receipt = this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'request');
           conn.sendResponse(req.id, receipt);
+          this.messagingChanged();
           // A feature set enabled again: what was withheld under the
           // reduction is offered again.
           this.enterHeldReads();
@@ -789,7 +796,10 @@ export class ZulipMcplServer {
         case method.FEATURE_SETS_UPDATE:
           // §6.7 Notification form: descriptive metadata only. Grant-bearing
           // updates (including the §5.3 initial policy) arrive as a Request.
-          if (this.mcplActive) this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'notification');
+          if (this.mcplActive) {
+            this.grant.apply(params as unknown as FeatureSetsUpdateParams, 'notification');
+            this.messagingChanged();
+          }
           break;
 
         case method.CHANNELS_TYPING:
@@ -1215,7 +1225,19 @@ export class ZulipMcplServer {
     if (ctx.w.delivery.countMissed(key, { id, text: bodyText })) this.delivery.save();
   }
 
-  private enterHeldReads(): void {
+  private messagingChanged(): void {
+    if (!this.lanes || !this.mcplActive) return;
+    const active = this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
+    if (!active && this.messagingHold === null) {
+      this.messagingHold = this.lanes.holdAll();
+    } else if (active && this.messagingHold !== null) {
+      this.messagingHold();
+      this.messagingHold = null;
+      this.enterHeldReads(true);
+    }
+  }
+
+  private enterHeldReads(first = false): void {
     if (!this.lanes || this.lanes.allHeld || !this.conn || !this.mcplActive) return;
     for (const key of this.delivery.heldChannels()) {
       const letGo = this.isMuted(key) || !this.isAllowed(key);
@@ -1223,10 +1245,12 @@ export class ZulipMcplServer {
       const lane = this.lanes.lane(key);
       if (lane.isEnded || this.heldReadWaiting.has(lane)) continue;
       this.heldReadWaiting.add(lane);
-      lane.enterRead((r) => {
+      const read: ReadJob<DeliveryWriter> = (r) => {
         this.heldReadWaiting.delete(lane);
         if (!r.ended) return this.readHeld(r, key);
-      });
+      };
+      if (first) lane.enterReadFirst(read);
+      else lane.enterRead(read);
     }
   }
 
@@ -1661,10 +1685,7 @@ export class ZulipMcplServer {
   private onSystemEvent(event: PlatformSystemEvent): void {
     const lanes = this.lanes;
     const tally: GapTally = { recovered: 0, caughtUp: new Set() };
-    // §6.7 holds for replayed traffic as much as for live: nothing is
-    // recovered into a feature set the host has disabled.
-    if (event.kind !== 'gap' || !lanes || !this.adapter.fetchHistory ||
-        !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+    if (event.kind !== 'gap' || !lanes || !this.adapter.fetchHistory) {
       this.channelManager.broadcastSystemEvent(this.adapter.type, event.kind === 'gap' ? gapNotice(event, tally) : event);
       return;
     }
@@ -2382,6 +2403,7 @@ export class ZulipMcplServer {
         }
       },
       (reaction) => {
+        if (this.messagingHold !== null) return;
         const unnamed = !isDmKey(reaction.key) && this.streamNameOf(reaction.key) === null;
         if (!unnamed && !this.reactionShown(reaction)) return;
         this.lanes?.lane(reaction.key).enter((ctx) => {
@@ -2391,7 +2413,13 @@ export class ZulipMcplServer {
         });
       },
       (entry) => {
-        this.lanes?.lane(entry.key).enter(async (ctx) => {
+        const lane = this.lanes?.lane(entry.key);
+        if (!lane) return;
+        if (this.messagingHold !== null) {
+          const waiting = new Set(lane.waitingMessages());
+          if (!entry.messageIds.some((id) => waiting.has(id))) return;
+        }
+        lane.enter(async (ctx) => {
           const change = await entry.ready();
           if (change === null || ctx.ended) return;
           if (change.key === entry.key) return this.onMessageChange(ctx, change);
