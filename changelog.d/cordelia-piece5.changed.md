@@ -42,7 +42,10 @@
   gets one line naming the channels whose reads wait then, and one more line
   when no read waits any more. The first line names no channel that is muted
   or outside the allowlist, and goes only if it names one. With no channel
-  open, both lines go to the log. A channel whose stream's rename is with
+  open, or while `zulip.messaging` is disabled, both lines go to the log,
+  and the first line goes to the open channels at the read's next failed
+  try once a channel is open and `zulip.messaging` is enabled. A channel
+  whose stream's rename is with
   the host at that moment may not get them: they go there under the old id,
   and the host may drop them. After a break, each open channel's notice
   of the break counts what had come when the notice reached that channel,
