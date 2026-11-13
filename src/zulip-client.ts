@@ -113,6 +113,11 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
+ * Subscribe to the streams named in ZULIP_SUBSCRIBE. Needed because, even
+ * with all_public_streams: true on the queue, a bot that isn't subscribed gets
+ * a public stream's edits and reactions only for messages that mention it, and
+ * from a private stream at most the messages that mention it.
+ *
  * Zulip's subscribe call takes names, and where the bot may create streams
  * it creates one for a name that no stream has.
  */

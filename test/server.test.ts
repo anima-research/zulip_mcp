@@ -342,6 +342,7 @@ interface HarnessOptions {
   announceTimeoutMs?: number;
   shutdownGraceMs?: number;
   maxWaitingMessages?: number;
+  catchupLimit?: number;
   readRetryWait?: (ms: number) => Promise<void>;
   now?: () => number;
   /** A second connection to a server that already served one (the TCP case). */
@@ -365,7 +366,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     contextHistorySize: 3,
     stateDir: opts.stateDir ?? null,
     sessionId: opts.sessionId ?? 'test',
-    catchupLimit: 100,
+    catchupLimit: opts.catchupLimit ?? 100,
     formatTime: () => 'T',
     announceTimeoutMs: opts.announceTimeoutMs ?? 100,
     shutdownGraceMs: opts.shutdownGraceMs,
@@ -2157,6 +2158,37 @@ test('a lane that gives up twice while zulip.messaging is disabled brings every 
     console.error = original;
   }
 });
+
+for (const form of ['with the catch-up limit at 0', 'on a closed channel that the host holds no id for', 'on a closed channel that the host holds an id for'] as const) {
+  test(`a give-up's log line says whether a read from history brings the given-up messages back: ${form}`, async () => {
+    const h = harness({ maxWaitingMessages: 2, ...(form === 'with the catch-up limit at 0' ? { catchupLimit: 0 } : {}) });
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+      await h.host.sendRequest('ping');
+      const late: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:late-stream', label: '#late-stream', address: { stream_name: 'late-stream', stream_id: 9 } };
+      for (const id of [1, 2, 3]) {
+        if (form === 'on a closed channel that the host holds no id for') h.adapter.emit!(streamMsg(id, { channelId: 'zulip:late-stream' }), late);
+        else h.adapter.emit!(streamMsg(id));
+      }
+      await until(() => lines.some((l) => l.includes('given up')), 'the give-up');
+      const line = lines.find((l) => l.includes('given up'))!;
+      const said = form === 'with the catch-up limit at 0'
+        ? 'with the catch-up limit at 0, no read from history brings them back'
+        : form === 'on a closed channel that the host holds no id for'
+          ? 'the host holds no id for this channel, so the read that takes their place brings none of them unless it holds one when the read runs'
+          : 'a read from history takes their place';
+      assert.ok(line.endsWith(`3 waiting message(s) given up; ${said}`), line);
+      await h.close();
+    } finally {
+      console.error = original;
+    }
+  });
+}
 
 test("while zulip.messaging is disabled, the edit of a message that waits is applied to it, so it comes once with its new text and no line, and the edit of any other message isn't told", async () => {
   const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
