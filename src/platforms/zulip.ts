@@ -533,7 +533,6 @@ export class ZulipAdapter implements PlatformAdapter {
     return change.streamId !== null ? streamKey(change.streamId) : null;
   }
 
-  /** `place` runs after every placement before it, and not at all once its event loop has stopped. */
   private inOrder(current: () => boolean, place: () => Promise<void>): void {
     this.placing++;
     this.placed = this.placed
@@ -1124,9 +1123,6 @@ export class ZulipAdapter implements PlatformAdapter {
         console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
         return;
       }
-      // Sent with every message, as a stream's descriptor is: the server's
-      // registry decides what is new, and a first message taken back while
-      // it waited never carries it.
       const descriptor = this.describeDm(m);
       onMessage({
         key,
