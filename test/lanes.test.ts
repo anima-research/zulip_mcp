@@ -139,7 +139,7 @@ test("one job that reads runs at a time across lanes, and a lane waiting for the
   assert.deepEqual(log, ['A read start', 'B open', 'A read end', 'B read']);
 });
 
-test('a job that reads gives the turn back before what it hands on runs: another lane reads meanwhile, and the first job reads no more', async () => {
+test('a job that reads gives the turn back before what it hands on runs: another lane reads meanwhile, and the first job\'s `reading` is false while it hands', async () => {
   const l = lanes();
   const log: string[] = [];
   const handing = gate();
@@ -220,7 +220,7 @@ test("a lane that a host's job reaches as the turn comes back to it doesn't keep
   assert.deepEqual(log, ['C', 'A host', 'B', 'A']);
 });
 
-test("a lane that a host's job reaches just as its hold ends doesn't keep the turn from the next lane that can read, at any timing", async () => {
+test("a lane that a host's job reaches just as its hold ends doesn't keep the turn from the next lane that can read, with the host's job 0 to 6 microtasks after the holds end", async () => {
   for (let k = 0; k <= 6; k++) {
     const l = lanes();
     const log: string[] = [];
@@ -247,7 +247,7 @@ test("a lane that a host's job reaches just as its hold ends doesn't keep the tu
     queueMicrotask(() => hostJobAfter(k));
     holdA.open();
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
-    assert.ok(log.includes('A') || log.includes('B'), `${k} hops: no lane read while A's host job ran: ${log.join(', ')}`);
+    assert.ok(log.includes('B'), `${k} hops: B didn't read while A's host job ran: ${log.join(', ')}`);
     hostA.open();
     await l.quiet();
     assert.deepEqual([...log].sort(), ['A', 'A host', 'B', 'C'], `${k} hops`);
