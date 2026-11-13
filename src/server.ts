@@ -1769,7 +1769,7 @@ export class ZulipMcplServer {
       console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
-      if (!this.toldReadWait && (ranOut || this.now() - since >= READ_WAIT_LINE_MS)) this.tellReadWait();
+      if (!this.toldReadWait && (ranOut || this.now() - since + ms >= READ_WAIT_LINE_MS)) this.tellReadWait();
       lane.enterReadFirst((r2) => (r2.ended ? undefined : this.fillRead(r2, read, tries + 1, since)));
       lane.holdOtherUntil((this.options.readRetryWait ?? waitMs)(ms));
       return;

@@ -5367,7 +5367,9 @@ test("a read that gets no answer is tried again after 2 s, doubling to at most 6
   await until(() => gapNoticeIn(h), 'the gap notice');
   await h.server.quiet();
   assert.deepEqual(asked, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 90000, 60000]);
-  assert.deepEqual(seenIds(h), ['1', '2', 'notice']);
+  assert.deepEqual(seenIds(h), ['1', 'notice', '2', 'notice', 'notice']);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, "the 90 s retry-after sets the channel's wait to reach 90 s");
+  assert.equal(readWaitLines(h, 'history-answered').length, 1);
   await h.close();
 });
 
@@ -5501,7 +5503,7 @@ test('with no channel open, the line that a read waits and the line that it no l
   await h.close();
 });
 
-test('a try that fails before its read has waited 90 s adds no line, and one that fails at 90 s does', async () => {
+test("a try after which a channel's wait isn't set to reach 90 s adds no line, and one after which it is does", async () => {
   const waits = heldWaits();
   const clock = { t: 0 };
   const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
@@ -5510,15 +5512,17 @@ test('a try that fails before its read has waited 90 s adds no line, and one tha
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
   h.adapter.emit!(streamMsg(1));
   await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
-  failReadsAt(h, clock, { 'zulip:general': [{ ms: 89_999 }, { ms: 1 }] });
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 87_999 }, { ms: 1 }] });
   breakQueue(h);
   await until(() => waits.asked.length === 1, 'the wait before the second try');
   await sentinelThrough(h, 1);
-  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no line at 89.999 s');
+  assert.deepEqual(waits.asked, [2_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 0, 'no line: 87.999 s waited, and 2 s to the next try');
   waits.release();
   await until(() => waits.asked.length === 2, 'the wait before the third try');
   await sentinelThrough(h, 1);
-  assert.equal(readWaitLines(h, 'history-waiting').length, 1, 'a line at 90 s');
+  assert.deepEqual(waits.asked, [2_000, 4_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, 'a line: 88 s waited, and 4 s to the next try');
   waits.release();
   await h.server.quiet();
   await h.close();
@@ -5745,5 +5749,26 @@ test('an open that comes after a featureSets/update waiting on the chain is judg
     releaseSlow();
     fakeTools.hold = null;
   }
+  await h.close();
+});
+
+test("a rate limit whose retry-after carries a channel's wait past 90 s tells at its first failure", async () => {
+  const waits = heldWaits();
+  const clock = { t: 0 };
+  const h = harness({ history: [1, 2].map((id) => streamMsg(id)), readRetryWait: waits.wait, now: () => clock.t });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+  h.adapter.emit!(streamMsg(1));
+  await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+  failReadsAt(h, clock, { 'zulip:general': [{ ms: 1, error: refusal('RATE_LIMIT_HIT', 300) }] });
+  breakQueue(h);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await sentinelThrough(h, 1);
+  assert.deepEqual(waits.asked, [300_000]);
+  assert.equal(readWaitLines(h, 'history-waiting').length, 1, 'a line at the first failure');
+  waits.release();
+  await h.server.quiet();
+  assert.equal(readWaitLines(h, 'history-answered').length, 1);
   await h.close();
 });
