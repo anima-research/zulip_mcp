@@ -317,6 +317,39 @@ test('a password exchange that gets no JSON answer fails the start, and its erro
   } finally { z.close(); }
 });
 
+async function startLogging(env: Record<string, string>) {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    return { session: await initializeZulipClient(env), lines };
+  } finally {
+    console.error = original;
+  }
+}
+
+test('a password exchange that Zulip refuses is logged with Zulip\'s words and the missing key, the start goes on, and no line shows the password', async () => {
+  const password = 'pw-that-must-not-show';
+  const z = await realm({
+    'POST /fetch_api_key': { status: 403, json: { result: 'error', msg: 'Your username or password is incorrect.', code: 'AUTHENTICATION_FAILED' } },
+  });
+  try {
+    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: password });
+    assert.equal(session.authHeader, '');
+    assert.ok(lines.includes('Failed to get an API key with ZULIP_PASSWORD: Zulip refused POST /fetch_api_key: Your username or password is incorrect. (AUTHENTICATION_FAILED). The server has no API key for this run, so Zulip refuses each call that needs one.'), lines.join('\n'));
+    assert.ok(lines.every((line) => !line.includes(password)));
+  } finally { z.close(); }
+});
+
+test('a password exchange whose answer holds no API key gets the same line', async () => {
+  const z = await realm({ 'POST /fetch_api_key': { json: { result: 'success' } } });
+  try {
+    const { session, lines } = await startLogging({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_PASSWORD: 'pw' });
+    assert.equal(session.authHeader, '');
+    assert.ok(lines.includes("Failed to get an API key with ZULIP_PASSWORD: Zulip's answer to POST /fetch_api_key held no API key. The server has no API key for this run, so Zulip refuses each call that needs one."), lines.join('\n'));
+  } finally { z.close(); }
+});
+
 test('a ZULIP_SUBSCRIBE that Zulip refuses gets the failure line, with Zulip\'s words, and no success line', async () => {
   const { api } = standInApi({
     'POST /users/me/subscriptions': { result: 'error', msg: 'Not allowed for guest users', code: 'BAD_REQUEST' },

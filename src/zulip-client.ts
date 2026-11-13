@@ -73,7 +73,11 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
     const answer = await exchange.requestAnswer<{ api_key?: unknown }>("POST", "/fetch_api_key", { username: email, password });
-    apiKey = answer.result === "success" && typeof answer.api_key === "string" ? answer.api_key : "";
+    if (answer.result === "success" && typeof answer.api_key === "string") apiKey = answer.api_key;
+    else {
+      const why = isRefusal(answer) ? `Zulip refused POST /fetch_api_key: ${refusalText(answer)}` : "Zulip's answer to POST /fetch_api_key held no API key";
+      console.error(`Failed to get an API key with ZULIP_PASSWORD: ${why}. The server has no API key for this run, so Zulip refuses each call that needs one.`);
+    }
   }
 
   realm = realm.replace(/\/+$/, "");
