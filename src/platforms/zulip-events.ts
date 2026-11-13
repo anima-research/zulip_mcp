@@ -15,7 +15,7 @@
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
-import { isRefusal, LONG_TIMEOUT_MS, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, LONG_TIMEOUT_MS, refusalText, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 import type { StreamDirectory, ZulipStreamEvent } from '../stream-directory.js';
 
 export interface ZulipEventMessage {
@@ -315,14 +315,17 @@ export class ZulipEventLoop {
         }
 
         if (isRefusal(response) || !Array.isArray(response.events)) {
-          // Malformed but non-throwing response — without a delay this
+          // A refused or malformed but non-throwing response — without a delay this
           // would hot-spin the poll and peg a CPU core.
           this.consecutiveFailures++;
           const delay = this.backoffDelay(this.consecutiveFailures);
-          console.error(
-            `Zulip events.retrieve returned no events array (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`,
-          );
-          this.maybeEmitDegraded(onSystemEvent, 'events.retrieve returned a malformed response (no events array)');
+          const refused = isRefusal(response) ? refusalText(response) : null;
+          console.error(refused === null
+            ? `Zulip events.retrieve returned no events array (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`
+            : `Zulip refused events.retrieve: ${refused} (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`);
+          this.maybeEmitDegraded(onSystemEvent, refused === null
+            ? 'events.retrieve returned a malformed response (no events array)'
+            : `events.retrieve was refused: ${refused}`);
           await this.sleep(delay);
           continue;
         }

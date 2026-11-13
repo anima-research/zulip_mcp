@@ -216,6 +216,31 @@ test('malformed non-throwing response (no events, no error code) sleeps instead 
   assert.deepEqual(delays, [2000, 4000, 8000]);
 });
 
+test('a refused poll, other than an expired queue, is logged and marked degraded with Zulip\'s words, and backs off as a malformed one does', async () => {
+  let loop: ZulipEventLoop;
+  const { delays, sleep } = makeSleepRecorder(() => loop, 3);
+  const systemEvents: PlatformSystemEvent[] = [];
+  loop = new ZulipEventLoop({ sleep, degradedThreshold: 3 });
+  const api = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': { result: 'error', msg: 'Invalid API key', code: 'INVALID_API_KEY' },
+  }).api;
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await loop.start(api, () => {}, (e) => systemEvents.push(e));
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(delays, [2000, 4000, 8000]);
+  assert.deepEqual(logged.filter((l) => /events\.retrieve/.test(l)), [1, 2, 3].map((n) =>
+    `Zulip refused events.retrieve: Invalid API key (INVALID_API_KEY) (attempt ${n}); retrying in ${[2000, 4000, 8000][n - 1]}ms`));
+  const degraded = systemEvents.filter((e) => e.kind === 'degraded');
+  assert.equal(degraded.length, 1);
+  assert.equal((degraded[0].metadata as { reason?: string }).reason, 'events.retrieve was refused: Invalid API key (INVALID_API_KEY)');
+});
+
 test('well-formed response resets the backoff counter', async () => {
   let loop: ZulipEventLoop;
   const { delays, sleep } = makeSleepRecorder(() => loop, 4);

@@ -55,6 +55,10 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
 }
 
+export function refusalText(answer: ZulipRefusal): string {
+  return answer.msg ? `${answer.msg}${answer.code ? ` (${answer.code})` : ''}` : answer.code ?? 'unknown error';
+}
+
 export class ZulipRefused extends Error {
   readonly code: string | undefined;
   readonly retryAfterSeconds: number | undefined;
