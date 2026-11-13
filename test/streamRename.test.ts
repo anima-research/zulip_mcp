@@ -1719,3 +1719,32 @@ scenario("70. an edit applied to a waiting message reaches the cache: a reaction
     assert.doesNotMatch(payloadText(reaction()!), /first words/);
   } finally { release(); await run.close(); }
 });
+
+scenario('71. under a disabled zulip.messaging, an edit runs after an older edit of the same message that waits in its lane: a reaction after the enable quotes the newer text', async (dir) => {
+  const r = realm({ 17: 'general' });
+  writeFilters(dir, { reactionChannels: ['zulip:general'] });
+  const run = await start(r, dir);
+  const release = r.hold('GET /messages/:id');
+  const polls = () => r.calls.filter((c) => c.method === 'GET' && c.path === '/events').length;
+  try {
+    const had = r.post(17, '@bot first words', { mentioned: true });
+    await until(() => named(run, had), 'the mention');
+    await busyGeneral(r);
+    let read = polls();
+    r.edit(had, '@bot second words', { mentioned: true });
+    await until(() => polls() > read, 'the older edit read');
+    run.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+    await run.host.sendRequest('ping');
+    read = polls();
+    r.edit(had, '@bot third words', { mentioned: true });
+    await until(() => polls() > read, 'the newer edit read');
+    release();
+    await run.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: GRANT });
+    await run.server.quiet();
+    r.react(had, 'thumbs_up', '1f44d');
+    const reaction = () => run.pushed.find((p) => payloadText(p).includes(`[reaction] Ann reacted :thumbs_up: on message ${had}`));
+    await until(() => reaction() !== undefined, 'the reaction');
+    assert.match(payloadText(reaction()!), /third words/);
+    assert.equal(pushesAbout(run, 'edit', had).length, 1, "only the older edit's line, from before the disable");
+  } finally { release(); await run.close(); }
+});

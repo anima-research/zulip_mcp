@@ -2416,11 +2416,12 @@ export class ZulipMcplServer {
         if (entry.kind === 'delete' && applied.length > 0) lane.dropAbout(applied);
         const rest = entry.messageIds.filter((id) => !applied.includes(id));
         if (rest.length === 0) return;
-        if (this.messagingHold !== null && !rest.some((id) => waiting.has(id))) {
+        const silent = this.messagingHold !== null && !rest.some((id) => waiting.has(id));
+        if (silent && !lane.changeWaitsAbout(rest)) {
           lane.host((ctx) => this.runChange(ctx, entry, rest, true));
           return;
         }
-        lane.enter((ctx) => this.runChange(ctx, entry, rest, false), { kind: 'change', about: rest });
+        lane.enter((ctx) => this.runChange(ctx, entry, rest, silent), { kind: 'change', about: rest });
       },
     );
   }
@@ -2480,8 +2481,9 @@ export class ZulipMcplServer {
     if (change === null || ctx.ended) return;
     if (change.key === entry.key) return this.onMessageChange(ctx, change, true, silent);
     const lane = this.lanes?.lane(change.key);
-    if (silent) lane?.host((c) => this.onMessageChange(c, change, true, true));
-    else lane?.enter((c) => this.onMessageChange(c, change), { kind: 'change', about: ids });
+    if (!lane) return;
+    if (silent && !lane.changeWaitsAbout(ids)) lane.host((c) => this.onMessageChange(c, change, true, true));
+    else lane.enter((c) => this.onMessageChange(c, change, true, silent), { kind: 'change', about: ids });
   }
 
   /**
