@@ -272,13 +272,16 @@ export class ZulipToolRuntime {
   private async streamIdForName(name: string): Promise<number> {
     const known = (await this.streamIdsByName([name])).get(name);
     if (known !== undefined) return known;
+    let id: unknown;
     try {
-      return (await this.api.request<{ stream_id: number }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(name)}`, { stream: name })).stream_id;
+      id = (await this.api.request<{ stream_id?: unknown }>("GET", "/get_stream_id", `looking up stream ${JSON.stringify(name)}`, { stream: name })).stream_id;
     } catch (err) {
       if (err instanceof ZulipNoAnswer) throw err;
       const text = (err as Error).message;
       throw new Error(`${text}${/[.!?]$/.test(text) ? "" : "."} list_streams gives each stream's name.`);
     }
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error(`Zulip's answer to looking up stream ${JSON.stringify(name)} gave no stream id.`);
+    return id;
   }
 
   private readonly uploader: Uploader | null;
@@ -848,21 +851,22 @@ export class ZulipToolRuntime {
           ...(streamId !== undefined ? { stream_id: streamId } : {}),
         });
         const asked = { ...(topic !== undefined ? { topic } : {}), ...(stream !== undefined ? { stream } : {}), scope };
+        const note = stream !== undefined ? { note: MOVE_NOTE } : {};
         let message: any;
         try {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId} back`)).message;
         } catch (err) {
-          return { moved: true, asked, readBackError: (err as Error).message };
+          return { moved: true, asked, readBackError: (err as Error).message, ...note };
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id)) {
-          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.` };
+          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, ...note };
         }
         return {
           channelId: this.channelIds?.channelIdOf(streamKey(message.stream_id)) ?? `zulip:${name}`,
           channel: name,
           topic: message.subject,
-          ...(stream !== undefined ? { note: MOVE_NOTE } : {}),
+          ...note,
         };
       }
 
