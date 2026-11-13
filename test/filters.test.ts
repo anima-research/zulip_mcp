@@ -247,6 +247,28 @@ test('a filters file that cannot be created fails the start, not silently', () =
   }
 });
 
+test('R1 (113): while the file is broken, the refusal says that its repair is the operator\'s, and that an update can be made once it is repaired', () => {
+  const dir = tmp();
+  try {
+    const path = join(dir, 'filters.json');
+    writeFileSync(path, JSON.stringify({ streams: ['general'] }));
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    quiet(() => plane.start());
+    writeFileSync(path, '{broken');
+    utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
+    const refused = quiet(() => plane.update((f) => f));
+    assert.equal(refused.ok, false);
+    const { reason } = refused as { reason: string };
+    assert.match(reason, /invalid on disk/);
+    assert.match(reason, /operator's to repair/);
+    assert.match(reason, /an update can be made again/);
+    assert.doesNotMatch(reason, /repair it/);
+    plane.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a broken file at startup is a startup failure, never a run on the env seed', () => {
   const dir = tmp();
   try {

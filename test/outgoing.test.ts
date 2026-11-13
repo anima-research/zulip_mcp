@@ -153,12 +153,12 @@ const threeChunks = [big(1, 9000), big(2, 9000), big(3, 5000)].join('\n\n');
 
 test('R3: a refusal at the second of three chunks keeps each caller\'s error text, and the first chunk is on record', async () => {
   const sm = tools(messagesApi(refuseSecond).api);
-  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), (e: Error) => e.message === 'nope');
+  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), (e: Error) => e.message.endsWith('nope'));
   assert.deepEqual(sm.sent.map((s) => s.messageId), ['901']);
   sm.done();
 
   const dm = tools(messagesApi(refuseSecond).api);
-  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), (e: Error) => e.message === 'nope');
+  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), (e: Error) => e.message.endsWith('nope'));
   assert.deepEqual(dm.sent.map((s) => s.messageId), ['901']);
   dm.done();
 
@@ -185,4 +185,28 @@ test('R3b: no answer at the second of three chunks throws that error, and the fi
   const pub = adapter(messagesApi(noAnswerSecond).api);
   await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e === noAnswer);
   assert.deepEqual(pub.sent.map((s) => s.messageId), ['901']);
+});
+
+test('R2 (109): a send that fails after a part was posted names that part by id, then Zulip\'s words or the error; a first part refused gives Zulip\'s words alone', async () => {
+  for (const tool of ['send_message', 'send_dm'] as const) {
+    const args = tool === 'send_message' ? { type: 'stream', to: 'general', topic: 't', content: threeChunks } : { to: ['42'], content: threeChunks };
+    const refused = tools(messagesApi(refuseSecond).api);
+    await assert.rejects(refused.runtime.handleToolCall(tool, args), (e: Error) => {
+      assert.match(e.message, /\b901\b/, `${tool}: the posted part's id`);
+      assert.ok(e.message.endsWith('nope'), `${tool}: Zulip's words last`);
+      return true;
+    });
+    refused.done();
+    const silent = tools(messagesApi(noAnswerSecond).api);
+    await assert.rejects(silent.runtime.handleToolCall(tool, args), (e: Error) => {
+      assert.equal(e, noAnswer, `${tool}: the same error`);
+      assert.match(e.message, /\b901\b/, `${tool}: the posted part's id`);
+      assert.match(e.message, /within 15 s/, `${tool}: the error's own words`);
+      return true;
+    });
+    silent.done();
+    const first = tools(messagesApi(() => ({ result: 'error', msg: 'nope', code: 'BAD_REQUEST' })).api);
+    await assert.rejects(first.runtime.handleToolCall(tool, args), (e: Error) => e.message === 'nope');
+    first.done();
+  }
 });
