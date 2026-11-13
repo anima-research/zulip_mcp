@@ -37,6 +37,8 @@ import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
+import { realm as httpRealm } from './http-realm.ts';
+import { initializeZulipClient, type ZulipSession } from '../src/zulip-client.ts';
 import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
@@ -6548,6 +6550,50 @@ test("a connection that ends while a lane waits to try its read again makes no t
   assert.equal(second.pushed.length, 1, 'the catch-up block');
   assert.match((second.pushed[0].payload.content[0] as { text: string }).text, /id=2\]/);
   await second.close();
+});
+
+test("after a break of the event queue, a read of history that meets the bot's own user id still unknown is tried again after the wait Zulip asked for in refusing the id's read", async () => {
+  let profileReads = 0;
+  const row = (id: number): ZulipRawMessage => ({
+    id, sender_id: 101, sender_full_name: 'User', sender_email: 'user@example.invalid',
+    display_recipient: 'general', subject: 'deploys', timestamp: 1_700_000_000 + id, type: 'stream', flags: [], content: `msg ${id}`,
+  });
+  const z = await httpRealm({
+    'GET /users/me': () => {
+      profileReads++;
+      if (profileReads === 1) return 'drop';
+      if (profileReads === 2) return { status: 429, json: { result: 'error', code: 'RATE_LIMIT_HIT', msg: 'API usage exceeded rate limit', 'retry-after': 5 } };
+      return { json: { result: 'success', user_id: 100 } };
+    },
+    'GET /messages': (r) => ({ json: { result: 'success', messages: [row(2), row(3)].filter((m) => m.id > Number(r.query.get('anchor'))), found_newest: true, found_oldest: false } }),
+  });
+  const original = console.error;
+  console.error = () => {};
+  let session: ZulipSession;
+  try {
+    session = await initializeZulipClient({ ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests' });
+  } finally { console.error = original; }
+  const waits = heldWaits();
+  const h = harness({ readRetryWait: waits.wait });
+  try {
+    assert.equal(session.selfUserId, null, "the start's read failed");
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(1));
+    await until(() => h.delivery.watermark('zulip:general') === 1, '1 accepted');
+    const history = new ZulipAdapter(session.api, session, { directory: historyStreams() });
+    h.adapter.fetchHistory = history.fetchHistory.bind(history);
+    breakQueue(h);
+    h.adapter.emit!(streamMsg(3));
+    await until(() => waits.asked.length === 1, 'the wait before the second try');
+    assert.deepEqual(waits.asked, [5000], 'the wait is the retry-after Zulip gave');
+    assert.equal(z.requests.filter((r) => r.path === '/messages').length, 0, 'no read of history went out');
+    waits.release();
+    await until(() => gapNoticeIn(h), 'the gap notice');
+    await h.server.quiet();
+    assert.deepEqual(seenIds(h), ['1', '2', '3', 'notice']);
+  } finally { await h.close(); z.close(); }
 });
 
 test("a read that gets no answer is tried again after 2 s, doubling to at most 60 s, and after a refusal by the rate limit after the longer of that step and Zulip's retry-after", async () => {
