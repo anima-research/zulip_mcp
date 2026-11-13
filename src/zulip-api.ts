@@ -136,7 +136,7 @@ export function httpTransport(config: HttpTransportConfig): Transport {
     if (method === 'GET') {
       const query = encoded.toString();
       if (query) url += `?${query}`;
-    } else {
+    } else if (encoded.toString()) {
       init.body = encoded;
     }
     const controller = new AbortController();

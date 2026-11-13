@@ -143,6 +143,7 @@ test('delete_message sends no parameter, and remove_reaction and unlisten send t
     assert.equal(deletes.length, 3);
     for (const d of deletes) assert.equal([...d.query.keys()].length, 0, `no parameter in the URL of ${d.path}`);
     assert.equal(deletes[0].body, '', 'delete_message sends no body');
+    assert.equal(deletes[0].contentType, undefined, 'delete_message sets no body, so no content type is sent');
     assert.equal(new URLSearchParams(deletes[1].body).get('emoji_name'), 'thumbs_up');
     assert.equal(new URLSearchParams(deletes[2].body).get('subscriptions'), JSON.stringify(['general']));
   } finally { s.done(); z.close(); }
