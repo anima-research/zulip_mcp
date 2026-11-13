@@ -753,6 +753,20 @@ test("where Zulip refuses the bot its profile with a client error, as it refuses
   ]);
 });
 
+test("where the start's read of the bot's profile fails and a later read is refused with a client error, the requests go out and the profile isn't read again", async () => {
+  let profileReads = 0;
+  const z = await realm({
+    'GET /users/me': () => (++profileReads === 1 ? 'drop' : { status: 400, json: { result: 'error', code: 'BAD_REQUEST', msg: 'This API is not available to incoming webhook bots.' } }),
+    'POST /messages': { json: { result: 'success', id: 501 } },
+  });
+  const s = await serverOn(z.url);
+  try {
+    for (const content of ['one', 'two']) await s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
+    assert.deepEqual(z.requests.map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /server_settings', 'GET /users/me', 'POST /messages', 'POST /messages']);
+    assert.equal(s.session.selfUserId, null);
+  } finally { s.done(); z.close(); }
+});
+
 test("a start whose read of the bot's profile fails still reads the realm's upload cap", async () => {
   const z = await realm({ 'GET /users/me': 'drop' });
   const s = await serverOn(z.url);
