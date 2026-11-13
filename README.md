@@ -425,8 +425,11 @@ restart.
   discovery and delivery on every surface: live, catch-up, gap recovery,
   backscroll on open, context injection, reactions.
 - `dmUsers` — who may DM the bot (absent = anyone), judged per sender on
-  every surface. Empty means unrestricted, deliberately: unsetting a
-  variable must not silently lose every DM.
+  every surface. A reaction is judged by the sender of the message it
+  reacts to, whoever reacts; one on the bot's own message passes where a
+  participant of the conversation may DM the bot. Empty means
+  unrestricted, deliberately: unsetting a variable must not silently lose
+  every DM.
 - `mutedStreams` — nothing from these reaches the agent on any surface:
   live delivery, mentions, backscroll on open, context injection, reactions,
   catch-up and gap recovery. The pull tools (`fetch_history`, …) still work.

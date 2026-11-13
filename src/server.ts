@@ -1002,11 +1002,15 @@ export class ZulipMcplServer {
       return name !== null && this.filters.streamAllowed(name);
     }
     const sender = message ? senderOf(message) : null;
-    if (sender) return this.filters.dmAllowed(sender);
+    if (sender) return this.senderAllowed(sender);
     const meta = this.channelManager.getChannel(this.ids.channelIdOf(key) ?? '')?.metadata as { participants?: unknown } | undefined;
     const participants = Array.isArray(meta?.participants) ? (meta!.participants as { id?: unknown; email?: unknown }[]) : [];
     if (participants.length === 0) return true;
     return participants.some((p) => this.filters!.dmAllowed({ id: Number(p.id), email: typeof p.email === 'string' ? p.email : '' }));
+  }
+
+  private senderAllowed(sender: { id: number; email: string }): boolean {
+    return !this.filters || this.filters.dmAllowed(sender);
   }
 
   /**
@@ -2550,7 +2554,9 @@ export class ZulipMcplServer {
     if (ev.previousTopic !== null && !ev.leftChannel) ctx.w.channels.followMove(ev.key, ev.messageIds, ev.topic);
     if (ev.byBot) return;
     if (ev.kind === 'edit' && ev.replyToSelf === false && ev.replyToSelfVerified === true) ctx.w.delivery.forgetReply(ev.key, Number(ev.messageId));
-    if (this.isMuted(ev.key) || !this.isAllowed(ev.key)) return;
+    const authorId = Number(ev.authorId ?? NaN);
+    const author = isDmKey(ev.key) && !ev.onOwnMessage && Number.isFinite(authorId) ? { id: authorId, email: ev.authorEmail ?? '' } : null;
+    if (this.isMuted(ev.key) || !(author ? this.senderAllowed(author) : this.isAllowed(ev.key))) return;
     if (silent || !this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
     const addressed = ev.mentioned || ev.isDM || ev.replyToSelf === true;
     // An edit or a deletion can be the first thing this server sees from a

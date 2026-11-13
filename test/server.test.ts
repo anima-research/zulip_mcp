@@ -7409,6 +7409,46 @@ test('a refused mention behind more ambient messages than the catch-up limit is 
   await h.close();
 });
 
+test('a change in a direct message is judged by its author, not by the conversation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-dm-change-author-'));
+  try {
+    writeFileSync(join(dir, 'filters.json'), JSON.stringify({ dmUsers: ['42'] }));
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    const group: ChannelDescriptor = {
+      id: 'zulip:dm:7+42', type: 'zulip', label: 'DM: Ann, Bo', direction: 'bidirectional',
+      address: { dm: true, user_ids: [7, 42] },
+      metadata: { channelType: 'dm', participants: [{ id: '7', email: 'ann@example.com' }, { id: '42', email: 'bo@example.com' }] },
+    };
+    h.adapter.emit!({
+      channelId: 'zulip:dm:7+42', messageId: '600', author: { id: '42', name: 'Bo' }, timestamp: new Date().toISOString(),
+      content: [{ type: 'text', text: 'from Bo' }], tags: ['chat:dm', 'chat:private'], metadata: { isDM: true, mentioned: false, senderEmail: 'bo@example.com' },
+    }, group);
+    await until(() => h.pushed.some((p) => ((p.payload.content[0] as { text?: string }).text ?? '').includes('from Bo')), "Bo's message pushed");
+    const linesWith = (text: string) => [...h.pushed.map((p) => (p.payload.content[0] as { text?: string }).text ?? ''), ...h.incoming.map((m) => (m.content[0] as { text: string }).text)]
+      .filter((t) => t.includes(text)).length;
+    const dmChange = (author: { id: string; name: string; email: string }, content: string) => h.adapter.change!({
+      kind: 'edit', channelId: 'zulip:dm:7+42', messageId: author.id === '7' ? '601' : '602', messageIds: [author.id === '7' ? '601' : '602'],
+      authorId: author.id, authorName: author.name, authorEmail: author.email, actorId: author.id,
+      topic: '', previousTopic: null, movedToChannelId: null, leftChannel: false, byBot: false, content, previousContent: 'before',
+      mentioned: false, previouslyMentioned: false, vanished: false, isDM: true, onOwnMessage: false, timestamp: new Date(1_700_000_200_000),
+    });
+    dmChange({ id: '42', name: 'Bo', email: 'bo@example.com' }, 'edited by Bo');
+    await h.server.quiet();
+    assert.equal(linesWith('edited by Bo'), 1, "an allowed author's edit gives its line");
+    dmChange({ id: '7', name: 'Ann', email: 'ann@example.com' }, 'edited by Ann');
+    await h.server.quiet();
+    assert.equal(linesWith('edited by Ann'), 0, "an edit by an author outside dmUsers gives no line, though Bo in the conversation is allowed");
+    plane.stop();
+    await h.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a refused catch-up block holds each row its text showed, so an open channel gets them all back', async () => {
   const h = harness({ history: [streamMsg(10, { mentioned: true })] });
   await initialize(h, true);
