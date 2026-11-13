@@ -1593,7 +1593,7 @@ export class ZulipMcplServer {
           if (w.channels.noteConversation(key, msgs[i])) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
-        w.delivery.releaseAll(key);
+        for (const id of w.delivery.heldIds(key)) if (id > after && id <= newestId) w.delivery.release(key, id);
       } else if (offered) {
         w.delivery.hold(key, firstId, 'rejected');
         w.delivery.refuse(key, after, newestId);

@@ -5625,3 +5625,61 @@ test("a read for held ids of a closed channel that the connection's end cuts sho
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a catch-up block that the host refuses while its stream is muted lets go of the holds in its own range only: a message that still waits keeps its hold", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-refused-muted-block-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'rmb' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.delivery.watermark('zulip:general') === 3, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    const OTHER: ChannelDescriptor = { ...DESCRIPTOR, id: 'zulip:other', label: '#other', address: { stream_name: 'other', stream_id: 8 } };
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const second = harness({
+      stateDir: dir, sessionId: 'rmb', filters: plane, visible: [DESCRIPTOR, OTHER],
+      history: [streamMsg(4, { mentioned: true }), streamMsg(5), streamMsg(500, { channelId: 'zulip:other' }), streamMsg(501, { channelId: 'zulip:other' })],
+    });
+    second.policy.holdPushes = true;
+    second.policy.rejectPushes.add('5');
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    await until(() => second.pushed.length === 1, "general's catch-up block, with the host");
+    await second.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:other', type: 'zulip', address: {} });
+    second.adapter.emit!(streamMsg(500, { channelId: 'zulip:other' }));
+    await until(() => second.delivery.watermark('zulip:other') === 500, "other's message accepted");
+    const real = second.adapter.fetchHistory!.bind(second.adapter);
+    let otherReading = false;
+    let releaseOther!: () => void;
+    const otherRead = new Promise<void>((resolve) => { releaseOther = resolve; });
+    second.adapter.fetchHistory = async (key, query) => {
+      if (second.adapter.wireOf(key) === 'zulip:other') { otherReading = true; await otherRead; }
+      return real(key, query);
+    };
+    try {
+      breakQueue(second);
+      await until(() => otherReading, "other's read, holding the turn");
+      second.adapter.history.push(streamMsg(7, { mentioned: true }));
+      second.adapter.emit!(streamMsg(7, { mentioned: true }));
+      await until(() => second.delivery.heldIds('zulip:general').includes(7), 'the mention, waiting behind general\'s read');
+      await second.host.sendRequest('tools/call', { name: 'mute_channel', arguments: { channel: '#general' } });
+      second.policy.heldPushes.shift()!();
+      await until(() => !second.delivery.heldIds('zulip:general').includes(4), "the block's hold, let go");
+      assert.deepEqual(second.delivery.heldIds('zulip:general'), [7], 'the mention that still waits keeps its hold');
+    } finally {
+      releaseOther();
+      second.policy.holdPushes = false;
+      for (const answer of second.policy.heldPushes.splice(0)) answer();
+    }
+    plane.stop();
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
