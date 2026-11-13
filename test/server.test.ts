@@ -5227,6 +5227,35 @@ function heldWaits() {
   };
 }
 
+test("a start whose catch-up's second pass gets no answer hands nothing before it tries again, and then offers each row once", async () => {
+  const waits = heldWaits();
+  const h = harness({ history: [2, 3, 4, 5].map((id) => streamMsg(id, { mentioned: true })), readRetryWait: waits.wait });
+  h.delivery.advance('zulip:general', 1);
+  const real = h.adapter.fetchHistory!.bind(h.adapter);
+  let secondFailures = 1;
+  h.adapter.fetchHistory = async (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '1') {
+      const page = await real(key, query);
+      return { ...page, unverifiedMessageIds: ['4'] };
+    }
+    if (h.adapter.wireOf(key) === 'zulip:general' && query.afterMessageId === '3' && secondFailures > 0) {
+      secondFailures--;
+      throw noAnswer();
+    }
+    return real(key, query);
+  };
+  await initialize(h, true);
+  await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+  await awaitRegistered(h, false);
+  await until(() => waits.asked.length === 1, 'the wait before the second try');
+  await h.host.sendRequest('ping');
+  assert.deepEqual(offeredIds(h), [], 'nothing offered while the read waits');
+  waits.release();
+  await h.server.quiet();
+  assert.deepEqual(offeredIds(h), ['2', '3', '4', '5']);
+  await h.close();
+});
+
 test("after a break of the event queue, a read that gets no answer is tried again after a wait, and a message behind it isn't handed over: the hole's rows reach the host first, then the message", async () => {
   const waits = heldWaits();
   const h = harness({ history: [1, 2, 3].map((id) => streamMsg(id)), readRetryWait: waits.wait });
