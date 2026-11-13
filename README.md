@@ -218,7 +218,8 @@ before inference for open channels).
 
 Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
-tool sends and `channels/publish` alike. Disabling `zulip.messaging` stops
+tool sends and `channels/publish` alike. It doesn't undo an edit or a move.
+Disabling `zulip.messaging` stops
 its delivery (incoming and push) and its tools at once. A message that
 arrives meanwhile waits in its channel until it is enabled again. An edit or
 a deletion of it that arrives meanwhile is applied to it, unless the change
