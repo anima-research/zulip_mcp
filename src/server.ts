@@ -1805,7 +1805,7 @@ export class ZulipMcplServer {
       }
       if (r.ended) return;
       const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
-      const ms = err instanceof ZulipRefused ? Math.max(step, (err.retryAfterSeconds ?? 0) * 1000) : step;
+      const ms = Math.max(step, (err.retryAfterSeconds ?? 0) * 1000);
       console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';

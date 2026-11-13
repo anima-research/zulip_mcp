@@ -31,7 +31,7 @@ export type Transport = (
   method: Method, path: string, params: Record<string, unknown> | undefined, opts: RequestOptions | undefined,
 ) => Promise<TransportAnswer>;
 
-export type NoAnswerKind = 'timeout' | 'network' | 'not-json';
+export type NoAnswerKind = 'timeout' | 'network' | 'not-json' | 'no-self-id';
 
 export class ZulipNoAnswer extends Error {
   constructor(
@@ -41,6 +41,7 @@ export class ZulipNoAnswer extends Error {
     readonly mayHaveBeenApplied: boolean,
     detail: string,
     readonly status?: number,
+    readonly retryAfterSeconds?: number,
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
@@ -62,9 +63,13 @@ export class ZulipRefused extends Error {
   constructor(what: string, answer: ZulipRefusal, readonly mayHaveBeenApplied = false) {
     super(`Zulip refused ${what}: ${answer.msg ?? answer.code ?? 'unknown error'}`);
     this.code = typeof answer.code === 'string' ? answer.code : undefined;
-    const after = answer['retry-after'];
-    this.retryAfterSeconds = typeof after === 'number' && Number.isFinite(after) && after >= 0 ? after : undefined;
+    this.retryAfterSeconds = retryAfterOf(answer);
   }
+}
+
+function retryAfterOf(answer: ZulipRefusal): number | undefined {
+  const after = answer['retry-after'];
+  return typeof after === 'number' && Number.isFinite(after) && after >= 0 ? after : undefined;
 }
 
 export function mayHaveBeenApplied(err: unknown): boolean {
@@ -88,6 +93,64 @@ export function zulipApi(transport: Transport): ZulipApi {
     },
     async requestAnswer<T extends object>(method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) {
       return (await answer(method, path, params, opts)).body as ZulipSuccess<T> | ZulipRefusal;
+    },
+  };
+}
+
+export interface SelfIdGate {
+  readonly selfUserId: number | null;
+  readonly transport: Transport;
+  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number } | null>;
+}
+
+function refusalWords(answer: ZulipRefusal): string {
+  return answer.msg ? `${answer.msg}${answer.code ? ` (${answer.code})` : ''}` : answer.code ?? 'unknown error';
+}
+
+export function selfIdGate(inner: Transport): SelfIdGate {
+  let selfUserId: number | null = null;
+  let refused = false;
+  let pending: ReturnType<SelfIdGate['read']> | null = null;
+
+  const readOnce = async (opts?: RequestOptions): ReturnType<SelfIdGate['read']> => {
+    let answer: TransportAnswer;
+    try {
+      answer = await inner('GET', '/users/me', undefined, opts);
+    } catch (err) {
+      return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, '') };
+    }
+    const { status, body } = answer;
+    const id = (body as { user_id?: unknown } | null)?.user_id;
+    if ((body as { result?: unknown } | null)?.result === 'success' && typeof id === 'number') {
+      selfUserId = id;
+      console.error(`Zulip MCP bot user_id: ${id}`);
+      return null;
+    }
+    const reason = isRefusal(body)
+      ? `Zulip answered GET /users/me with HTTP ${status}: ${refusalWords(body).replace(/\.+$/, '')}`
+      : `Zulip's answer to GET /users/me (HTTP ${status}) held no user id`;
+    if (status >= 400 && status <= 499 && status !== 429) {
+      refused = true;
+      console.error(`Zulip refused the read of the bot's own user id: ${reason}. The server goes on without it for this run.`);
+      return null;
+    }
+    return { reason, retryAfterSeconds: isRefusal(body) ? retryAfterOf(body) : undefined };
+  };
+  const read = (opts?: RequestOptions) => (pending ??= readOnce(opts).finally(() => { pending = null; }));
+
+  return {
+    get selfUserId() { return selfUserId; },
+    read,
+    transport: async (method, path, params, opts) => {
+      if (selfUserId === null && !refused) {
+        const failure = await read();
+        if (failure) {
+          throw new ZulipNoAnswer('no-self-id', method, path, false,
+            `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. It reads it again before the next request.`,
+            undefined, failure.retryAfterSeconds);
+        }
+      }
+      return inner(method, path, params, opts);
     },
   };
 }

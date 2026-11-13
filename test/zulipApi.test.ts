@@ -25,6 +25,12 @@ async function serverOn(realmUrl: string, env: Record<string, string> = {}, opti
   }
 }
 
+function toolsKnowingTheId(realmUrl: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
+  const session = { api: zulipApi(httpTransport({ apiUrl: `${realmUrl}/api/v1`, authHeader: '' })), selfUserId: 790, realm: realmUrl, authHeader: '', sessionId: 't' };
+  return { tools: new ZulipToolRuntime(session, dir), done: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 test('a long edit_message sends its text in the body, and nothing in the URL', async () => {
   const content = 'é'.repeat(9000);
   const z = await realm({ 'PATCH /messages/55': { json: { result: 'success' } } });
@@ -143,7 +149,7 @@ test('delete_message keeps its note of the delete while the delete may have been
   } finally { s.done(); z.close(); }
   const gone = await realm({});
   gone.close();
-  const refused = await serverOn(gone.url);
+  const refused = toolsKnowingTheId(gone.url);
   refused.tools.onDeleteFailed = (id) => failed.push(id);
   try {
     await assert.rejects(refused.tools.handleToolCall('delete_message', { message_id: 58 }));
@@ -166,7 +172,7 @@ test('send_message to a person with no topic sends no topic parameter', async ()
 test('a refused connection says the request was not sent', async () => {
   const z = await realm({});
   z.close();
-  const s = await serverOn(z.url);
+  const s = toolsKnowingTheId(z.url);
   try {
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
@@ -652,5 +658,14 @@ test("where Zulip refuses the bot its profile with a client error, as it refuses
     for (const content of ['one', 'two']) await s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content });
     assert.deepEqual(z.requests.map((r) => `${r.method} ${r.path}`), ['GET /users/me', 'GET /server_settings', 'POST /messages', 'POST /messages']);
     assert.equal(s.session.selfUserId, null);
+  } finally { s.done(); z.close(); }
+});
+
+test("a start whose read of the bot's profile fails still reads the realm's upload cap", async () => {
+  const z = await realm({ 'GET /users/me': 'drop' });
+  const s = await serverOn(z.url);
+  try {
+    assert.equal(s.session.selfUserId, null, "the start's read failed");
+    assert.equal(s.session.maxUploadBytes, 25 * 1024 * 1024);
   } finally { s.done(); z.close(); }
 });
