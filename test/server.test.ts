@@ -7394,9 +7394,12 @@ test('a refused mention behind more ambient messages than the catch-up limit is 
   await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(161), 'the refused mention held');
   h.policy.rejectPushes.delete('161');
   const offersOf161 = () => h.pushed.filter((p) => ((p.payload.content[0] as { text?: string }).text ?? '').includes('msg 161')).length;
-  // A held read that no acceptance starts: its read from the watermark stops at the limit, 100 here, with ambient rows only.
+  const callsBefore = h.adapter.historyCalls.length;
   await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
   await h.server.quiet();
+  const heldRead = h.adapter.historyCalls.slice(callsBefore).find((c) => c.channelId === 'zulip:general' && c.query.afterMessageId === '10');
+  assert.ok(heldRead, 'the update starts a held read from the watermark');
+  assert.equal(heldRead.query.limit, 100, 'which reads up to the catch-up limit, with ambient rows only');
   assert.equal(offersOf161(), 1, 'the first read stops before 161');
   for (const later of [162, 163]) {
     h.adapter.history.push(streamMsg(later, { mentioned: true }));

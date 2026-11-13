@@ -1916,12 +1916,16 @@ scenario('79. an open stream removed, its removal answered, and the stream back:
     r.post(17, 'ambient one, with the channel closed at the host');
     await untilAsync(async () => (await missedOn(first, 'zulip:general')) === 1, 'counted as missed');
   } finally { await first.end(); }
-  r.post(17, 'ambient two, while no host was connected');
+  r.post(17, 'early ambient, while no host was connected');
+  for (let n = 1; n <= 8; n++) r.post(17, `near ambient ${n}`);
+  r.post(17, '@bot while no host was connected', { mentioned: true });
   const second = await start(r, dir, { reuse: first });
   try {
     await deliveriesSettled(second);
     const blocks = second.pushed.map(payloadText).filter((t) => t.includes('channelId="zulip:general"'));
-    assert.deepEqual(blocks, [], 'no backscroll block for a channel the host had closed');
-    assert.equal(await missedOn(second, 'zulip:general'), 2);
+    assert.equal(blocks.length, 1, 'one catch-up block, for the mention');
+    assert.match(blocks[0], /@bot while no host was connected/);
+    assert.doesNotMatch(blocks[0], /early ambient/, 'the mention and its vicinity, not a backscroll of the channel the host had closed');
+    assert.equal(await missedOn(second, 'zulip:general'), 10);
   } finally { await second.close(); }
 });

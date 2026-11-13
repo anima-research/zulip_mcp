@@ -1151,7 +1151,7 @@ test("a reaction to a direct message is judged by that message's sender, not by 
   } finally { adapter.stopEvents(); }
 });
 
-test("a reaction to the bot's own direct message is left to the server's check of the conversation, so a participant listed by email alone is heard", async () => {
+test("the adapter passes on a reaction to the bot's own direct message, for the server's check of the conversation, where dmUsers names a participant by email alone", async () => {
   let polls = 0;
   const { api: client } = standInApi({
     'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
@@ -1173,6 +1173,6 @@ test("a reaction to the bot's own direct message is left to the server's check o
     const deadline = performance.now() + 2000;
     while (reacted.length < 1 && performance.now() < deadline) await new Promise((res) => setTimeout(res, 5));
     await new Promise((res) => setTimeout(res, 50));
-    assert.deepEqual(reacted, ['51'], "Ann's reaction to the bot's message is told");
+    assert.deepEqual(reacted, ['51'], "Ann's reaction to the bot's message is passed on");
   } finally { adapter.stopEvents(); }
 });
