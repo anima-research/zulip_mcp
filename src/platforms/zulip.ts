@@ -570,13 +570,15 @@ export class ZulipAdapter implements PlatformAdapter {
   private async onZulipChange(change: ZulipMessageChange, located?: SeenMessage, only?: readonly number[]): Promise<MessageChangeEvent | null> {
     const self = this.identity.selfUserId;
     if (change.kind === 'edit') {
-      const id = located || this.seen.has(change.messageId) ? change.messageId : change.messageIds.find((m) => this.seen.has(m)) ?? change.messageId;
-      const cached = located ? null : this.seen.get(id) ?? null;
       // A cache miss GETs the message as it reads NOW. For a content edit
       // that is the right place; for a cross-stream move it is the stream
       // the message went to, and the agent only ever saw it in the one it
       // came from — which the event names.
-      const where = located ?? cached ?? await this.locate(id, 'an edit');
+      const known = located ? null : this.seen.get(change.messageId) ?? null;
+      const first = located ?? known ?? await this.locate(change.messageId, 'an edit');
+      const id = first ? change.messageId : change.messageIds.find((m) => this.seen.has(m)) ?? change.messageId;
+      const cached = first ? known : this.seen.get(id) ?? null;
+      const where = first ?? cached;
       if (!where) return null;
       const crossStream = change.newStreamId !== null && !where.isDm;
       // A cross-stream move of an uncached message whose origin the event
