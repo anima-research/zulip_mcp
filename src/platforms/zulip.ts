@@ -1111,7 +1111,7 @@ export class ZulipAdapter implements PlatformAdapter {
             timestamp,
           });
           const emit = (where: SeenMessage | null) => {
-            if (!where || !current()) return;
+            if (!where || !current() || (where.isDm && where.authorId !== this.identity.selfUserId && !this.changeAllowed(where))) return;
             const arrived = at(where, new Date());
             onReaction({ ...arrived, placed: () => at(this.seen.get(ev.message_id) ?? where, arrived.timestamp) });
           };

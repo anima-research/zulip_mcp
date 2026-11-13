@@ -1120,3 +1120,59 @@ test("a new DM conversation whose first message is taken out while it waits stil
   const next = await messages[1].ready();
   assert.equal(next?.newChannel?.id, 'zulip:dm:7+42', "the conversation with Ann and Bo, as the README names it");
 });
+
+test("a reaction to a direct message is judged by that message's sender, not by the conversation", async () => {
+  let polls = 0;
+  const reaction = (id: number, messageId: number, by: number) => ({ id, type: 'reaction', op: 'add', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: messageId, user_id: by });
+  const { api: client } = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls > 1) return new Promise(() => {});
+      // A group DM of the bot, Ann (7) and Bo (42). Only Bo is in dmUsers.
+      return { events: [
+        { id: 1, type: 'message', flags: [], message: dm(31, 7) },
+        { id: 2, type: 'message', flags: [], message: dm(32, 42) },
+        reaction(3, 31, 42),
+        reaction(4, 32, 7),
+      ] };
+    },
+  });
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: onlyDev, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const delivered: string[] = [];
+  const reacted: { messageId: string; snippet: string | null }[] = [];
+  adapter.startEvents(inTurn(({ message: m }) => { delivered.push(m.messageId); }), undefined, (r) => { reacted.push({ messageId: r.messageId, snippet: r.messageSnippet }); });
+  try {
+    const deadline = performance.now() + 2000;
+    while ((delivered.length < 1 || reacted.length < 1) && performance.now() < deadline) await new Promise((res) => setTimeout(res, 5));
+    await new Promise((res) => setTimeout(res, 50));
+    assert.deepEqual(delivered, ['32'], "Ann's message isn't delivered: she isn't in dmUsers");
+    assert.deepEqual(reacted.map((r) => r.messageId), ['32'], "only the reaction to Bo's message is told; the one to Ann's would carry her text as its snippet");
+  } finally { adapter.stopEvents(); }
+});
+
+test("the adapter passes on a reaction to the bot's own direct message, for the server's check of the conversation, where dmUsers names a participant by email alone", async () => {
+  let polls = 0;
+  const { api: client } = standInApi({
+    'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+    'GET /events': async () => {
+      polls++;
+      if (polls > 1) return new Promise(() => {});
+      return { events: [
+        // The bot's one-to-one DM with Ann (7), whom dmUsers names by email alone.
+        { id: 1, type: 'message', flags: [], message: raw(51, { type: 'private', display_recipient: [{ id: SELF, full_name: 'Bot', email: 'bot@example.com' }, { id: 7, full_name: 'Ann', email: 'ann@example.com' }], sender_id: SELF, sender_full_name: 'Bot', sender_email: 'bot@example.com' }) },
+        { id: 2, type: 'reaction', op: 'add', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: 51, user_id: 7 },
+      ] };
+    },
+  });
+  const annByEmail: FilterView = { streamAllowed: () => true, dmAllowed: (u) => u.email === 'ann@example.com' };
+  const adapter = new ZulipAdapter(client, SELF, 's', { filters: annByEmail, dmDiscoveryLimit: 0, directory: directoryOf() });
+  const reacted: string[] = [];
+  adapter.startEvents(inTurn(() => {}), undefined, (r) => { reacted.push(r.messageId); });
+  try {
+    const deadline = performance.now() + 2000;
+    while (reacted.length < 1 && performance.now() < deadline) await new Promise((res) => setTimeout(res, 5));
+    await new Promise((res) => setTimeout(res, 50));
+    assert.deepEqual(reacted, ['51'], "Ann's reaction to the bot's message is passed on");
+  } finally { adapter.stopEvents(); }
+});
