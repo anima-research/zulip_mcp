@@ -155,7 +155,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "send_message",
     description:
-      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments.",
+      "Send a stream or direct message using 'type' and 'to' (plus 'topic' for streams), or use 'reply_to' to derive the destination. Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id.",
     inputSchema: {
       type: "object",
       properties: {
