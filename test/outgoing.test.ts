@@ -12,6 +12,8 @@ import type { ZulipSession } from '../src/zulip-client.ts';
 import type { UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
 
+import { MessageIds, LEGACY_IDS } from '../src/message-ids.ts';
+
 type Sent = { messageId: string; channelId: string; content: string };
 type Answer = (n: number) => unknown;
 
@@ -29,13 +31,13 @@ const uploader = {
 };
 const uploadPolicy: UploadPolicy = { roots: new Map(), maxBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
 
-function tools(api: ZulipSession['api'], maxMessageLength?: number) {
+function tools(api: ZulipSession['api'], maxMessageLength?: number, messageIds = LEGACY_IDS) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-outgoing-'));
   const session: ZulipSession = { api, selfUserId: 790, realm: 'https://z', authHeader: 'Basic x', sessionId: 't' };
   const original = console.error;
   console.error = () => {};
   try {
-    const runtime = new ZulipToolRuntime(session, dir, { uploader, uploadPolicy, ...(maxMessageLength ? { maxMessageLength } : {}) } as never);
+    const runtime = new ZulipToolRuntime(session, dir, { uploader, uploadPolicy, messageIds, ...(maxMessageLength ? { maxMessageLength } : {}) } as never);
     const sent: Sent[] = [];
     runtime.onSent = (s) => sent.push(s);
     return { runtime, sent, done: () => rmSync(dir, { recursive: true, force: true }) };
@@ -242,3 +244,58 @@ test('R4 (109, publish): a plain answer that fails after a part was posted names
   const first = adapter(messagesApi(refuseAt(1)).api);
   await assert.rejects(first.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e: Error) => e.message === 'Zulip refused message to #general: nope');
 });
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  for (const path of ['send_message', 'send_dm', 'publish'] as const) {
+    for (const failure of ['refusal', 'transport'] as const) {
+      test(`partial-send receipts: ${mode} ${path} ${failure}`, async () => {
+        const messageIds = new MessageIds('alpha', mode);
+        const original = 'message 901 failed; user text alpha:902 and 903 stays unchanged';
+        for (const count of [0, 1, 2, 3]) {
+          const transport = new ZulipNoAnswer('timeout', 'POST', '/messages', true, original);
+          const transportMessage = transport.message;
+          const { api, calls } = messagesApi(n => {
+            if (n <= count) return ok(n);
+            if (failure === 'transport') throw transport;
+            return { result: 'error', msg: original, code: 'BAD_REQUEST' };
+          });
+          const t = tools(api, 5, messageIds);
+          const pub = adapter(api, { maxMessageLength: 5, messageIds });
+          const content = 'abcdefghijklmnopqrst';
+          try {
+            const send = path === 'publish'
+              ? pub.publish('zulip:general', undefined, text(content))
+              : t.runtime.handleToolCall(path, path === 'send_dm'
+                ? { to: ['42'], content }
+                : { type: 'stream', to: 'general', topic: 't', content });
+            await assert.rejects(send, (err: Error) => {
+              const ids = Array.from({ length: count }, (_, i) => String(messageIds.format(901 + i)));
+              const names = count === 1 ? ids[0] : `${ids.slice(0, -1).join(', ')} and ${ids.at(-1)}`;
+              const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
+              const prefix = count === 0 ? '' :
+                `Posted as message${count === 1 ? '' : 's'} ${names} (${parts}) before the send stopped; sending the whole text again posts ${count === 1 ? 'that part' : 'those parts'} twice. `;
+              const suffix = failure === 'transport' ? transportMessage : path === 'publish'
+                ? `Zulip refused message to #general: ${original}`
+                : `${count ? 'Zulip: ' : ''}${original}`;
+              assert.equal(err.message, prefix + suffix);
+              if (failure === 'transport') assert.equal(err, transport);
+              if (failure === 'refusal' && path === 'publish') {
+                assert.ok(err instanceof ZulipRefused);
+                assert.equal(err.code, 'BAD_REQUEST');
+              }
+              // Every reported ID remains valid for recovery in the configured mode.
+              for (const id of ids) assert.equal(messageIds.parse(id), Number(id.split(':').at(-1)));
+              return true;
+            });
+            assert.equal(calls.length, count + 1);
+            assert.equal(bodies(calls).join(''), content.slice(0, (count + 1) * 5));
+            assert.deepEqual((path === 'publish' ? pub.sent : t.sent).map(s => s.messageId),
+              Array.from({ length: count }, (_, i) => String(901 + i)), 'internal IDs stay numeric strings');
+          } finally {
+            t.done();
+          }
+        }
+      });
+    }
+  }
+}

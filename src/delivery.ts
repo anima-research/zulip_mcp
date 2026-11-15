@@ -1,3 +1,4 @@
+import { LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { TextContent } from '@animalabs/mcpl-core';
@@ -448,13 +449,13 @@ export function viewOf(m: KeyedMessage): MissedView {
  * header can skip it, and one that scans message text can strip the prefix
  * first.
  */
-export function attributeMessage(m: KeyedMessage, stream: string | null, formatTime: (d: Date) => string): KeyedMessage {
+export function attributeMessage(m: KeyedMessage, stream: string | null, formatTime: (d: Date) => string, ids: MessageIds = LEGACY_IDS): KeyedMessage {
   const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
   if (meta.attributed === true) return m;
   const isDM = meta.isDM === true || isDmKey(m.key);
   const at = new Date(m.timestamp);
   const header = messageLineHead({
-    id: m.messageId,
+    id: ids.format(m.messageId),
     time: Number.isNaN(at.getTime()) ? '' : formatTime(at),
     stream: isDM ? null : (stream ?? ''),
     topic: typeof meta.topic === 'string' ? meta.topic : (m.threadId ?? ''),
@@ -489,6 +490,7 @@ export function selectMissed<T extends { mentioned: boolean; replyToSelf?: boole
 export const DEFAULT_MISSED_BLOCK_MAX_CHARS = 40_000;
 
 export interface MissedBlockOptions {
+  messageIds?: MessageIds;
   streamName: string;
   channelId: string;
   reason: 'backscroll' | 'mention' | 'addressed';
@@ -499,16 +501,17 @@ export interface MissedBlockOptions {
   newestScannedId?: number;
 }
 
-function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined): string {
-  return `fetch_history(channel="${channelId}", ${cursor}=${id})`;
+function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
+  return `fetch_history(channel="${channelId}", ${cursor}=${JSON.stringify(id === undefined ? id : ids.format(id))})`;
 }
 
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): { text: string; elided: number } {
+  const ids = opts.messageIds ?? LEGACY_IDS;
   const dm = parseDmChannelId(opts.channelId) !== null;
   const render = (m: MissedView): string => {
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
     const head = messageLineHead({
-      id: m.id,
+      id: ids.format(m.id),
       time: Number.isNaN(m.timestamp.getTime()) ? '' : opts.formatTime(m.timestamp),
       stream: dm ? null : opts.streamName,
       topic: m.topic,
@@ -529,13 +532,13 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const tail: string[] = [];
     if (elided > 0) {
       head.push(
-        `[${elided} earlier line(s) elided (ids ${msgs[0].id}–${msgs[elided - 1].id}) to fit the catch-up budget — ` +
-          `${historyPointer(opts.channelId, 'before', msgs[elided].id)} pages into them]`,
+        `[${elided} earlier line(s) elided (ids ${ids.format(msgs[0].id)}–${ids.format(msgs[elided - 1].id)}) to fit the catch-up budget — ` +
+          `${historyPointer(opts.channelId, 'before', msgs[elided].id, ids)} pages into them]`,
       );
       attrs.push(`elided="${elided}"`);
     }
     if (opts.moreBeyond) {
-      tail.push(`[the catch-up ceiling was reached; newer messages exist — ${historyPointer(opts.channelId, 'after', newestScanned)} continues]`);
+      tail.push(`[the catch-up ceiling was reached; newer messages exist — ${historyPointer(opts.channelId, 'after', newestScanned, ids)} continues]`);
       attrs.push('truncated="true"');
     }
     const body = cut !== null ? [cut] : lines.slice(elided);
@@ -550,7 +553,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
   }
   if (block.length > budget && lines.length > 0) {
     const last = msgs[msgs.length - 1];
-    const marker = ` … [line cut to fit the catch-up budget — fetch_around(${last.id}) has the whole message]`;
+    const marker = ` … [line cut to fit the catch-up budget — fetch_around(${JSON.stringify(ids.format(last.id))}) has the whole message]`;
     const room = budget - (assemble(elided, '').length + marker.length);
     const full = lines[lines.length - 1];
     block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);

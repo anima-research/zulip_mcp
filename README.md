@@ -639,3 +639,9 @@ catch-up, and the tools — the fastest way to see the wire behaviour.
 ## License
 
 MIT
+
+### Realm-tagged message IDs (opt-in)
+
+For multi-realm deployments, `ZULIP_ID_MODE=compat` or `strict` and a distinct
+`ZULIP_REALM_TAG` enable scoped message IDs such as `research:123`. The default
+remains unchanged. See [the ID contract and host handshake check](docs/realm-ids.md).

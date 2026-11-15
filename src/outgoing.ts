@@ -1,3 +1,4 @@
+import { LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { isRefusal, type ZulipApi, type ZulipRefusal, type ZulipSuccess } from './zulip-api.js';
 import { withAttachmentLinks, type UploadedFile } from './uploads.js';
 import { blankLineAboveTables } from './tables.js';
@@ -54,10 +55,11 @@ function splitsPair(text: string, at: number): boolean {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
-export function namePosted<E extends Error>(err: E, posted: readonly number[]): E {
+export function namePosted<E extends Error>(err: E, posted: readonly number[], messageIds: MessageIds = LEGACY_IDS): E {
   if (posted.length === 0) return err;
   const n = posted.length;
-  const ids = n === 1 ? String(posted[0]) : `${posted.slice(0, -1).join(', ')} and ${posted[n - 1]}`;
+  const formatted = posted.map(id => messageIds.format(id));
+  const ids = n === 1 ? String(formatted[0]) : `${formatted.slice(0, -1).join(', ')} and ${formatted[n - 1]}`;
   const parts = n === 1 ? 'part 1' : n === 2 ? 'parts 1 and 2' : `parts 1 to ${n}`;
   err.message = `Posted as message${n === 1 ? '' : 's'} ${ids} (${parts}) before the send stopped; ` +
     `sending the whole text again posts ${n === 1 ? 'that part' : 'those parts'} twice. ${err.message}`;
@@ -80,13 +82,14 @@ export async function sendMessage(
   destination: Destination,
   content: string,
   opts: {
+    messageIds?: MessageIds;
     limit: number;
     unlinkable: Unlinkable;
     upload?: () => Promise<UploadedFile[]>;
     onChunk?: (chunk: SentChunk) => void;
   },
 ): Promise<SendResult> {
-  const prepared = await linkMessages(api, prepareOutgoing(content), async () => audienceOf(destination), opts.unlinkable);
+  const prepared = await linkMessages(api, prepareOutgoing(content), async () => audienceOf(destination), opts.unlinkable, opts.messageIds ?? LEGACY_IDS);
   const uploaded = (await opts.upload?.()) ?? [];
   const parts = chunkMessage(withAttachmentLinks(prepared, uploaded), opts.limit);
   if (parts.length === 0) throw new NothingToSend();

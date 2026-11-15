@@ -56,11 +56,12 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+import { LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from './markdown-blocks.js';
 import { tableTest } from './tables.js';
 import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
-const TOKEN = /\[\[msg:([0-9]+)\]\]/g;
+const TOKEN = /\[\[msg:([^\]\r\n]*)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
 /** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
 const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;
@@ -123,7 +124,7 @@ function inlineRuns(
  * and outside inline code. Zulip has no backslash escape for a bracket, so a
  * backslash before a token changes nothing.
  */
-function messageTokens(text: string): MessageToken[] {
+function messageTokens(text: string, scoped = false): MessageToken[] {
   if (!text.includes('[[msg:')) return [];
   const raw = text.split('\n');
   const starts: number[] = [];
@@ -152,7 +153,7 @@ function messageTokens(text: string): MessageToken[] {
   const tokens: MessageToken[] = [];
   let line = 0;
   let span = 0;
-  for (const m of text.matchAll(TOKEN)) {
+  for (const m of text.matchAll(scoped ? TOKEN : /\[\[msg:([0-9]+)\]\]/g)) {
     const start = m.index;
     const end = start + m[0].length;
     while (line + 1 < starts.length && starts[line + 1]! <= start) line += 1;
@@ -162,6 +163,18 @@ function messageTokens(text: string): MessageToken[] {
     tokens.push({ start, end, digits: m[1]! });
   }
   return tokens;
+}
+
+/** Validate all active tokens before any destination lookup or upload. */
+export function validateMessageLinks(text: string, ids: MessageIds = LEGACY_IDS, bare?: () => void): void {
+  if (ids.mode === 'legacy') return;
+  for (const token of messageTokens(text, true)) {
+    // An odd backslash escapes a literal token; code spans were excluded by the scanner.
+    let slashes = 0;
+    for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
+    if (slashes % 2 && !/^[0-9]+$/.test(token.digits)) continue;
+    ids.parse(token.digits, bare);
+  }
 }
 
 const HASH_REPLACEMENTS = new Map([
@@ -255,8 +268,14 @@ export async function linkMessages(
   text: string,
   audience: () => Promise<Audience>,
   unlinkable: Unlinkable,
+  ids: MessageIds = LEGACY_IDS,
 ): Promise<string> {
-  const tokens = messageTokens(text);
+  validateMessageLinks(text, ids);
+  const tokens = messageTokens(text, ids.mode !== 'legacy').filter(token => {
+    let slashes = 0;
+    for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
+    return slashes % 2 === 0 || /^[0-9]+$/.test(token.digits);
+  });
   if (tokens.length === 0) return text;
 
   let destination: Promise<Audience> | undefined;
@@ -283,7 +302,7 @@ export async function linkMessages(
   };
 
   const decide = async (digits: string): Promise<Outcome> => {
-    const id = Number(digits);
+    const id = ids.mode === 'legacy' ? Number(digits) : ids.parse(digits);
     if (!Number.isSafeInteger(id) || id <= 0) return { reason: `there is no message ${digits}` };
     const answer = await api.requestAnswer<{ message?: Record<string, unknown> }>('GET', `/messages/${id}`, {
       apply_markdown: false,
@@ -308,7 +327,7 @@ export async function linkMessages(
     return { reason: `message ${id} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
   };
 
-  const keyOf = (digits: string) => (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits);
+  const keyOf = (digits: string) => ids.mode === 'legacy' ? (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits) : ids.parse(digits);
   const outcomes = new Map<number | string, { digits: string; outcome: Outcome | null }>();
   let answered = true;
   for (const token of tokens) {

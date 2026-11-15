@@ -23,6 +23,7 @@ import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import type { ZulipRawMessage } from '../src/history.ts';
 import { FiltersPlane, type ZulipFilters } from '../src/filters.ts';
 import { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { MessageIds } from '../src/message-ids.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { TOOL_CLASSES } from '../src/tool-classes.ts';
 import { standInApi } from './zulip-stand-in.ts';
@@ -314,6 +315,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
+  messageIds?: MessageIds;
   mcpl?: boolean;
   typing?: boolean;
   stateDir?: string;
@@ -353,6 +355,7 @@ function harness(opts: HarnessOptions = {}): Harness {
   if (opts.visible) adapter.visible = opts.visible;
   const server = opts.reuse?.server ?? new ZulipMcplServer(adapter as unknown as PlatformAdapter, opts.tools ?? (fakeTools as unknown as ZulipToolRuntime), {
     serverInfo: { name: 'zulip-mcp-test', version: '0.0.0' },
+    messageIds: opts.messageIds,
     mcplEnabled: opts.mcpl ?? true,
     batchWindowMs: opts.batchWindowMs ?? 5,
     contextHistorySize: 3,
@@ -7415,4 +7418,41 @@ test('a catch-up block that is never offered, because the grant lost pushEvents 
   assert.deepEqual(h.delivery.heldIds('zulip:general'), [11, 12], 'both rows its text showed are held');
   assert.deepEqual(h.delivery.heldIds('zulip:general', { replayable: true }), [11, 12], 'and each can be offered at a later read');
   await h.close();
+});
+
+
+test('initialize advertises the active ID contract in MCP and MCPL; legacy is unchanged', async () => {
+  for (const mcpl of [false, true]) for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const h = harness({ messageIds: new MessageIds('alpha', mode) });
+    try {
+      const result = await initialize(h, mcpl);
+      assert.deepEqual(result.serverInfo, {
+        name: 'zulip-mcp-test', version: '0.0.0',
+        ...(mode === 'legacy' ? {} : { _meta: { 'zulip_mcp/messageIds': { version: 1, mode, realmTag: 'alpha' } } }),
+      });
+      const listed = await h.host.sendRequest('tools/list', {}) as { tools: typeof toolDefinitions };
+      const schema = listed.tools.find(t => t.name === 'add_reaction')!.inputSchema.properties as any;
+      assert.deepEqual(schema.message_id.type, mode === 'legacy' ? 'number' : mode === 'strict' ? 'string' : ['string', 'number']);
+    } finally { await h.close(); }
+  }
+});
+
+test('scoped MCPL history, delivery and acknowledgments keep internal cursors numeric', async () => {
+  const h = harness({ messageIds: new MessageIds('alpha', 'strict'), history: [streamMsg(7)] });
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(h);
+    const opened = await h.host.sendRequest(method.CHANNELS_OPEN, {
+      channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5, beforeMessageId: 'alpha:9' },
+    }) as { history: IncomingChannelMessage[] };
+    assert.equal(h.adapter.historyCalls.at(-1)?.query.beforeMessageId, '9');
+    assert.equal(opened.history[0].messageId, 'alpha:7');
+    h.adapter.emit!(streamMsg(10));
+    await h.server.quiet();
+    assert.equal(h.incoming.at(-1)?.messageId, 'alpha:10');
+    assert.equal(h.delivery.watermark('zulip:general'), 10);
+    await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: 'alpha:10' });
+    assert.equal(h.adapter.acked.at(-1), '10:');
+  } finally { await h.close(); }
 });
