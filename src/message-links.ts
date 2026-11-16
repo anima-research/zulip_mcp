@@ -61,7 +61,7 @@ import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from '.
 import { tableTest } from './tables.js';
 import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
-const TOKEN = /\[\[msg:([^\]\r\n]*)\]\]/g;
+const TOKEN = /\[\[msg:([^\[\]\r\n]*)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
 /** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
 const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;
@@ -121,8 +121,8 @@ function inlineRuns(
 /**
  * Each `[[msg:ID]]` that Zulip would read as Markdown: outside every code and
  * math fence (a quote, quoted or spoiler fence's inside counts as Markdown)
- * and outside inline code. Zulip has no backslash escape for a bracket, so a
- * backslash before a token changes nothing.
+ * and outside inline code. Legacy numeric tokens ignore backslashes; enabled
+ * modes preserve escaped nonnumeric tokens as literals.
  */
 function messageTokens(text: string, scoped = false): MessageToken[] {
   if (!text.includes('[[msg:')) return [];
@@ -173,7 +173,7 @@ export function validateMessageLinks(text: string, ids: MessageIds = LEGACY_IDS,
     let slashes = 0;
     for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
     if (slashes % 2 && !/^[0-9]+$/.test(token.digits)) continue;
-    ids.parse(token.digits, bare);
+    ids.parse(token.digits, bare, `[[msg:${token.digits}]]`);
   }
 }
 
@@ -270,11 +270,15 @@ export async function linkMessages(
   unlinkable: Unlinkable,
   ids: MessageIds = LEGACY_IDS,
 ): Promise<string> {
-  validateMessageLinks(text, ids);
+  if (unlinkable === 'refuse') validateMessageLinks(text, ids);
   const tokens = messageTokens(text, ids.mode !== 'legacy').filter(token => {
     let slashes = 0;
     for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
-    return slashes % 2 === 0 || /^[0-9]+$/.test(token.digits);
+    if (slashes % 2 && !/^[0-9]+$/.test(token.digits)) return false;
+    if (ids.mode !== 'legacy' && unlinkable === 'as-typed') {
+      try { ids.parse(token.digits); } catch { return false; }
+    }
+    return true;
   });
   if (tokens.length === 0) return text;
 
@@ -308,23 +312,23 @@ export async function linkMessages(
       apply_markdown: false,
       allow_empty_topic_name: true,
     });
-    if (isRefusal(answer)) return { reason: `Zulip refused to show message ${id} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
+    if (isRefusal(answer)) return { reason: `Zulip refused to show message ${ids.format(id)} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
     const m = answer.message ?? {};
-    if (m.type !== 'stream') return { reason: `message ${id} is a direct message, and only a stream message can be linked` };
+    if (m.type !== 'stream') return { reason: `message ${ids.format(id)} is a direct message, and only a stream message can be linked` };
     const { stream_id: streamId, display_recipient: stream, subject: topic } = m;
     if (typeof streamId !== 'number' || typeof stream !== 'string' || typeof topic !== 'string') {
-      return { reason: `Zulip's answer for message ${id} names no stream and topic` };
+      return { reason: `Zulip's answer for message ${ids.format(id)} names no stream and topic` };
     }
     const link = { link: messageLink({ id, streamId, stream, topic }) };
     const to = await destinationOnce();
     if (to.kind === 'stream' && to.id === streamId) return link;
     const read = await privacyOnce(streamId);
-    if ('refused' in read) return { reason: `Zulip didn't say whether message ${id}'s stream is private (${read.refused})` };
+    if ('refused' in read) return { reason: `Zulip didn't say whether message ${ids.format(id)}'s stream is private (${read.refused})` };
     if (!read.inviteOnly) return link;
     const destinationId = await destinationIdOnce();
     if ('refused' in destinationId) return { reason: destinationId.refused };
     if (destinationId.id === streamId) return link;
-    return { reason: `message ${id} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
+    return { reason: `message ${ids.format(id)} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
   };
 
   const keyOf = (digits: string) => ids.mode === 'legacy' ? (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits) : ids.parse(digits);

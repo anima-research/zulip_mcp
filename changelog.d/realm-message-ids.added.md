@@ -1,1 +1,1 @@
-Opt-in realm-tagged message IDs via `ZULIP_ID_MODE=compat|strict` and `ZULIP_REALM_TAG`, including reaction tools and MCP/MCPL boundaries. Enabled servers advertise contract version, mode and realm tag in initialize serverInfo metadata; unset behavior is unchanged.
+- Opt-in realm-tagged message IDs via `ZULIP_ID_MODE=compat|strict` and `ZULIP_REALM_TAG`, including reaction tools and MCP/MCPL boundaries. Enabled servers advertise contract version, mode and realm tag in initialize serverInfo metadata; unset behavior is unchanged.

@@ -315,6 +315,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
+  incomingResults?: (messages: IncomingChannelMessage[]) => unknown[];
   messageIds?: MessageIds;
   mcpl?: boolean;
   typing?: boolean;
@@ -410,7 +411,7 @@ function harness(opts: HarnessOptions = {}): Harness {
       }
       const refused = new Set(p.messages.filter((m) => policy.rejectIds.has(m.messageId) || policy.rejectOnce.delete(m.messageId)).map((m) => m.messageId));
       incoming.push(...p.messages.filter((m) => !refused.has(m.messageId)));
-      host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) })) });
+      host.sendResponse(req.id, { results: opts.incomingResults?.(p.messages) ?? p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) })) });
     } else if (req.method === method.PUSH_EVENT) {
       const p = req.params as PushEventParams;
       pushed.push(p);
@@ -7438,7 +7439,8 @@ test('initialize advertises the active ID contract in MCP and MCPL; legacy is un
 });
 
 test('scoped MCPL history, delivery and acknowledgments keep internal cursors numeric', async () => {
-  const h = harness({ messageIds: new MessageIds('alpha', 'strict'), history: [streamMsg(7)] });
+  const dir = mkdtempSync(join(tmpdir(), 'realm-delivery-'));
+  const h = harness({ stateDir: dir, messageIds: new MessageIds('alpha', 'strict'), history: [streamMsg(7)] });
   try {
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
@@ -7454,5 +7456,51 @@ test('scoped MCPL history, delivery and acknowledgments keep internal cursors nu
     assert.equal(h.delivery.watermark('zulip:general'), 10);
     await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: 'alpha:10' });
     assert.equal(h.adapter.acked.at(-1), '10:');
+  } finally { await h.close(); }
+  try {
+    const persisted = JSON.parse(readFileSync(join(dir, 'test.delivery.json'), 'utf8'));
+    assert.equal(persisted.watermarks['zulip:general'], 10);
+    const restarted = harness({ stateDir: dir, messageIds: new MessageIds('beta', 'compat') });
+    try {
+      assert.equal(restarted.delivery.watermark('zulip:general'), 10);
+    } finally { await restarted.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('itemized realm results preserve synthetic IDs and isolate malformed entries', async () => {
+  for (const tag of ['reaction', 'edit', 'move', 'delete']) {
+    const eventId = `${tag}:add:7:2:123`;
+    const h = harness({
+      messageIds: new MessageIds(tag, 'strict'),
+      incomingResults: messages => [
+        ...messages.map(m => ({ messageId: m.messageId, accepted: true })),
+        { accepted: true }, { messageId: 7, accepted: true },
+        { messageId: `${tag}:not-a-number`, accepted: true }, null,
+      ],
+    });
+    try {
+      await initialize(h, true);
+      const result = await (h.server as any).sendIncomingToHost([streamMsg(7), { ...streamMsg(8), messageId: eventId }]);
+      assert.equal(result.results[0].messageId, '7');
+      assert.equal(result.results[1].messageId, eventId);
+      assert.equal(h.incoming[0].messageId, `${tag}:7`);
+    } finally { await h.close(); }
+  }
+});
+
+test('invalid realm history cursors are invalid params before subscription', async () => {
+  const h = harness({ messageIds: new MessageIds('alpha', 'strict') });
+  try {
+    await initialize(h, true);
+    await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(h);
+    await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, {
+      channelId: 'zulip:general', type: 'zulip', address: {}, history: { beforeMessageId: 'other:7' },
+    }), (err: any) => {
+      assert.equal(err.code, -32602);
+      assert.match(err.message, /beforeMessageId=.*other:7/);
+      return true;
+    });
+    assert.equal(h.adapter.subscribed.length, 0);
   } finally { await h.close(); }
 });

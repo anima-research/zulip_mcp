@@ -2,6 +2,7 @@
 
 import { MessageIds } from './message-ids.js';
 import * as net from 'node:net';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
@@ -103,7 +104,9 @@ async function main(): Promise<void> {
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
   const server = new ZulipMcplServer(adapter, tools, {
-    serverInfo: SERVER_INFO,
+    serverInfo: messageIds.mode === 'legacy' ? SERVER_INFO : {
+      ...SERVER_INFO, version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
+    },
     mcplEnabled: process.env.MCPL_ENABLED !== 'false',
     batchWindowMs: intEnv('MCPL_BATCH_WINDOW_MS', 500),
     contextHistorySize: intEnv('MCPL_CONTEXT_HISTORY_SIZE', 20),

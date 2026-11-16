@@ -295,7 +295,7 @@ export class ZulipToolRuntime {
   private async followedTopic(messageId: number, streamId: number): Promise<{ topic: string } | "elsewhere" | undefined> {
     let message: any;
     try {
-      message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId}`)).message;
+      message = (await this.api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)}`)).message;
     } catch {
       return undefined;
     }
@@ -368,14 +368,14 @@ export class ZulipToolRuntime {
     if (args.to !== undefined) throw new Error("reply_to sets the destination; omit to");
     const result = await this.api.requestAnswer<{ message?: any }>("GET", `/messages/${id}`);
     if (result.result === "error") {
-      throw new Error(`Zulip refused reply_to ${id}${result.code ? ` (${result.code})` : ""}: ${result.msg ?? "unknown error"}`);
+      throw new Error(`Zulip refused reply_to ${this.messageIds.format(id!)}${result.code ? ` (${result.code})` : ""}: ${result.msg ?? "unknown error"}`);
     }
     const message = result.message;
-    const unreadable = () => new Error(`reply_to ${id} has no readable destination`);
+    const unreadable = () => new Error(`reply_to ${this.messageIds.format(id!)} has no readable destination`);
     if (!message || !["stream", "private"].includes(message.type)) throw unreadable();
     const type = args.type === "direct" ? "private" : args.type === "channel" ? "stream" : args.type;
     if (type !== undefined && type !== message.type) {
-      throw new Error(`reply_to ${id}: type disagrees with the referenced message`);
+      throw new Error(`reply_to ${this.messageIds.format(id!)}: type disagrees with the referenced message`);
     }
     if (message.type === "stream") {
       const name = message.display_recipient;
@@ -386,7 +386,7 @@ export class ZulipToolRuntime {
         ? { type: message.type, to: message.stream_id ?? name, topic: message.subject, channelId: channelId ?? named, receipt: { channelId, channel: name, topic: message.subject } }
         : { type: message.type, to: message.stream_id ?? name, topic: args.topic, channelId: channelId ?? named, receipt: { channelId, channel: name } };
     }
-    if (args.topic !== undefined) throw new Error(`reply_to ${id} is a direct message, which has no topic; omit topic`);
+    if (args.topic !== undefined) throw new Error(`reply_to ${this.messageIds.format(id!)} is a direct message, which has no topic; omit topic`);
 
     const recipients: ZulipRecipient[] = message.display_recipient;
     if (!Array.isArray(recipients) || recipients.length === 0 || recipients.some((r) => !Number.isSafeInteger(r?.id))) {
@@ -467,8 +467,8 @@ export class ZulipToolRuntime {
     const bare = () => { if (!warned) { warned = true; console.error(`[zulip-mcp] ${warning}`); } };
     const fields = name === 'send_message' ? ['reply_to'] : name === 'fetch_history' ? ['before', 'after']
       : ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around'].includes(name) ? ['message_id'] : [];
-    for (const field of fields) if (args[field] !== undefined) args[field] = this.messageIds.parse(args[field], bare);
-    if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(args.content, this.messageIds, bare);
+    for (const field of fields) if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare, field);
+    if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare);
     const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
     return warned ? { ...result, warnings: [warning] } : result;
   }
@@ -842,7 +842,7 @@ export class ZulipToolRuntime {
         const messageId = positiveIdArg("message_id", args.message_id);
         if (typeof args.content !== "string") throw new Error("content must be a string");
         const edited = async (): Promise<Audience> => {
-          const { message } = await api.request<{ message?: { type?: unknown; stream_id?: unknown } }>("GET", `/messages/${messageId}`, `reading message ${messageId}`, { apply_markdown: false, allow_empty_topic_name: true });
+          const { message } = await api.request<{ message?: { type?: unknown; stream_id?: unknown } }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)}`, { apply_markdown: false, allow_empty_topic_name: true });
           return message?.type === "stream" && typeof message.stream_id === "number" ? { kind: "stream", id: message.stream_id } : { kind: "direct" };
         };
         const tabled = prepareOutgoing(args.content);
@@ -862,7 +862,7 @@ export class ZulipToolRuntime {
           const posted = changes.length === 0 ? "" : ` as it would be posted, with ${changes.join(" and ")} (${[...args.content].length} as written)`;
           throw new Error(`content is ${length} characters${posted}, above the message length of ${this.maxMessageLength}; an edit can't be split as a send is`);
         }
-        return api.request("PATCH", `/messages/${messageId}`, `editing message ${args.message_id}`, { content });
+        return api.request("PATCH", `/messages/${messageId}`, `editing message ${this.messageIds.format(args.message_id)}`, { content });
       }
 
       case "delete_message": {
@@ -871,7 +871,7 @@ export class ZulipToolRuntime {
         const messageId = positiveIdArg("message_id", args.message_id);
         this.onDeleted?.(String(args.message_id));
         try {
-          return await api.request("DELETE", `/messages/${messageId}`, `deleting message ${args.message_id}`);
+          return await api.request("DELETE", `/messages/${messageId}`, `deleting message ${this.messageIds.format(args.message_id)}`);
         } catch (err) {
           if (!mayHaveBeenApplied(err)) this.onDeleteFailed?.(String(args.message_id));
           throw err;
@@ -888,7 +888,7 @@ export class ZulipToolRuntime {
         const scope = args.scope;
         if (typeof scope !== "string" || !Object.hasOwn(MOVE_SCOPES, scope)) throw new Error("scope must be one, later or all.");
         const streamId = stream === undefined ? undefined : await this.streamIdForName(stream);
-        await api.request("PATCH", `/messages/${messageId}`, `moving message ${messageId}`, {
+        await api.request("PATCH", `/messages/${messageId}`, `moving message ${this.messageIds.format(messageId)}`, {
           propagate_mode: MOVE_SCOPES[scope],
           ...(topic !== undefined ? { topic } : {}),
           ...(streamId !== undefined ? { stream_id: streamId } : {}),
@@ -896,13 +896,13 @@ export class ZulipToolRuntime {
         const asked = { ...(topic !== undefined ? { topic } : {}), ...(stream !== undefined ? { stream } : {}), scope };
         let message: any;
         try {
-          message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${messageId} back`)).message;
+          message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)} back`)).message;
         } catch (err) {
           return { moved: true, asked, readBackError: (err as Error).message, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
-          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${messageId}.`, note: MOVE_NOTE };
+          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
@@ -1084,7 +1084,7 @@ export class ZulipToolRuntime {
         const messageId = numberOrUndefined(args.message_id);
         if (messageId === undefined) throw new Error("message_id must be a number");
         const limit = clampInt(args.limit, 50, 1, 200);
-        const page = await fetchAround(api, messageId, limit);
+        const page = await fetchAround(api, messageId, limit, this.messageIds.format(messageId));
         const anchor = page.messages.find((m) => m.id === messageId);
         const shown = anchor?.streamNameShown ?? null;
         const known = this.channelIds != null && anchor?.streamId != null;

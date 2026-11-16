@@ -299,3 +299,15 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
     }
   }
 }
+
+test('realm MCPL publish keeps invalid references as typed', async () => {
+  for (const mode of ['strict', 'compat'] as const) {
+    const { api, calls } = messagesApi();
+    const a = adapter(api, { messageIds: new MessageIds('alpha', mode) });
+    const content = '[[msg:beta:7]] [[msg:not-an-id]]' + (mode === 'strict' ? ' [[msg:7]]' : '');
+    const result = await a.publish('zulip:general', undefined, text(content));
+    assert.equal(result.delivered, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].params.content, content);
+  }
+});

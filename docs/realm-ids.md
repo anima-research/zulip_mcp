@@ -4,8 +4,8 @@ Message IDs are realm-local in Zulip. Deployments connected to several realms ca
 opt in to tagged IDs to reject a message reference sent to the wrong server:
 
 ```sh
-ZULIP_ID_MODE=strict
-ZULIP_REALM_TAG=research
+export ZULIP_ID_MODE=strict
+export ZULIP_REALM_TAG=research
 ```
 
 - Unset or `legacy`: existing numeric IDs, tool schemas, message-link handling,
@@ -26,7 +26,10 @@ publish receipts, acknowledgments, and history-open cursors. Active Markdown
 links use `[[msg:research:123]]`; code spans/fences stay literal. A backslash
 before a nonnumeric token keeps it literal. Foreign tags and malformed IDs are
 rejected before the tool's API calls or uploads. Message text, user/stream/channel
-IDs, event IDs and checkpoint tokens are not rewritten. Zulip API calls, routing
+IDs, event IDs and checkpoint tokens are not rewritten. Zero/negative sentinel
+values remain numeric, not usable message references. MCPL publish retains its
+as-typed policy: invalid, foreign and strict bare link tokens remain literal;
+tool calls reject them. Zulip API calls, routing
 cursors and persisted state remain numeric. No state migration is needed.
 
 ## Host compatibility check

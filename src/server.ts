@@ -745,10 +745,14 @@ export class ZulipMcplServer {
   }
 
   private async openChannel(ctx: Ctx, params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey, conn: McplConnection): Promise<ChannelsOpenResult> {
-    if (this.messageIds.mode !== 'legacy' && params.history?.beforeMessageId !== undefined) {
-      params = { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId)) } };
-    }
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    if (this.messageIds.mode !== 'legacy' && params.history?.beforeMessageId !== undefined) {
+      try {
+        params = { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, undefined, 'beforeMessageId')) } };
+      } catch (err) {
+        throw new McplRpcError(-32602, (err as Error).message);
+      }
+    }
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
     this.channelManager.confirmAnnounced(descriptor.id);
@@ -2423,7 +2427,11 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     const result = (await conn.sendRequest(method.CHANNELS_INCOMING, this.messageIds.project({ messages }))) as ChannelsIncomingResult | undefined;
     if (this.messageIds.mode !== 'legacy' && result?.results) {
-      return { ...result, results: result.results.map(r => ({ ...r, messageId: r.messageId.startsWith(`${this.messageIds.tag}:`) ? String(this.messageIds.parse(r.messageId)) : r.messageId })) };
+      // Only reverse IDs actually sent in this batch. Synthetic events and bad
+      // host entries must not throw or prevent independent results settling.
+      const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
+      return { ...result, results: result.results.map(r => r && typeof r.messageId === 'string'
+        ? { ...r, messageId: originals.get(r.messageId) ?? r.messageId } : r).filter(r => r != null) };
     }
     return result;
   }

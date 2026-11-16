@@ -364,7 +364,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // Older (pre-5.0) servers omit code; only then use the legacy text.
       if (quoteLookup && result.result === 'error' &&
           (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
-      if (isRefusal(result)) throw new ZulipRefused(`message ${messageId}`, result);
+      if (isRefusal(result)) throw new ZulipRefused(`message ${this.messageIds.format(messageId)}`, result);
       const raw = result.message;
       if (!raw) throw new Error('response contained no message');
       if (raw.id !== messageId) throw new Error('response contained a different message id');
@@ -707,7 +707,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
   async acknowledge(_key: ChannelKey | null, messageId: string, value?: string): Promise<string> {
     const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
-    await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${messageId}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
+    await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${this.messageIds.format(messageId)}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
     return `:${name}:`;
   }
 
@@ -715,7 +715,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const id = Number(messageId);
     this.noteSelfDeleted(id);
     try {
-      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`);
+      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${this.messageIds.format(messageId)}`);
     } catch (err) {
       if (!mayHaveBeenApplied(err)) this.selfDeleted.delete(id);
       throw err;

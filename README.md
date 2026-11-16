@@ -645,3 +645,6 @@ MIT
 For multi-realm deployments, `ZULIP_ID_MODE=compat` or `strict` and a distinct
 `ZULIP_REALM_TAG` enable scoped message IDs such as `research:123`. The default
 remains unchanged. See [the ID contract and host handshake check](docs/realm-ids.md).
+
+In strict realm-ID mode, reply with `{"reply_to":"research:12345","content":"Thanks!"}`
+(using your configured realm tag) rather than the legacy integer example above.
