@@ -122,7 +122,14 @@ test('attachment timeout and HTTP reason phrases expose only safe facts', async 
     assert.match(messageIdError(error, new MessageIds('alpha', 'legacy')).message, /private proxy/);
     return true;
   });
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+  } catch (error) {
+    // Node 20.10 predates the options-object API; keep the engines floor covered.
+    if (!(error instanceof TypeError) || (error as NodeJS.ErrnoException).code !== 'ERR_INVALID_ARG_TYPE') throw error;
+    const legacyTimers = t.mock.timers as unknown as { enable(apis: string[]): void };
+    legacyTimers.enable(['setTimeout']);
+  }
   let original: unknown;
   globalThis.fetch = async (_url, init) => new Promise((_resolve, reject) => {
     init!.signal!.addEventListener('abort', () => {
