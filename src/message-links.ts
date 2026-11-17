@@ -122,7 +122,7 @@ function inlineRuns(
  * Each `[[msg:ID]]` that Zulip would read as Markdown: outside every code and
  * math fence (a quote, quoted or spoiler fence's inside counts as Markdown)
  * and outside inline code. Legacy numeric tokens ignore backslashes; enabled
- * modes preserve escaped nonnumeric tokens as literals.
+ * modes preserve all escaped tokens as literals.
  */
 function messageTokens(text: string, scoped = false): MessageToken[] {
   if (!text.includes('[[msg:')) return [];
@@ -172,7 +172,7 @@ export function validateMessageLinks(text: string, ids: MessageIds = LEGACY_IDS,
     // An odd backslash escapes a literal token; code spans were excluded by the scanner.
     let slashes = 0;
     for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
-    if (slashes % 2 && !/^[0-9]+$/.test(token.digits)) continue;
+    if (slashes % 2) continue;
     ids.parse(token.digits, bare, `[[msg:${token.digits}]]`);
   }
 }
@@ -274,7 +274,7 @@ export async function linkMessages(
   const tokens = messageTokens(text, ids.mode !== 'legacy').filter(token => {
     let slashes = 0;
     for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
-    if (slashes % 2 && !/^[0-9]+$/.test(token.digits)) return false;
+    if (ids.mode !== 'legacy' && slashes % 2) return false;
     if (ids.mode !== 'legacy' && unlinkable === 'as-typed') {
       try { ids.parse(token.digits); } catch { return false; }
     }

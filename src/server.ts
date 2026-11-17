@@ -2434,8 +2434,20 @@ export class ZulipMcplServer {
       // Only reverse IDs actually sent in this batch. Synthetic events and bad
       // host entries must not throw or prevent independent results settling.
       const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
-      return { ...result, results: result.results.filter(r => r && typeof r.messageId === 'string' && originals.has(r.messageId))
-        .map(r => ({ ...r, messageId: originals.get(r.messageId)! })) };
+      const numericOriginals = new Map(messages.filter(m => /^[0-9]+$/.test(m.messageId))
+        .map(m => [Number(m.messageId), m.messageId]));
+      const results = result.results.flatMap(r => {
+        let original = r && typeof r.messageId === 'string' ? originals.get(r.messageId) : undefined;
+        if (original === undefined && r && typeof r.messageId === 'string') {
+          try { original = numericOriginals.get(this.messageIds.parse(r.messageId)); } catch { /* diagnosed below */ }
+        }
+        if (original === undefined) {
+          console.error(`[zulip-mcp] Ignoring incoming result: messageId=${JSON.stringify(r?.messageId)} does not match this batch under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
+          return [];
+        }
+        return [{ ...r, messageId: original }];
+      });
+      return { ...result, results };
     }
     return result;
   }

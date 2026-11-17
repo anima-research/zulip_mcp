@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { McplConnection } from '@animalabs/mcpl-core';
 
 const api = createServer((req, res) => {
@@ -17,7 +18,7 @@ await once(api, 'listening');
 const dir = mkdtempSync(join(tmpdir(), 'handshake-'));
 try {
   for (const mode of ['compat', 'strict']) for (const mcpl of [false, true]) {
-    const child = spawn(process.execPath, [new URL('../build/index.js', import.meta.url).pathname], {
+    const child = spawn(process.execPath, [fileURLToPath(new URL('../build/index.js', import.meta.url))], {
       cwd: dir,
       env: {
         PATH: process.env.PATH, HOME: dir,
@@ -38,6 +39,13 @@ try {
         capabilities: mcpl ? { experimental: { mcpl: { version: '0.5', channels: true } } } : {},
         clientInfo: { name: 'built-smoke', version: '0' },
       });
+      const manifest = result.capabilities?.experimental?.mcpl;
+      if (mcpl) {
+        assert.equal(manifest?.version, '0.5');
+        for (const capability of ['incoming', 'publish', 'acknowledge', 'lifecycle']) {
+          assert.equal(manifest.channels?.[capability], true, capability);
+        }
+      } else assert.equal(manifest, undefined);
       assert.deepEqual(result.serverInfo, {
         name: 'zulip-mcp-server',
         version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url))).version,

@@ -7469,7 +7469,9 @@ test('scoped MCPL history, delivery and acknowledgments keep internal cursors nu
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('itemized realm results preserve synthetic IDs and isolate malformed entries', async () => {
+test('itemized realm results preserve synthetic IDs and isolate malformed entries', async t => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { diagnostics.push(args.join(' ')); });
   for (const tag of ['reaction', 'edit', 'move', 'delete']) {
     const eventId = `${tag}:add:7:2:123`;
     const h = harness({
@@ -7483,9 +7485,9 @@ test('itemized realm results preserve synthetic IDs and isolate malformed entrie
     try {
       await initialize(h, true);
       const result = await (h.server as any).sendIncomingToHost([streamMsg(7), { ...streamMsg(8), messageId: eventId }]);
-      assert.equal(result.results[0].messageId, '7');
-      assert.equal(result.results[1].messageId, eventId);
+      assert.deepEqual(result.results, [{ messageId: '7', accepted: true }, { messageId: eventId, accepted: true }]);
       assert.equal(h.incoming[0].messageId, `${tag}:7`);
+      assert.ok(diagnostics.some(line => line.includes('Ignoring incoming result:') && line.includes(`strict mode (realm ${tag})`)));
     } finally { await h.close(); }
   }
 });
@@ -7575,12 +7577,17 @@ test('mixed scoped delivery settles accepted IDs but holds refused IDs below the
 
 test('unmatched host result IDs cannot release numeric holds in enabled modes', async () => {
   for (const mode of ['strict', 'compat'] as const) {
+    let returned = 0;
     const h = harness({
       messageIds: new MessageIds('alpha', mode),
-      incomingResults: () => [
-        { messageId: '7', accepted: true }, { messageId: 7, accepted: true },
-        { messageId: 'other:7', accepted: true }, { messageId: 'alpha:8', accepted: true },
-      ],
+      incomingResults: messages => {
+        assert.ok(messages.some(m => m.messageId === 'alpha:7'));
+        returned++;
+        return [
+          ...(mode === 'strict' ? [{ messageId: '7', accepted: true }] : []), { messageId: 7, accepted: true },
+          { messageId: 'other:7', accepted: true }, { messageId: 'alpha:8', accepted: true },
+        ];
+      },
     });
     try {
       await initialize(h, true);
@@ -7588,8 +7595,27 @@ test('unmatched host result IDs cannot release numeric holds in enabled modes', 
       await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
       h.adapter.emit!(streamMsg(7));
       await h.server.quiet();
+      assert.ok(returned > 0, 'host returned unmatched results');
       assert.deepEqual(h.delivery.heldIds('zulip:general'), [7]);
       assert.notEqual(h.delivery.watermark('zulip:general'), 7);
     } finally { await h.close(); }
   }
+});
+
+
+test('compat itemized bare references settle only messages in the batch', async () => {
+  const h = harness({ messageIds: new MessageIds('alpha', 'compat'),
+    incomingResults: () => [{ messageId: '7', accepted: true }, { messageId: '8', accepted: true }],
+  });
+  try {
+    await initialize(h, true);
+    const result = await (h.server as any).sendIncomingToHost([streamMsg(7)]);
+    assert.deepEqual(result.results, [{ messageId: '7', accepted: true }]);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(7));
+    await h.server.quiet();
+    assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+    assert.equal(h.delivery.watermark('zulip:general'), 7);
+  } finally { await h.close(); }
 });

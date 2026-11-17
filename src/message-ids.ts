@@ -13,16 +13,16 @@ export class MessageIds {
   }
 
   static fromEnv(realm: string, env: NodeJS.ProcessEnv = process.env): MessageIds {
-    if (env.ZULIP_ID_MODE === undefined || env.ZULIP_ID_MODE === 'legacy') return LEGACY_IDS;
+    if (!env.ZULIP_ID_MODE || env.ZULIP_ID_MODE === 'legacy') return LEGACY_IDS;
     if (!['compat', 'strict'].includes(env.ZULIP_ID_MODE)) throw new Error('ZULIP_ID_MODE must be legacy, compat or strict');
-    if (env.ZULIP_REALM_TAG !== undefined) return new MessageIds(env.ZULIP_REALM_TAG, env.ZULIP_ID_MODE as IdMode);
+    if (env.ZULIP_REALM_TAG) return new MessageIds(env.ZULIP_REALM_TAG, env.ZULIP_ID_MODE as IdMode);
     let url: URL;
     try { url = new URL(realm); }
     catch { throw new Error('Zulip realm (ZULIP_REALM or zuliprc site) must be an absolute URL to infer ZULIP_REALM_TAG'); }
     if (!url.hostname) throw new Error('Zulip realm URL must have a hostname to infer ZULIP_REALM_TAG');
     const label = url.hostname.split('.')[0].toLowerCase()
       .replace(/[^a-z0-9_-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'realm';
-    return new MessageIds(env.ZULIP_REALM_TAG ?? label, (env.ZULIP_ID_MODE ?? 'legacy') as IdMode);
+    return new MessageIds(label, (env.ZULIP_ID_MODE ?? 'legacy') as IdMode);
   }
 
   format(id: number | string): number | string {

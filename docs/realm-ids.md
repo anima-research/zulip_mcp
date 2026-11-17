@@ -8,14 +8,14 @@ export ZULIP_ID_MODE=strict
 export ZULIP_REALM_TAG=research
 ```
 
-- Unset or `legacy`: existing numeric IDs, tool schemas, message-link handling,
+- Unset, empty, or `legacy`: existing numeric IDs, tool schemas, message-link handling,
   and handshake identity are unchanged. `ZULIP_REALM_TAG` is unused.
 - `compat`: emit `research:123`, accept matching tagged IDs and bare positive safe
   integers (including decimal strings). Bare tool inputs warn on stderr and in
   successful results' `warnings` array, or in the error text when a call fails.
 - `strict`: emit tagged IDs and reject bare inputs.
 
-Tags match `[a-z0-9][a-z0-9_-]{0,63}`. If omitted in an enabled mode, the tag is
+Tags match `[a-z0-9][a-z0-9_-]{0,63}`. If omitted or empty in an enabled mode, the tag is
 inferred from the first hostname label. **Set an explicit, distinct tag per realm**:
 that inference is not globally unique. Tags are routing guards, not authentication.
 Invalid enabled configuration fails before Zulip requests.
@@ -23,9 +23,11 @@ Invalid enabled configuration fails before Zulip requests.
 The contract covers message-ID tool inputs (`message_id`, `reply_to`, history
 `before`/`after`), receipts, raw/history output, MCPL message delivery and history,
 publish receipts, acknowledgments, and history-open cursors. Active Markdown
-links use `[[msg:research:123]]`; code spans/fences stay literal. An odd-length run of backslashes
-before a token keeps it literal; an even-length run leaves it active. Foreign tags and malformed IDs are
-rejected before the tool's API calls or uploads. Message text, user/stream/channel
+links use `[[msg:research:123]]`; code spans/fences stay literal. In compat/strict,
+an odd-length run of backslashes before any token (numeric, tagged, or malformed)
+keeps it literal; an even-length run leaves it active. Legacy retains upstream
+behavior: backslashes do not escape numeric tokens. Active foreign tags and
+malformed IDs are rejected before the tool's API calls or uploads. Message text, user/stream/channel
 IDs, event IDs and checkpoint tokens are not rewritten. Zero/negative sentinel
 values remain numeric, not usable message references. MCPL publish retains its
 as-typed policy: invalid, foreign and strict bare link tokens remain literal;
@@ -64,3 +66,8 @@ No released version is claimed by this change: consumers must pin the upstream
 release that first includes it once published. A source SHA copied into host
 configuration is not a substitute for these runtime checks. Handshake metadata
 is a server self-description, not cryptographic provenance of its executable.
+
+Itemized host results are correlated only to IDs in the delivered batch. Compat
+accepts bare decimal string references too; strict requires the matching tag.
+Synthetic event IDs must be echoed exactly. Invalid/unmatched entries are logged
+and ignored independently, never settling an unrelated message.

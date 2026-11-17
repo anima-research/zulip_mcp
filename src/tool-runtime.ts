@@ -473,7 +473,15 @@ export class ZulipToolRuntime {
     const fields = name === 'send_message' ? ['reply_to'] : name === 'fetch_history' ? ['before', 'after']
       : ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around'].includes(name) ? ['message_id'] : [];
     try {
-      for (const field of fields) if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare(field), field);
+      for (const field of fields) {
+        // Compat preserves empty/default and padded decimal history cursors.
+        if (name === 'fetch_history' && this.messageIds.mode === 'compat' && typeof args[field] === 'string') {
+          const trimmed = args[field].trim();
+          if (trimmed === '') args[field] = undefined;
+          else if (/^[0-9]+$/.test(trimmed)) args[field] = trimmed;
+        }
+        if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare(field), field);
+      }
       if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
       const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
       return warnings.length ? { ...result, warnings } : result;

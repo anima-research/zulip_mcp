@@ -42,8 +42,8 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
     });
     tools.onSent = () => { writes++; };
     for (const [name, field] of [['send_message', 'reply_to'], ['edit_message', 'message_id'], ['move_messages', 'message_id'], ['delete_message', 'message_id'], ['add_reaction', 'message_id'], ['remove_reaction', 'message_id'], ['fetch_around', 'message_id'], ['fetch_history', 'before'], ['fetch_history', 'after']]) {
-      await assert.rejects(tools.handleToolCall(name, { [field]: 'beta:7', content: 'hello' }), /differs/);
-      if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { [field]: 7 }), /bare/);
+      await assert.rejects(tools.handleToolCall(name, { [field]: 'beta:7', content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
+      if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
     }
     await assert.rejects(tools.handleToolCall('send_message', { reply_to: 'alpha:7', content: '[[msg:alpha:7]] [[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
     assert.equal(calls.length, 0);
@@ -333,5 +333,49 @@ test('malformed move read-back names the operation only in enabled modes', async
     assert.equal(result.moved, true);
     assert.equal(result.readBackError, (mode === 'legacy' ? '' : 'move_messages: ') +
       "Zulip's answer gave no stream and topic for message " + (mode === 'legacy' ? '7' : 'alpha:7') + '.');
+  }
+});
+
+
+test('empty configuration uses defaults', () => {
+  assert.equal(MessageIds.fromEnv('not a URL', { ZULIP_ID_MODE: '' }).mode, 'legacy');
+  assert.equal(MessageIds.fromEnv('https://alpha.example', { ZULIP_ID_MODE: 'compat', ZULIP_REALM_TAG: '' }).tag, 'alpha');
+});
+
+test('numeric token escaping is consistent in enabled modes, legacy remains upstream', async () => {
+  const audience = async () => ({ kind: 'stream' as const, id: 12 });
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    for (const count of [1, 2, 3, 4]) {
+      const { api, calls } = standInApi({ 'GET /messages/:id': { result: 'success', message } });
+      const ids = new MessageIds('alpha', mode);
+      const text = '\\'.repeat(count) + '[[msg:7]]';
+      const literal = mode !== 'legacy' && count % 2 === 1;
+      if (mode === 'strict' && !literal) {
+        assert.throws(() => validateMessageLinks(text, ids), /bare/);
+        await assert.rejects(linkMessages(api, text, audience, 'refuse', ids), /bare/);
+        assert.equal(calls.length, 0);
+      } else {
+        let warnings = 0;
+        validateMessageLinks(text, ids, () => warnings++);
+        assert.equal(warnings, mode === 'compat' && !literal ? 1 : 0);
+        const result = await linkMessages(api, text, audience, 'refuse', ids);
+        if (literal) { assert.equal(result, text); assert.equal(calls.length, 0); }
+        else { assert.notEqual(result, text); assert.ok(calls.length > 0); }
+      }
+    }
+  }
+});
+
+test('compat history preserves empty and padded decimal cursors', async t => {
+  const { api, calls } = standInApi({ 'GET /messages': { result: 'success', messages: [] } });
+  const dir = mkdtempSync(join(tmpdir(), 'cursor-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir,
+    { messageIds: new MessageIds('alpha', 'compat') });
+  for (const field of ['before', 'after']) {
+    for (const value of ['', '   ', ' 12 ']) {
+      await runtime.handleToolCall('fetch_history', { channel: 'dm:9', [field]: value });
+      assert.equal(calls.at(-1)?.params.anchor, value.trim() ? 12 : 'newest');
+    }
   }
 });
