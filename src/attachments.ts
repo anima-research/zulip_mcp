@@ -1,4 +1,4 @@
-import { messageIdError, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { messageIdError, markTransportError, LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -144,7 +144,7 @@ export async function fetchCapped(
   maxBytes: number,
   signal: AbortSignal,
 ): Promise<FetchedBytes> {
-  const res = await fetch(url, { headers, redirect: 'follow', signal });
+  const res = await fetch(url, { headers, redirect: 'follow', signal }).catch(error => { throw markTransportError(error); });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
   const declared = Number(res.headers.get('content-length') ?? '');
@@ -156,7 +156,7 @@ export async function fetchCapped(
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await reader.read().catch(error => { throw markTransportError(error); });
     if (done) break;
     total += value.length;
     if (total > maxBytes) {

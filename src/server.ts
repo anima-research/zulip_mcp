@@ -687,8 +687,8 @@ export class ZulipMcplServer {
       conn.sendError(req.id, err.code, err.message, err.data);
       return;
     }
-    const e = err as Error;
-    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, e.stack ?? e.message);
+    const e = messageIdError(err, this.messageIds);
+    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, this.messageIds.mode === "legacy" ? e.stack ?? e.message : e.message);
     conn.sendError(req.id, -32603, err instanceof Error ? messageIdError(err, this.messageIds).message : e.message ?? String(err));
   }
 
@@ -1425,7 +1425,8 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    const shownIds = [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
+    const omittedBacklog = this.messageIds.mode !== 'legacy' && elided === kept.length;
+    const shownIds = omittedBacklog ? kept.map(v => v.id) : [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
     for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
@@ -1438,7 +1439,11 @@ export class ZulipMcplServer {
       if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
-      if (ok) {
+      if (ok && omittedBacklog) {
+        // The bounded fallback only recovers its anchor, not the backlog.
+        // Keep every omitted row replayable and do not acknowledge the scan.
+        for (const id of shownIds) w.delivery.hold(key, id, 'failed');
+      } else if (ok) {
         w.delivery.advanceThrough(key, newestId, after);
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
@@ -2010,7 +2015,7 @@ export class ZulipMcplServer {
       return result;
     } catch (error) {
       const reason = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
-      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
+      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, this.messageIds.mode === 'legacy' ? error : reason);
       return { ...empty, reason };
     }
   }

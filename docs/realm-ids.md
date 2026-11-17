@@ -74,7 +74,12 @@ and ignored independently, never settling an unrelated message.
 
 Enabled modes keep transport timeout seconds, HTTP status, retry advice and
 write-outcome uncertainty in agent-facing errors, but omit raw transport paths
-and bodies. Original transport diagnostics go to stderr. Native fetch TypeError,
-AbortError and TimeoutError messages are replaced with safe uncertainty guidance;
+and bodies. Original transport diagnostics go to stderr. Errors marked at the native fetch boundary (not arbitrary local TypeErrors) are replaced with safe uncertainty guidance;
 ordinary Zulip refusals and validation messages remain unchanged. Failed unread
 checks report unknown state instead of claiming that no messages are unread.
+
+When a long channel ID forces the bounded catch-up fallback, the anchor only
+recovers its newest message. The entire omitted backlog remains held and
+unacknowledged for replay; accepting that notice does not advance its watermark.
+Unread aggregates are null when any channel check failed; summary counts are
+labelled “At least” in that case.

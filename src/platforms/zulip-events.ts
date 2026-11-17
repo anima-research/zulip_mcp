@@ -389,7 +389,8 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        const errMsg = error instanceof Error ? error.message : String(error);
+        const diagnostic = messageIdError(error, this.options.messageIds ?? LEGACY_IDS);
+        const errMsg = diagnostic.message;
 
         this.consecutiveFailures++;
         const delay = this.backoffDelay(this.consecutiveFailures);
@@ -399,7 +400,7 @@ export class ZulipEventLoop {
             `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms: ${errMsg}`,
           );
         } else {
-          console.error(`Zulip event poll error (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, error);
+          console.error(`Zulip event poll error (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, (this.options.messageIds ?? LEGACY_IDS).mode === 'legacy' ? error : diagnostic.message);
         }
         this.maybeEmitDegraded(
           onSystemEvent,

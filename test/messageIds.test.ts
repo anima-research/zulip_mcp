@@ -540,6 +540,7 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
 
 test('safe diagnostics retain facts, log originals once, and never mutate legacy errors', async t => {
   const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const { markTransportError } = await import('../src/message-ids.ts');
   const logs: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
   for (const mode of ['compat', 'strict'] as const) {
@@ -550,9 +551,9 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
       [new ZulipNoAnswer('timeout', 'POST', '/private', true, 'secret body', undefined, undefined, 1.5),
         'Zulip transport failure (timeout). Timeout: 1.5 seconds. The request may have been applied: check before sending it again.'],
       [new ZulipNoAnswer('not-json', 'GET', '/private', false, 'secret body', 502),
-        'Zulip transport failure (not-json). HTTP 502.'],
-      [new TypeError('secret URL'), 'Transport failed before a complete answer was received; check the outcome before retrying a write.'],
-      [new DOMException('secret URL', 'AbortError'), 'Transport failed before a complete answer was received; check the outcome before retrying a write.'],
+        'Zulip transport failure (not-json). The server returned an unreadable response; retry the read or contact the host operator if it persists. HTTP 502.'],
+      [markTransportError(new TypeError('secret URL')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
+      [markTransportError(new DOMException('secret URL', 'AbortError')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
     ] as const;
     for (const [error, expected] of cases) {
       const original = error.message;
@@ -567,4 +568,48 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
       assert.equal(messageIdError(error, new MessageIds('alpha', 'legacy')), error);
     }
   }
+});
+
+test('local TypeErrors are not transport failures and malformed attachment URLs are actionable', async t => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    assert.equal(messageIdError(new TypeError('local processing failed'), ids).message, 'local processing failed');
+    const { api, calls } = standInApi({});
+    const dir = mkdtempSync(join(tmpdir(), 'bad-url-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+    await assert.rejects(runtime.handleToolCall('fetch_attachment', { path: 'https://[' }), /Invalid attachment path: use a \/user_uploads\/ path/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('self-ID transport failures retain timeout and HTTP facts', async () => {
+  const { selfIdGate, ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); });
+  await assert.rejects(gate.transport('POST', '/messages', {}, undefined), (error: Error) => {
+    const safe = messageIdError(error, new MessageIds('alpha', 'strict'));
+    assert.match(safe.message, /Timeout: 15 seconds/);
+    assert.match(safe.message, /HTTP 504/);
+    assert.match(safe.message, /Retry after 3 seconds/);
+    assert.match(safe.message, /not sent/);
+    return true;
+  });
+});
+
+test('failed unread checks make aggregates unknown and successful subtotals explicit', async t => {
+  const { api } = standInApi({ 'GET /messages': (params: any) => {
+    if (JSON.stringify(params.narrow).includes('broken')) throw new Error('unavailable');
+    return { result: 'success', messages: [message] };
+  } });
+  const dir = mkdtempSync(join(tmpdir(), 'partial-unread-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', 'strict') });
+  // Seed monitoring directly so failed baseline reads do not exclude the channel.
+  (runtime as any).monitoredChannels.set('general', { lastReadMessageId: 0 });
+  (runtime as any).monitoredChannels.set('broken', { lastReadMessageId: 0 });
+  const result = await runtime.handleToolCall('get_unread_messages', { mark_as_read: false });
+  assert.equal(result.total_unread, null);
+  const summary = await runtime.readResource('zulip://unread/summary');
+  assert.match(summary.contents[0].text, /At least 1 unread message/);
+  assert.match(summary.contents[0].text, /Unread state unknown for #broken/);
 });

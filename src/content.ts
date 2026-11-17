@@ -1,3 +1,4 @@
+import { markTransportError } from "./message-ids.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TIMEOUT_MS } from "./zulip-api.js";
@@ -46,7 +47,7 @@ export async function fetchAttachmentBytes(
   try {
     return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal, progressed);
   } catch (err) {
-    if (controller.signal.aborted) throw new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`);
+    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`));
     throw err;
   } finally {
     clearTimeout(timer);
@@ -60,7 +61,7 @@ async function readAttachment(
   signal: AbortSignal,
   progressed: () => void,
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers, redirect: "follow", signal });
+  const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error); });
   progressed();
   if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
 
@@ -75,7 +76,7 @@ async function readAttachment(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    buf = Buffer.from(await resp.arrayBuffer());
+    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error); }));
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
     }
@@ -83,7 +84,7 @@ async function readAttachment(
     const chunks: Buffer[] = [];
     let total = 0;
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await reader.read().catch(error => { throw markTransportError(error); });
       if (done) break;
       if (!value) continue;
       progressed();

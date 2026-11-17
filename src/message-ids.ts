@@ -107,6 +107,13 @@ function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
+const nativeTransportErrors = new WeakSet<Error>();
+/** Mark failures at the fetch boundary, not by their JavaScript error class. */
+export function markTransportError(error: unknown): unknown {
+  if (error instanceof Error) nativeTransportErrors.add(error);
+  return error;
+}
+
 const loggedTransport = new WeakSet<Error>();
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
@@ -119,7 +126,7 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
     : error instanceof Error
     ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
     : new Error(String(error));
-  const nativeTransport = copy instanceof TypeError || copy.name === 'AbortError' || copy.name === 'TimeoutError';
+  const nativeTransport = error instanceof Error && nativeTransportErrors.has(error);
   if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
     // Stderr is diagnostic-only; never send request paths or bodies to the host.
     if (error instanceof Error && !loggedTransport.has(error)) {
@@ -128,6 +135,7 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
     }
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
+      if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; retry the read or contact the host operator if it persists.';
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
@@ -135,7 +143,7 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
-      Object.defineProperty(copy, 'message', { value: 'Transport failed before a complete answer was received; check the outcome before retrying a write.', writable: true, configurable: true });
+      Object.defineProperty(copy, 'message', { value: 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.', writable: true, configurable: true });
     }
     Object.defineProperty(copy, safeTransport, { value: true });
   }

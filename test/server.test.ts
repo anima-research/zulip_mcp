@@ -417,7 +417,7 @@ function harness(opts: HarnessOptions = {}): Harness {
         if (r?.accepted !== true || typeof r.messageId !== 'string') return false;
         if (r.messageId === m.messageId) return true;
         return opts.messageIds?.mode === 'compat' && /^[0-9]+$/.test(r.messageId)
-          && m.messageId === String(opts.messageIds.format(r.messageId));
+          && m.messageId === String(opts.messageIds.format(Number(r.messageId)));
       })));
       host.sendResponse(req.id, { results });
     } else if (req.method === method.PUSH_EVENT) {
@@ -7612,7 +7612,7 @@ test('unmatched host result IDs cannot release numeric holds in enabled modes', 
 
 test('compat itemized bare references settle only messages in the batch', async () => {
   const h = harness({ messageIds: new MessageIds('alpha', 'compat'),
-    incomingResults: () => [{ messageId: '7', accepted: true }, { messageId: '8', accepted: true }],
+    incomingResults: () => [{ messageId: '007', accepted: true }, { messageId: '8', accepted: true }],
   });
   try {
     await initialize(h, true);
@@ -7723,6 +7723,57 @@ test('enabled listen and unlisten transport failures set the MCP isError flag', 
         assert.equal(result.isError, true);
         assert.match(result.content[0].text, /Timeout: 15 seconds/);
         assert.doesNotMatch(result.content[0].text, /private path|users\/me/);
+      }
+    } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('accepted bounded fallback retains the entire 101–200 group-DM backlog', async () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const users = Array.from({ length: 400 }, (_, i) => i + 10000);
+    const channelId = 'zulip:dm:' + users.join(',');
+    const descriptor = { ...BO_DM, id: channelId, address: { dm: true, user_ids: users } };
+    const message = (id: number) => ({ ...boDm(id), channelId });
+    const h = harness({ messageIds: new MessageIds('alpha', mode), visible: [descriptor],
+      history: [message(100)], missedBlockMaxChars: 1000 });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      h.adapter.emit!(message(100), descriptor);
+      await until(() => h.delivery.watermark(channelId) === 100, 'initial accepted DM');
+      for (let id = 101; id <= 200; id++) h.adapter.history.push(message(id));
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+      await until(() => h.pushed.some(p => firstText(p).includes('Catch-up omitted')), 'bounded fallback');
+      await h.server.quiet();
+      assert.equal(h.delivery.watermark(channelId), 100);
+      assert.deepEqual(h.delivery.heldIds(channelId), Array.from({ length: 100 }, (_, i) => i + 101));
+      const block = h.pushed.map(firstText).find(t => t.includes('Catch-up omitted'))!;
+      assert.ok(block.length <= 1000);
+      assert.match(block, /message_id="alpha:200"/);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: "zulip", address: {} });
+      h.adapter.history.push(message(201));
+      h.adapter.emit!(message(201));
+      await until(() => h.delivery.watermark(channelId) === 201, "held backlog replayed");
+      assert.deepEqual(h.incoming.filter(m => Number(m.messageId.split(":").at(-1)) >= 101 && Number(m.messageId.split(":").at(-1)) <= 200).map(m => m.messageId),
+        Array.from({ length: 100 }, (_, i) => "alpha:" + (101 + i)));
+    } finally { await h.close(); }
+  }
+});
+
+test('enabled listen/unlisten validation and refusals set isError', async () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'listen-refusal-'));
+    const ids = new MessageIds('alpha', mode);
+    const refusal = { result: 'error', msg: 'Subscription refused' };
+    const { api } = standInApi({ 'POST /users/me/subscriptions': refusal, 'DELETE /users/me/subscriptions': refusal });
+    const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+    const h = harness({ tools, messageIds: ids });
+    try {
+      await initialize(h, false);
+      for (const name of ['listen', 'unlisten']) for (const channels of [[], ['general']]) {
+        const result = await h.host.sendRequest('tools/call', { name, arguments: { channels } }) as any;
+        assert.equal(result.isError, true);
+        assert.match(result.content[0].text, channels.length ? /Subscription refused/ : /non-empty/);
       }
     } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
   }

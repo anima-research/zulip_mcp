@@ -106,7 +106,7 @@ export function zulipApi(transport: Transport): ZulipApi {
 export interface SelfIdGate {
   readonly selfUserId: number | null;
   readonly transport: Transport;
-  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number } | null>;
+  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number } | null>;
 }
 
 export function selfIdGate(inner: Transport): SelfIdGate {
@@ -119,7 +119,8 @@ export function selfIdGate(inner: Transport): SelfIdGate {
     try {
       answer = await inner('GET', '/users/me', undefined, opts);
     } catch (err) {
-      return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, '') };
+      return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
+        ...(err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
     }
     const { status, body } = answer;
     const id = (body as { user_id?: unknown } | null)?.user_id;
@@ -136,7 +137,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
       console.error(`Zulip refused the read of the bot's own user id: ${reason}. The server goes on without it for this run.`);
       return null;
     }
-    return { reason, retryAfterSeconds: isRefusal(body) ? retryAfterOf(body) : undefined };
+    return { reason, status, retryAfterSeconds: isRefusal(body) ? retryAfterOf(body) : undefined };
   };
   const read = (opts?: RequestOptions) => (pending ??= readOnce(opts).finally(() => { pending = null; }));
 
@@ -149,7 +150,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
         if (failure) {
           throw new ZulipNoAnswer('no-self-id', method, path, false,
             `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. A later call reads it again.`,
-            undefined, failure.retryAfterSeconds);
+            failure.status, failure.retryAfterSeconds, failure.timeoutSeconds);
         }
       }
       return inner(method, path, params, opts);

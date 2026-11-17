@@ -3,6 +3,7 @@
  * `/user_uploads/...` path and the message body links to it.
  */
 
+import { markTransportError } from './message-ids.js';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, type FileHandle, open, readlink, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -114,14 +115,17 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         method: 'POST',
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: multipartBody(input, boundary),
-      });
+      }).catch(error => { throw markTransportError(error); });
+      let unreadable = false;
       let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
       try {
         body = (await res.json()) as typeof body;
       } catch {
+        unreadable = true;
       }
       if (!res.ok || body.result !== 'success') {
-        throw new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
+        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
+        throw unreadable ? markTransportError(error) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.

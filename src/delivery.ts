@@ -565,7 +565,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[Catch-up omitted to fit the budget; fetch_around(message_id=${JSON.stringify(anchor)}) recovers the newest message and its context.` +
+      `[Catch-up omitted to fit the budget; fetch_around(message_id=${JSON.stringify(anchor)}) recovers only the newest message and its context. Omitted messages remain unacknowledged for replay.` +
       `${opts.moreBeyond ? ' Newer messages also exist.' : ''}]\n</missed>`;
   }
   return { text: block, elided };

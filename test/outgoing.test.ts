@@ -252,7 +252,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
         const messageIds = new MessageIds('alpha', mode);
         const original = 'message 901 failed; user text alpha:902 and 903 stays unchanged';
         for (const count of [0, 1, 2, 3]) {
-          const transport = new ZulipNoAnswer('timeout', 'POST', '/messages', true, original);
+          const transport = new ZulipNoAnswer('timeout', 'POST', '/messages', true, original, undefined, undefined, 15);
           const transportMessage = transport.message;
           const { api, calls } = messagesApi(n => {
             if (n <= count) return ok(n);
@@ -274,7 +274,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
               const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
               const prefix = count === 0 ? '' :
                 `Posted as message${count === 1 ? '' : 's'} ${names} (${parts}) before the send stopped; sending the whole text again posts ${count === 1 ? 'that part' : 'those parts'} twice. `;
-              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : 'Zulip transport failure (timeout). The request may have been applied: check before sending it again.') : path === 'publish'
+              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : 'Zulip transport failure (timeout). Timeout: 15 seconds. The request may have been applied: check before sending it again.') : path === 'publish'
                 ? `Zulip refused message to #general: ${original}`
                 : `${count ? 'Zulip: ' : ''}${original}`;
               const context = failure === 'transport' && mode !== 'legacy' && path !== 'publish' ? `${path}: ` : '';

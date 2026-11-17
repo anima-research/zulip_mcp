@@ -582,6 +582,7 @@ export class ZulipToolRuntime {
       case "listen": {
         const channels: string[] = args.channels;
         if (!Array.isArray(channels) || channels.length === 0) {
+          if (this.messageIds.mode !== "legacy") throw new Error("channels array is required and must be non-empty");
           return { error: "channels array is required and must be non-empty" };
         }
         try {
@@ -592,6 +593,7 @@ export class ZulipToolRuntime {
           // A stream the bot just joined is not in the host's channel list
           // yet; registering it here is what makes it openable without a
           // refresh or a restart (#20).
+          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg);
           const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
           const joined = channels.filter((name) => !unauthorized.includes(name));
           const registration = result?.result === "success" && joined.length > 0
@@ -627,6 +629,7 @@ export class ZulipToolRuntime {
       case "unlisten": {
         const channels: string[] = args.channels;
         if (!Array.isArray(channels) || channels.length === 0) {
+          if (this.messageIds.mode !== "legacy") throw new Error("channels array is required and must be non-empty");
           return { error: "channels array is required and must be non-empty" };
         }
         try {
@@ -634,6 +637,7 @@ export class ZulipToolRuntime {
           const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
             subscriptions: channels,
           });
+          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg);
           return {
             result: result?.result,
             removed: result?.removed ?? [],
@@ -797,7 +801,7 @@ export class ZulipToolRuntime {
         const formattedOutput = formatMessages(stripSuppressedReactions(allUnreadMessages, this.reactionPolicy), format, this.messageIds);
 
         return {
-          total_unread: allUnreadMessages.length,
+          total_unread: this.messageIds.mode !== "legacy" && channelResults.some(c => c.status === "error") ? null : allUnreadMessages.length,
           channels_checked: channelResults,
           formatted_messages: formattedOutput,
         };
@@ -1132,7 +1136,12 @@ export class ZulipToolRuntime {
       }
 
       case "fetch_attachment": {
-        const url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm);
+        let url: URL;
+        try { url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm); }
+        catch (error) {
+          if (this.messageIds.mode !== "legacy" && error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or a valid absolute URL on the configured realm.");
+          throw error;
+        }
 
         const headers: Record<string, string> = {};
         if (this.session.authHeader) headers["Authorization"] = this.session.authHeader;
@@ -1228,6 +1237,7 @@ export class ZulipToolRuntime {
 
     if (uri === "zulip://unread/summary") {
       let totalUnread = 0;
+      let partial = false;
       const channelSummaries: string[] = [];
 
       for (const [channelName, state] of monitoredChannels) {
@@ -1246,12 +1256,13 @@ export class ZulipToolRuntime {
             channelSummaries.push(`📬 #${channelName}: ${unread.length} unread`);
           }
         } catch (error) {
+          if (this.messageIds.mode !== "legacy") partial = true;
           if (this.messageIds.mode !== "legacy") channelSummaries.push(`Unread state unknown for #${channelName}: ${messageIdError(error, this.messageIds).message}`);
         }
       }
 
       const summary = totalUnread > 0
-        ? `🔔 ${totalUnread} unread message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
+        ? `🔔 ${partial ? "At least " : ""}${totalUnread} unread message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
         : channelSummaries.length > 0 ? channelSummaries.join('\n') : "✅ No unread messages";
 
       return { contents: [{ uri, mimeType: "text/plain", text: summary }] };
