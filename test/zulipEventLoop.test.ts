@@ -528,3 +528,25 @@ test('degraded event text and metadata wrap transport failures in enabled modes'
     }
   }
 });
+
+for (const mode of ['compat', 'strict'] as const) {
+  test(`non-JSON degraded events retain safe HTTP status in ${mode}`, async () => {
+    const { MessageIds } = await import('../src/message-ids.ts');
+    let loop: ZulipEventLoop;
+    const { sleep } = makeSleepRecorder(() => loop, 3);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, messageIds: new MessageIds('alpha', mode) });
+    const failure = new ZulipNoAnswer('not-json', 'GET', '/events', false,
+      'private upstream response body', 502);
+    await loop.start(standInApi({
+      'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+      'GET /events': async () => { throw failure; },
+    }).api, () => {}, e => events.push(e));
+    const degraded = events.filter(e => e.kind === 'degraded');
+    assert.equal(degraded.length, 1);
+    assert.match(degraded[0].text, /HTTP 502/);
+    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). HTTP 502');
+    assert.doesNotMatch(JSON.stringify(degraded), /private upstream response body|GET|\/events/);
+    assert.equal(failure.message, 'private upstream response body');
+  });
+}

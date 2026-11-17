@@ -559,5 +559,14 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const full = lines[lines.length - 1];
     block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);
   }
+  if (ids.mode !== 'legacy' && block.length > budget && msgs.length > 0) {
+    // Long group-DM identifiers can exhaust the budget before any body fits.
+    // Recover by message anchor, without repeating the unbounded channel name.
+    const anchor = ids.format(msgs[msgs.length - 1].id);
+    elided = msgs.length;
+    block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
+      `[Catch-up omitted to fit the budget; fetch_around(message_id=${JSON.stringify(anchor)}) recovers the newest message and its context.` +
+      `${opts.moreBeyond ? ' Newer messages also exist.' : ''}]\n</missed>`;
+  }
   return { text: block, elided };
 }

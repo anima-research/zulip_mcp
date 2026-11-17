@@ -43,6 +43,7 @@ export class ZulipNoAnswer extends Error {
     detail: string,
     readonly status?: number,
     readonly retryAfterSeconds?: number,
+    readonly timeoutSeconds?: number,
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
@@ -215,7 +216,7 @@ export function httpTransport(config: HttpTransportConfig): Transport {
       text = await response.text();
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`);
+        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, undefined, undefined, timeoutMs / 1000);
       }
       const code = causeCode(err);
       const unsent = code !== undefined && notSent(code);

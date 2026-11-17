@@ -7575,6 +7575,7 @@ test('mixed scoped delivery settles accepted IDs but holds refused IDs below the
     await h.server.quiet();
     assert.ok(h.incoming.some(m => m.messageId === eventId));
     assert.ok(h.incoming.some(m => m.messageId === 'reaction:7'));
+    assert.ok(h.hostSaw.some(req => req.method === method.CHANNELS_INCOMING && (req.params as ChannelsIncomingParams).messages.some(m => m.messageId === 'reaction:8')), 'host was offered the refused live message');
     assert.ok(!h.incoming.some(m => m.messageId === 'reaction:8'));
     assert.deepEqual(h.delivery.heldIds('zulip:general'), [8]);
     assert.equal(h.delivery.watermark('zulip:general'), 7);
@@ -7618,12 +7619,15 @@ test('compat itemized bare references settle only messages in the batch', async 
     const result = await (h.server as any).sendIncomingToHost([streamMsg(7)]);
     assert.deepEqual(result.results, [{ messageId: '7', accepted: true }]);
     assert.ok(h.incoming.some(m => m.messageId === 'alpha:7'));
+    h.incoming.length = 0;
+    h.hostSaw.length = 0;
     await settled(h);
     await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
     h.adapter.emit!(streamMsg(7));
     await h.server.quiet();
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
     assert.equal(h.delivery.watermark('zulip:general'), 7);
+    assert.ok(h.incoming.some(m => m.messageId === 'alpha:7'), 'live message reached host after direct-call records were cleared');
   } finally { await h.close(); }
 });
 
@@ -7699,5 +7703,27 @@ test('channels/open wraps subscription errors before RPC conversion', async () =
         assert.equal(failure.message, original);
       } finally { await h.close(); }
     }
+  }
+});
+
+
+test('enabled listen and unlisten transport failures set the MCP isError flag', async () => {
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  for (const mode of ['compat', 'strict'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'listen-error-'));
+    const ids = new MessageIds('alpha', mode);
+    const fail = () => { throw new ZulipNoAnswer('timeout', 'POST', '/users/me/subscriptions', true, 'private path', undefined, undefined, 15); };
+    const { api } = standInApi({ 'POST /users/me/subscriptions': fail, 'DELETE /users/me/subscriptions': fail });
+    const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+    const h = harness({ tools, messageIds: ids });
+    try {
+      await initialize(h, false);
+      for (const name of ['listen', 'unlisten']) {
+        const result = await h.host.sendRequest('tools/call', { name, arguments: { channels: ['general'] } }) as { isError: boolean; content: { text: string }[] };
+        assert.equal(result.isError, true);
+        assert.match(result.content[0].text, /Timeout: 15 seconds/);
+        assert.doesNotMatch(result.content[0].text, /private path|users\/me/);
+      }
+    } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
   }
 });

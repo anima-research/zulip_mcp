@@ -107,19 +107,36 @@ function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
+const loggedTransport = new WeakSet<Error>();
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
  * Legacy returns the original unchanged; enabled copies may safely be annotated by callers.
  */
 export function messageIdError(error: unknown, ids: MessageIds): Error {
   if (ids.mode === 'legacy') return error as Error;
-  const copy: Error = error instanceof Error
+  const copy: Error = error instanceof DOMException
+    ? Object.defineProperties(new DOMException(error.message, error.name), Object.getOwnPropertyDescriptors(error))
+    : error instanceof Error
     ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
     : new Error(String(error));
-  if (copy instanceof ZulipNoAnswer && !(safeTransport in copy)) {
-    const safe = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
-      `Zulip transport failure (${copy.kind}).`, copy.status, copy.retryAfterSeconds);
-    copy.message = safe.message;
+  const nativeTransport = copy instanceof TypeError || copy.name === 'AbortError' || copy.name === 'TimeoutError';
+  if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
+    // Stderr is diagnostic-only; never send request paths or bodies to the host.
+    if (error instanceof Error && !loggedTransport.has(error)) {
+      console.error('[zulip transport]', error);
+      loggedTransport.add(error);
+    }
+    if (copy instanceof ZulipNoAnswer) {
+      let detail = `Zulip transport failure (${copy.kind}).`;
+      if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
+      if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
+      if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
+      if (copy.retryAfterSeconds !== undefined) detail += ` Retry after ${copy.retryAfterSeconds} seconds.`;
+      copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
+        detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
+    } else {
+      Object.defineProperty(copy, 'message', { value: 'Transport failed before a complete answer was received; check the outcome before retrying a write.', writable: true, configurable: true });
+    }
     Object.defineProperty(copy, safeTransport, { value: true });
   }
   return copy;

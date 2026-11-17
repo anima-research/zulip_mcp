@@ -324,6 +324,7 @@ test('a call\'s own bound ends a real HTTP call at it, below the default', { tim
     const started = Date.now();
     await assert.rejects(api.request('GET', '/streams', 'listing streams', {}, { timeoutMs: 300 }), (err: Error & { kind?: string }) => {
       assert.equal(err.kind, 'timeout');
+      assert.equal((err as Error & { timeoutSeconds: number }).timeoutSeconds, 0.3);
       assert.match(err.message, /within 300 ms\./);
       return true;
     });

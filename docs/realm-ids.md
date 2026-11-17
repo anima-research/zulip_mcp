@@ -71,3 +71,10 @@ Itemized host results are correlated only to IDs in the delivered batch. Compat
 accepts bare decimal string references too; strict requires the matching tag.
 Synthetic event IDs must be echoed exactly. Invalid/unmatched entries are logged
 and ignored independently, never settling an unrelated message.
+
+Enabled modes keep transport timeout seconds, HTTP status, retry advice and
+write-outcome uncertainty in agent-facing errors, but omit raw transport paths
+and bodies. Original transport diagnostics go to stderr. Native fetch TypeError,
+AbortError and TimeoutError messages are replaced with safe uncertainty guidance;
+ordinary Zulip refusals and validation messages remain unchanged. Failed unread
+checks report unknown state instead of claiming that no messages are unread.

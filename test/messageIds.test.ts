@@ -294,7 +294,7 @@ test('move_messages read-back timeout retains success and adds context only in e
     assert.deepEqual(result, {
       moved: true,
       asked: { topic: 'new', scope: 'one' },
-      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): ${messageIdError(error, new MessageIds('alpha', mode)).message}`,
+      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): Zulip transport failure (timeout).`,
       note: 'To answer this message where it is now, use send_message with reply_to.',
     });
     if (mode === 'legacy') assert.equal(result.readBackError, error.message);
@@ -505,6 +505,10 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
         { messageIds: new MessageIds('alpha', mode) });
       if (name === 'get_unread_messages') await runtime.handleToolCall('start_monitoring', { channels: ['general'] });
       fail = true;
+      if (mode !== 'legacy' && (name === 'listen' || name === 'unlisten')) {
+        await assert.rejects(runtime.handleToolCall(name, { channels: ['general'] }), /Zulip transport failure/);
+        continue;
+      }
       const result = await runtime.handleToolCall(name, { channels: ['general'] });
       const error = name === 'start_monitoring' ? result.channels[0].error
         : name === 'get_unread_messages' ? result.channels_checked[0].error : result.error;
@@ -522,9 +526,45 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
         else {
           assert.match(text, /Zulip transport failure/);
           assert.ok(!text.includes('/messages'));
+          assert.ok(!text.includes('ZulipNoAnswer:'));
+          const summary = await runtime.readResource('zulip://unread/summary');
+          assert.match(summary.contents[0].text, /Unread state unknown for #general/);
+          assert.doesNotMatch(summary.contents[0].text, /No unread messages/);
         }
       }
       assert.equal(failure.message, original);
+    }
+  }
+});
+
+
+test('safe diagnostics retain facts, log originals once, and never mutate legacy errors', async t => {
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
+  for (const mode of ['compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    const cases = [
+      [new ZulipNoAnswer('no-self-id', 'POST', '/private', false, 'secret body', undefined, 3),
+        "The server doesn't have the bot's own user id yet; it will retry on a later call. Retry after 3 seconds. The request was not sent."],
+      [new ZulipNoAnswer('timeout', 'POST', '/private', true, 'secret body', undefined, undefined, 1.5),
+        'Zulip transport failure (timeout). Timeout: 1.5 seconds. The request may have been applied: check before sending it again.'],
+      [new ZulipNoAnswer('not-json', 'GET', '/private', false, 'secret body', 502),
+        'Zulip transport failure (not-json). HTTP 502.'],
+      [new TypeError('secret URL'), 'Transport failed before a complete answer was received; check the outcome before retrying a write.'],
+      [new DOMException('secret URL', 'AbortError'), 'Transport failed before a complete answer was received; check the outcome before retrying a write.'],
+    ] as const;
+    for (const [error, expected] of cases) {
+      const original = error.message;
+      const before = logs.length;
+      const safe = messageIdError(error, ids);
+      assert.equal(safe.message, expected);
+      assert.equal(messageIdError(safe, ids).message, expected);
+      assert.equal(messageIdError(error, ids).message, expected);
+      assert.equal(logs.length, before + 1);
+      assert.equal(logs.at(-1)?.[1], error);
+      assert.equal(error.message, original);
+      assert.equal(messageIdError(error, new MessageIds('alpha', 'legacy')), error);
     }
   }
 });

@@ -617,6 +617,7 @@ export class ZulipToolRuntime {
               : {}),
           };
         } catch (error) {
+          if (this.messageIds.mode !== "legacy") throw messageIdError(error, this.messageIds);
           return {
             error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
           };
@@ -640,6 +641,7 @@ export class ZulipToolRuntime {
             msg: result?.msg,
           };
         } catch (error) {
+          if (this.messageIds.mode !== "legacy") throw messageIdError(error, this.messageIds);
           return {
             error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
           };
@@ -1244,12 +1246,13 @@ export class ZulipToolRuntime {
             channelSummaries.push(`📬 #${channelName}: ${unread.length} unread`);
           }
         } catch (error) {
+          if (this.messageIds.mode !== "legacy") channelSummaries.push(`Unread state unknown for #${channelName}: ${messageIdError(error, this.messageIds).message}`);
         }
       }
 
       const summary = totalUnread > 0
         ? `🔔 ${totalUnread} unread message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
-        : "✅ No unread messages";
+        : channelSummaries.length > 0 ? channelSummaries.join('\n') : "✅ No unread messages";
 
       return { contents: [{ uri, mimeType: "text/plain", text: summary }] };
     }
@@ -1293,7 +1296,7 @@ export class ZulipToolRuntime {
 
         return { contents: [{ uri, mimeType: "text/plain", text }] };
       } catch (error) {
-        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${this.messageIds.mode === "legacy" ? error : messageIdError(error, this.messageIds)}` }] };
+        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${this.messageIds.mode === "legacy" ? error : messageIdError(error, this.messageIds).message}` }] };
       }
     }
 

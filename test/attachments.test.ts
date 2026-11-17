@@ -299,3 +299,23 @@ test('inline attachment transport diagnostics use the shared mode-aware wrapper'
     }
   }
 });
+
+
+test('inline native fetch failures hide raw URLs in enabled modes', async t => {
+  const { MessageIds } = await import('../src/message-ids.ts');
+  for (const failure of [new TypeError('fetch failed: https://private.invalid/secret'), new DOMException('private response body', 'AbortError')]) {
+    t.mock.method(globalThis, 'fetch', async () => { throw failure; });
+    for (const mode of ['legacy', 'compat', 'strict'] as const) {
+      const blocks = await buildAttachmentBlocks(
+        [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
+        { fetch: (path, maxBytes, signal) => fetchCapped('https://private.invalid' + path, {}, maxBytes, signal) }, resolveInlineOptions(), new AbortController().signal,
+        new MessageIds('alpha', mode));
+      const text = JSON.stringify(blocks);
+      if (mode === 'legacy') assert.ok(text.includes(failure.message));
+      else {
+        assert.match(text, /Transport failed before a complete answer/);
+        assert.doesNotMatch(text, /private|secret/);
+      }
+    }
+  }
+});

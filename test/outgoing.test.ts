@@ -12,7 +12,7 @@ import type { ZulipSession } from '../src/zulip-client.ts';
 import type { UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
 
-import { MessageIds, messageIdError, LEGACY_IDS } from '../src/message-ids.ts';
+import { MessageIds, LEGACY_IDS } from '../src/message-ids.ts';
 
 type Sent = { messageId: string; channelId: string; content: string };
 type Answer = (n: number) => unknown;
@@ -274,7 +274,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
               const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
               const prefix = count === 0 ? '' :
                 `Posted as message${count === 1 ? '' : 's'} ${names} (${parts}) before the send stopped; sending the whole text again posts ${count === 1 ? 'that part' : 'those parts'} twice. `;
-              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : messageIdError(transport, messageIds).message) : path === 'publish'
+              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : 'Zulip transport failure (timeout). The request may have been applied: check before sending it again.') : path === 'publish'
                 ? `Zulip refused message to #general: ${original}`
                 : `${count ? 'Zulip: ' : ''}${original}`;
               const context = failure === 'transport' && mode !== 'legacy' && path !== 'publish' ? `${path}: ` : '';

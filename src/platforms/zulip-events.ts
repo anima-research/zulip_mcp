@@ -403,7 +403,7 @@ export class ZulipEventLoop {
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          nonJson ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : (error instanceof Error ? messageIdError(error, this.options.messageIds ?? LEGACY_IDS).message : errMsg).replace(/\.$/, ''),
+          nonJson && (this.options.messageIds ?? LEGACY_IDS).mode === 'legacy' ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : (error instanceof Error ? messageIdError(error, this.options.messageIds ?? LEGACY_IDS).message : errMsg).replace(/\.$/, ''),
         );
         await this.sleep(delay);
       }

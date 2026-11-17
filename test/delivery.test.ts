@@ -456,3 +456,17 @@ test('enabled recovery advice quotes channel IDs while legacy stays unchanged', 
     assert.ok(text.includes(`fetch_history(channel=${channel}, after=${mode === 'legacy' ? '7' : '"alpha:7"'})`));
   }
 });
+
+
+test('enabled catch-up bounds long channel identifiers and realm tags', () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const ids = new MessageIds('a'.repeat(64), mode);
+    const block = renderMissedBlock([viewOf(msg(7, false, 'x'.repeat(2000))), viewOf(msg(8, false, 'y'.repeat(2000)))], {
+      streamName: 'group', channelId: 'zulip:dm:' + '12345,'.repeat(400), reason: 'backscroll', count: 2,
+      formatTime: () => '', maxChars: 1000, moreBeyond: true, newestScannedId: 8, messageIds: ids,
+    }).text;
+    assert.ok(block.length <= 1000);
+    assert.ok(block.includes(`fetch_around(message_id="${'a'.repeat(64)}:8")`));
+    assert.match(block, /Newer messages also exist/);
+  }
+});
