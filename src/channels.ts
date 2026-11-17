@@ -1,3 +1,4 @@
+import { messageIdError, LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { ERR_UNKNOWN_CHANNEL } from '@animalabs/mcpl-core';
 import type {
   ChannelDescriptor,
@@ -72,6 +73,7 @@ export class ChannelManager {
     readonly ids: ChannelIds,
     batchWindowMs?: number,
     private hooks: ChannelManagerHooks = {},
+    private messageIds: MessageIds = LEGACY_IDS,
   ) {
     this.batchWindowMs = batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS;
   }
@@ -220,7 +222,7 @@ export class ChannelManager {
       if (refusedNow.length > 0) console.error(`host refused ${refusedNow.length} channel(s): ${refusedNow.join(', ')}`);
       return { announced, local, refused: refusedNow };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
       console.error(`Failed to announce ${added.length} channel(s) (${reason}); they stay usable here and are re-announced on the next refresh`);
       const local: string[] = [];
       for (const d of added) {

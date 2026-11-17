@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import {
   McplConnection,
+  ERR_CHANNEL_OPEN_FAILED,
   method,
   type ChannelDescriptor,
   type ChannelsIncomingParams,
@@ -7548,7 +7549,7 @@ test('scoped acknowledgment errors identify the request field', async () => {
     const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE,
       { channelId: 'zulip:general', messageId: 'other:7' }) as { acknowledged: boolean; reason: string };
     assert.equal(result.acknowledged, false);
-    assert.match(result.reason, /^messageId="other:7"/);
+    assert.match(result.reason, /messageId="other:7"/);
     assert.equal(h.adapter.acked.length, 0);
   } finally { await h.close(); }
 });
@@ -7642,6 +7643,60 @@ test('non-array host results retain non-itemized acceptance without retries', as
         assert.equal(batches, 1);
         assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
         assert.equal(h.delivery.watermark('zulip:general'), 7);
+      } finally { await h.close(); }
+    }
+  }
+});
+
+test('acknowledgment transport errors share safe diagnostics in enabled modes', async () => {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    const h = harness({ messageIds: ids });
+    const error = new ZulipNoAnswer('timeout', 'POST', '/messages/7/reactions', true, 'POST /messages/7/reactions timed out.');
+    h.adapter.acknowledge = async () => { throw error; };
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE,
+        { channelId: 'zulip:general', messageId: String(ids.format(7)) }) as { acknowledged: boolean; reason: string };
+      assert.equal(result.acknowledged, false);
+      if (mode === 'legacy') assert.equal(result.reason, error.message);
+      else {
+        assert.match(result.reason, /channels\/acknowledge.*alpha:7/);
+        assert.match(result.reason, /check before sending it again/);
+        assert.doesNotMatch(result.reason, /\/messages\/7/);
+      }
+    } finally { await h.close(); }
+  }
+});
+
+test('channels/open wraps subscription errors before RPC conversion', async () => {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    for (const failure of [
+      new ZulipNoAnswer('timeout', 'POST', '/users/me/subscriptions', true,
+        'POST /users/me/subscriptions timed out.'),
+      new ZulipRefused('subscribing', { result: 'error', msg: 'Permission denied', code: 'DENIED' }),
+    ]) {
+      const h = harness({ messageIds: new MessageIds('alpha', mode) });
+      h.adapter.ensureSubscribed = async () => { throw failure; };
+      const original = failure.message;
+      try {
+        await initialize(h, true);
+        await settled(h);
+        await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN,
+          { channelId: 'zulip:general', type: 'zulip', address: {} }), (error: any) => {
+          assert.equal(error.code, ERR_CHANNEL_OPEN_FAILED);
+          assert.deepEqual(error.data, { channelId: 'zulip:general' });
+          if (mode === 'legacy' || failure instanceof ZulipRefused) {
+            assert.equal(error.message, `RPC error ${ERR_CHANNEL_OPEN_FAILED}: Cannot open zulip:general: ${original}`);
+          } else {
+            assert.match(error.message, /Cannot open zulip:general: Zulip transport failure \(timeout\)/);
+            assert.match(error.message, /check before sending it again/);
+            assert.doesNotMatch(error.message, /POST|\/users\/me\/subscriptions/);
+          }
+          return true;
+        });
+        assert.equal(failure.message, original);
       } finally { await h.close(); }
     }
   }

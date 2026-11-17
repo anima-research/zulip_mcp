@@ -1,3 +1,4 @@
+import { messageIdError, LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -230,6 +231,7 @@ export async function buildAttachmentBlocks(
   source: AttachmentSource,
   options: InlineOptions,
   deadline: AbortSignal,
+  messageIds: MessageIds = LEGACY_IDS,
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   let imagesLeft = options.inlineImages ? options.maxImages : 0;
@@ -262,7 +264,7 @@ export async function buildAttachmentBlocks(
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
     } catch (err) {
-      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${(err as Error).message}); fetch_attachment ${ref.path}]`));
+      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${messageIdError(err, messageIds).message}); fetch_attachment ${ref.path}]`));
     }
   }
   return blocks;

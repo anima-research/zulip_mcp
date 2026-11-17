@@ -1,4 +1,4 @@
-import { LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { messageIdError, LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { isRefusal, type ZulipApi, type ZulipRefusal, type ZulipSuccess } from './zulip-api.js';
 import { withAttachmentLinks, type UploadedFile } from './uploads.js';
 import { blankLineAboveTables } from './tables.js';
@@ -56,6 +56,7 @@ function splitsPair(text: string, at: number): boolean {
 }
 
 export function namePosted<E extends Error>(err: E, posted: readonly number[], messageIds: MessageIds = LEGACY_IDS): E {
+  err = messageIdError(err, messageIds) as E;
   if (posted.length === 0) return err;
   const n = posted.length;
   const formatted = posted.map(id => messageIds.format(id));

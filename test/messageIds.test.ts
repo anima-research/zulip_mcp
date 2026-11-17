@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MessageIds, idToolDefinitions, messageIdServerInfo } from '../src/message-ids.ts';
+import { MessageIds, messageIdError, idToolDefinitions, messageIdServerInfo } from '../src/message-ids.ts';
 import { ZulipToolRuntime, formatHistoryLines, formatMessages } from '../src/tool-runtime.ts';
 import { normalizeMessage } from '../src/history.ts';
 import { toolDefinitions } from '../src/tools.ts';
 import { standInApi } from './zulip-stand-in.ts';
 import { validateMessageLinks, linkMessages } from '../src/message-links.ts';
-import { prepareOutgoing } from '../src/outgoing.ts';
+import { namePosted, prepareOutgoing } from '../src/outgoing.ts';
 import { initializeZulipClient } from '../src/zulip-client.ts';
 
 const message = { id: 7, type: 'stream', stream_id: 12, display_recipient: 'general', subject: 'topic',
@@ -42,8 +42,8 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
     });
     tools.onSent = () => { writes++; };
     for (const [name, field] of [['send_message', 'reply_to'], ['edit_message', 'message_id'], ['move_messages', 'message_id'], ['delete_message', 'message_id'], ['add_reaction', 'message_id'], ['remove_reaction', 'message_id'], ['fetch_around', 'message_id'], ['fetch_history', 'before'], ['fetch_history', 'after']]) {
-      await assert.rejects(tools.handleToolCall(name, { [field]: 'beta:7', content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
-      if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
+      await assert.rejects(tools.handleToolCall(name, { channel: 'dm:9', topic: 'new', scope: 'one', emoji_name: 'warning', [field]: 'beta:7', content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
+      if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { channel: 'dm:9', topic: 'new', scope: 'one', emoji_name: 'warning', [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
     }
     await assert.rejects(tools.handleToolCall('send_message', { reply_to: 'alpha:7', content: '[[msg:alpha:7]] [[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
     assert.equal(calls.length, 0);
@@ -261,6 +261,7 @@ test('enabled transport errors retain tagged operation context and uncertainty',
     assert.notEqual(err, error);
     assert.ok(err instanceof ZulipNoAnswer);
     assert.equal(mayHaveBeenApplied(err), true);
+    assert.doesNotMatch(err.message, /\/messages\/7/);
     assert.match((err as Error).message, /edit_message \(message_id=alpha:7\)/);
     assert.match((err as Error).message, /check before sending it again/);
     return true;
@@ -293,10 +294,11 @@ test('move_messages read-back timeout retains success and adds context only in e
     assert.deepEqual(result, {
       moved: true,
       asked: { topic: 'new', scope: 'one' },
-      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): ${error.message}`,
+      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): ${messageIdError(error, new MessageIds('alpha', mode)).message}`,
       note: 'To answer this message where it is now, use send_message with reply_to.',
     });
-    assert.match(result.readBackError, /GET \/messages\/7 timed out\./);
+    if (mode === 'legacy') assert.equal(result.readBackError, error.message);
+    else assert.doesNotMatch(result.readBackError, /\/messages\/7/);
     assert.deepEqual(calls, ['PATCH /messages/7', 'GET /messages/7']);
   }
 });
@@ -395,4 +397,134 @@ test('strict missing required IDs give tagged guidance; compat trims read anchor
   const compat = new ZulipToolRuntime(session, dir, { messageIds: new MessageIds('alpha', 'compat') });
   await compat.handleToolCall('fetch_around', { message_id: ' 123 ' });
   assert.equal(calls.at(-1)?.params.anchor, 123);
+});
+
+test('profile and all additional structured message cursors are projected, not unrelated IDs', async t => {
+  const fields = ['max_message_id', 'min_message_id', 'latestMessageId', 'beforeMessageId', 'afterMessageId', 'scannedThrough'];
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    const record = { ...Object.fromEntries(fields.map(key => [key, 7])),
+      unread_message_ids: [7, 0], unverifiedMessageIds: ['7'], user_id: 9, stream_id: 12, max_message_length: 10000 };
+    const result = ids.project(record) as any;
+    for (const field of fields) assert.equal(result[field], mode === 'legacy' ? 7 : 'alpha:7');
+    assert.deepEqual(result.unread_message_ids, mode === 'legacy' ? [7, 0] : ['alpha:7', 0]);
+    assert.deepEqual(result.unverifiedMessageIds, mode === 'legacy' ? ['7'] : ['alpha:7']);
+    assert.equal(result.user_id, 9);
+    assert.equal(result.stream_id, 12);
+    assert.equal(result.max_message_length, 10000);
+    const { api } = standInApi({ 'GET /users/me': { result: 'success', max_message_id: 123, user_id: 9 } });
+    const dir = mkdtempSync(join(tmpdir(), 'profile-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+    assert.equal((await runtime.handleToolCall('get_user_profile', {})).max_message_id, mode === 'legacy' ? 123 : 'alpha:123');
+  }
+});
+
+test('parser diagnostics survive non-JSON library inputs', () => {
+  const cycle: any = {}; cycle.self = cycle;
+  for (const value of [1n, cycle]) {
+    assert.throws(() => new MessageIds('alpha', 'strict').parse(value, undefined, 'before'),
+      /before=.*expected a tagged positive safe integer.*Nothing was written/);
+  }
+});
+
+test('partial sends never contaminate a reused transport error in enabled modes', async () => {
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  for (const mode of ['compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    const original = new ZulipNoAnswer('timeout', 'POST', '/messages', true, 'raw diagnostic 7');
+    const text = original.message;
+    const first = namePosted(original, [7], ids);
+    assert.notEqual(first, original);
+    assert.ok(first instanceof ZulipNoAnswer);
+    assert.match(messageIdError(first, ids).message, /Posted as message alpha:7/);
+    assert.equal(original.message, text);
+    const second = messageIdError(namePosted(original, [], ids), ids);
+    assert.doesNotMatch(second.message, /Posted|alpha:7|raw diagnostic/);
+    assert.ok(second instanceof ZulipNoAnswer);
+    assert.equal(second.path, original.path);
+  }
+});
+
+test('link lookup transport failures hide raw text only in enabled modes', async () => {
+  const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
+  const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    await assert.rejects(linkMessages(zulipApi(async () => { throw error; }),
+      `[[msg:${ids.format(7)}]]`, async () => ({ kind: 'stream', id: 12 }), 'refuse', ids), (err: Error) => {
+      if (mode === 'legacy') assert.match(err.message, /GET \/messages\/7/);
+      else { assert.match(err.message, /alpha:7/); assert.doesNotMatch(err.message, /\/messages\/7/); }
+      return true;
+    });
+  }
+});
+
+test('two sends sharing a transport exception report only their own posted chunks', async t => {
+  const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
+  for (const mode of ['compat', 'strict'] as const) {
+    const error = new ZulipNoAnswer('timeout', 'POST', '/messages', true, 'raw transport detail');
+    let posts = 0;
+    const api = zulipApi(async () => {
+      if (++posts === 1) return { status: 200, body: { result: 'success', id: 7 } };
+      throw error;
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'partial-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir,
+      { messageIds: new MessageIds('alpha', mode), maxMessageLength: 3 });
+    const args = { type: 'private', to: [9], content: 'abcdef' };
+    await assert.rejects(runtime.handleToolCall('send_message', args), /Posted as message alpha:7/);
+    await assert.rejects(runtime.handleToolCall('send_message', args), (err: Error) => {
+      assert.doesNotMatch(err.message, /Posted|alpha:7|raw transport detail/);
+      assert.match(err.message, /may have been applied/);
+      return true;
+    });
+    assert.equal(posts, 3);
+  }
+});
+
+test('caught tool transport errors are safe data in enabled modes, unchanged in legacy', async t => {
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    for (const name of ['start_monitoring', 'listen', 'unlisten', 'get_unread_messages']) {
+      const method = name === 'listen' ? 'POST' : name === 'unlisten' ? 'DELETE' : 'GET';
+      const path = method === 'GET' ? '/messages' : '/users/me/subscriptions';
+      const failure = new ZulipNoAnswer('timeout', method, path, method !== 'GET', `No answer to ${method} ${path}`);
+      const original = failure.message;
+      let fail = false;
+      const { api, calls } = standInApi({
+        [`${method} ${path}`]: () => {
+          if (fail) throw failure;
+          return { result: 'success', messages: [message] };
+        },
+      });
+      const dir = mkdtempSync(join(tmpdir(), 'caught-'));
+      t.after(() => rmSync(dir, { recursive: true, force: true }));
+      const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir,
+        { messageIds: new MessageIds('alpha', mode) });
+      if (name === 'get_unread_messages') await runtime.handleToolCall('start_monitoring', { channels: ['general'] });
+      fail = true;
+      const result = await runtime.handleToolCall(name, { channels: ['general'] });
+      const error = name === 'start_monitoring' ? result.channels[0].error
+        : name === 'get_unread_messages' ? result.channels_checked[0].error : result.error;
+      assert.equal(calls.at(-1)?.path, path);
+      if (mode === 'legacy') assert.equal(error, original);
+      else {
+        assert.match(error, /Zulip transport failure \(timeout\)/);
+        assert.doesNotMatch(JSON.stringify(result), /\/messages|\/users\/me\/subscriptions/);
+        if (method !== 'GET') assert.match(error, /may have been applied: check before sending it again/);
+      }
+      if (name === 'get_unread_messages') {
+        const resource = await runtime.readResource('zulip://channel/general/unread');
+        const text = resource.contents[0].text;
+        if (mode === 'legacy') assert.equal(text, `Error checking #general: ${failure}`);
+        else {
+          assert.match(text, /Zulip transport failure/);
+          assert.ok(!text.includes('/messages'));
+        }
+      }
+      assert.equal(failure.message, original);
+    }
+  }
 });

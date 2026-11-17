@@ -507,3 +507,24 @@ test('stopping in a message handler drops all subsequent events in its batch', a
   }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
   assert.deepEqual(seen, ['message']);
 });
+
+test('degraded event text and metadata wrap transport failures in enabled modes', async () => {
+  const { MessageIds } = await import('../src/message-ids.ts');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    let loop: ZulipEventLoop;
+    const { sleep } = makeSleepRecorder(() => loop, 3);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, messageIds: new MessageIds('alpha', mode) });
+    const failure = econnresetError();
+    await loop.start(standInApi({
+      'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+      'GET /events': async () => { throw failure; },
+    }).api, () => {}, e => events.push(e));
+    const result = JSON.stringify(events.filter(e => e.kind === 'degraded'));
+    if (mode === 'legacy') assert.match(result, /ECONNRESET/);
+    else {
+      assert.match(result, /Zulip transport failure/);
+      assert.doesNotMatch(result, /ECONNRESET|GET \/events/);
+    }
+  }
+});

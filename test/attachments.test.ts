@@ -281,3 +281,21 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     server.close();
   }
 });
+
+test('inline attachment transport diagnostics use the shared mode-aware wrapper', async () => {
+  const { MessageIds } = await import('../src/message-ids.ts');
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const failure = new ZulipNoAnswer('network', 'GET', '/messages/7', false, 'raw GET /messages/7');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const blocks = await buildAttachmentBlocks(
+      [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
+      { fetch: async () => { throw failure; } }, resolveInlineOptions(), new AbortController().signal,
+      new MessageIds('alpha', mode));
+    const result = JSON.stringify(blocks);
+    if (mode === 'legacy') assert.ok(result.includes(failure.message));
+    else {
+      assert.match(result, /Zulip transport failure/);
+      assert.doesNotMatch(result, /raw GET|\/messages\/7/);
+    }
+  }
+});

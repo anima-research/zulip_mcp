@@ -1,10 +1,13 @@
+import { ZulipNoAnswer } from './zulip-api.js';
+
 /** Agent boundary only. API calls, routing cursors and disk state remain numeric. */
 export type IdMode = 'legacy' | 'compat' | 'strict';
 const TAG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const ID_FIELDS = new Set(['message_id', 'messageId', 'targetMessageId', 'oldest_id', 'newest_id',
   'sinceMessageId', 'talliedThroughMessageId', 'last_message_id', 'latest_message_id', 'last_read_message_id', 'lastReadMessageId', 'lastMessageId',
-  'first_message_id', 'first_message_id_allowed_to_move', 'max_id']);
-const ID_ARRAYS = new Set(['message_ids', 'messageIds', 'targetMessageIds']);
+  'first_message_id', 'first_message_id_allowed_to_move', 'max_id', 'max_message_id', 'min_message_id',
+  'latestMessageId', 'beforeMessageId', 'afterMessageId', 'scannedThrough']);
+const ID_ARRAYS = new Set(['message_ids', 'messageIds', 'targetMessageIds', 'unverifiedMessageIds', 'unread_message_ids']);
 
 export class MessageIds {
   constructor(readonly tag: string, readonly mode: IdMode = 'legacy') {
@@ -32,7 +35,7 @@ export class MessageIds {
 
   parse(value: unknown, bare?: () => void, field = 'message_id'): number {
     const fail = (reason: string): never => {
-      throw new Error(`${field}=${JSON.stringify(value)}: ${reason}. Nothing was written.`);
+      throw new Error(`${field}=${describe(value)}: ${reason}. Nothing was written.`);
     };
     const expected = this.mode === 'strict'
       ? `expected a tagged positive safe integer; use ${this.tag}:<n>`
@@ -96,4 +99,28 @@ export function messageIdServerInfo<T extends { name: string; version: string; _
   return { ...info, _meta: { ...info._meta,
     'zulip_mcp/messageIds': { version: 1, mode: ids.mode, realmTag: ids.tag },
   } };
+}
+
+function describe(value: unknown): string {
+  try { return JSON.stringify(value) ?? String(value); }
+  catch { return typeof value === 'bigint' ? `${value}n` : '<unserializable value>'; }
+}
+
+const safeTransport = Symbol('safeTransport');
+
+/** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
+ * Legacy returns the original unchanged; enabled copies may safely be annotated by callers.
+ */
+export function messageIdError(error: unknown, ids: MessageIds): Error {
+  if (ids.mode === 'legacy') return error as Error;
+  const copy: Error = error instanceof Error
+    ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
+    : new Error(String(error));
+  if (copy instanceof ZulipNoAnswer && !(safeTransport in copy)) {
+    const safe = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
+      `Zulip transport failure (${copy.kind}).`, copy.status, copy.retryAfterSeconds);
+    copy.message = safe.message;
+    Object.defineProperty(copy, safeTransport, { value: true });
+  }
+  return copy;
 }

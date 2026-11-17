@@ -1,4 +1,4 @@
-import { LEGACY_IDS, type MessageIds } from "./message-ids.js";
+import { messageIdError, LEGACY_IDS, type MessageIds } from "./message-ids.js";
 import { validateMessageLinks } from "./message-links.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -487,13 +487,11 @@ export class ZulipToolRuntime {
       return warnings.length ? { ...result, warnings } : result;
     } catch (error) {
       // Keep API error types and uncertainty flags intact for callers.
-      const err: Error = error instanceof Error
-        ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
-        : new Error(String(error));
+      const err = messageIdError(error, this.messageIds);
       if (err instanceof ZulipNoAnswer) {
         const references = fields.filter(field => args[field] != null)
           .map(field => `${field}=${this.messageIds.format(args[field])}`).join(', ');
-        if (references) err.message = `${name} (${references}): ${err.message}`;
+        err.message = `${name}${references ? ` (${references})` : ''}: ${err.message}`;
       }
       if (warnings.length) err.message += `\n${warnings.join('\n')}`;
       throw err;
@@ -538,7 +536,7 @@ export class ZulipToolRuntime {
             results.push({
               channel: channelName,
               status: "error",
-              error: error instanceof Error ? error.message : String(error),
+              error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
             });
           }
         }
@@ -620,7 +618,7 @@ export class ZulipToolRuntime {
           };
         } catch (error) {
           return {
-            error: error instanceof Error ? error.message : String(error),
+            error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
           };
         }
       }
@@ -643,7 +641,7 @@ export class ZulipToolRuntime {
           };
         } catch (error) {
           return {
-            error: error instanceof Error ? error.message : String(error),
+            error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
           };
         }
       }
@@ -782,7 +780,7 @@ export class ZulipToolRuntime {
             channelResults.push({
               channel: channelName,
               status: "error",
-              error: error instanceof Error ? error.message : String(error),
+              error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
             });
           }
         }
@@ -925,7 +923,7 @@ export class ZulipToolRuntime {
         try {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)} back`)).message;
         } catch (err) {
-          const diagnostic = (err as Error).message;
+          const diagnostic = messageIdError(err, this.messageIds).message;
           const readBackError = this.messageIds.mode === 'legacy' ? diagnostic
             : `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic}`;
           return { moved: true, asked, readBackError, note: MOVE_NOTE };
@@ -1295,7 +1293,7 @@ export class ZulipToolRuntime {
 
         return { contents: [{ uri, mimeType: "text/plain", text }] };
       } catch (error) {
-        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${error}` }] };
+        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${this.messageIds.mode === "legacy" ? error : messageIdError(error, this.messageIds)}` }] };
       }
     }
 

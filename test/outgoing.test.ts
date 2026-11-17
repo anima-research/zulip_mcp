@@ -12,7 +12,7 @@ import type { ZulipSession } from '../src/zulip-client.ts';
 import type { UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
 
-import { MessageIds, LEGACY_IDS } from '../src/message-ids.ts';
+import { MessageIds, messageIdError, LEGACY_IDS } from '../src/message-ids.ts';
 
 type Sent = { messageId: string; channelId: string; content: string };
 type Answer = (n: number) => unknown;
@@ -274,11 +274,13 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
               const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
               const prefix = count === 0 ? '' :
                 `Posted as message${count === 1 ? '' : 's'} ${names} (${parts}) before the send stopped; sending the whole text again posts ${count === 1 ? 'that part' : 'those parts'} twice. `;
-              const suffix = failure === 'transport' ? transportMessage : path === 'publish'
+              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : messageIdError(transport, messageIds).message) : path === 'publish'
                 ? `Zulip refused message to #general: ${original}`
                 : `${count ? 'Zulip: ' : ''}${original}`;
-              assert.equal(err.message, prefix + suffix);
-              if (failure === 'transport' && (mode === 'legacy' || path === 'publish')) assert.equal(err, transport);
+              const context = failure === 'transport' && mode !== 'legacy' && path !== 'publish' ? `${path}: ` : '';
+              assert.equal(err.message, context + prefix + suffix);
+              if (mode !== 'legacy') assert.equal(transport.message, transportMessage);
+              if (failure === 'transport' && mode === 'legacy') assert.equal(err, transport);
               if (failure === 'refusal' && path === 'publish') {
                 assert.ok(err instanceof ZulipRefused);
                 assert.equal(err.code, 'BAD_REQUEST');
