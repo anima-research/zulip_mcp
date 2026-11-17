@@ -30,9 +30,12 @@ try {
     });
     let diagnostics = '';
     child.stderr.on('data', b => { diagnostics += b; });
-    const exited = once(child, 'exit');
+    // close follows exit and draining stderr, so failures retain all diagnostics.
+    const exited = once(child, 'close');
     const conn = McplConnection.fromStreams(child.stdout, child.stdin);
     const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
+    let failure;
+    let status;
     try {
       const result = await conn.sendRequest('initialize', {
         protocolVersion: '2025-03-26',
@@ -52,13 +55,17 @@ try {
         _meta: { 'zulip_mcp/messageIds': { version: 1, mode, realmTag: 'alpha' } },
       });
     } catch (error) {
-      throw new Error(`${error.message}\n${diagnostics}`, { cause: error });
+      failure = error;
     } finally {
       child.stdin.end();
-      await exited;
+      status = await exited;
       clearTimeout(timer);
       conn.close();
     }
+    if (!failure && (status[0] !== 0 || status[1] !== null)) {
+      failure = new Error(`Child exited with code ${status[0]}, signal ${status[1]}`);
+    }
+    if (failure) throw new Error(`${failure.message}\n${diagnostics}`, { cause: failure });
   }
   console.log('Built MCP/MCPL handshake matches package version in compat and strict.');
 } finally {

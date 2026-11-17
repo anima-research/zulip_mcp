@@ -379,3 +379,20 @@ test('compat history preserves empty and padded decimal cursors', async t => {
     }
   }
 });
+
+test('strict missing required IDs give tagged guidance; compat trims read anchors', async t => {
+  const { api, calls } = standInApi({ 'GET /messages/123': { result: 'success', message: { ...message, id: 123 } }, 'GET /messages': { result: 'success', messages: [] } });
+  const dir = mkdtempSync(join(tmpdir(), 'required-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const session = { api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' };
+  const strict = new ZulipToolRuntime(session, dir, { messageIds: new MessageIds('alpha', 'strict') });
+  for (const name of ['fetch_around', 'edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction']) {
+    for (const value of [undefined, null]) {
+      await assert.rejects(strict.handleToolCall(name, { message_id: value }), /use alpha:<n>/);
+    }
+  }
+  assert.equal(calls.length, 0);
+  const compat = new ZulipToolRuntime(session, dir, { messageIds: new MessageIds('alpha', 'compat') });
+  await compat.handleToolCall('fetch_around', { message_id: ' 123 ' });
+  assert.equal(calls.at(-1)?.params.anchor, 123);
+});

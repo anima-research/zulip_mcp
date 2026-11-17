@@ -474,13 +474,13 @@ export class ZulipToolRuntime {
       : ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around'].includes(name) ? ['message_id'] : [];
     try {
       for (const field of fields) {
-        // Compat preserves empty/default and padded decimal history cursors.
-        if (name === 'fetch_history' && this.messageIds.mode === 'compat' && typeof args[field] === 'string') {
+        // Compat preserves padded decimal read anchors and empty/default history cursors.
+        if (['fetch_history', 'fetch_around'].includes(name) && this.messageIds.mode === 'compat' && typeof args[field] === 'string') {
           const trimmed = args[field].trim();
           if (trimmed === '') args[field] = undefined;
           else if (/^[0-9]+$/.test(trimmed)) args[field] = trimmed;
         }
-        if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare(field), field);
+        if (args[field] != null || field === 'message_id') args[field] = this.messageIds.parse(args[field], bare(field), field);
       }
       if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
       const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));

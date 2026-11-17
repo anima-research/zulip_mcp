@@ -316,7 +316,7 @@ interface Harness {
 
 interface HarnessOptions {
   serverMeta?: Record<string, unknown>;
-  incomingResults?: (messages: IncomingChannelMessage[]) => unknown[];
+  incomingResults?: (messages: IncomingChannelMessage[]) => unknown;
   messageIds?: MessageIds;
   mcpl?: boolean;
   typing?: boolean;
@@ -412,7 +412,12 @@ function harness(opts: HarnessOptions = {}): Harness {
       }
       const refused = new Set(p.messages.filter((m) => policy.rejectIds.has(m.messageId) || policy.rejectOnce.delete(m.messageId)).map((m) => m.messageId));
       const results = opts.incomingResults?.(p.messages) ?? p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) }));
-      incoming.push(...p.messages.filter(m => results.some((r: any) => r?.messageId === m.messageId && r.accepted === true)));
+      incoming.push(...p.messages.filter(m => !Array.isArray(results) || results.some((r: any) => {
+        if (r?.accepted !== true || typeof r.messageId !== 'string') return false;
+        if (r.messageId === m.messageId) return true;
+        return opts.messageIds?.mode === 'compat' && /^[0-9]+$/.test(r.messageId)
+          && m.messageId === String(opts.messageIds.format(r.messageId));
+      })));
       host.sendResponse(req.id, { results });
     } else if (req.method === method.PUSH_EVENT) {
       const p = req.params as PushEventParams;
@@ -7611,6 +7616,7 @@ test('compat itemized bare references settle only messages in the batch', async 
     await initialize(h, true);
     const result = await (h.server as any).sendIncomingToHost([streamMsg(7)]);
     assert.deepEqual(result.results, [{ messageId: '7', accepted: true }]);
+    assert.ok(h.incoming.some(m => m.messageId === 'alpha:7'));
     await settled(h);
     await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
     h.adapter.emit!(streamMsg(7));
@@ -7618,4 +7624,25 @@ test('compat itemized bare references settle only messages in the batch', async 
     assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
     assert.equal(h.delivery.watermark('zulip:general'), 7);
   } finally { await h.close(); }
+});
+
+test('non-array host results retain non-itemized acceptance without retries', async () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    for (const results of [{}, 'accepted', true, 1]) {
+      let batches = 0;
+      const h = harness({ messageIds: new MessageIds('alpha', mode),
+        incomingResults: () => { batches++; return results; },
+      });
+      try {
+        await initialize(h, true);
+        await settled(h);
+        await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+        h.adapter.emit!(streamMsg(7));
+        await h.server.quiet();
+        assert.equal(batches, 1);
+        assert.deepEqual(h.delivery.heldIds('zulip:general'), []);
+        assert.equal(h.delivery.watermark('zulip:general'), 7);
+      } finally { await h.close(); }
+    }
+  }
 });

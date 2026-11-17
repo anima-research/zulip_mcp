@@ -502,7 +502,8 @@ export interface MissedBlockOptions {
 }
 
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
-  return `fetch_history(channel="${channelId}", ${cursor}=${JSON.stringify(id === undefined ? id : ids.format(id))})`;
+  const channel = ids.mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
+  return `fetch_history(channel=${channel}, ${cursor}=${JSON.stringify(id === undefined ? id : ids.format(id))})`;
 }
 
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): { text: string; elided: number } {

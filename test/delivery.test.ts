@@ -261,6 +261,7 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
     messageIds: new MessageIds('alpha', 'strict'),
   }).text;
+  assert.ok(tagged.length <= 1000, `block is ${tagged.length} chars`);
   assert.match(tagged, /fetch_around\(message_id="alpha:7"\)/);
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
@@ -442,4 +443,16 @@ test('a save after a failed load whose file is gone by then writes the state, wi
     assert.deepEqual(readdirSync(dir), ['s1.delivery.json']);
     assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
   });
+});
+
+test('enabled recovery advice quotes channel IDs while legacy stays unchanged', () => {
+  const channelId = 'zulip:team "alpha"';
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const text = renderMissedBlock([viewOf(msg(7, true, 'hello'))], {
+      streamName: 'team "alpha"', channelId, reason: 'backscroll', count: 1,
+      formatTime: () => '', moreBeyond: true, messageIds: new MessageIds('alpha', mode),
+    }).text;
+    const channel = mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
+    assert.ok(text.includes(`fetch_history(channel=${channel}, after=${mode === 'legacy' ? '7' : '"alpha:7"'})`));
+  }
 });

@@ -2430,7 +2430,7 @@ export class ZulipMcplServer {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
     const result = (await conn.sendRequest(method.CHANNELS_INCOMING, this.messageIds.project({ messages }))) as ChannelsIncomingResult | undefined;
-    if (this.messageIds.mode !== 'legacy' && result?.results) {
+    if (this.messageIds.mode !== 'legacy' && Array.isArray(result?.results)) {
       // Only reverse IDs actually sent in this batch. Synthetic events and bad
       // host entries must not throw or prevent independent results settling.
       const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
