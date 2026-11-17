@@ -462,15 +462,32 @@ export class ZulipToolRuntime {
   async handleToolCall(name: string, args: any): Promise<any> {
     if (this.messageIds.mode === 'legacy') return this.handleValidatedCall(name, args);
     args = { ...(args ?? {}) };
-    let warned = false;
-    const warning = `Warning: bare message_id accepted; use ${this.messageIds.tag}:<n>.`;
-    const bare = () => { if (!warned) { warned = true; console.error(`[zulip-mcp] ${warning}`); } };
+    const warnings: string[] = [];
+    const bare = (field: string) => () => {
+      const warning = `Warning: bare ${field} accepted; use ${this.messageIds.tag}:<n>.`;
+      if (!warnings.includes(warning)) {
+        warnings.push(warning);
+        console.error(`[zulip-mcp] ${warning}`);
+      }
+    };
     const fields = name === 'send_message' ? ['reply_to'] : name === 'fetch_history' ? ['before', 'after']
       : ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around'].includes(name) ? ['message_id'] : [];
-    for (const field of fields) if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare, field);
-    if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare);
-    const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
-    return warned ? { ...result, warnings: [warning] } : result;
+    try {
+      for (const field of fields) if (args[field] != null) args[field] = this.messageIds.parse(args[field], bare(field), field);
+      if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
+      const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
+      return warnings.length ? { ...result, warnings } : result;
+    } catch (error) {
+      // Keep API error types and uncertainty flags intact for callers.
+      const err = error instanceof Error ? error : new Error(String(error));
+      if (err instanceof ZulipNoAnswer) {
+        const references = fields.filter(field => args[field] != null)
+          .map(field => `${field}=${this.messageIds.format(args[field])}`).join(', ');
+        if (references) err.message = `${name} (${references}): ${err.message}`;
+      }
+      if (warnings.length) err.message += `\n${warnings.join('\n')}`;
+      throw err;
+    }
   }
 
   private async handleValidatedCall(name: string, args: any): Promise<any> {
@@ -898,7 +915,10 @@ export class ZulipToolRuntime {
         try {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)} back`)).message;
         } catch (err) {
-          return { moved: true, asked, readBackError: (err as Error).message, note: MOVE_NOTE };
+          const diagnostic = (err as Error).message;
+          const readBackError = this.messageIds.mode === 'legacy' ? diagnostic
+            : `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic}`;
+          return { moved: true, asked, readBackError, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {

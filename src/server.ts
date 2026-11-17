@@ -652,7 +652,7 @@ export class ZulipMcplServer {
             break;
           }
           try {
-            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), String(this.messageIds.mode === 'legacy' ? ack.messageId : this.messageIds.parse(ack.messageId)), ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), String(this.messageIds.mode === 'legacy' ? ack.messageId : this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
             conn.sendResponse(req.id, { acknowledged: false, reason: (error as Error).message });

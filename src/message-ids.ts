@@ -14,7 +14,12 @@ export class MessageIds {
 
   static fromEnv(realm: string, env: NodeJS.ProcessEnv = process.env): MessageIds {
     if (env.ZULIP_ID_MODE === undefined || env.ZULIP_ID_MODE === 'legacy') return LEGACY_IDS;
-    const label = new URL(realm).hostname.split('.')[0].toLowerCase()
+    if (!['compat', 'strict'].includes(env.ZULIP_ID_MODE)) throw new Error('ZULIP_ID_MODE must be legacy, compat or strict');
+    if (env.ZULIP_REALM_TAG !== undefined) return new MessageIds(env.ZULIP_REALM_TAG, env.ZULIP_ID_MODE as IdMode);
+    let url: URL;
+    try { url = new URL(realm); }
+    catch { throw new Error('Zulip realm (ZULIP_REALM or zuliprc site) must be an absolute URL to infer ZULIP_REALM_TAG'); }
+    const label = url.hostname.split('.')[0].toLowerCase()
       .replace(/[^a-z0-9_-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'realm';
     return new MessageIds(env.ZULIP_REALM_TAG ?? label, (env.ZULIP_ID_MODE ?? 'legacy') as IdMode);
   }
@@ -28,18 +33,21 @@ export class MessageIds {
     const fail = (reason: string): never => {
       throw new Error(`${field}=${JSON.stringify(value)}: ${reason}. Nothing was written.`);
     };
+    const expected = this.mode === 'strict'
+      ? `expected a tagged positive safe integer; use ${this.tag}:<n>`
+      : 'expected a positive safe integer or <tag>:<n>';
     let numeric = value;
     let isBare = true;
     if (typeof value === 'string' && value.includes(':')) {
       isBare = false;
       const match = /^([a-z0-9][a-z0-9_-]{0,63}):([0-9]+)$/.exec(value);
-      if (!match) return fail('expected a positive safe integer or <tag>:<n>');
+      if (!match) return fail(expected);
       if (match[1] !== this.tag) return fail(`tag "${match[1]}" differs from this server's "${this.tag}"; use the matching server`);
       numeric = match[2];
     }
     if ((typeof numeric !== 'number' && (typeof numeric !== 'string' || !/^[0-9]+$/.test(numeric))) ||
         !Number.isSafeInteger(Number(numeric)) || Number(numeric) <= 0) {
-      return fail('expected a positive safe integer');
+      return fail(expected);
     }
     if (isBare && this.mode === 'strict') return fail(`bare ID is refused; use ${this.tag}:<n>`);
     if (isBare) bare?.();
@@ -54,6 +62,8 @@ export class MessageIds {
       if (ID_FIELDS.has(key) || (receipt && key === 'id')) return this.format(v);
       if (Array.isArray(v)) return (ID_ARRAYS.has(key) || (receipt && key === 'ids'))
         ? v.map(id => this.format(id)) : v.map(item => walk(item));
+      // Project JSON records, not opaque objects with their own serialization.
+      if (typeof v === 'object' && Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) return v;
       if (typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, k)]));
       return v;
     };
@@ -80,9 +90,9 @@ export function idToolDefinitions<T>(definitions: T, ids: MessageIds): T {
 }
 
 /** Runtime contract identity, not a source-revision or realm-authentication claim. */
-export function messageIdServerInfo<T extends { name: string; version: string }>(info: T, ids: MessageIds): T {
+export function messageIdServerInfo<T extends { name: string; version: string; _meta?: Record<string, unknown> }>(info: T, ids: MessageIds): T {
   if (ids.mode === 'legacy') return info;
-  return { ...info, _meta: {
+  return { ...info, _meta: { ...info._meta,
     'zulip_mcp/messageIds': { version: 1, mode: ids.mode, realmTag: ids.tag },
   } };
 }

@@ -12,7 +12,7 @@ export ZULIP_REALM_TAG=research
   and handshake identity are unchanged. `ZULIP_REALM_TAG` is unused.
 - `compat`: emit `research:123`, accept matching tagged IDs and bare positive safe
   integers (including decimal strings). Bare tool inputs warn on stderr and in
-  the result's `warnings` array.
+  successful results' `warnings` array, or in the error text when a call fails.
 - `strict`: emit tagged IDs and reject bare inputs.
 
 Tags match `[a-z0-9][a-z0-9_-]{0,63}`. If omitted in an enabled mode, the tag is

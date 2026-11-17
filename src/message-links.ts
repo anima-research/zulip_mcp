@@ -61,7 +61,7 @@ import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from '.
 import { tableTest } from './tables.js';
 import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
-const TOKEN = /\[\[msg:([^\[\]\r\n]*)\]\]/g;
+const TOKEN = /\[\[msg:((?:(?!\[\[msg:)[^\r\n])*?)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
 /** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
 const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;

@@ -7504,3 +7504,59 @@ test('invalid realm history cursors are invalid params before subscription', asy
     assert.equal(h.adapter.subscribed.length, 0);
   } finally { await h.close(); }
 });
+
+test('compat refusal warnings reach MCP error content', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'realm-errors-'));
+  const ids = new MessageIds('alpha', 'compat');
+  const { api } = standInApi({
+    'GET /realm/emoji': { result: 'success', emoji: {} },
+    'POST /messages/:id/reactions': { result: 'error', msg: 'reaction refused' },
+  });
+  const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+  const h = harness({ tools, messageIds: ids });
+  try {
+    await initialize(h, false);
+    const result = await h.host.sendRequest('tools/call', { name: 'add_reaction', arguments: { message_id: 7, emoji_name: 'warning' } }) as { isError: boolean; content: { text: string }[] };
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /reaction refused[\s\S]*Warning: bare message_id accepted/);
+  } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('scoped acknowledgment errors identify the request field', async () => {
+  const h = harness({ messageIds: new MessageIds('alpha', 'strict') });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE,
+      { channelId: 'zulip:general', messageId: 'other:7' }) as { acknowledged: boolean; reason: string };
+    assert.equal(result.acknowledged, false);
+    assert.match(result.reason, /^messageId="other:7"/);
+    assert.equal(h.adapter.acked.length, 0);
+  } finally { await h.close(); }
+});
+
+test('mixed scoped delivery settles accepted IDs but holds refused IDs below the watermark', async () => {
+  const eventId = 'reaction:add:7:2:123';
+  const h = harness({
+    messageIds: new MessageIds('reaction', 'strict'),
+    history: [streamMsg(7), streamMsg(8)],
+    incomingResults: messages => [
+      ...messages.map(m => ({ messageId: m.messageId, accepted: m.messageId !== 'reaction:8' })),
+      null, { accepted: true }, { messageId: 8, accepted: true },
+      { messageId: 'reaction:bad', accepted: true },
+    ],
+  });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    h.adapter.emit!(streamMsg(7));
+    h.adapter.emit!(streamMsg(8));
+    h.adapter.emit!({ ...streamMsg(9), messageId: eventId });
+    await h.server.quiet();
+    assert.ok(h.incoming.some(m => m.messageId === eventId));
+    assert.ok(h.incoming.some(m => m.messageId === 'reaction:7'));
+    assert.deepEqual(h.delivery.heldIds('zulip:general'), [8]);
+    assert.equal(h.delivery.watermark('zulip:general'), 7);
+  } finally { await h.close(); }
+});

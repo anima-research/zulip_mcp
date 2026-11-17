@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MessageIds, idToolDefinitions } from '../src/message-ids.ts';
+import { MessageIds, idToolDefinitions, messageIdServerInfo } from '../src/message-ids.ts';
 import { ZulipToolRuntime, formatHistoryLines, formatMessages } from '../src/tool-runtime.ts';
 import { normalizeMessage } from '../src/history.ts';
 import { toolDefinitions } from '../src/tools.ts';
@@ -141,7 +141,7 @@ test('enabled link expansion preserves escaped literals and as-typed invalid tok
   validateMessageLinks(nested, new MessageIds('alpha', 'compat'), () => { warned = true; });
   assert.equal(warned, true);
   const expanded = await linkMessages(api, nested, audience, 'refuse', new MessageIds('alpha', 'compat'));
-  assert.ok(!expanded.includes('[[msg:7]]'));
+  assert.equal(expanded, String.raw`\[[msg:literal [#general > topic @ 💬](#narrow/channel/12-general/topic/topic/near/7)`);
 });
 
 test('normalized Markdown validates before reply lookup; optional null IDs are omitted', async t => {
@@ -174,4 +174,108 @@ test('monitor cursors persist numeric and reload across enabled modes', async t 
   assert.equal(state.monitoredChannels.general.lastReadMessageId, 7);
   const restarted = new ZulipToolRuntime(session, dir, { messageIds: new MessageIds('beta', 'compat') });
   assert.equal((restarted as any).monitoredChannels.get('general').lastReadMessageId, 7);
+});
+
+test('strict invalid IDs recommend the usable tagged form', () => {
+  for (const value of [0, 'oops', 'alpha:0', 'alpha:bad']) {
+    assert.throws(() => new MessageIds('alpha', 'strict').parse(value), /use alpha:<n>/);
+  }
+});
+
+test('enabled configuration identifies invalid mode and realm', () => {
+  assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'bad' }), /ZULIP_ID_MODE/);
+  assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict' }), /Zulip realm.*URL/);
+  assert.equal(MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict', ZULIP_REALM_TAG: 'alpha' }).tag, 'alpha');
+});
+
+test('projection preserves opaque serialization and existing handshake metadata', () => {
+  const ids = new MessageIds('alpha', 'strict');
+  const date = new Date('2024-01-01T00:00:00Z');
+  class Metadata { toJSON() { return 'metadata'; } }
+  const input = { message_id: 7, date, custom: new Metadata() };
+  assert.equal(JSON.stringify(ids.project(input)), JSON.stringify({ ...input, message_id: 'alpha:7' }));
+  assert.deepEqual(messageIdServerInfo({ name: 'test', version: '1', _meta: { other: true } }, ids)._meta,
+    { other: true, 'zulip_mcp/messageIds': { version: 1, mode: 'strict', realmTag: 'alpha' } });
+});
+
+test('malformed bracket tokens are rejected before tool side effects', async t => {
+  const { api, calls } = standInApi({});
+  const dir = mkdtempSync(join(tmpdir(), 'realm-brackets-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+    { messageIds: new MessageIds('alpha', 'strict') });
+  for (const content of ['[[msg:other:7[bad]]]', '[[msg:alpha:7]bad]]']) {
+    await assert.rejects(runtime.handleToolCall('send_message', { to: 12, type: 'stream', topic: 'topic', content }), /Nothing was written/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('compat warnings identify every bare field and survive refusals', async t => {
+  const { api } = standInApi({
+    'GET /messages/:id': { result: 'success', message },
+    'POST /messages': { result: 'success', id: 8 },
+    'GET /messages': { result: 'success', messages: [] },
+    'GET /realm/emoji': { result: 'success', emoji: {} },
+    'POST /messages/:id/reactions': { result: 'error', msg: 'reaction refused' },
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'realm-warnings-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+    { messageIds: new MessageIds('alpha', 'compat') });
+  for (const [name, args, field] of [
+    ['send_message', { reply_to: 7, content: 'hello' }, 'reply_to'],
+    ['fetch_history', { channel: 'dm:9', before: 7 }, 'before'],
+    ['fetch_history', { channel: 'dm:9', after: 7 }, 'after'],
+    ['send_message', { reply_to: 'alpha:7', content: '[[msg:7]]' }, 'message-link token'],
+  ] as const) {
+    const result = await runtime.handleToolCall(name, args);
+    assert.ok(result.warnings.some((w: string) => w.includes(field)), field);
+  }
+  await assert.rejects(runtime.handleToolCall('add_reaction', { message_id: 7, emoji_name: 'warning' }),
+    /reaction refused[\s\S]*Warning: bare message_id accepted/);
+});
+
+test('enabled transport errors retain tagged operation context and uncertainty', async t => {
+  const { ZulipNoAnswer, zulipApi, mayHaveBeenApplied } = await import('../src/zulip-api.ts');
+  const error = new ZulipNoAnswer('timeout', 'PATCH', '/messages/7', true, 'PATCH /messages/7 timed out.');
+  const api = zulipApi(async () => { throw error; });
+  const dir = mkdtempSync(join(tmpdir(), 'realm-transport-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+    { messageIds: new MessageIds('alpha', 'strict') });
+  await assert.rejects(runtime.handleToolCall('edit_message', { message_id: 'alpha:7', content: 'hello' }), err => {
+    assert.equal(err, error);
+    assert.equal(mayHaveBeenApplied(err), true);
+    assert.match(error.message, /edit_message \(message_id=alpha:7\)/);
+    assert.match(error.message, /check before sending it again/);
+    return true;
+  });
+});
+
+test('move_messages read-back timeout retains success and adds context only in enabled modes', async t => {
+  const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.');
+    const calls: string[] = [];
+    const api = zulipApi(async (method, path) => {
+      calls.push(`${method} ${path}`);
+      if (method === 'GET') throw error;
+      return { result: 'success' };
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'move-timeout-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+      { messageIds: new MessageIds('alpha', mode) });
+    const result = await runtime.handleToolCall('move_messages', {
+      message_id: mode === 'legacy' ? 7 : 'alpha:7', topic: 'new', scope: 'one',
+    });
+    assert.deepEqual(result, {
+      moved: true,
+      asked: { topic: 'new', scope: 'one' },
+      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): ${error.message}`,
+      note: 'To answer this message where it is now, use send_message with reply_to.',
+    });
+    assert.match(result.readBackError, /GET \/messages\/7 timed out\./);
+    assert.deepEqual(calls, ['PATCH /messages/7', 'GET /messages/7']);
+  }
 });
