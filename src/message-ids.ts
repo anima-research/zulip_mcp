@@ -19,13 +19,14 @@ export class MessageIds {
     let url: URL;
     try { url = new URL(realm); }
     catch { throw new Error('Zulip realm (ZULIP_REALM or zuliprc site) must be an absolute URL to infer ZULIP_REALM_TAG'); }
+    if (!url.hostname) throw new Error('Zulip realm URL must have a hostname to infer ZULIP_REALM_TAG');
     const label = url.hostname.split('.')[0].toLowerCase()
       .replace(/[^a-z0-9_-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'realm';
     return new MessageIds(env.ZULIP_REALM_TAG ?? label, (env.ZULIP_ID_MODE ?? 'legacy') as IdMode);
   }
 
   format(id: number | string): number | string {
-    if (this.mode === 'legacy' || !/^[0-9]+$/.test(String(id)) || !Number.isSafeInteger(Number(id)) || Number(id) <= 0) return id;
+    if (this.mode === 'legacy' || (typeof id !== 'number' && typeof id !== 'string') || !/^[0-9]+$/.test(String(id)) || !Number.isSafeInteger(Number(id)) || Number(id) <= 0) return id;
     return `${this.tag}:${id}`;
   }
 

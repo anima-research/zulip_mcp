@@ -23,8 +23,8 @@ Invalid enabled configuration fails before Zulip requests.
 The contract covers message-ID tool inputs (`message_id`, `reply_to`, history
 `before`/`after`), receipts, raw/history output, MCPL message delivery and history,
 publish receipts, acknowledgments, and history-open cursors. Active Markdown
-links use `[[msg:research:123]]`; code spans/fences stay literal. A backslash
-before a nonnumeric token keeps it literal. Foreign tags and malformed IDs are
+links use `[[msg:research:123]]`; code spans/fences stay literal. An odd-length run of backslashes
+before a token keeps it literal; an even-length run leaves it active. Foreign tags and malformed IDs are
 rejected before the tool's API calls or uploads. Message text, user/stream/channel
 IDs, event IDs and checkpoint tokens are not rewritten. Zero/negative sentinel
 values remain numeric, not usable message references. MCPL publish retains its

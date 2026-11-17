@@ -315,6 +315,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
+  serverMeta?: Record<string, unknown>;
   incomingResults?: (messages: IncomingChannelMessage[]) => unknown[];
   messageIds?: MessageIds;
   mcpl?: boolean;
@@ -355,7 +356,7 @@ function harness(opts: HarnessOptions = {}): Harness {
   if (opts.history) adapter.history = opts.history;
   if (opts.visible) adapter.visible = opts.visible;
   const server = opts.reuse?.server ?? new ZulipMcplServer(adapter as unknown as PlatformAdapter, opts.tools ?? (fakeTools as unknown as ZulipToolRuntime), {
-    serverInfo: { name: 'zulip-mcp-test', version: '0.0.0' },
+    serverInfo: { name: 'zulip-mcp-test', version: '0.0.0', ...(opts.serverMeta ? { _meta: opts.serverMeta } : {}) },
     messageIds: opts.messageIds,
     mcplEnabled: opts.mcpl ?? true,
     batchWindowMs: opts.batchWindowMs ?? 5,
@@ -410,8 +411,9 @@ function harness(opts: HarnessOptions = {}): Harness {
         return;
       }
       const refused = new Set(p.messages.filter((m) => policy.rejectIds.has(m.messageId) || policy.rejectOnce.delete(m.messageId)).map((m) => m.messageId));
-      incoming.push(...p.messages.filter((m) => !refused.has(m.messageId)));
-      host.sendResponse(req.id, { results: opts.incomingResults?.(p.messages) ?? p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) })) });
+      const results = opts.incomingResults?.(p.messages) ?? p.messages.map((m) => ({ messageId: m.messageId, accepted: !refused.has(m.messageId) }));
+      incoming.push(...p.messages.filter(m => results.some((r: any) => r?.messageId === m.messageId && r.accepted === true)));
+      host.sendResponse(req.id, { results });
     } else if (req.method === method.PUSH_EVENT) {
       const p = req.params as PushEventParams;
       pushed.push(p);
@@ -7424,12 +7426,12 @@ test('a catch-up block that is never offered, because the grant lost pushEvents 
 
 test('initialize advertises the active ID contract in MCP and MCPL; legacy is unchanged', async () => {
   for (const mcpl of [false, true]) for (const mode of ['legacy', 'compat', 'strict'] as const) {
-    const h = harness({ messageIds: new MessageIds('alpha', mode) });
+    const h = harness({ messageIds: new MessageIds('alpha', mode), serverMeta: { existing: true } });
     try {
       const result = await initialize(h, mcpl);
       assert.deepEqual(result.serverInfo, {
         name: 'zulip-mcp-test', version: '0.0.0',
-        ...(mode === 'legacy' ? {} : { _meta: { 'zulip_mcp/messageIds': { version: 1, mode, realmTag: 'alpha' } } }),
+        _meta: { existing: true, ...(mode === 'legacy' ? {} : { 'zulip_mcp/messageIds': { version: 1, mode, realmTag: 'alpha' } }) },
       });
       const listed = await h.host.sendRequest('tools/list', {}) as { tools: typeof toolDefinitions };
       const schema = listed.tools.find(t => t.name === 'add_reaction')!.inputSchema.properties as any;
@@ -7488,12 +7490,21 @@ test('itemized realm results preserve synthetic IDs and isolate malformed entrie
   }
 });
 
-test('invalid realm history cursors are invalid params before subscription', async () => {
+test('invalid realm history cursors are invalid params before subscription', async t => {
   const h = harness({ messageIds: new MessageIds('alpha', 'strict') });
   try {
     await initialize(h, true);
     await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
     await awaitRegistered(h);
+    let rediscoveries = 0;
+    t.mock.method(h.server as any, 'applyFilterChange', async () => { rediscoveries++; throw new Error('unexpected rediscovery'); });
+    await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, {
+      channelId: 'zulip:newly-discovered', type: 'zulip', address: {}, history: { beforeMessageId: '7' },
+    }), (err: any) => {
+      assert.equal(err.code, -32602);
+      return true;
+    });
+    assert.equal(rediscoveries, 0);
     await assert.rejects(h.host.sendRequest(method.CHANNELS_OPEN, {
       channelId: 'zulip:general', type: 'zulip', address: {}, history: { beforeMessageId: 'other:7' },
     }), (err: any) => {
@@ -7556,7 +7567,29 @@ test('mixed scoped delivery settles accepted IDs but holds refused IDs below the
     await h.server.quiet();
     assert.ok(h.incoming.some(m => m.messageId === eventId));
     assert.ok(h.incoming.some(m => m.messageId === 'reaction:7'));
+    assert.ok(!h.incoming.some(m => m.messageId === 'reaction:8'));
     assert.deepEqual(h.delivery.heldIds('zulip:general'), [8]);
     assert.equal(h.delivery.watermark('zulip:general'), 7);
   } finally { await h.close(); }
+});
+
+test('unmatched host result IDs cannot release numeric holds in enabled modes', async () => {
+  for (const mode of ['strict', 'compat'] as const) {
+    const h = harness({
+      messageIds: new MessageIds('alpha', mode),
+      incomingResults: () => [
+        { messageId: '7', accepted: true }, { messageId: 7, accepted: true },
+        { messageId: 'other:7', accepted: true }, { messageId: 'alpha:8', accepted: true },
+      ],
+    });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      h.adapter.emit!(streamMsg(7));
+      await h.server.quiet();
+      assert.deepEqual(h.delivery.heldIds('zulip:general'), [7]);
+      assert.notEqual(h.delivery.watermark('zulip:general'), 7);
+    } finally { await h.close(); }
+  }
 });

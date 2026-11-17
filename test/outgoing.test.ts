@@ -269,7 +269,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
                 ? { to: ['42'], content }
                 : { type: 'stream', to: 'general', topic: 't', content });
             await assert.rejects(send, (err: Error) => {
-              const ids = Array.from({ length: count }, (_, i) => String(messageIds.format(901 + i)));
+              const ids = Array.from({ length: count }, (_, i) => mode === 'legacy' ? String(901 + i) : `alpha:${901 + i}`);
               const names = count === 1 ? ids[0] : `${ids.slice(0, -1).join(', ')} and ${ids.at(-1)}`;
               const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
               const prefix = count === 0 ? '' :
@@ -278,7 +278,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
                 ? `Zulip refused message to #general: ${original}`
                 : `${count ? 'Zulip: ' : ''}${original}`;
               assert.equal(err.message, prefix + suffix);
-              if (failure === 'transport') assert.equal(err, transport);
+              if (failure === 'transport' && (mode === 'legacy' || path === 'publish')) assert.equal(err, transport);
               if (failure === 'refusal' && path === 'publish') {
                 assert.ok(err instanceof ZulipRefused);
                 assert.equal(err.code, 'BAD_REQUEST');

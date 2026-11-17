@@ -1,3 +1,4 @@
+import { MessageIds } from '../src/message-ids.ts';
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, type PathLike } from 'node:fs';
@@ -256,6 +257,11 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
   }).text;
+  const tagged = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
+    streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
+    messageIds: new MessageIds('alpha', 'strict'),
+  }).text;
+  assert.match(tagged, /fetch_around\(message_id="alpha:7"\)/);
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });

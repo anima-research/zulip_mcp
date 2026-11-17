@@ -553,7 +553,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
   }
   if (block.length > budget && lines.length > 0) {
     const last = msgs[msgs.length - 1];
-    const marker = ` … [line cut to fit the catch-up budget — fetch_around(${JSON.stringify(ids.format(last.id))}) has the whole message]`;
+    const marker = ` … [line cut to fit the catch-up budget — fetch_around(${ids.mode === 'legacy' ? '' : 'message_id='}${JSON.stringify(ids.format(last.id))}) has the whole message]`;
     const room = budget - (assemble(elided, '').length + marker.length);
     const full = lines[lines.length - 1];
     block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);

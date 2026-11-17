@@ -41,7 +41,7 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
       uploader: { async upload() { writes++; throw new Error('unexpected upload'); } },
     });
     tools.onSent = () => { writes++; };
-    for (const [name, field] of [['send_message', 'reply_to'], ['edit_message', 'message_id'], ['delete_message', 'message_id'], ['add_reaction', 'message_id'], ['remove_reaction', 'message_id'], ['fetch_around', 'message_id'], ['fetch_history', 'before'], ['fetch_history', 'after']]) {
+    for (const [name, field] of [['send_message', 'reply_to'], ['edit_message', 'message_id'], ['move_messages', 'message_id'], ['delete_message', 'message_id'], ['add_reaction', 'message_id'], ['remove_reaction', 'message_id'], ['fetch_around', 'message_id'], ['fetch_history', 'before'], ['fetch_history', 'after']]) {
       await assert.rejects(tools.handleToolCall(name, { [field]: 'beta:7', content: 'hello' }), /differs/);
       if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { [field]: 7 }), /bare/);
     }
@@ -76,6 +76,7 @@ test('invalid realm config fails before profile, settings or password exchange',
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => { calls++; throw new Error('unexpected request'); });
   await assert.rejects(initializeZulipClient({ ZULIP_REALM: 'https://alpha.example.invalid', ZULIP_EMAIL: 'bot@example.invalid', ZULIP_PASSWORD: 'test', ZULIP_ID_MODE: 'bad' }), /ZULIP_ID_MODE/);
+  await assert.rejects(initializeZulipClient({ ZULIP_REALM: 'file:///tmp/zulip', ZULIP_EMAIL: 'bot@example.invalid', ZULIP_PASSWORD: 'test', ZULIP_ID_MODE: 'strict' }), /hostname/);
   assert.equal(calls, 0);
 });
 
@@ -177,7 +178,7 @@ test('monitor cursors persist numeric and reload across enabled modes', async t 
 });
 
 test('strict invalid IDs recommend the usable tagged form', () => {
-  for (const value of [0, 'oops', 'alpha:0', 'alpha:bad']) {
+  for (const value of [7, '7', 0, 'oops', 'alpha:0', 'alpha:bad']) {
     assert.throws(() => new MessageIds('alpha', 'strict').parse(value), /use alpha:<n>/);
   }
 });
@@ -185,6 +186,7 @@ test('strict invalid IDs recommend the usable tagged form', () => {
 test('enabled configuration identifies invalid mode and realm', () => {
   assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'bad' }), /ZULIP_ID_MODE/);
   assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict' }), /Zulip realm.*URL/);
+  assert.throws(() => MessageIds.fromEnv('file:///tmp/zulip', { ZULIP_ID_MODE: 'strict' }), /hostname/);
   assert.equal(MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict', ZULIP_REALM_TAG: 'alpha' }).tag, 'alpha');
 });
 
@@ -193,6 +195,12 @@ test('projection preserves opaque serialization and existing handshake metadata'
   const date = new Date('2024-01-01T00:00:00Z');
   class Metadata { toJSON() { return 'metadata'; } }
   const input = { message_id: 7, date, custom: new Metadata() };
+  assert.equal(ids.project(input).date, date);
+  assert.equal(ids.project(input).custom, input.custom);
+  for (const value of [new Number(7), Object.create(null), date]) {
+    assert.equal(ids.project({ message_id: value }).message_id, value);
+    assert.equal(ids.project({ message_ids: [value] }).message_ids[0], value);
+  }
   assert.equal(JSON.stringify(ids.project(input)), JSON.stringify({ ...input, message_id: 'alpha:7' }));
   assert.deepEqual(messageIdServerInfo({ name: 'test', version: '1', _meta: { other: true } }, ids)._meta,
     { other: true, 'zulip_mcp/messageIds': { version: 1, mode: 'strict', realmTag: 'alpha' } });
@@ -231,6 +239,12 @@ test('compat warnings identify every bare field and survive refusals', async t =
     const result = await runtime.handleToolCall(name, args);
     assert.ok(result.warnings.some((w: string) => w.includes(field)), field);
   }
+  const both = await runtime.handleToolCall('send_message', { reply_to: 7, content: '[[msg:7]]' });
+  for (const field of ['reply_to', 'message-link token']) assert.ok(both.warnings.some((w: string) => w.includes(field)));
+  await assert.rejects(runtime.handleToolCall('send_message', { reply_to: 7, content: '[[msg:7]] [[msg:beta:8]]' }), (err: Error) => {
+    for (const field of ['reply_to', 'message-link token']) assert.ok(err.message.includes('bare ' + field));
+    return true;
+  });
   await assert.rejects(runtime.handleToolCall('add_reaction', { message_id: 7, emoji_name: 'warning' }),
     /reaction refused[\s\S]*Warning: bare message_id accepted/);
 });
@@ -244,10 +258,17 @@ test('enabled transport errors retain tagged operation context and uncertainty',
   const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
     { messageIds: new MessageIds('alpha', 'strict') });
   await assert.rejects(runtime.handleToolCall('edit_message', { message_id: 'alpha:7', content: 'hello' }), err => {
-    assert.equal(err, error);
+    assert.notEqual(err, error);
+    assert.ok(err instanceof ZulipNoAnswer);
     assert.equal(mayHaveBeenApplied(err), true);
-    assert.match(error.message, /edit_message \(message_id=alpha:7\)/);
-    assert.match(error.message, /check before sending it again/);
+    assert.match((err as Error).message, /edit_message \(message_id=alpha:7\)/);
+    assert.match((err as Error).message, /check before sending it again/);
+    return true;
+  });
+  assert.doesNotMatch(error.message, /edit_message/);
+  await assert.rejects(runtime.handleToolCall('edit_message', { message_id: 'alpha:8', content: 'hello' }), (err: Error) => {
+    assert.match(err.message, /message_id=alpha:8/);
+    assert.doesNotMatch(err.message, /message_id=alpha:7/);
     return true;
   });
 });
@@ -260,7 +281,7 @@ test('move_messages read-back timeout retains success and adds context only in e
     const api = zulipApi(async (method, path) => {
       calls.push(`${method} ${path}`);
       if (method === 'GET') throw error;
-      return { result: 'success' };
+      return { status: 200, body: { result: 'success' } };
     });
     const dir = mkdtempSync(join(tmpdir(), 'move-timeout-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -277,5 +298,40 @@ test('move_messages read-back timeout retains success and adds context only in e
     });
     assert.match(result.readBackError, /GET \/messages\/7 timed out\./);
     assert.deepEqual(calls, ['PATCH /messages/7', 'GET /messages/7']);
+  }
+});
+
+test('reused transport errors do not leak compat warnings into tagged calls', async t => {
+  const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
+  const error = new ZulipNoAnswer('timeout', 'PATCH', '/messages/7', true, 'timeout');
+  const original = error.message;
+  const dir = mkdtempSync(join(tmpdir(), 'shared-error-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const runtime = new ZulipToolRuntime({ api: zulipApi(async () => { throw error; }), selfUserId: 1,
+    realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+    { messageIds: new MessageIds('alpha', 'compat') });
+  await assert.rejects(runtime.handleToolCall('edit_message', { message_id: 7, content: 'hello' }), /Warning: bare message_id/);
+  await assert.rejects(runtime.handleToolCall('edit_message', { message_id: 'alpha:8', content: 'hello' }), (err: Error) => {
+    assert.match(err.message, /message_id=alpha:8/);
+    assert.doesNotMatch(err.message, /Warning:|alpha:7/);
+    return true;
+  });
+  assert.equal(error.message, original);
+});
+
+test('malformed move read-back names the operation only in enabled modes', async t => {
+  for (const mode of ['legacy', 'strict', 'compat'] as const) {
+    const { api } = standInApi({
+      'PATCH /messages/:id': { result: 'success' },
+      'GET /messages/:id': { result: 'success', message: {} },
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'move-malformed-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example.invalid', authHeader: '', sessionId: 'test' }, dir,
+      { messageIds: new MessageIds('alpha', mode) });
+    const result = await runtime.handleToolCall('move_messages', { message_id: mode === 'legacy' ? 7 : 'alpha:7', topic: 'new', scope: 'one' });
+    assert.equal(result.moved, true);
+    assert.equal(result.readBackError, (mode === 'legacy' ? '' : 'move_messages: ') +
+      "Zulip's answer gave no stream and topic for message " + (mode === 'legacy' ? '7' : 'alpha:7') + '.');
   }
 });

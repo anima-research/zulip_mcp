@@ -732,8 +732,18 @@ export class ZulipMcplServer {
     void conn;
   }
 
+  private parseOpenCursor(params: ChannelsOpenParams): ChannelsOpenParams {
+    if (this.messageIds.mode === 'legacy' || params.history?.beforeMessageId === undefined) return params;
+    try {
+      return { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, undefined, 'beforeMessageId')) } };
+    } catch (err) {
+      throw new McplRpcError(-32602, (err as Error).message);
+    }
+  }
+
   private async openTarget(params: ChannelsOpenParams): Promise<{ descriptor: ChannelDescriptor; key: ChannelKey }> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    this.parseOpenCursor(params); // Refuse before rediscovery can register channels.
     if (params.channelId) {
       const answer = await this.ids.keyOf(params.channelId);
       if ('refusal' in answer) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, answer.refusal, { channelId: params.channelId });
@@ -746,13 +756,7 @@ export class ZulipMcplServer {
 
   private async openChannel(ctx: Ctx, params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey, conn: McplConnection): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
-    if (this.messageIds.mode !== 'legacy' && params.history?.beforeMessageId !== undefined) {
-      try {
-        params = { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, undefined, 'beforeMessageId')) } };
-      } catch (err) {
-        throw new McplRpcError(-32602, (err as Error).message);
-      }
-    }
+    params = this.parseOpenCursor(params);
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
     this.channelManager.confirmAnnounced(descriptor.id);
@@ -2430,8 +2434,8 @@ export class ZulipMcplServer {
       // Only reverse IDs actually sent in this batch. Synthetic events and bad
       // host entries must not throw or prevent independent results settling.
       const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
-      return { ...result, results: result.results.map(r => r && typeof r.messageId === 'string'
-        ? { ...r, messageId: originals.get(r.messageId) ?? r.messageId } : r).filter(r => r != null) };
+      return { ...result, results: result.results.filter(r => r && typeof r.messageId === 'string' && originals.has(r.messageId))
+        .map(r => ({ ...r, messageId: originals.get(r.messageId)! })) };
     }
     return result;
   }

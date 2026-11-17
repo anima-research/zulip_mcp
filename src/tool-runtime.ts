@@ -479,7 +479,9 @@ export class ZulipToolRuntime {
       return warnings.length ? { ...result, warnings } : result;
     } catch (error) {
       // Keep API error types and uncertainty flags intact for callers.
-      const err = error instanceof Error ? error : new Error(String(error));
+      const err: Error = error instanceof Error
+        ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
+        : new Error(String(error));
       if (err instanceof ZulipNoAnswer) {
         const references = fields.filter(field => args[field] != null)
           .map(field => `${field}=${this.messageIds.format(args[field])}`).join(', ');
@@ -922,7 +924,7 @@ export class ZulipToolRuntime {
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
-          return { moved: true, asked, readBackError: `Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
+          return { moved: true, asked, readBackError: `${this.messageIds.mode === 'legacy' ? '' : 'move_messages: '}Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {

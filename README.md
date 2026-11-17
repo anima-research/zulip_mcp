@@ -554,7 +554,8 @@ folded onto one line but not escaped, so a topic containing `]: ` reads
 ambiguously to a regex. The backscroll returned on `channels/open` is not
 prefixed: the host hands it to the agent as the `channel_open` tool result,
 JSON that already shows each message's author and topic. The legacy
-`get_channel_history` / `get_unread_messages` formats are unchanged.
+`get_channel_history` / `get_unread_messages` formats are unchanged in legacy
+ID mode; compat and strict tag their message IDs, including raw output.
 
 **Hosts that render provenance themselves.** A prefixed message is stamped
 `attributed: true` with `attributionHeader` (the exact prefix added) in its
