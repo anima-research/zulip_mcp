@@ -79,7 +79,9 @@ ordinary Zulip refusals and validation messages remain unchanged. Failed unread
 checks report unknown state instead of claiming that no messages are unread.
 
 When a long channel ID forces the bounded catch-up fallback, the anchor only
-recovers its newest message. The entire omitted backlog remains held and
-unacknowledged for replay; accepting that notice does not advance its watermark.
+recovers its newest message. Omitted rows in the fetched page remain held and
+unacknowledged for replay; accepting that notice does not advance its watermark
+or mark those rows replayed. This is not an interval barrier for unfetched pages
+or overflow beyond the existing held-ID cap; those delivery limitations remain.
 Unread aggregates are null when any channel check failed; summary counts are
 labelled “At least” in that case.

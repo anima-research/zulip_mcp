@@ -107,10 +107,11 @@ function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
-const nativeTransportErrors = new WeakSet<Error>();
+type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown };
+const nativeTransportErrors = new WeakMap<Error, TransportFacts>();
 /** Mark failures at the fetch boundary, not by their JavaScript error class. */
-export function markTransportError(error: unknown): unknown {
-  if (error instanceof Error) nativeTransportErrors.add(error);
+export function markTransportError(error: unknown, facts: TransportFacts = {}): unknown {
+  if (error instanceof Error) nativeTransportErrors.set(error, facts);
   return error;
 }
 
@@ -130,12 +131,12 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
   if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
     // Stderr is diagnostic-only; never send request paths or bodies to the host.
     if (error instanceof Error && !loggedTransport.has(error)) {
-      console.error('[zulip transport]', error);
+      console.error('[zulip transport]', nativeTransportErrors.get(error)?.original ?? error);
       loggedTransport.add(error);
     }
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
-      if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; retry the read or contact the host operator if it persists.';
+      if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; verify the outcome before repeating writes, or contact the host operator if it persists.';
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
@@ -143,7 +144,11 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
-      Object.defineProperty(copy, 'message', { value: 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.', writable: true, configurable: true });
+      const facts = nativeTransportErrors.get(error as Error);
+      const detail = `${facts?.operation ?? 'Transport'} failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.`
+        + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
+        + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '');
+      Object.defineProperty(copy, 'message', { value: detail, writable: true, configurable: true });
     }
     Object.defineProperty(copy, safeTransport, { value: true });
   }

@@ -115,17 +115,19 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         method: 'POST',
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: multipartBody(input, boundary),
-      }).catch(error => { throw markTransportError(error); });
+      }).catch(error => { throw markTransportError(error, { operation: 'Upload' }); });
       let unreadable = false;
+      let original: unknown;
       let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
       try {
         body = (await res.json()) as typeof body;
-      } catch {
+      } catch (error) {
+        original = error;
         unreadable = true;
       }
       if (!res.ok || body.result !== 'success') {
         const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
-        throw unreadable ? markTransportError(error) : error;
+        throw unreadable ? markTransportError(error, { operation: 'Upload', status: res.status, original }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.

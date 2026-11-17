@@ -109,7 +109,7 @@ export interface SelfIdGate {
   read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number } | null>;
 }
 
-export function selfIdGate(inner: Transport): SelfIdGate {
+export function selfIdGate(inner: Transport, retainDiagnostics = false): SelfIdGate {
   let selfUserId: number | null = null;
   let refused = false;
   let pending: ReturnType<SelfIdGate['read']> | null = null;
@@ -120,7 +120,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
       answer = await inner('GET', '/users/me', undefined, opts);
     } catch (err) {
       return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
-        ...(err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
+        ...(retainDiagnostics && err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
     }
     const { status, body } = answer;
     const id = (body as { user_id?: unknown } | null)?.user_id;

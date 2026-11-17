@@ -551,7 +551,7 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
       [new ZulipNoAnswer('timeout', 'POST', '/private', true, 'secret body', undefined, undefined, 1.5),
         'Zulip transport failure (timeout). Timeout: 1.5 seconds. The request may have been applied: check before sending it again.'],
       [new ZulipNoAnswer('not-json', 'GET', '/private', false, 'secret body', 502),
-        'Zulip transport failure (not-json). The server returned an unreadable response; retry the read or contact the host operator if it persists. HTTP 502.'],
+        'Zulip transport failure (not-json). The server returned an unreadable response; verify the outcome before repeating writes, or contact the host operator if it persists. HTTP 502.'],
       [markTransportError(new TypeError('secret URL')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
       [markTransportError(new DOMException('secret URL', 'AbortError')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
     ] as const;
@@ -585,7 +585,7 @@ test('local TypeErrors are not transport failures and malformed attachment URLs 
 
 test('self-ID transport failures retain timeout and HTTP facts', async () => {
   const { selfIdGate, ZulipNoAnswer } = await import('../src/zulip-api.ts');
-  const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); });
+  const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); }, true);
   await assert.rejects(gate.transport('POST', '/messages', {}, undefined), (error: Error) => {
     const safe = messageIdError(error, new MessageIds('alpha', 'strict'));
     assert.match(safe.message, /Timeout: 15 seconds/);

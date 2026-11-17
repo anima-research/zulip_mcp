@@ -7750,10 +7750,15 @@ test('accepted bounded fallback retains the entire 101–200 group-DM backlog', 
       const block = h.pushed.map(firstText).find(t => t.includes('Catch-up omitted'))!;
       assert.ok(block.length <= 1000);
       assert.match(block, /message_id="alpha:200"/);
-      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: "zulip", address: {} });
+      // A newer accepted closed-channel message triggers a second held read.
       h.adapter.history.push(message(201));
       h.adapter.emit!(message(201));
-      await until(() => h.delivery.watermark(channelId) === 201, "held backlog replayed");
+      await until(() => h.pushed.filter(p => firstText(p).includes('Catch-up omitted')).length >= 2, 'repeated compact notice');
+      await h.server.quiet();
+      assert.equal(h.delivery.heldIds(channelId, { replayable: true }).length, 100);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: "zulip", address: {} });
+      h.adapter.emit!(message(202));
+      await until(() => h.delivery.watermark(channelId) >= 201, "held backlog replayed");
       assert.deepEqual(h.incoming.filter(m => Number(m.messageId.split(":").at(-1)) >= 101 && Number(m.messageId.split(":").at(-1)) <= 200).map(m => m.messageId),
         Array.from({ length: 100 }, (_, i) => "alpha:" + (101 + i)));
     } finally { await h.close(); }

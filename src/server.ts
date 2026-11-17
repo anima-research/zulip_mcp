@@ -652,11 +652,11 @@ export class ZulipMcplServer {
             break;
           }
           try {
-            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), String(this.messageIds.mode === 'legacy' ? ack.messageId : this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
             conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' ? (error as Error).message
-              : `channels/acknowledge (messageId=${this.messageIds.format(ack.messageId)}): ${messageIdError(error, this.messageIds).message}` });
+              : `channels/acknowledge (messageId=${ack.messageId}): ${messageIdError(error, this.messageIds).message}` });
           }
           break;
         }
@@ -1435,8 +1435,8 @@ export class ZulipMcplServer {
       ...((truncated && !read.ceiling) || blocked !== undefined ? { truncated: true } : {}),
     }, () => {
       offered = true;
-      read.onAttempt?.(ctx.w, newestId);
-      if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
+      if (!omittedBacklog) read.onAttempt?.(ctx.w, newestId);
+      if (read.onAttempt && !omittedBacklog) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok && omittedBacklog) {

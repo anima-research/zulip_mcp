@@ -47,7 +47,7 @@ export async function fetchAttachmentBytes(
   try {
     return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal, progressed);
   } catch (err) {
-    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`));
+    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`), { operation: 'Attachment download', timeoutSeconds: DEFAULT_TIMEOUT_MS / 1000, original: err });
     throw err;
   } finally {
     clearTimeout(timer);
@@ -61,9 +61,9 @@ async function readAttachment(
   signal: AbortSignal,
   progressed: () => void,
 ): Promise<FetchedAttachment> {
-  const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error); });
+  const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
   progressed();
-  if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
+  if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status });
 
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
@@ -76,7 +76,7 @@ async function readAttachment(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error); }));
+    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); }));
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
     }
@@ -84,7 +84,7 @@ async function readAttachment(
     const chunks: Buffer[] = [];
     let total = 0;
     while (true) {
-      const { value, done } = await reader.read().catch(error => { throw markTransportError(error); });
+      const { value, done } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
       if (done) break;
       if (!value) continue;
       progressed();

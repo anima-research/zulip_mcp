@@ -390,7 +390,7 @@ export class ZulipEventLoop {
         if (this.stopped) return;
 
         const diagnostic = messageIdError(error, this.options.messageIds ?? LEGACY_IDS);
-        const errMsg = diagnostic.message;
+        const errMsg = diagnostic instanceof Error ? diagnostic.message : String(diagnostic);
 
         this.consecutiveFailures++;
         const delay = this.backoffDelay(this.consecutiveFailures);

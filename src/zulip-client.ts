@@ -61,7 +61,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     apiUrl = realm.endsWith("/api") ? `${realm}/v1` : `${realm}/api/v1`;
   }
 
-  MessageIds.fromEnv(realm, env); // validate before any request
+  const messageIds = MessageIds.fromEnv(realm, env); // validate before any request
 
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
@@ -76,7 +76,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   realm = realm.replace(/\/+$/, "");
   const authHeader = email && apiKey ? basic(email, apiKey) : "";
   const transport = httpTransport({ apiUrl, authHeader: basic(email, apiKey), timeoutMs: options.timeoutMs });
-  const gate = selfIdGate(transport);
+  const gate = selfIdGate(transport, messageIds.mode !== 'legacy');
   const api = zulipApi(gate.transport);
 
   const sessionId = env.ZULIP_SESSION_ID || email || env.ZULIP_USERNAME || "default";

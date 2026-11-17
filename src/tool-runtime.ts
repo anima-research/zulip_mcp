@@ -593,7 +593,7 @@ export class ZulipToolRuntime {
           // A stream the bot just joined is not in the host's channel list
           // yet; registering it here is what makes it openable without a
           // refresh or a restart (#20).
-          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg);
+          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
           const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
           const joined = channels.filter((name) => !unauthorized.includes(name));
           const registration = result?.result === "success" && joined.length > 0
@@ -637,7 +637,7 @@ export class ZulipToolRuntime {
           const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
             subscriptions: channels,
           });
-          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg);
+          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
           return {
             result: result?.result,
             removed: result?.removed ?? [],
@@ -1137,6 +1137,10 @@ export class ZulipToolRuntime {
 
       case "fetch_attachment": {
         let url: URL;
+        if (this.messageIds.mode !== "legacy") {
+          try { new URL(this.session.realm); }
+          catch { throw new Error("Invalid configured realm URL; ask the host operator to repair the configuration."); }
+        }
         try { url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm); }
         catch (error) {
           if (this.messageIds.mode !== "legacy" && error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or a valid absolute URL on the configured realm.");
