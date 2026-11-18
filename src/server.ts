@@ -211,7 +211,10 @@ export class ZulipMcplServer {
     });
     void this.directory.whenFilled().then(() => this.logUnmatchedFilters());
 
-    const manifest = buildServerCapabilities({ typing: typeof adapter.sendTyping === 'function' });
+    const manifest = buildServerCapabilities({
+      typing: typeof adapter.sendTyping === 'function',
+      contextPosition: adapter.contextPosition,
+    });
 
     // The manifest is what `initialize` presents (§5.1) and what `mcpl/manifest`
     // returns (§17.4).

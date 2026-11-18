@@ -15,8 +15,14 @@ export const MESSAGING_FEATURE_SET = 'zulip.messaging';
 export const HISTORY_FEATURE_SET = 'zulip.history';
 export const CONTEXT_FEATURE_SET = 'zulip.context';
 
+/** Where a host places the `zulip.context` injection (SPEC §10.1). */
+export type ContextPosition = 'beforeUser' | 'afterUser';
+
+export const DEFAULT_CONTEXT_POSITION: ContextPosition = 'beforeUser';
+
 export interface FeatureSetOptions {
   typing: boolean;
+  contextPosition?: ContextPosition;
 }
 
 /**
@@ -63,6 +69,7 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     'tools',
   ];
   if (options.typing) messagingUses.push('channels.typing');
+  const contextPosition = options.contextPosition ?? DEFAULT_CONTEXT_POSITION;
 
   return {
     [MESSAGING_FEATURE_SET]: {
@@ -77,12 +84,13 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     },
     [CONTEXT_FEATURE_SET]: {
       description: 'Zulip message history injection before inference',
-      uses: ['contextHooks.beforeInference.inject.beforeUser'],
+      uses: [`contextHooks.beforeInference.inject.${contextPosition}` as const],
     },
   };
 }
 
 export function buildServerCapabilities(options: FeatureSetOptions): McplManifest {
+  const contextPosition = options.contextPosition ?? DEFAULT_CONTEXT_POSITION;
   return {
     version: '0.5',
     pushEvents: true,
@@ -91,7 +99,13 @@ export function buildServerCapabilities(options: FeatureSetOptions): McplManifes
         // Injection without observation — the write-without-read shape of
         // §10.1. This server never reads `userMessage`.
         observe: false,
-        inject: { system: false, beforeUser: true, afterUser: false },
+        // Only the position in use is declared: a host grants per position
+        // (§6.2), and an injection at an ungranted one is dropped (§10.8).
+        inject: {
+          system: false,
+          beforeUser: contextPosition === 'beforeUser',
+          afterUser: contextPosition === 'afterUser',
+        },
       },
     },
     featureSets: buildFeatureSets(options),

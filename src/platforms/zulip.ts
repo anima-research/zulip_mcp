@@ -23,6 +23,7 @@ import type {
 } from './adapter.js';
 import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
+import { DEFAULT_CONTEXT_POSITION, type ContextPosition } from '../feature-sets.js';
 import { namePosted, NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
 import { LEGACY_IDS, type MessageIds } from '../message-ids.js';
 import { messageLineHead } from '../message-line.js';
@@ -139,6 +140,7 @@ export interface ZulipAdapterOptions {
   uploader?: Uploader;
   uploadPolicy?: UploadPolicy;
   formatTime?: (d: Date) => string;
+  contextPosition?: ContextPosition;
 }
 
 export const DEFAULT_BACKSCROLL = 500;
@@ -159,6 +161,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly uploader: Uploader | null;
   private readonly uploadPolicy: UploadPolicy | null;
   private readonly formatTime: (d: Date) => string;
+  readonly contextPosition: ContextPosition;
   readonly directory: StreamDirectory;
   private knownDms = new Map<string, ChannelDescriptor>();
   private seen = new Map<number, SeenMessage>();
@@ -203,6 +206,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.uploader = options.uploader ?? null;
     this.uploadPolicy = options.uploadPolicy ?? null;
     this.formatTime = options.formatTime ?? agentLineTimeFormatter();
+    this.contextPosition = options.contextPosition ?? DEFAULT_CONTEXT_POSITION;
     this.directory = options.directory ?? new StreamDirectory();
     if (this.backscrollLimits.size > 0) {
       void this.directory.whenFilled().then(() => this.logFormerBackscrollNames());
@@ -843,7 +847,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
     const label = parsed.kind === 'dm' ? `the direct-message conversation ${dmChannelIdFor(parsed.userIds)}` : `Zulip #${streamName}`;
     return {
-      position: 'beforeUser',
+      position: this.contextPosition,
       content: `Recent messages from ${label}:\n${formatted}`,
     };
   }

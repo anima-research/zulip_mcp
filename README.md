@@ -200,6 +200,7 @@ are likely to touch:
 | `ZULIP_UPLOAD_ROOTS` | — | Named directories local-file attachments may come from, `notes=./notes,out=/srv/out`. Unset: local files refused, base64 only |
 | `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
+| `MCPL_CONTEXT_POSITION` | `beforeUser` | The position the `zulip.context` injection is declared at: `beforeUser` or `afterUser` (see *MCPL host*) |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
 
 ### Realm-tagged message IDs (opt-in)
@@ -240,6 +241,18 @@ transport; `--tcp <port>` serves one connection at a time on localhost.
 Feature sets: `zulip.messaging` (channels, push events, tools, rollback),
 `zulip.history` (the read tools), `zulip.context` (recent history injected
 before inference for open channels).
+
+`zulip.context` gives one injection for each open channel, "Recent messages
+from …", whose text changes whenever a message arrives there. It is declared
+at `beforeUser`, or at `afterUser` with `MCPL_CONTEXT_POSITION=afterUser`.
+The manifest asks for that one position, so a host that grants only the
+other gets no injection, and its `featureSets/update` receipt names
+`zulip.context` as unavailable. What each position costs is the host's to
+say. agent-framework places a `beforeUser` injection afresh at every
+request, which moves it and so rewrites the prompt cache from its old place
+on. It stores an `afterUser` injection in the agent's history each time the
+text changes, which keeps the cache and adds one copy for each change until
+the host folds it.
 
 Every `zulip.messaging` tool result carries `state.checkpoint` (SPEC §8);
 `state/rollback` to a checkpoint deletes what the bot sent after it —
