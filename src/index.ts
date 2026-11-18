@@ -7,6 +7,7 @@ import { McplConnection } from '@animalabs/mcpl-core';
 import { isMainModule } from './content.js';
 import { checkImageDecoder, fetchCapped, resolveInlineOptions } from './attachments.js';
 import { parseZulipAttachmentUrl } from './content.js';
+import { DEFAULT_CONTEXT_POSITION, type ContextPosition } from './feature-sets.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { StreamDirectory } from './stream-directory.js';
@@ -35,6 +36,16 @@ function intEnv(name: string, fallback: number, min = 0): number {
 
 export function maxMessageLengthFromEnv(): number | undefined {
   return process.env.ZULIP_MAX_MESSAGE_LENGTH ? intEnv('ZULIP_MAX_MESSAGE_LENGTH', 10000, 1) : undefined;
+}
+
+export function contextPositionFromEnv(): ContextPosition {
+  const raw = process.env.MCPL_CONTEXT_POSITION;
+  if (raw === undefined || raw === '') return DEFAULT_CONTEXT_POSITION;
+  const named = raw.trim().toLowerCase();
+  if (named === 'beforeuser') return 'beforeUser';
+  if (named === 'afteruser') return 'afterUser';
+  console.error(`[zulip-mcp] ignoring MCPL_CONTEXT_POSITION=${JSON.stringify(raw)} (not "beforeUser" or "afterUser"); using ${DEFAULT_CONTEXT_POSITION}`);
+  return DEFAULT_CONTEXT_POSITION;
 }
 
 export function parseBackscrollLimits(raw: string | undefined): Map<string, number> {
@@ -94,6 +105,7 @@ async function main(): Promise<void> {
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
     filters,
     maxMessageLength,
+    contextPosition: contextPositionFromEnv(),
   });
   const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength });
   tools.setReactionPolicy({

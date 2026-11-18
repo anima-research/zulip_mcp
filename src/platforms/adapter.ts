@@ -5,6 +5,7 @@ import type {
   ContextInjection,
 } from '@animalabs/mcpl-core';
 import type { ChannelKey, KeyedMessage } from '../channel-key.js';
+import type { ContextPosition } from '../feature-sets.js';
 
 export interface SentRecord {
   messageId: string;
@@ -123,6 +124,9 @@ export interface ChannelHistoryPage {
 
 export interface PlatformAdapter {
   readonly type: string;
+
+  /** The position `fetchContext` returns, which the manifest declares. Absent reads as `beforeUser`. */
+  readonly contextPosition?: ContextPosition;
 
   discoverChannels(): Promise<ChannelDescriptor[]>;
 

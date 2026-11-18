@@ -32,6 +32,7 @@ import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey, type ChannelKey, type KeyedMessage } from '../src/channel-key.ts';
 import { parseDmChannelId } from '../src/history.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
+import type { ContextPosition } from '../src/feature-sets.ts';
 import type { DeliveryState } from '../src/delivery.ts';
 
 beforeEach(() => {
@@ -86,7 +87,7 @@ interface FakeAdapter extends Omit<PlatformAdapter, 'startEvents'> {
   wireOf(key: ChannelKey): string;
 }
 
-function fakeAdapter(withTyping = true): FakeAdapter {
+function fakeAdapter(withTyping = true, contextPosition?: ContextPosition): FakeAdapter {
   let server: ZulipMcplServer | null = null;
   let nextStreamId = 1000;
   const changeOf = new WeakMap<ChangeEntry, MessageChangeEvent>();
@@ -184,7 +185,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       return { delivered: true, messageId: String(40 + n), messageIds: [String(40 + n)] };
     },
     async fetchContext() {
-      return { position: 'beforeUser' as const, content: 'recent history' };
+      return { position: contextPosition ?? ('beforeUser' as const), content: 'recent history' };
     },
     startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction, onMessageChange?: OnMessageChange) {
       directory().registration(streamList(adapter.visible));
@@ -251,6 +252,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
   if (withTyping) {
     adapter.sendTyping = async (key, _d, m, op) => { adapter.typing.push({ channelId: adapter.wireOf(key), op, metadata: m as Record<string, unknown> | undefined }); };
   }
+  if (contextPosition) Object.defineProperty(adapter, 'contextPosition', { value: contextPosition });
   return adapter;
 }
 
@@ -316,6 +318,7 @@ interface Harness {
 interface HarnessOptions {
   mcpl?: boolean;
   typing?: boolean;
+  contextPosition?: ContextPosition;
   stateDir?: string;
   sessionId?: string;
   history?: IncomingChannelMessage[];
@@ -348,7 +351,7 @@ function harness(opts: HarnessOptions = {}): Harness {
     return message;
   };
 
-  const adapter = opts.reuse?.adapter ?? fakeAdapter(opts.typing ?? true);
+  const adapter = opts.reuse?.adapter ?? fakeAdapter(opts.typing ?? true, opts.contextPosition);
   if (opts.history) adapter.history = opts.history;
   if (opts.visible) adapter.visible = opts.visible;
   const server = opts.reuse?.server ?? new ZulipMcplServer(adapter as unknown as PlatformAdapter, opts.tools ?? (fakeTools as unknown as ZulipToolRuntime), {
@@ -791,6 +794,57 @@ test('context/beforeInference injects history for open channels under zulip.cont
   h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.context'] });
   const reduced = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, params)) as { contextInjections: unknown[] };
   assert.deepEqual(reduced.contextInjections, []);
+  await h.close();
+});
+
+const INFERENCE = {
+  inferenceId: 'i1',
+  conversationId: 'c1',
+  turnIndex: 0,
+  userMessage: null,
+  model: { id: 'm', vendor: 'v', contextWindow: 1, capabilities: [] },
+};
+
+test('with the context position at afterUser, the manifest asks for afterUser alone and the injection comes at it (#47)', async () => {
+  const h = harness({ contextPosition: 'afterUser' });
+  const init = await initialize(h, true);
+  const manifest = (init.capabilities.experimental as {
+    mcpl: { contextHooks: { beforeInference: { inject: unknown } }; featureSets: Record<string, { uses: string[] }> };
+  }).mcpl;
+  assert.deepEqual(manifest.contextHooks.beforeInference.inject, { system: false, beforeUser: false, afterUser: true });
+  assert.deepEqual(manifest.featureSets['zulip.context'].uses, ['contextHooks.beforeInference.inject.afterUser']);
+
+  const receipt = (await h.host.sendRequest(method.FEATURE_SETS_UPDATE, {
+    effectiveCapabilities: FULL_GRANT.map((path) => path.replace('inject.beforeUser', 'inject.afterUser')),
+  })) as { mode: string };
+  assert.equal(receipt.mode, 'full');
+  await awaitRegistered(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  const result = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, INFERENCE)) as { featureSet: string; contextInjections: ContextInjection[] };
+  assert.equal(result.featureSet, 'zulip.context');
+  assert.equal(result.contextInjections.length, 1);
+  assert.equal(result.contextInjections[0].position, 'afterUser');
+  await h.close();
+});
+
+test('with the context position at afterUser, a host that grants only beforeUser is told zulip.context is unavailable, and gets no injection', async () => {
+  const h = harness({ contextPosition: 'afterUser' });
+  await initialize(h, true);
+  const receipt = (await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT })) as {
+    mode: string;
+    unavailableFeatures: { featureSet: string; missingCapabilities: string[] }[];
+  };
+  assert.equal(receipt.mode, 'degraded');
+  assert.deepEqual(
+    receipt.unavailableFeatures.map((f) => [f.featureSet, f.missingCapabilities]),
+    [['zulip.context', ['contextHooks.beforeInference.inject.afterUser']]],
+  );
+  await awaitRegistered(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  const result = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, INFERENCE)) as { contextInjections: unknown[] };
+  assert.deepEqual(result.contextInjections, []);
   await h.close();
 });
 
