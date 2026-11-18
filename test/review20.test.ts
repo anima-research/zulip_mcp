@@ -24,15 +24,15 @@ function state(t: any) {
     saved: () => JSON.parse(readFileSync(join(dir, 'test.delivery.json'), 'utf8')) };
 }
 
-test('bulk holds scan and replace state once, and retry reservation preserves saved eligibility', t => {
+test('bulk holds replace state once, and retry reservation preserves saved eligibility', t => {
   t.mock.method(console, 'error', () => {});
   const { delivery, saved } = state(t);
   delivery.advance(key, 100);
-  const scans = t.mock.method(delivery as any, 'savedHolds');
+  const saves = t.mock.method(delivery, 'save');
   for (let id = 101; id <= 1100; id++) delivery.hold(key, id, 'failed', false);
-  assert.equal(scans.mock.callCount(), 0, 'no scan/write per held ID');
+  assert.equal(saves.mock.callCount(), 0, 'no write per held ID; candidate trimming is bounded to 51 IDs');
   delivery.save();
-  assert.equal(scans.mock.callCount(), 1);
+  assert.equal(saves.mock.callCount(), 1);
   assert.deepEqual(Object.keys(saved().held['zulip:general']), Array.from({ length: 50 }, (_, i) => String(1051 + i)));
   delivery.hold(key, 1100, 'queued');
   delivery.save();

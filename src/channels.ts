@@ -22,7 +22,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
-  sendIncoming(messages: IncomingChannelMessage[], beforeOffer?: () => void): Promise<ChannelsIncomingResult | undefined>;
+  sendIncoming(messages: IncomingChannelMessage[], onWritten?: () => void): Promise<ChannelsIncomingResult | undefined>;
 }
 
 /** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
@@ -776,7 +776,9 @@ export class ChannelManager {
     sent: KeyedMessage[],
   ): Set<string> {
     if (result && Array.isArray(result.results)) {
-      return new Set(result.results.filter((r) => r?.accepted).map((r) => r.messageId));
+      const counts = new Map<string, number>();
+      for (const r of result.results) if (typeof r?.messageId === 'string') counts.set(r.messageId, (counts.get(r.messageId) ?? 0) + 1);
+      return new Set(result.results.filter((r) => r?.accepted === true && counts.get(r.messageId) === 1).map((r) => r.messageId));
     }
     return new Set(sent.map((m) => m.messageId));
   }

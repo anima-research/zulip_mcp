@@ -94,7 +94,7 @@ checks report unknown state instead of claiming that no messages are unread.
 When a long channel ID forces the bounded catch-up fallback, the compact notice
 names the omitted count and first/last message IDs. Its `fetch_around` pointer
 recovers the first message and context, including a pageable `channelId` for DMs; `fetch_history`
-can then page through the omitted range. Acceptance acknowledges the omissions,
+can then page through the omitted range. A compact by-ID notice covers only its listed messages and never advances the watermark. For an ordinary scan, acceptance acknowledges the omissions,
 records progress through the scan, including unselected messages and earlier
 holds within that scan; the durable watermark advances only as far as remaining
 holds permit. Ordinary catch-up starts after the saved watermark, but a separate bounded list
@@ -119,3 +119,13 @@ Pending catch-up offers do not exclude overlapping history scans: this can repea
 already offered rows, but must not suppress an unoffered addressed tail. Catch-up
 answers from an older connection generation cannot clear or recreate current
 holds. Accepted answers still drain on shutdown before a replacement begins.
+
+A by-ID offer is recorded only after the connection writer accepts its request,
+synchronously before response settlement. Closed/failed writers retain unoffered
+IDs, including during shutdown flush. Backpressure is an accepted write; later
+transport failure is uncertain delivery. Save errors are logged: a failed save
+can leave an old ID on disk and allow a duplicate after restart. Rename-only
+saves do not provide power-loss durability or an atomic host/filesystem transaction.
+Unverified quote-budget rows remain listed without consuming failed-read tries.
+For streams absent from the current directory, saved IDs and progress use stable
+`stream-id:<number>` keys, not a stale name that another stream might reuse.

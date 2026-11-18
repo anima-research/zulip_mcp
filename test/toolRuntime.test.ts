@@ -1016,7 +1016,7 @@ test('move_messages says the move was made when Zulip accepted it but the read b
       assert.deepEqual(result, {
         moved: true,
         asked: { topic: 'renamed', scope: 'one' },
-        readBackError: "move_messages: Zulip's answer gave no stream and topic for message 77.",
+        readBackError: "move_messages: Zulip's answer gave no stream and topic for message 77. Inspect it with fetch_around(message_id=77); do not repeat the move to retry its read-back.",
         note: 'To answer this message where it is now, use send_message with reply_to.',
       }, `an answer with no usable stream claims no place, and has the note: ${JSON.stringify(answer)}`);
     } finally { rmSync(placeless.dir, { recursive: true, force: true }); }

@@ -7889,6 +7889,7 @@ test('pending compact scan reserves ambient holds and acceptance advances past u
       assert.match(h.pushed.map(firstText).find(t => t.includes('messages omitted'))!, /entire scanned interval alpha:101–alpha:200/);
       assert.deepEqual(h.delivery.heldIds(key, { replayable: true }), []);
       await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await (h.server as any).lanes.quiet();
       assert.equal(h.pushed.filter(p => firstText(p).includes('messages omitted')).length, 1, 'no second offer while the first is pending');
       h.policy.holdPushes = false;
       h.policy.heldPushes.splice(0).forEach(answer => answer());
@@ -8531,8 +8532,10 @@ for (const mode of ['legacy', 'strict'] as const) {
       h.adapter.emit!(mention(40));
       await until(() => h.delivery.acceptedThrough('zulip:general') === 40, 'live 40 accepted');
       h.delivery.hold('zulip:general', 26, 'failed');
-      h.adapter.fetchHistory = () => new Promise(() => {});
+      let readEntered = false;
+      h.adapter.fetchHistory = () => { readEntered = true; return new Promise(() => {}); };
       await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await until(() => readEntered, 'the held replay actually entered Zulip');
       prefix.forEach((answer) => answer());
       await h.host.sendRequest('ping');
       assert.equal(h.delivery.watermark('zulip:general'), 20, 'the answer waits behind the read');
@@ -8886,7 +8889,7 @@ for (const mode of ['legacy', 'strict'] as const) {
     assert.equal(savedDelivery(dir).held, undefined);
   });
 
-  test(`${mode}: carried closed messages save removal before the request and do not repeat after a crash`, async t => {
+  test(`${mode}: carried closed messages save removal after writing the request and do not repeat after a crash`, async t => {
     t.mock.method(console, 'error', () => {});
     const dir = mkdtempSync(join(tmpdir(), 'zulip-one-off-closed-'));
     const restartDir = mkdtempSync(join(tmpdir(), 'zulip-one-off-closed-restart-'));
@@ -8902,12 +8905,13 @@ for (const mode of ['legacy', 'strict'] as const) {
     const send = conn.sendRequest.bind(conn);
     const snapshots: string[] = [];
     t.mock.method(conn, 'sendRequest', (name, params) => {
+      const answer = send(name, params);
       if (name === method.PUSH_EVENT) {
-        // Preserve exactly what a process crash at dispatch would leave, before
+        // Preserve exactly what a process crash after the write would leave, before
         // readStart's later save or any answer/shutdown settlement can mask it.
         snapshots.push(readFileSync(join(dir, 'test.delivery.json'), 'utf8'));
       }
-      return send(name, params);
+      return answer;
     });
     try {
       await initialize(h, true);
@@ -8924,14 +8928,14 @@ for (const mode of ['legacy', 'strict'] as const) {
         assert.ok(restarted.adapter.historyCalls.some(c => c.query.afterMessageId === '31'), 'ordinary catch-up really ran');
         assert.ok(restarted.adapter.historyCalls.every(c => c.query.afterMessageId !== '20'), 'no repeated by-ID read');
       });
-      assert.equal((JSON.parse(snapshots[0]) as SavedDelivery).held, undefined, 'removal is on disk before dispatch');
+      assert.equal((JSON.parse(snapshots[0]) as SavedDelivery).held, undefined, 'removal is on disk before the answer');
     } finally {
       for (const answer of h.policy.heldPushes.splice(0)) answer();
       await h.close();
     }
   });
 
-  test(`${mode}: carried open messages commit removal before sending on a busy lane and do not retry lost answers`, async t => {
+  test(`${mode}: carried open messages commit removal after writing on a busy lane and do not retry lost answers`, async t => {
     t.mock.method(console, 'error', () => {});
     const dir = mkdtempSync(join(tmpdir(), 'zulip-one-off-open-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -8957,7 +8961,9 @@ for (const mode of ['legacy', 'strict'] as const) {
       conn.sendRequest = (name: string, params: unknown) => {
         if (name !== method.CHANNELS_INCOMING) return send(name, params);
         attempts++;
-        assert.equal(savedDelivery(dir).held, undefined, 'durable removal precedes the actual request, not its answer');
+        const answer = send(name, params); // Really write the request, then lose only its answer.
+        void answer.catch(() => {});
+        assert.equal(savedDelivery(dir).held, undefined, 'durable removal follows the actual write, before its answer');
         return Promise.reject(new Error('host received the request but its answer was lost'));
       };
       await h.server.channelManager.flush();
@@ -8986,3 +8992,44 @@ test('empty by-ID selection logs actual withdrawals without discarding interveni
       ? Promise.resolve({ messages: [], scannedThrough: null, reachedNewest: true, policyFiltered: true }) : read(key, query);
   } });
 });
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`${mode}: unverified carried rows retain their failure count across four starts`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-unverified-carried-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    leaveState(dir, 31, { 21: 2 });
+    const ids = new MessageIds('alpha', mode);
+    for (let start = 0; start < 4; start++) {
+      await startOnce(dir, ids, [mention(21)], h => {
+        assert.equal(offers(h, String(ids.format(21))), 0);
+        assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 21: 2 }, 'quote-budget skip is not a failed by-ID read');
+      }, { catchupLimit: 0, prepare: h => {
+        const fetch = h.adapter.fetchHistory!.bind(h.adapter);
+        h.adapter.fetchHistory = async (key, query) => ({ ...await fetch(key, query), unverifiedMessageIds: ['21'] });
+      } });
+    }
+  });
+
+  test(`${mode}: shutdown flush on a closed connection keeps an enqueued carried ID`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-closed-flush-carried-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    leaveState(dir, 31, { 21: 0 }, { lastOpen: ['zulip:general'], watermarks: { 'zulip:aaa': 1, 'zulip:general': 31 }, streams: { 6: 'aaa', 7: 'general' } });
+    const h = harness({ messageIds: new MessageIds('alpha', mode), stateDir: dir, history: [mention(21)], visible: [AAA, DESCRIPTOR], batchWindowMs: 60_000 });
+    const turn = aaaHoldsTheTurn(h);
+    try {
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(h, false);
+      await until(turn.reading, 'aaa reading');
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      turn.release();
+      await until(() => h.server.channelManager.pendingCount() === 1, 'one carried row enqueued');
+      h.serverSide.close(); // sendRequest now really fails without writing
+      await h.close();
+      assert.equal(h.incoming.length, 0);
+      assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 21: 0 });
+    } finally { turn.release(); await h.close(); }
+  });
+}

@@ -149,11 +149,11 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
         ? "The server doesn't have the bot's own user id yet; it will retry on a later call."
         : `Zulip transport failure (${copy.kind}).`;
       if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
-      if ((copy.method === 'GET' || copy.kind === 'no-self-id') && [401, 403].includes(copy.status ?? 0)) detail += ' Correct the access configuration before retrying; the host operator must repair authorization; repeating this read will not fix authorization.';
+      if ([401, 403].includes(copy.status ?? 0)) detail += ' Correct the access configuration before retrying; the host operator must repair authorization; repeating this operation will not fix authorization.';
       else if (copy.method === 'GET' && copy.kind !== 'no-self-id' && copy.retryAfterSeconds === undefined) detail += ' Retry the read.';
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
-      if (copy.retryAfterSeconds !== undefined) detail += (copy.method === 'GET' || copy.kind === 'no-self-id') && [401, 403].includes(copy.status ?? 0)
+      if (copy.retryAfterSeconds !== undefined) detail += [401, 403].includes(copy.status ?? 0)
         ? ` Server Retry-After: ${copy.retryAfterSeconds} seconds; access must be corrected first.`
         : ` Retry after ${copy.retryAfterSeconds} seconds${copy.method === 'GET' ? ', then retry the read' : ''}.`;
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
@@ -168,6 +168,7 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
           : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying the attachment upload in the original operation; retrying may create a duplicate.'
           : 'Retry reads; verify the outcome before repeating writes.'))
         + (facts?.attachmentName !== undefined ? ` Attachment: ${JSON.stringify(facts.attachmentName)}.` : '')
+        + (facts?.operation === 'Upload' && facts.refused && facts.status === 413 ? ' Reduce the attachment size or omit it before retrying.' : '')
         + (authorization ? ' The host operator must repair authorization; retries alone cannot fix access.' : '')
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
         + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '')

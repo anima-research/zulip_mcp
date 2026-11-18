@@ -211,13 +211,15 @@ test('completed upload refusals differ from truncated response bodies in every m
         return true;
       });
     }
-    const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({
-      ok: false, status: 503, headers: { get: () => '120' }, text: async () => { throw new TypeError('socket lost'); }, json: async () => ({}),
-    }));
-    await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
-      assert.match(messageIdError(error, ids).message, /before a complete.*No uploaded path was confirmed.*HTTP 503.*Retry after 120 seconds/);
-      return true;
-    });
+    for (const status of [413, 503]) {
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({
+        ok: false, status, headers: { get: () => '120' }, text: async () => { throw new TypeError('socket lost'); }, json: async () => ({}),
+      }));
+      await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+        assert.match(messageIdError(error, ids).message, new RegExp(`before a complete.*No uploaded path was confirmed.*HTTP ${status}.*Retry after 120 seconds`));
+        return true;
+      });
+    }
   }
 });
 

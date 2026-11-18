@@ -46,7 +46,7 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
       if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { channel: 'dm:9', topic: 'new', scope: 'one', emoji_name: 'warning', [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
     }
     await assert.rejects(tools.handleToolCall('send_message', { reply_to: 'alpha:7', content: '[[msg:alpha:7]] [[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
-    await assert.rejects(tools.handleToolCall('send_dm', { to: ['someone'], content: '[[msg:beta:8]]' }), /differs/);
+    await assert.rejects(tools.handleToolCall('send_dm', { to: ['someone'], content: '[[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
     await assert.rejects(tools.handleToolCall('edit_message', { message_id: 'alpha:7', content: '[[msg:beta:8]]' }), /differs/);
     assert.equal(calls.length, 0);
     assert.equal(writes, 0);
@@ -220,7 +220,9 @@ test('malformed bracket tokens are rejected before tool side effects', async t =
   assert.equal(calls.length, 0);
 });
 
-test('compat warnings identify every bare field and survive refusals', async t => {
+test('compat send/history warnings reach stderr and results and survive refusals', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args.join(' ')));
   const { api } = standInApi({
     'GET /messages/:id': { result: 'success', message },
     'POST /messages': { result: 'success', id: 8 },
@@ -238,7 +240,9 @@ test('compat warnings identify every bare field and survive refusals', async t =
     ['fetch_history', { channel: 'dm:9', after: 7 }, 'after'],
     ['send_message', { reply_to: 'alpha:7', content: '[[msg:7]]' }, 'message-link token'],
   ] as const) {
+    logs.length = 0;
     const result = await runtime.handleToolCall(name, args);
+    assert.ok(logs.some(line => line.includes('Warning: bare ' + field)), field + ' on stderr');
     assert.ok(result.warnings.some((w: string) => w.includes(field)), field);
   }
   const both = await runtime.handleToolCall('send_message', { reply_to: 7, content: '[[msg:7]]' });
@@ -335,7 +339,7 @@ test('malformed move read-back names the operation in every mode', async t => {
     const result = await runtime.handleToolCall('move_messages', { message_id: mode === 'legacy' ? 7 : 'alpha:7', topic: 'new', scope: 'one' });
     assert.equal(result.moved, true);
     assert.equal(result.readBackError, 'move_messages: ' +
-      "Zulip's answer gave no stream and topic for message " + (mode === 'legacy' ? '7' : 'alpha:7') + '.');
+      "Zulip's answer gave no stream and topic for message " + (mode === 'legacy' ? '7' : 'alpha:7') + '. Inspect it with fetch_around(message_id=' + JSON.stringify(mode === 'legacy' ? 7 : 'alpha:7') + '); do not repeat the move to retry its read-back.');
   }
 });
 
@@ -408,12 +412,13 @@ test('profile and all additional structured message cursors are projected, not u
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     const record = { ...Object.fromEntries(fields.map(key => [key, 7])),
-      unread_message_ids: [7, 0], unverifiedMessageIds: ['7'], message_ids: [7], messageIds: ['7'], targetMessageIds: [7], user_id: 9, stream_id: 12, max_message_length: 10000 };
-    const result = ids.project(record) as any;
+      ids: [7, 8], unread_message_ids: [7, 0], unverifiedMessageIds: ['7'], message_ids: [7], messageIds: ['7'], targetMessageIds: [7], user_id: 9, stream_id: 12, max_message_length: 10000 };
+    const result = ids.project(record, true) as any;
     for (const field of fields) assert.equal(result[field], mode === 'legacy' ? 7 : 'alpha:7');
     assert.deepEqual(result.unread_message_ids, mode === 'legacy' ? [7, 0] : ['alpha:7', 0]);
     assert.deepEqual(result.unverifiedMessageIds, mode === 'legacy' ? ['7'] : ['alpha:7']);
     for (const field of ['message_ids', 'messageIds', 'targetMessageIds']) assert.deepEqual(result[field], mode === 'legacy' ? record[field as keyof typeof record] : ['alpha:7']);
+    assert.deepEqual(result.ids, mode === 'legacy' ? [7, 8] : ['alpha:7', 'alpha:8']);
     assert.equal(result.user_id, 9);
     assert.equal(result.stream_id, 12);
     assert.equal(result.max_message_length, 10000);
@@ -652,7 +657,7 @@ test('every message-ID schema field follows the selected ID contract', () => {
   }
 });
 
-test('compat warns on bare IDs for every message-ID tool', async t => {
+test('compat warns on bare message_id for the six single-message tools', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'compat-tool-warnings-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const logs: string[] = [];
@@ -669,5 +674,18 @@ test('compat warns on bare IDs for every message-ID tool', async t => {
     const result = await runtime.handleToolCall(name, { message_id: 7, content: 'edited', topic: 'new', scope: 'one', emoji_name: 'eyes' });
     assert.match(JSON.stringify(result), /Warning:.*bare message_id/, `${name} returns its warning on success`);
     assert.ok(logs.some(line => /Warning:.*bare message_id/.test(line)), `${name} must warn`);
+  }
+});
+
+test('multipart send_message and send_dm receipt ids arrays are projected in every mode', async t => {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) for (const tool of ['send_message', 'send_dm']) {
+    let id = 7;
+    const { api } = standInApi({ 'POST /messages': () => ({ result: 'success', id: id++ }) });
+    const dir = mkdtempSync(join(tmpdir(), 'split-receipt-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir,
+      { messageIds: new MessageIds('alpha', mode), maxMessageLength: 4 });
+    const receipt = await runtime.handleToolCall(tool, { type: 'stream', to: tool === 'send_dm' ? [9] : 12, topic: 't', content: 'abcdefgh' });
+    assert.deepEqual(receipt.ids, mode === 'legacy' ? [7, 8] : ['alpha:7', 'alpha:8']);
   }
 });

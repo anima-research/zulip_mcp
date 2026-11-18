@@ -1,3 +1,4 @@
+import { requestWritten } from './request-written.js';
 import {
   ERR_CHANNEL_OPEN_FAILED,
   ERR_UNKNOWN_CHANNEL,
@@ -229,10 +230,10 @@ export class ZulipMcplServer {
     const host: HostClient = {
       registerChannels: (channels) => this.registerChannelsWithHost(channels),
       channelsChanged: (params, timeoutMs) => this.channelsChangedWithHost(params, timeoutMs),
-      sendIncoming: (messages, beforeOffer) => this.sendIncomingToHost(messages, beforeOffer),
+      sendIncoming: (messages, onWritten) => this.sendIncomingToHost(messages, onWritten),
     };
     const channels = new ChannelManager(host, this.adapters, this.grant, this.ids, options.batchWindowMs, {
-      // Commit the one-off saved-list removal synchronously at the request
+      // Commit the one-off saved-list removal synchronously at the written-request
       // boundary; a busy channel lane must not postpone it until after send.
       onOffered: (key, messages) => {
         const carried = new Set(this.delivery.carriedIds(key));
@@ -1061,7 +1062,7 @@ export class ZulipMcplServer {
       const authorId = message.author.id;
       const note = `<system>Direct message from ${message.author.name} (user id ${authorId}). ` +
         `To reply, use send_dm(["${authorId}"]) or publish to channel ${this.ids.channelIdOf(key)}. ` +
-        `DMs always reach you; there is nothing to subscribe to.</system>`;
+        `DMs use live push and bounded recovery; there is nothing to subscribe to.</system>`;
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
 
@@ -1131,7 +1132,7 @@ export class ZulipMcplServer {
     if (this.isMuted(key) || !this.isAllowed(key)) {
       return (ctx) => {
         const waiting = new Set(ctx.lane.waitingMessages());
-        for (const id of ctx.w.delivery.heldIds(key)) if (!waiting.has(id)) ctx.w.delivery.release(key, id);
+        for (const id of ctx.w.delivery.heldIds(key)) if (!waiting.has(id)) ctx.w.delivery.release(key, id, 'channel is muted or outside the allowlist');
         this.delivery.save();
       };
     }
@@ -1195,7 +1196,7 @@ export class ZulipMcplServer {
     const found = new Set(fetched.messages.map((m) => numericId(m)));
     const scanned = fetched.scannedThrough ?? 0;
     const gone = ids.filter((id) => !found.has(id) && (id <= scanned || fetched.complete));
-    for (const id of gone) w.delivery.release(key, id);
+    for (const id of gone) w.delivery.release(key, id, 'message no longer exists in fetched history');
     if (gone.length > 0) this.delivery.save();
   }
 
@@ -1208,7 +1209,7 @@ export class ZulipMcplServer {
    * origin carries the MCPL channel id, which the host registers and routes
    * replies to.
    */
-  private async pushEvent(message: KeyedMessage, eventId: string, extraOrigin: Record<string, unknown> = {}, beforeOffer?: () => void): Promise<boolean> {
+  private async pushEvent(message: KeyedMessage, eventId: string, extraOrigin: Record<string, unknown> = {}, onWritten?: () => void): Promise<boolean> {
     const conn = this.conn;
     if (!conn || !this.mcplActive) return false;
     const channelId = this.ids.channelIdOf(message.key);
@@ -1247,8 +1248,7 @@ export class ZulipMcplServer {
       payload: { content: message.content },
     };
     try {
-      beforeOffer?.();
-      const result = (await this.outToHost(conn.sendRequest(method.PUSH_EVENT, this.messageIds.project(params)))) as { accepted?: boolean; reason?: string } | undefined;
+      const result = (await this.outToHost(requestWritten(conn, method.PUSH_EVENT, this.messageIds.project(params), onWritten))) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
         return false;
@@ -1495,7 +1495,7 @@ export class ZulipMcplServer {
           if (w.channels.noteConversation(key, this.asLastSeen(key, msgs[i]))) break;
         }
       } else if (offered && (this.isMuted(key) || !this.isAllowed(key))) {
-        for (const id of w.delivery.heldIds(key)) if (id > after && id <= newestId) w.delivery.release(key, id);
+        for (const id of w.delivery.heldIds(key)) if (id > after && id <= newestId) w.delivery.release(key, id, 'channel is muted or outside the allowlist');
       } else if (offered) {
         w.delivery.hold(key, firstId, 'rejected');
         w.delivery.refuse(key, after, newestId);
@@ -1539,7 +1539,9 @@ export class ZulipMcplServer {
       if (r.ended) return;
       try {
         const page = await this.adapter.fetchHistory!(key, { limit: 1, afterMessageId: String(id - 1), timeoutMs: LONG_TIMEOUT_MS });
-        if (page.unverifiedMessageIds?.includes(String(id))) throw new Error('whether it replies to the agent could not be checked');
+        // A quote-budget skip is not a failed read or evidence of deletion.
+        // Leave this ID listed for a later start, without consuming a try.
+        if (page.unverifiedMessageIds?.includes(String(id))) continue;
         const row = page.messages.find((m) => numericId(m) === id);
         if (row) rows.push(row);
         else if (!page.policyFiltered) gone.push(id);
@@ -1577,7 +1579,7 @@ export class ZulipMcplServer {
           // Called at the actual push boundary, or on empty selection (withdrawal).
           onAttempt: (w) => {
             w.delivery.uncarry(key, rows.map((row) => Number(row.messageId)));
-            // As with open-channel onOffered, persist before the host request:
+            // As with open-channel onOffered, persist after the request is written:
             // a crash without an answer must not restore the one-off offer.
             w.delivery.save();
           },
@@ -2553,12 +2555,11 @@ export class ZulipMcplServer {
     return answer;
   }
 
-  private async sendIncomingToHost(messages: IncomingChannelMessage[], beforeOffer?: () => void): Promise<ChannelsIncomingResult | undefined> {
+  private async sendIncomingToHost(messages: IncomingChannelMessage[], onWritten?: () => void): Promise<ChannelsIncomingResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    beforeOffer?.();
-    const result = (await conn.sendRequest(method.CHANNELS_INCOMING, this.messageIds.project({ messages }))) as ChannelsIncomingResult | undefined;
-    if (this.messageIds.mode !== 'legacy' && Array.isArray(result?.results)) {
+    const result = (await requestWritten(conn, method.CHANNELS_INCOMING, this.messageIds.project({ messages }), onWritten)) as ChannelsIncomingResult | undefined;
+    if (Array.isArray(result?.results)) {
       // Only reverse IDs actually sent in this batch. Synthetic events and bad
       // host entries must not throw or prevent independent results settling.
       const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));

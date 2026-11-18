@@ -927,7 +927,7 @@ export class ZulipToolRuntime {
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
-          return { moved: true, asked, readBackError: `move_messages: Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
+          return { moved: true, asked, readBackError: `move_messages: Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}. Inspect it with fetch_around(message_id=${JSON.stringify(this.messageIds.format(messageId))}); do not repeat the move to retry its read-back.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
@@ -1132,7 +1132,7 @@ export class ZulipToolRuntime {
         let url: URL;
         try { url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm); }
         catch (error) {
-          if (error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or a valid absolute URL on the configured realm.");
+          if (error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or an absolute /user_uploads/ URL on the configured realm.");
           throw error;
         }
 

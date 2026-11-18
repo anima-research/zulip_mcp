@@ -28,6 +28,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
             if (text.startsWith('<')) {
               assert.match(safe.message, new RegExp(`HTTP ${status}`));
               assert.match(safe.message, /Upload was refused/);
+              if (status === 413) assert.match(safe.message, /Reduce the attachment size or omit it/);
             }
           }
           return true;

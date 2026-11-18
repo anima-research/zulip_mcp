@@ -33,7 +33,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
-  `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
+  `push/event` when delivery is available (bounded recovery is described below); ambient traffic on closed channels is dropped and counted
   (`channel_missed`). On live delivery, each channel's messages, reactions and
   changes are offered to the host in the order the server received them. An
   edit that doesn't move its message, or a deletion, that arrives while the
@@ -166,7 +166,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   The list holds only ids the server itself
   held: a message that never reached it (one beyond a catch-up ceiling, say)
   is not on it, and once the host accepts something newer only
-  `fetch_history` reaches it.
+  `fetch_history` or `fetch_around` (with a known ID) reaches it.
   On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
@@ -184,7 +184,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   that arrives before its channel's catch-up has run waits for it and
   follows it, as a message. If catch-up fails or stops at its ceiling, later
   accepted live delivery can move the watermark past unfetched offline rows.
-  Never-held rows then require explicit `fetch_history`; the saved held-ID list
+  Never-held rows then require explicit `fetch_history` or `fetch_around` with a known ID; the saved held-ID list
   does not cover them. Past 5,000 waiting messages, the channel with the
   most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,

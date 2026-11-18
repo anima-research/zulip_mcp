@@ -491,7 +491,7 @@ export const toolDefinitions: ToolDefinition[] = [
     name: "channel_missed",
     description:
       "Report how much ambient (non-mention) traffic you have missed in a stream since the host CLOSED " +
-      "its channel — returns missed message and character counts. Mentions always reach you and are " +
+      "its channel — returns missed message and character counts. Addressed messages use live push and bounded recovery and are " +
       "not counted. Counts are durable across restarts and backfill downtime on reconnect. Useful for " +
       "deciding whether to reopen the channel.",
     inputSchema: {

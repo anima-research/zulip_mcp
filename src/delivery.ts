@@ -37,7 +37,6 @@ interface Held {
   replayed: boolean;
   replyVerified: boolean;
   saveDropped?: boolean;
-  saveEligible?: boolean;
 }
 
 const HELD_CAP_PER_CHANNEL = 50_000;
@@ -50,12 +49,15 @@ export const CARRIED_READ_TRIES = 3;
 export class DeliveryState {
   writes = true;
   private unreadableFile = false;
+  private lastSaved: string | undefined;
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
   private lastOpen = new Set<ChannelKey>();
   private unresolved = new Map<string, Unresolved>();
   private held = new Map<ChannelKey, Map<number, Held>>();
+  // Bounded save-eligible current-run IDs; saving never traverses queued holds.
+  private savedCurrent = new Map<ChannelKey, Set<number>>();
   private reached = new Map<ChannelKey, number>();
   // The holds the last run saved, with the failed reads of each.
   private carried = new Map<ChannelKey, Map<number, number>>();
@@ -78,6 +80,7 @@ export class DeliveryState {
     if (!path || !existsSync(path)) return;
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8')) as DeliveryFile;
+      this.lastSaved = JSON.stringify(parsed, null, 2) + '\n';
       const saved = parsed.streams && typeof parsed.streams === 'object' ? parsed.streams : null;
       if (saved) {
         this.directory.load({ streams: saved, formerNames: parsed.formerNames ?? {} });
@@ -86,6 +89,12 @@ export class DeliveryState {
       const idBySavedName = new Map<string, number>();
       for (const [id, name] of Object.entries(saved ?? {})) if (typeof name === 'string') idBySavedName.set(name, Number(id));
       const keyOf = (chan: string): ChannelKey | null => {
+        // Absent streams retain stable numeric keys; names may be reused while
+        // the stream is archived/deleted, so do not fall back to stale names.
+        if (/^stream-id:[1-9][0-9]*$/.test(chan)) {
+          const id = Number(chan.slice(10));
+          return Number.isSafeInteger(id) ? streamKey(id) : null;
+        }
         const dm = parseDmChannelId(chan);
         if (dm) return dmKey(dm);
         if (!chan.startsWith('zulip:')) return null;
@@ -124,14 +133,15 @@ export class DeliveryState {
       for (const [chan, ids] of Object.entries(parsed.held ?? {})) {
         const tries = new Map<number, number>();
         for (const [id, failed] of Object.entries(ids ?? {})) {
-          if (Number.isSafeInteger(Number(id)) && Number(id) > 0) tries.set(Number(id), num(failed));
+          if (Number.isSafeInteger(Number(id)) && Number(id) > 0) tries.set(Number(id), Number.isInteger(failed) && failed >= 0 && failed < CARRIED_READ_TRIES ? failed : 0);
           else console.error(`[zulip-mcp] ${chan}: dropping saved held ID ${JSON.stringify(id)}: not a positive safe integer`);
         }
         if (tries.size === 0) continue;
-        place(chan, (key) => {
+        const key = keyOf(chan);
+        if (key !== null) {
           this.carried.set(key, tries);
           this.savedHolds(key);
-        }, () => console.error(`[zulip-mcp] delivery state: dropping ${tries.size} held message id(s) of ${chan}: the file has no stream list to place them by`));
+        } else for (const id of tries.keys()) console.error(`[zulip-mcp] ${chan}: dropping saved held ID ${id}: the file has no stream list to place it by`);
       }
     } catch (err) {
       this.unreadableFile = true;
@@ -163,7 +173,7 @@ export class DeliveryState {
     const parsed = parseKey(key);
     if (parsed.kind === 'dm') return dmChannelIdFor(parsed.userIds);
     const name = this.directory.nameOf(parsed.streamId);
-    return name === undefined ? null : `zulip:${name}`;
+    return name === undefined ? `stream-id:${parsed.streamId}` : `zulip:${name}`;
   }
 
   save(): void {
@@ -185,9 +195,10 @@ export class DeliveryState {
       };
       const lastOpen = [...this.lastOpen].map((key) => this.fileKey(key)).filter((c): c is string => c !== null);
       for (const [name, u] of this.unresolved) if (u.lastOpen) lastOpen.push(`zulip:${name}`);
-      const copy = this.copy !== null || this.directory.isFilled ? this.directory.snapshot() : null;
+      const snapshot = this.directory.snapshot();
+      const copy = this.copy !== null || this.directory.isFilled || Object.keys(snapshot.streams).length > 0 ? snapshot : null;
       const held: [string, Record<string, number>][] = [];
-      for (const key of new Set([...this.carried.keys(), ...this.held.keys()])) {
+      for (const key of new Set([...this.carried.keys(), ...this.savedCurrent.keys()])) {
         const chan = this.fileKey(key);
         const ids = this.savedHolds(key);
         if (chan !== null && ids.length > 0) held.push([chan, Object.fromEntries(ids)]);
@@ -199,8 +210,10 @@ export class DeliveryState {
         ...(held.length > 0 ? { held: Object.fromEntries(held.sort((a, b) => a[0].localeCompare(b[0]))) } : {}),
         ...(copy ?? {}),
       };
+      const serialized = JSON.stringify(out, null, 2) + '\n';
+      if (serialized === this.lastSaved && !this.unreadableFile) return;
       const tmp = `${path}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+      writeFileSync(tmp, serialized);
       if (this.unreadableFile) {
         const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
         try {
@@ -216,6 +229,7 @@ export class DeliveryState {
         this.unreadableFile = false;
       }
       renameSync(tmp, path);
+      this.lastSaved = serialized;
       if (copy) this.copy = copy;
     } catch (err) {
       console.error('[zulip-mcp] Failed to save delivery state:', (err as Error).message);
@@ -230,7 +244,7 @@ export class DeliveryState {
    */
   private savedHolds(key: ChannelKey): [number, number][] {
     const all = new Map<number, number>();
-    for (const [id, h] of this.held.get(key) ?? []) if ((h.saveEligible || h.status !== 'queued') && !h.saveDropped) all.set(id, 0);
+    for (const id of this.savedCurrent.get(key) ?? []) all.set(id, 0);
     for (const [id, failed] of this.carried.get(key) ?? []) all.set(id, failed);
     const kept = [...all].sort((a, b) => a[0] - b[0]);
     const dropped = kept.splice(0, Math.max(0, kept.length - HELD_SAVED_PER_CHANNEL)).map(([id]) => id);
@@ -238,6 +252,7 @@ export class DeliveryState {
     for (const id of dropped) {
       const h = this.held.get(key)?.get(id);
       if (h) h.saveDropped = true;
+      this.savedCurrent.get(key)?.delete(id);
     }
     if (dropped.length > 0) {
       console.error(
@@ -245,7 +260,16 @@ export class DeliveryState {
           `the oldest ${dropped.length} (${dropped[0]}–${dropped[dropped.length - 1]}) are dropped from that list and will not be offered by id`,
       );
     }
+    if (this.savedCurrent.get(key)?.size === 0) this.savedCurrent.delete(key);
     return kept;
+  }
+
+  private rememberHold(key: ChannelKey, id: number): void {
+    if (this.held.get(key)?.get(id)?.saveDropped) return;
+    const saved = this.savedCurrent.get(key) ?? new Set<number>();
+    saved.add(id);
+    this.savedCurrent.set(key, saved);
+    if (saved.size + (this.carried.get(key)?.size ?? 0) > HELD_SAVED_PER_CHANNEL) this.savedHolds(key);
   }
 
   carriedChannels(): ChannelKey[] {
@@ -292,7 +316,7 @@ export class DeliveryState {
     this.uncarry(key, this.carriedIds(key).filter((id) => id > afterId && id <= messageId));
     const held = this.held.get(key);
     if (held) {
-      for (const id of held.keys()) if (id > afterId && id <= messageId) held.delete(id);
+      for (const id of held.keys()) if (id > afterId && id <= messageId) { held.delete(id); this.savedCurrent.get(key)?.delete(id); }
       if (held.size === 0) this.held.delete(key);
     }
     return this.advance(key, messageId);
@@ -332,16 +356,20 @@ export class DeliveryState {
     }
     const existing = held.get(messageId);
     if (existing) {
-      existing.saveEligible ||= existing.status !== 'queued' || status !== 'queued';
       existing.status = status;
     } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
       console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
       return;
     } else {
-      if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
+      if (held.size >= HELD_CAP_PER_CHANNEL) {
+        const evicted = Math.max(...held.keys());
+        held.delete(evicted);
+        if (this.savedCurrent.get(key)?.delete(evicted)) console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: dropping saved held ID ${evicted}: in-memory hold cap eviction`);
+      }
       held.set(messageId, { status, replayed: false, replyVerified: false });
     }
     if (status !== 'queued') {
+      this.rememberHold(key, messageId);
       this.watermarkBelowHolds(key);
       if (save) this.save();
     }
@@ -358,17 +386,17 @@ export class DeliveryState {
   release(key: ChannelKey, messageId: number, reason?: string): boolean {
     const carried = this.carried.get(key)?.has(messageId) ?? false;
     this.uncarry(key, [messageId], reason);
+    const saved = this.savedCurrent.get(key)?.delete(messageId) ?? false;
     const held = this.held.get(key);
-    if (!held?.delete(messageId)) return carried;
+    if (!held?.delete(messageId)) return carried || saved;
     if (held.size === 0) this.held.delete(key);
-    this.settle(key);
-    return true;
+    return this.settle(key) || carried || saved;
   }
 
   refuse(key: ChannelKey, afterId: number, messageId: number): void {
     const held = this.held.get(key);
     if (!held) return;
-    for (const [id, h] of held) if (id > afterId && id <= messageId) h.status = 'rejected';
+    for (const [id, h] of held) if (id > afterId && id <= messageId) { h.status = 'rejected'; this.rememberHold(key, id); }
     this.watermarkBelowHolds(key);
     this.save();
   }
@@ -376,9 +404,10 @@ export class DeliveryState {
   failQueued(): void {
     for (const [key, held] of this.held) {
       let failed = false;
-      for (const h of held.values()) {
+      for (const [id, h] of held) {
         if (h.status !== 'queued') continue;
         h.status = 'failed';
+        this.rememberHold(key, id);
         failed = true;
       }
       if (failed) this.watermarkBelowHolds(key);
@@ -386,8 +415,9 @@ export class DeliveryState {
   }
 
   releaseAll(key: ChannelKey): boolean {
-    if (!this.held.delete(key)) return false;
-    return this.settle(key);
+    const saved = this.savedCurrent.delete(key);
+    if (!this.held.delete(key)) return saved;
+    return this.settle(key) || saved;
   }
 
   floor(key: ChannelKey): number | undefined {

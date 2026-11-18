@@ -564,7 +564,7 @@ test("past the cap the oldest held ids leave the saved list with a warning, on s
     assert.equal(b.carriedIds(GENERAL).length, HELD_SAVED_PER_CHANNEL, 'a longer list in the file is cut on load, so a start reads at most that many by id');
     assert.equal(b.carriedIds(GENERAL)[0], 3);
     assert.ok(logs.some((line) => /the oldest 2 \(1–2\) are dropped/.test(line)));
-    assert.ok(logs.some((line) => line.includes('dropping zulip:gone')), "a channel the file's stream list doesn't hold is dropped aloud, as its watermark is");
+    assert.ok(logs.some((line) => line.includes('zulip:gone: dropping saved held ID 3:')), "a channel the file's stream list doesn't hold is dropped aloud, as its watermark is");
 
     logs.length = 0;
     for (let id = 201; id <= 260; id++) b.hold(GENERAL, id, 'rejected');
