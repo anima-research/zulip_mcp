@@ -344,8 +344,9 @@ export async function linkMessages(
     try {
       outcomes.set(key, { digits: token.digits, outcome: await decide(token.digits) });
     } catch (err) {
-      if (unlinkable === 'refuse') throw new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? messageIdError(err, ids).message : err).replace(/\.$/, '')}.`]);
+      if (unlinkable === 'refuse') throw messageIdError(new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? messageIdError(err, ids).message : err).replace(/\.$/, '')}.`]), ids, false);
       if (!(err instanceof ZulipNoAnswer)) throw err;
+      messageIdError(err, ids); // Best-effort as-typed fallback still retains the original diagnostic.
       outcomes.set(key, { digits: token.digits, outcome: null });
       answered = false;
     }

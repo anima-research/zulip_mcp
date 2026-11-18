@@ -3,7 +3,8 @@
  * `/user_uploads/...` path and the message body links to it.
  */
 
-import { markTransportError } from './message-ids.js';
+import { parseRetryAfter } from './zulip-api.js';
+import { LEGACY_IDS, messageIdError, markTransportError } from './message-ids.js';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, type FileHandle, open, readlink, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -82,7 +83,7 @@ export interface UploadTarget {
   authHeader: string;
 }
 
-type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: Buffer }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: Buffer }) => Promise<{ ok: boolean; status: number; headers?: { get(name: string): string | null }; text?(): Promise<string>; json(): Promise<unknown> }>;
 
 /** RFC 2045 `type/subtype`, no parameters. Anything else cannot go into a part header. */
 const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
@@ -116,11 +117,21 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: multipartBody(input, boundary),
       }).catch(error => { throw markTransportError(error, { operation: 'Upload' }); });
+      const retryAfterSeconds = parseRetryAfter(res.headers?.get('retry-after'));
+      let completed = false;
       let unreadable = false;
       let original: unknown;
       let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
       try {
-        const parsed = await res.json();
+        let parsed: unknown;
+        if (res.text) {
+          const text = await res.text();
+          completed = true; // Receiving the body and parsing it are different failures.
+          parsed = JSON.parse(text);
+        } else {
+          parsed = await res.json();
+          completed = true;
+        }
         if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as typeof body;
         else unreadable = true;
       } catch (error) {
@@ -130,7 +141,7 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
       if (!res.ok || body.result !== 'success') {
         const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
         throw unreadable || res.status >= 500 || body.result !== 'error'
-          ? markTransportError(error, { operation: 'Upload', status: res.status, original }) : error;
+          ? markTransportError(error, { operation: 'Upload', status: res.status, original, completed: completed && !res.ok, retryAfterSeconds }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.
@@ -428,6 +439,11 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
       if (total > policy.maxTotalBytes) throw new Error(`attachments total over the ${fmt(policy.maxTotalBytes)} per-message budget`);
       out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data }));
     }
+  } catch (error) {
+    if (out.length === 0) throw error;
+    const safe = messageIdError(error, LEGACY_IDS);
+    safe.message += ` Earlier attachment uploads confirmed: ${JSON.stringify(out.map(file => file.path))}. No message was sent. Retrying the original send uploads those attachments again; reuse the confirmed paths instead.`;
+    throw safe;
   } finally {
     await closeAll(prepared);
   }

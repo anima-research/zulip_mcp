@@ -735,7 +735,9 @@ export class ChannelManager {
       byKey.set(m.key, entry);
     }
     if (rejected > 0) {
-      console.error(`Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
+      console.error(this.messageIds.mode === 'legacy'
+        ? `Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`
+        : `Host did not confirm acceptance of ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
     }
     for (const [key, entry] of byKey) {
       try {

@@ -12,7 +12,8 @@ export ZULIP_REALM_TAG=research
   and handshake metadata are unchanged. `ZULIP_REALM_TAG` is unused.
 - `compat`: emit `research:123`, accept matching tagged IDs and bare positive safe
   integers (including decimal strings). Bare tool inputs warn on stderr and in
-  successful results' `warnings` array, or in the error text when a call fails.
+  successful record results' `warnings` array, or in the error text when a call fails.
+  Primitive, array and null successes are preserved unchanged; their warning is stderr-only.
 - `strict`: emit tagged IDs and reject bare inputs.
 
 Tags match `[a-z0-9][a-z0-9_-]{0,63}`. Enabled modes require an explicit,
@@ -92,9 +93,10 @@ names the omitted count and first/last message IDs. Its `fetch_around` pointer
 recovers the first message and context, including a pageable `channelId` for DMs; `fetch_history`
 can then page through the omitted range. Acceptance acknowledges the omissions,
 advances the watermark through the scan, including unselected messages and earlier
-holds within that scan. This normally prevents repeated notices or automatic replay,
-but an earlier hold outside the scan can pin the durable watermark: acceptance of
-a later range is not independently persisted, and that range can recur after restart. Explicit history reads remain available. Recovery covers fetched rows only,
+holds within that scan. No-repeat across restart is guaranteed only for ranges at
+or below the saved watermark. An earlier hold outside the scan can pin that
+watermark: acceptance of a later range is not independently persisted, and that
+range can be offered again, including after restart. Explicit history reads remain available. Recovery covers fetched rows only,
 not an unfetched interval or overflow beyond the existing held-ID cap.
 Unread aggregates are null when any channel check failed; summary counts are
 labelled “At least” in that case.

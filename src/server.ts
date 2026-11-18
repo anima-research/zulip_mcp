@@ -165,6 +165,8 @@ export class ZulipMcplServer {
   private readonly hostRequestsOut = new Set<Promise<unknown>>();
   private readonly lifecycleOnChain = new Map<string, number>();
   private lifecycleWaitsOnChain = 0;
+  // Lane hands serialize access; keep scan intervals reserved until their answer is applied.
+  private readonly pendingCatchUps = new Map<ChannelKey, Set<{ after: number; through: number }>>();
   private readonly heldReadWaiting = new WeakSet<Lane<DeliveryWriter>>();
   private messagingHold: (() => void) | null = null;
   private readonly changesOnTurn = new Map<number, ChangeEntry[]>();
@@ -290,6 +292,7 @@ export class ZulipMcplServer {
     this.grant.reset();
     this.channelManager.reset();
     this.toldAgent.clear();
+    this.pendingCatchUps.clear();
     this.readWaits.clear();
     this.toldReadWait = null;
     this.messagingHold = null;
@@ -655,9 +658,12 @@ export class ZulipMcplServer {
             const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
+            const parserPrefix = `messageId=${describe(ack.messageId)}:`;
+            const context = error instanceof Error && error.message.startsWith(parserPrefix)
+              ? 'channels/acknowledge' : `channels/acknowledge (messageId=${describe(ack.messageId)})`;
             conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' && !(error instanceof ZulipNoAnswer)
               ? messageIdError(error, this.messageIds).message
-              : `channels/acknowledge (messageId=${describe(ack.messageId)}): ${messageIdError(error, this.messageIds).message}` });
+              : `${context}: ${messageIdError(error, this.messageIds).message}` });
           }
           break;
         }
@@ -1368,6 +1374,11 @@ export class ZulipMcplServer {
     }
     const truncated = fetched.truncated || (pass.retry && window.truncated);
     let newestId = Math.min(fetched.scannedThrough, window.through, read.through?.() ?? Infinity);
+    // A held read can begin below a pending scan, so reserving just its held
+    // IDs is insufficient. Deliver only the non-overlapping prefix, if any.
+    for (const pending of this.pendingCatchUps.get(key) ?? []) {
+      if (after < pending.through && newestId > pending.after) newestId = Math.min(newestId, pending.after);
+    }
     if (newestId <= after) return;
     let msgs = fetched.messages.filter((message) => Number(message.messageId) > after && Number(message.messageId) <= newestId);
     const blocked = second && fetched.unverifiedMessageIds.find((id) => id > after && id <= newestId);
@@ -1432,6 +1443,10 @@ export class ZulipMcplServer {
     const shownIds = [...new Set([...this.heldBetween(key, after, newestId), firstId,
       ...kept.slice(Math.max(1, elided)).map(v => v.id)])];
     for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
+    const reservation = { after, through: newestId };
+    const pending = this.pendingCatchUps.get(key) ?? new Set();
+    pending.add(reservation);
+    this.pendingCatchUps.set(key, pending);
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
       reason,
@@ -1443,6 +1458,8 @@ export class ZulipMcplServer {
       if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
+      pending.delete(reservation);
+      if (pending.size === 0 && this.pendingCatchUps.get(key) === pending) this.pendingCatchUps.delete(key);
       if (ok) {
         w.delivery.markReplayed(key, shownIds);
         w.delivery.advanceThrough(key, newestId, after);
@@ -2449,7 +2466,9 @@ export class ZulipMcplServer {
           try { original = numericOriginals.get(this.messageIds.parse(r.messageId)); } catch { /* diagnosed below */ }
         }
         if (original === undefined || typeof r.accepted !== 'boolean') {
-          console.error(`[zulip-mcp] Ignoring incoming result: malformed or unmatched under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
+          const id = typeof r?.messageId === 'string' && /^[a-zA-Z0-9:_-]{1,100}$/.test(r.messageId) ? JSON.stringify(r.messageId) : '<malformed ID>';
+          const reason = original === undefined ? 'malformed ID or not in offered batch' : 'acceptance is not boolean';
+          console.error(`[zulip-mcp] Ignoring incoming result: ${id}: ${reason} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
           return [];
         }
         return [{ ...r, messageId: original }];
@@ -2457,6 +2476,9 @@ export class ZulipMcplServer {
       // Refuse ambiguous duplicates after normalization, regardless of spelling.
       const counts = new Map<string, number>();
       for (const r of results) counts.set(r.messageId, (counts.get(r.messageId) ?? 0) + 1);
+      for (const [id, count] of counts) if (count > 1) {
+        console.error(`[zulip-mcp] Ignoring incoming result: duplicate normalized ID ${JSON.stringify(id)} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}); ${count} entries in offered batch.`);
+      }
       return { ...result, results: results.filter(r => counts.get(r.messageId) === 1) };
     }
     return result;

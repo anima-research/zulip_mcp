@@ -566,7 +566,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) to fit the catch-up budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); use that as fetch_history(channel=channelId) to page through the range. Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected messages and earlier holds within this scan.` +
+      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) to fit the catch-up budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); use that as fetch_history(channel=channelId) to page through the range. Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected messages and earlier holds within this scan. An older hold outside this scan can cause it to recur after restart.` +
       `${opts.moreBeyond ? ' Newer messages also exist.' : ''}]\n</missed>`;
   }
   return { text: block, elided };

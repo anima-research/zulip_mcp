@@ -470,3 +470,21 @@ test('enabled catch-up bounds long channel identifiers and realm tags', () => {
     assert.match(block, /Newer messages also exist/);
   }
 });
+
+test('only the watermark is durable: an older hold permits an accepted later scan to recur after restart', () => {
+  const dir = tmp();
+  try {
+    const state = new DeliveryState(dir, 'pinned', directoryOf({ 1: 'general' }));
+    state.advance(GENERAL, 9);
+    state.hold(GENERAL, 10, 'rejected');
+    state.hold(GENERAL, 21);
+    state.hold(GENERAL, 30);
+    state.advanceThrough(GENERAL, 30, 20);
+    state.save();
+    assert.equal(state.watermark(GENERAL), 9);
+    assert.equal(state.acceptedThrough(GENERAL), 30);
+    const restarted = new DeliveryState(dir, 'pinned', new StreamDirectory());
+    assert.equal(restarted.watermark(GENERAL), 9);
+    assert.equal(restarted.acceptedThrough(GENERAL), 9, 'a restarted scan begins at 9, not at the accepted 30');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

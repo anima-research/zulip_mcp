@@ -393,7 +393,8 @@ export class ZulipEventLoop {
         const errMsg = diagnostic instanceof Error ? diagnostic.message : String(diagnostic);
 
         this.consecutiveFailures++;
-        const delay = this.backoffDelay(this.consecutiveFailures);
+        const delay = Math.max(this.backoffDelay(this.consecutiveFailures),
+          error instanceof ZulipNoAnswer ? (error.retryAfterSeconds ?? 0) * 1000 : 0);
         const nonJson = error instanceof ZulipNoAnswer && error.kind === 'not-json';
         if (nonJson) {
           console.error(
@@ -404,7 +405,7 @@ export class ZulipEventLoop {
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          errMsg.replace(' Retry the read.', ' The server is retrying event polling.').replace(/\.$/, ''),
+          errMsg.replace(' Retry the read.', ' The server is retrying event polling.').replace(', then retry the read', ', then the server retries event polling').replace(/\.$/, ''),
         );
         await this.sleep(delay);
       }

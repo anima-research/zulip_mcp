@@ -1052,7 +1052,7 @@ for (const known of [false, true]) {
   });
 }
 
-test('move_messages keeps a stream lookup that got no answer as it is, with no pointer to list_streams, and moves nothing', async () => {
+test('move_messages sanitizes an unanswered stream lookup, with no pointer to list_streams, and moves nothing', async () => {
   const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => { throw new ZulipNoAnswer('timeout', 'GET', '/get_stream_id', false, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.'); } });
   try {
     await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' }), (err: Error) => {

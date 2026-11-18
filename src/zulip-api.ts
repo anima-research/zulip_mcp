@@ -197,6 +197,13 @@ function duration(ms: number): string {
   return ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
 }
 
+/** Retry-After permits delta seconds or an HTTP date; retain fractional delays. */
+export function parseRetryAfter(after: string | null | undefined): number | undefined {
+  if (!after) return undefined;
+  const seconds = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) : (Date.parse(after) - Date.now()) / 1000;
+  return Number.isFinite(seconds) ? Math.max(0, seconds) : undefined;
+}
+
 export function httpTransport(config: HttpTransportConfig): Transport {
   return async (method, path, params, opts) => {
     const timeoutMs = opts?.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -219,11 +226,7 @@ export function httpTransport(config: HttpTransportConfig): Transport {
     try {
       const response = await fetch(url, init);
       status = response.status;
-      const after = response.headers?.get('retry-after');
-      if (after) {
-        const seconds = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) : (Date.parse(after) - Date.now()) / 1000;
-        if (Number.isFinite(seconds)) retryAfterSeconds = Math.max(0, seconds);
-      }
+      retryAfterSeconds = parseRetryAfter(response.headers?.get('retry-after'));
       text = await response.text();
     } catch (err) {
       if (controller.signal.aborted) {

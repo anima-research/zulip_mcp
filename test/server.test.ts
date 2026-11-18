@@ -7483,7 +7483,7 @@ test('itemized realm results preserve synthetic IDs and isolate malformed entrie
     const h = harness({
       messageIds: new MessageIds(tag, 'strict'),
       incomingResults: messages => [
-        ...messages.map(m => ({ messageId: m.messageId, accepted: true })),
+        ...messages.map(m => ({ messageId: m.messageId, accepted: true })).reverse(),
         { accepted: true }, { messageId: 7, accepted: true },
         { messageId: `${tag}:not-a-number`, accepted: true }, null,
       ],
@@ -7491,7 +7491,7 @@ test('itemized realm results preserve synthetic IDs and isolate malformed entrie
     try {
       await initialize(h, true);
       const result = await (h.server as any).sendIncomingToHost([streamMsg(7), { ...streamMsg(8), messageId: eventId }]);
-      assert.deepEqual(result.results, [{ messageId: '7', accepted: true }, { messageId: eventId, accepted: true }]);
+      assert.deepEqual(result.results, [{ messageId: eventId, accepted: true }, { messageId: '7', accepted: true }]);
       assert.equal(h.incoming[0].messageId, `${tag}:7`);
       assert.ok(diagnostics.some(line => line.includes('Ignoring incoming result:') && line.includes(`strict mode (realm ${tag})`)));
     } finally { await h.close(); }
@@ -7560,7 +7560,7 @@ test('mixed scoped delivery settles accepted IDs but holds refused IDs below the
     messageIds: new MessageIds('reaction', 'strict'),
     history: [streamMsg(7), streamMsg(8)],
     incomingResults: messages => [
-      ...messages.map(m => ({ messageId: m.messageId, accepted: m.messageId !== 'reaction:8' })),
+      ...messages.map(m => ({ messageId: m.messageId, accepted: m.messageId !== 'reaction:8' })).reverse(),
       null, { accepted: true }, { messageId: 8, accepted: true },
       { messageId: 'reaction:bad', accepted: true },
     ],
@@ -7728,7 +7728,7 @@ test('listen and unlisten transport failures set the MCP isError flag', async ()
   }
 });
 
-test('accepted compact notice acknowledges its range once, without replay on open or restart', async () => {
+test('accepted compact notice does not recur when its durable watermark advances', async () => {
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const users = [42, ...Array.from({ length: 399 }, (_, i) => i + 10000)];
     const channelId = 'zulip:dm:' + users.join('+');
@@ -7878,7 +7878,97 @@ test('enabled incoming results reject non-boolean acceptance and normalized dupl
         const result = await (h.server as any).sendIncomingToHost([streamMsg(7)]);
         assert.deepEqual(result.results, []);
         assert.ok(logs.every(line => !line.includes('secret-host-payload')));
+        if (entries.length === 2) assert.ok(logs.some(line => line.includes('duplicate normalized ID \"7\"') && line.includes(`${mode} mode (realm alpha)`)));
+        else if (typeof entries[0].messageId === 'string') assert.ok(logs.some(line => line.includes('acceptance is not boolean')));
+        else assert.ok(logs.some(line => line.includes('<malformed ID>')));
       } finally { await h.close(); }
     }
   }
+});
+
+test('a replayable hold below a pending catch-up cannot offer its interval again', async () => {
+  for (const maxChars of [1000, 20000]) for (const accepted of [true, false]) {
+    const channelId = 'zulip:' + 'long'.repeat(400);
+    const descriptor = { ...DESCRIPTOR, id: channelId, label: '#long', address: { stream_id: 7, stream_name: channelId.slice(6) } };
+    const message = (id: number) => streamMsg(id, { channelId, mentioned: true });
+    const h = harness({ messageIds: new MessageIds('alpha', 'strict'), visible: [descriptor], history: [message(20)], missedBlockMaxChars: maxChars });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const key = h.adapter.keyOf(channelId);
+      h.delivery.advance(key, 9);
+      h.delivery.hold(key, 10, 'queued'); // not replayable during the gap's own recovery
+      h.adapter.emit!(message(20), descriptor);
+      await until(() => h.delivery.acceptedThrough(key) === 20, 'initial live message');
+      for (let id = 21; id <= 30; id++) h.adapter.history.push(message(id));
+      h.policy.holdPushes = true;
+      if (!accepted) h.policy.rejectPushes.add('alpha:30');
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+      await until(() => h.pushed.some(p => p.origin?.missed && p.origin.messageId === 'alpha:30'), 'pending catch-up');
+      // Re-arm a genuine replayable hold below the scan, not a queued hold inside it.
+      h.delivery.hold(key, 10, 'failed');
+      const calls = h.adapter.historyCalls.length;
+      (h.server as any).enterHeldReads();
+      await until(() => h.adapter.historyCalls.length > calls, 'held read actually ran');
+      await (h.server as any).lanes.quiet();
+      assert.equal(h.pushed.filter(p => p.origin?.missed && Number(String(p.origin.messageId).split(':').at(-1)) > 20).length, 1,
+        'no overlapping offer even when an older hold starts the read');
+      h.policy.holdPushes = false;
+      h.policy.heldPushes.splice(0).forEach(answer => answer());
+      await h.server.quiet();
+      if (!accepted) assert.ok(h.delivery.heldIds(key).includes(21), 'refused scan stays held');
+    } finally {
+      h.policy.holdPushes = false;
+      h.policy.heldPushes.splice(0).forEach(answer => answer());
+      await h.close();
+    }
+  }
+});
+
+test('acknowledgement parser diagnostics name the argument once', async () => {
+  const h = harness({ messageIds: new MessageIds('alpha', 'strict') });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: '123' }) as { acknowledged: boolean; reason: string };
+    assert.equal(result.acknowledged, false);
+    assert.match(result.reason, /^channels\/acknowledge: messageId="123":/);
+    assert.equal(result.reason.split('messageId="123"').length - 1, 1);
+  } finally { await h.close(); }
+});
+
+test('an accepted compact scan can recur after restart when an older hold pins its watermark', async () => {
+  const users = [42, ...Array.from({ length: 399 }, (_, i) => i + 10000)];
+  const channelId = 'zulip:dm:' + users.join('+');
+  const descriptor = { ...BO_DM, id: channelId, address: { dm: true, user_ids: users } };
+  const message = (id: number) => ({ ...boDm(id), channelId });
+  const dir = mkdtempSync(join(tmpdir(), 'pinned-scan-'));
+  const ids = new MessageIds('alpha', 'strict');
+  const options = { messageIds: ids, stateDir: dir, sessionId: 'pinned', visible: [descriptor], missedBlockMaxChars: 1000, catchupLimit: 200 };
+  const h = harness({ ...options, history: [message(100)] });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const key = h.adapter.keyOf(channelId);
+    h.delivery.advance(key, 98);
+    h.delivery.hold(key, 99, 'queued');
+    h.adapter.emit!(message(100), descriptor);
+    await until(() => h.delivery.acceptedThrough(key) === 100, 'initial DM accepted above hold');
+    for (let id = 101; id <= 200; id++) h.adapter.history.push(message(id));
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+    await until(() => h.pushed.some(p => firstText(p).includes('100 messages omitted')), 'accepted compact scan');
+    await h.server.quiet();
+    const text = h.pushed.map(firstText).find(text => text.includes('100 messages omitted'))!;
+    assert.match(text, /older hold outside this scan can cause it to recur after restart/);
+    assert.equal(h.delivery.watermark(key), 98);
+    assert.equal(h.delivery.acceptedThrough(key), 200);
+  } finally { await h.close(); }
+  const restarted = harness({ ...options, history: Array.from({ length: 101 }, (_, i) => message(i + 100)) });
+  try {
+    await initialize(restarted, true);
+    await settled(restarted);
+    await restarted.server.quiet();
+    assert.ok(restarted.pushed.some(p => firstText(p).includes('messages omitted') && firstText(p).includes('alpha:200')),
+      'watermark-only persistence allows the already accepted range to be offered again');
+  } finally { await restarted.close(); rmSync(dir, { recursive: true, force: true }); }
 });

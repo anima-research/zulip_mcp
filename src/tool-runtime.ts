@@ -357,7 +357,10 @@ export class ZulipToolRuntime {
       if (err instanceof SendRefused) {
         throw namePosted(new Error(`${posted.length > 0 ? "Zulip: " : ""}${err.answer.msg ?? "Zulip refused the message"}`), posted, this.messageIds);
       }
-      if (err instanceof MessageLinkRefused) throw new Error(`${err.message} Nothing was sent.`);
+      if (err instanceof MessageLinkRefused) {
+        err.message += " Nothing was sent.";
+        throw err;
+      }
       throw err instanceof Error ? namePosted(err, posted, this.messageIds) : err;
     }
   }
@@ -867,7 +870,10 @@ export class ZulipToolRuntime {
         try {
           content = await linkMessages(api, tabled, edited, "refuse", this.messageIds);
         } catch (err) {
-          if (err instanceof MessageLinkRefused) throw new Error(`${err.message} The message wasn't edited.`);
+          if (err instanceof MessageLinkRefused) {
+            err.message += " The message wasn't edited.";
+            throw err;
+          }
           throw err;
         }
         const length = [...content].length;

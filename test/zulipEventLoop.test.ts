@@ -549,3 +549,21 @@ for (const mode of ['compat', 'strict'] as const) {
     assert.equal(failure.message, 'private upstream response body');
   });
 }
+
+test('event polling honors Retry-After even beyond the exponential-backoff cap', async t => {
+  t.mock.method(console, 'error', () => {});
+  for (const seconds of [60, 0.5]) {
+    let loop: ZulipEventLoop;
+    const { delays, sleep } = makeSleepRecorder(() => loop, 1);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, degradedThreshold: 1 });
+    const { api } = standInApi({
+      'POST /register': { queue_id: 'q1', last_event_id: -1 },
+      'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, seconds); },
+    });
+    await loop.start(api, () => {}, event => events.push(event));
+    assert.deepEqual(delays, [Math.max(2000, seconds * 1000)]);
+    assert.match(events[0].text, new RegExp(`Retry after ${seconds} seconds, then the server retries event polling`));
+    assert.doesNotMatch(events[0].text, /retry the read/i);
+  }
+});

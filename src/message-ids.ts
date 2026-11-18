@@ -101,7 +101,7 @@ export function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
-type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean };
+type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean; retryAfterSeconds?: number };
 const nativeTransportErrors = new WeakMap<Error, TransportFacts>();
 /** Mark failures at the fetch boundary, not by their JavaScript error class. */
 export function markTransportError(error: unknown, facts: TransportFacts = {}): unknown {
@@ -132,11 +132,11 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
       if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
-      if (copy.method === 'GET' && copy.kind !== 'no-self-id') detail += ' Retry the read.';
+      if (copy.method === 'GET' && copy.kind !== 'no-self-id' && copy.retryAfterSeconds === undefined) detail += ' Retry the read.';
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
-      if (copy.retryAfterSeconds !== undefined) detail += ` Retry after ${copy.retryAfterSeconds} seconds.`;
+      if (copy.retryAfterSeconds !== undefined) detail += ` Retry after ${copy.retryAfterSeconds} seconds${copy.method === 'GET' ? ', then retry the read' : ''}.`;
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
@@ -145,10 +145,11 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
         ? `${facts.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
         : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `
         + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
-          : facts?.operation === 'Upload' ? 'No uploaded path was confirmed. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
+          : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
           : 'Retry reads; verify the outcome before repeating writes.'))
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
-        + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '');
+        + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '')
+        + (facts?.retryAfterSeconds !== undefined ? ` Retry after ${facts.retryAfterSeconds} seconds.` : '');
       Object.defineProperty(copy, 'message', { value: detail, writable: true, configurable: true });
     }
     Object.defineProperty(copy, 'cause', { value: undefined, configurable: true });

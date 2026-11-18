@@ -333,3 +333,23 @@ test('R8: send_message\'s text tells the agent about the token', () => {
   const tool = toolDefinitions.find((t) => t.name === 'send_message')!;
   assert.ok(tool.description.endsWith(" Supports attachments. In a message's text, [[msg:ID]] becomes a link to the stream message with that id."));
 });
+
+test('lookup failures log the original exception once across send/edit wrappers and as-typed publish', async t => {
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const z = zulip(PUBLIC, MESSAGES, undefined, { noAnswer: [5005] });
+  try {
+    for (const name of ['send_message', 'edit_message']) {
+      logs.length = 0;
+      await assert.rejects(z.runtime.handleToolCall(name, { type: 'stream', to: 'general', topic: 't', message_id: 1001, content: '[[msg:5005]]' }), /transport failure/);
+      assert.equal(logs.length, 1, name);
+      assert.ok(logs[0][1] instanceof ZulipNoAnswer);
+      assert.match((logs[0][1] as Error).stack!, /Zulip gave no answer/);
+    }
+    logs.length = 0;
+    await z.adapter.publish({ streamName: 'general' }, undefined, [{ type: 'text', text: '[[msg:5005]]' }]);
+    assert.equal(logs.length, 1);
+    assert.ok(logs[0][1] instanceof ZulipNoAnswer);
+    assert.deepEqual(z.posts(), ['[[msg:5005]]'], 'best-effort publish still sends as typed');
+  } finally { z.done(); }
+});

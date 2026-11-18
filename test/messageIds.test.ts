@@ -399,7 +399,10 @@ test('strict missing required IDs give tagged guidance; compat trims read anchor
 });
 
 test('profile and all additional structured message cursors are projected, not unrelated IDs', async t => {
-  const fields = ['max_message_id', 'min_message_id', 'latestMessageId', 'beforeMessageId', 'afterMessageId', 'scannedThrough'];
+  const fields = ['message_id', 'messageId', 'targetMessageId', 'oldest_id', 'newest_id',
+    'sinceMessageId', 'talliedThroughMessageId', 'last_message_id', 'latest_message_id', 'last_read_message_id', 'lastReadMessageId', 'lastMessageId',
+    'first_message_id', 'first_message_id_allowed_to_move', 'max_id', 'max_message_id', 'min_message_id',
+    'latestMessageId', 'beforeMessageId', 'afterMessageId', 'scannedThrough'];
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     const record = { ...Object.fromEntries(fields.map(key => [key, 7])),

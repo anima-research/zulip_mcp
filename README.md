@@ -120,10 +120,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   has accepted a message (itemized `channels/incoming` results, acknowledged
   `push/event`). A channel the host has accepted nothing on gets one just
   below its first message that isn't accepted, and while `zulip.messaging`
-  is disabled, as that message comes in. It never advances past a message
-  the host was offered but did not accept — a refusal, a batch lost to a
-  transport failure — which is replayed from history once the host answers
-  again. The exception is a channel that is muted or outside the allowlist
+  is disabled, as that message comes in. A refused or transport-lost offer holds
+  the watermark back until replay or acceptance of a later catch-up scan that
+  includes it (including compact notices acknowledging omitted rows).
+  Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.
   On the next connection one or more `<missed>` blocks per channel
