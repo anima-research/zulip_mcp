@@ -122,7 +122,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   below its first message that isn't accepted, and while `zulip.messaging`
   is disabled, as that message comes in. A refused or transport-lost offer holds
   the watermark back until replay or acceptance of a later catch-up scan that
-  includes it (including compact notices acknowledging omitted rows).
+  includes it (including compact notices acknowledging omitted rows), subject to
+  the 50,000 held-ID cap: untracked refusals can be passed after older holds
+  release, so automatic restart recovery is not guaranteed at that cap.
   Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.

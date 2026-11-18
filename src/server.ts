@@ -46,7 +46,7 @@ import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, P
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
-import { describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { hasLoggedDiagnostic, describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
@@ -698,7 +698,7 @@ export class ZulipMcplServer {
       return;
     }
     const e = messageIdError(err, this.messageIds, false);
-    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
+    if (!hasLoggedDiagnostic(err)) console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
     conn.sendError(req.id, -32603, e.message);
   }
 
@@ -2463,22 +2463,22 @@ export class ZulipMcplServer {
       const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
       const numericOriginals = new Map(messages.filter(m => /^[0-9]+$/.test(m.messageId))
         .map(m => [Number(m.messageId), m.messageId]));
+      const counts = new Map<string, number>();
       const results = result.results.flatMap(r => {
         let original = r && typeof r.messageId === 'string' ? originals.get(r.messageId) : undefined;
         if (original === undefined && r && typeof r.messageId === 'string') {
           try { original = numericOriginals.get(this.messageIds.parse(r.messageId)); } catch { /* diagnosed below */ }
         }
+        if (original !== undefined) counts.set(original, (counts.get(original) ?? 0) + 1);
         if (original === undefined || typeof r.accepted !== 'boolean') {
-          const id = typeof r?.messageId === 'string' && /^[a-zA-Z0-9:_-]{1,100}$/.test(r.messageId) ? JSON.stringify(r.messageId) : '<malformed ID>';
           const reason = original === undefined ? 'malformed ID or not in offered batch' : 'acceptance is not boolean';
-          console.error(`[zulip-mcp] Ignoring incoming result: ${id}: ${reason} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
+          console.error(`[zulip-mcp] Ignoring incoming result: ${reason} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
           return [];
         }
         return [{ ...r, messageId: original }];
       });
       // Refuse ambiguous duplicates after normalization, regardless of spelling.
-      const counts = new Map<string, number>();
-      for (const r of results) counts.set(r.messageId, (counts.get(r.messageId) ?? 0) + 1);
+      // Count recognized IDs even when their acceptance value is malformed.
       for (const [id, count] of counts) if (count > 1) {
         console.error(`[zulip-mcp] Ignoring incoming result: duplicate normalized ID ${JSON.stringify(id)} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}); ${count} entries in offered batch.`);
       }

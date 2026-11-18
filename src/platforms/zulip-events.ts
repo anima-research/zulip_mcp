@@ -393,8 +393,8 @@ export class ZulipEventLoop {
         const errMsg = diagnostic instanceof Error ? diagnostic.message : String(diagnostic);
 
         this.consecutiveFailures++;
-        const delay = Math.max(this.backoffDelay(this.consecutiveFailures),
-          error instanceof ZulipNoAnswer ? (error.retryAfterSeconds ?? 0) * 1000 : 0);
+        const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures),
+          error instanceof ZulipNoAnswer ? (error.retryAfterSeconds ?? 0) * 1000 : 0));
         const nonJson = error instanceof ZulipNoAnswer && error.kind === 'not-json';
         if (nonJson) {
           console.error(

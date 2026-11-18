@@ -7927,6 +7927,8 @@ test('enabled incoming results reject non-boolean acceptance and normalized dupl
     for (const entries of [
       [{ messageId: 'alpha:7', accepted: 'false' }],
       [{ messageId: 'alpha:7', accepted: false }, { messageId: mode === 'compat' ? '0007' : 'alpha:007', accepted: true }],
+      [{ messageId: 'alpha:7', accepted: true }, { messageId: 'alpha:007', accepted: 'false' }],
+      [{ messageId: 'secret-host-payload', accepted: true }],
       [{ messageId: { credential: 'secret-host-payload'.repeat(1000) }, accepted: true }],
     ]) {
       const h = harness({ messageIds: new MessageIds('alpha', mode), incomingResults: () => entries });
@@ -7936,8 +7938,8 @@ test('enabled incoming results reject non-boolean acceptance and normalized dupl
         assert.deepEqual(result.results, []);
         assert.ok(logs.every(line => !line.includes('secret-host-payload')));
         if (entries.length === 2) assert.ok(logs.some(line => line.includes('duplicate normalized ID \"7\"') && line.includes(`${mode} mode (realm alpha)`)));
-        else if (typeof entries[0].messageId === 'string') assert.ok(logs.some(line => line.includes('acceptance is not boolean')));
-        else assert.ok(logs.some(line => line.includes('<malformed ID>')));
+        else if (typeof entries[0].accepted !== 'boolean') assert.ok(logs.some(line => line.includes('acceptance is not boolean')));
+        else assert.ok(logs.some(line => line.includes('malformed ID or not in offered batch')));
       } finally { await h.close(); }
     }
   }
@@ -8029,3 +8031,93 @@ test('an accepted compact scan can recur after restart when an older hold pins i
       'watermark-only persistence allows the already accepted range to be offered again');
   } finally { await restarted.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+for (const mode of ['legacy', 'strict'] as const) {
+  test(`rev15 public upload_file retains Retry-After on malformed success in ${mode}`, async t => {
+    const { createZulipUploader } = await import('../src/uploads.ts');
+    const logs: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+    const dir = mkdtempSync(join(tmpdir(), 'upload-receipt-'));
+    const ids = new MessageIds('alpha', mode);
+    const session = { api: standInApi({}).api, selfUserId: 1, realm: 'https://alpha.example', authHeader: 'test', sessionId: 'test' };
+    const uploader = createZulipUploader(session, async () => new Response('{"result":"success"}', { headers: { 'Retry-After': '120' } }));
+    const tools = new ZulipToolRuntime(session, dir, { messageIds: ids, uploader });
+    const h = harness({ tools, messageIds: ids });
+    try {
+      await initialize(h, false);
+      const result = await h.host.sendRequest('tools/call', { name: 'upload_file', arguments: { data: 'YQ==', name: 'a.txt' } }) as { isError: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /HTTP 200/);
+      assert.match(result.content[0].text, /duplicate/);
+      assert.match(result.content[0].text, /Retry after 120 seconds/);
+      assert.equal(logs.filter(args => args[0] === '[zulip diagnostic]').length, 1);
+    } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test(`rev15 public fetch_attachment keeps main input restrictions and origin checks in ${mode}`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const fetched: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (url: unknown) => {
+      fetched.push(String(url));
+      return new Response('hello', { headers: { 'Content-Type': 'text/plain' } });
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'attachment-input-'));
+    const ids = new MessageIds('alpha', mode);
+    const tools = new ZulipToolRuntime({ api: standInApi({}).api, selfUserId: 1, realm: 'https://alpha.example', authHeader: 'test', sessionId: 'test' }, dir, { messageIds: ids });
+    const h = harness({ tools, messageIds: ids });
+    try {
+      await initialize(h, false);
+      for (const path of ['HTTPS://alpha.example/user_uploads/a.txt', '//alpha.example/user_uploads/a.txt', '//foreign.example/user_uploads/a.txt', '/\\foreign.example/user_uploads/a.txt', '/user_uploads/../api/v1/users/me']) {
+        const result = await h.host.sendRequest('tools/call', { name: 'fetch_attachment', arguments: { path } }) as { isError?: boolean };
+        assert.equal(result.isError, true, path);
+      }
+      assert.deepEqual(fetched, [], 'rejected inputs never send credentials');
+      for (const path of ['/user_uploads/a.txt', 'user_uploads/a.txt', 'https://alpha.example/user_uploads/a.txt']) {
+        const result = await h.host.sendRequest('tools/call', { name: 'fetch_attachment', arguments: { path } }) as { isError?: boolean };
+        assert.notEqual(result.isError, true, path);
+      }
+      assert.deepEqual(fetched, Array(3).fill('https://alpha.example/user_uploads/a.txt'));
+    } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test(`rev15 public MCPL publish preserves partial upload receipts in ${mode}`, async t => {
+    const { createZulipUploader, resolveUploadPolicy } = await import('../src/uploads.ts');
+    const logs: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+    const ids = new MessageIds('alpha', mode);
+    const stand = standInApi({ 'POST /messages': { result: 'success', id: 42 } });
+    let uploads = 0;
+    const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => {
+      uploads++;
+      return uploads === 2 ? new Response('private proxy text', { status: 503, headers: { 'Retry-After': '120' } })
+        : new Response('{"result":"success","url":"/user_uploads/confirmed.png"}');
+    });
+    const h = harness({ messageIds: ids });
+    // Use the normal stream harness for discovery, but the real adapter's
+    // publish/send/upload implementation (not a fake publish result).
+    const real = new ZulipAdapter(stand.api, { selfUserId: 1 }, { directory: h.server.directory, messageIds: ids, uploader, uploadPolicy: resolveUploadPolicy({}) });
+    h.adapter.publish = real.publish.bind(real);
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const content: ContentBlock[] = [1, 2].map(() => ({ type: 'image', mimeType: 'image/png', data: 'YQ==' }));
+      await assert.rejects(h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'zulip:general', content }), (error: Error) => {
+        assert.match(error.message, /HTTP 503.*Retry after 120 seconds/);
+        assert.match(error.message, /duplicate/);
+        assert.doesNotMatch(error.message, /private proxy/);
+        assert.match(error.message, /Earlier attachment uploads confirmed:.*\/user_uploads\/confirmed.png/);
+        assert.match(error.message, /No message was sent/);
+        assert.match(error.message, /Retrying the original publish uploads those attachments again; reuse the confirmed paths instead/);
+        return true;
+      });
+      assert.equal(uploads, 2);
+      assert.equal(stand.calls.length, 0, 'no message posted after partial upload failure');
+      assert.equal(logs.filter(args => args[0] === '[zulip diagnostic]').length, 1);
+      assert.equal(logs.filter(args => String(args[0]).includes('handleRequest error')).length, 0);
+      const result = await h.host.sendRequest(method.CHANNELS_PUBLISH, { channelId: 'zulip:general', content: content.slice(0, 1) });
+      assert.equal((result as { delivered: boolean }).delivered, true);
+      assert.equal((result as { messageId: string }).messageId, mode === 'legacy' ? '42' : 'alpha:42');
+      assert.equal(stand.calls.filter(call => call.path === '/messages').length, 1);
+    } finally { await h.close(); }
+  });
+}

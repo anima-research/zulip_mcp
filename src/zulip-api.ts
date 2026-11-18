@@ -200,6 +200,8 @@ function duration(ms: number): string {
 /** Retry-After permits delta seconds or an HTTP date; retain fractional delays. */
 export function parseRetryAfter(after: string | null | undefined): number | undefined {
   if (!after) return undefined;
+  after = after.trim();
+  if (!/^\d+(?:\.\d+)?$/.test(after) && !/^[A-Za-z]{3,9},? /.test(after)) return undefined;
   const seconds = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) : (Date.parse(after) - Date.now()) / 1000;
   return Number.isFinite(seconds) ? Math.max(0, seconds) : undefined;
 }

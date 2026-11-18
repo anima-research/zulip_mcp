@@ -138,16 +138,19 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         original = error;
         unreadable = true;
       }
+      // These statuses reject the request before storage. Timeouts, conflicts,
+      // redirects and server/proxy failures do not establish that nothing was stored.
+      const refused = completed && [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(res.status);
       if (!res.ok || body.result !== 'success') {
         const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
-        throw unreadable || res.status >= 500 || body.result !== 'error'
-          ? markTransportError(error, { operation: 'Upload', status: res.status, original, completed: completed && !res.ok, retryAfterSeconds }) : error;
+        throw unreadable || !refused || body.result !== 'error'
+          ? markTransportError(error, { operation: 'Upload', status: res.status, original, completed, refused, retryAfterSeconds }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.
       const path = body.url ?? body.uri;
       if (typeof path !== 'string' || !path.startsWith('/user_uploads/')) {
-        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', status: res.status });
+        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', status: res.status, completed, retryAfterSeconds });
       }
       return { name: input.name, path, url: `${realm}${path}` };
     },
@@ -440,10 +443,7 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
       out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data }));
     }
   } catch (error) {
-    if (out.length === 0) throw error;
-    const safe = messageIdError(error, LEGACY_IDS);
-    safe.message += ` Earlier attachment uploads confirmed: ${JSON.stringify(out.map(file => file.path))}. No message was sent. Retrying the original send uploads those attachments again; reuse the confirmed paths instead.`;
-    throw safe;
+    throw partialUploadError(error, out, 'send');
   } finally {
     await closeAll(prepared);
   }
@@ -497,17 +497,32 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
   return prepared;
 }
 
+/** Retain confirmed receipts independently of the failing attempt's uncertainty. */
+function partialUploadError(error: unknown, confirmed: UploadedFile[], operation: 'send' | 'publish'): unknown {
+  if (confirmed.length === 0) return error;
+  const safe = messageIdError(error, LEGACY_IDS);
+  safe.message += ` Earlier attachment uploads confirmed: ${JSON.stringify(confirmed.map(file => file.path))}. No message was sent. Retrying the original ${operation} uploads those attachments again; reuse the confirmed paths instead.`;
+  return safe;
+}
+
 export async function uploadBlocks(uploader: Uploader, blocks: ContentBlock[], policy: UploadPolicy): Promise<UploadedFile[]> {
+  const prepared = await prepareBlocks(blocks, policy);
   const out: UploadedFile[] = [];
-  for (const p of await prepareBlocks(blocks, policy)) {
-    const data = await p.read();
-    let mimeType = p.mimeType;
-    let name = p.name;
-    if (!mimeType && name.startsWith('image-')) {
-      mimeType = sniffImageType(data);
-      if (mimeType) name = name.replace(/\.bin$/, `.${extensionFor(mimeType)}`);
+  try {
+    for (const p of prepared) {
+      const data = await p.read();
+      let mimeType = p.mimeType;
+      let name = p.name;
+      if (!mimeType && name.startsWith('image-')) {
+        mimeType = sniffImageType(data);
+        if (mimeType) name = name.replace(/\.bin$/, `.${extensionFor(mimeType)}`);
+      }
+      out.push(await uploader.upload({ name, mimeType, data }));
     }
-    out.push(await uploader.upload({ name, mimeType, data }));
+  } catch (error) {
+    throw partialUploadError(error, out, 'publish');
+  } finally {
+    await closeAll(prepared);
   }
   return out;
 }

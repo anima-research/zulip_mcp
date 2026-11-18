@@ -61,7 +61,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
       globalThis.fetch = (async () => {
         requests++;
         if (stage === 'fetch' || stage === 'upload') throw failure;
-        if (stage === 'upload-body') return { ok: true, status: 200, json: async () => { throw failure; } };
+        if (stage === 'upload-body') return { ok: true, status: 200, text: async () => { throw failure; }, json: async () => { throw failure; } };
         return {
           ok: true, headers: new Headers(),
           body: stage === 'buffer' ? null : { getReader: () => ({ read: async () => { throw failure; } }) },
@@ -174,7 +174,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: 'Basic secret', sessionId: 'test' }, dir,
       { messageIds: new MessageIds('alpha', mode) });
     for (const path of [
-      '//foreign.example/user_uploads/a', 'https://foreign.example/user_uploads/a',
+      '//foreign.example/user_uploads/a', '//alpha.example/user_uploads/a', 'HTTPS://alpha.example/user_uploads/a', 'https://foreign.example/user_uploads/a',
       String.raw`/\foreign.example/user_uploads/a`, String.raw`\\foreign.example\user_uploads\a`,
       String.raw`https:\\foreign.example\user_uploads\a`,
       '//%66oreign.example/user_uploads/a', 'https://%66oreign.example/user_uploads/a',
@@ -187,11 +187,11 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
     }
     assert.equal(requests.length, 0);
     assert.equal(calls.length, 0);
-    for (const path of ['/user_uploads/a', 'user_uploads/a', 'https://alpha.example/user_uploads/a', '//alpha.example/user_uploads/a']) {
+    for (const path of ['/user_uploads/a', 'user_uploads/a', 'https://alpha.example/user_uploads/a']) {
       const result = await runtime.handleToolCall('fetch_attachment', { path }) as { content_text: string };
       assert.equal(result.content_text, 'safe');
     }
-    assert.equal(requests.length, 4);
+    assert.equal(requests.length, 3);
     assert.ok(requests.every(r => r.url === 'https://alpha.example/user_uploads/a' && r.auth === 'Basic secret'));
   });
 

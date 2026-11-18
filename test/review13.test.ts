@@ -119,10 +119,10 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
   test(`${mode} proxy JSON and malformed successful uploads retain uncertainty without leaking text`, async t => {
     t.mock.method(console, 'error', () => {});
     for (const [status, body] of [[502, { msg: 'private proxy text' }], [200, {}], [200, null], [200, { result: 'success' }]] as const) {
-      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({ ok: status === 200, status, json: async () => body }));
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({ ok: status === 200, status, text: async () => JSON.stringify(body), json: async () => body }));
       await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
         const safe = messageIdError(error, ids);
-        assert.match(safe.message, status >= 500 ? /Upload was refused by the server/ : /No uploaded path was confirmed.*duplicate/);
+        assert.match(safe.message, /No uploaded path was confirmed.*duplicate/);
         assert.match(safe.message, new RegExp(`HTTP ${status}`));
         assert.doesNotMatch(safe.message, /private/);
         return true;
@@ -141,7 +141,7 @@ test('non-JSON transport failures retain numeric and date Retry-After headers', 
     await assert.rejects(httpTransport({ apiUrl: 'https://alpha.example/api/v1', authHeader: '' })('GET', '/messages', {}, {}), error => {
       assert.ok(error instanceof ZulipNoAnswer);
       assert.equal(error.retryAfterSeconds, seconds);
-      assert.match(messageIdError(error, new MessageIds('alpha', 'strict')).message, /HTTP 503.*Retry after/);
+      assert.match(messageIdError(error, new MessageIds('alpha', 'strict')).message, new RegExp(`HTTP 503.*Retry after ${seconds} seconds`));
       return true;
     });
   }
@@ -197,17 +197,17 @@ test('completed upload refusals differ from truncated response bodies in every m
       const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => new Response(text, { status, headers: { 'Retry-After': '120' } }));
       await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
         const safe = messageIdError(error, ids);
-        assert.match(safe.message, /Upload was refused by the server/);
+        assert.match(safe.message, status === 413 ? /Upload was refused by the server/ : /No uploaded path was confirmed.*duplicate/);
         assert.match(safe.message, new RegExp(`HTTP ${status}.*Retry after 120 seconds`));
-        assert.doesNotMatch(safe.message, /before a complete|duplicate|private|<html>/);
+        assert.doesNotMatch(safe.message, /before a complete|private|<html>/);
         return true;
       });
     }
     const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({
-      ok: false, status: 503, text: async () => { throw new TypeError('socket lost'); }, json: async () => ({}),
+      ok: false, status: 503, headers: { get: () => '120' }, text: async () => { throw new TypeError('socket lost'); }, json: async () => ({}),
     }));
     await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
-      assert.match(messageIdError(error, ids).message, /before a complete.*No uploaded path was confirmed.*HTTP 503/);
+      assert.match(messageIdError(error, ids).message, /before a complete.*No uploaded path was confirmed.*HTTP 503.*Retry after 120 seconds/);
       return true;
     });
   }

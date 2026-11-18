@@ -151,6 +151,16 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   } catch {
     throw new Error("Invalid configured realm URL; use an HTTP(S) origin, optionally suffixed /api, without credentials, query or fragment; ask the host operator to repair the configuration.");
   }
+  // Preserve main's input grammar: only lowercase http(s) prefixes denote
+  // absolute URLs; other spellings must parse as /user_uploads/ paths when
+  // appended to the origin. In particular, //host and HTTPS:// are not aliases.
+  if (!rawPath.startsWith('http://') && !rawPath.startsWith('https://')) {
+    const path = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    const legacyUrl = new URL(realm.origin + path);
+    if (!legacyUrl.pathname.startsWith('/user_uploads/')) {
+      throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${legacyUrl.pathname})`);
+    }
+  }
   // Check the resolved URL, not its spelling: protocol-relative paths and
   // WHATWG backslash/host normalization can change the origin during parsing.
   const url = new URL(rawPath, realm.origin + '/');

@@ -80,8 +80,11 @@ write-outcome uncertainty in agent-facing errors, but omit raw transport paths
 and bodies. Original transport diagnostics go to stderr. Errors marked at the native fetch boundary (not arbitrary local TypeErrors) are replaced with safe uncertainty guidance;
 ordinary Zulip refusals and validation messages remain unchanged. Completed HTTP
 attachment refusals report their status and corrective checks, not an incomplete
-download or a blind retry. Upload proxy failures and malformed successful upload
-responses retain duplicate-upload uncertainty. Attachment URLs accept origin and
+download or a blind retry. Complete upload responses with rejection statuses
+400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals. Other upload
+responses, including all 5xx/proxy failures, incomplete bodies and malformed
+successful responses, retain duplicate-upload uncertainty; a complete body alone
+does not prove that nothing was stored. Attachment URLs accept origin and
 `/api`-suffixed realm configurations; only the initial URL is checked for same-origin
 `/user_uploads/` authorization. Redirect destinations follow native fetch policy
 and are not revalidated. Credential-bearing URLs and encoded path separators are

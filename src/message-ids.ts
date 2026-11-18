@@ -101,7 +101,7 @@ export function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
-type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean; retryAfterSeconds?: number };
+type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean; refused?: boolean; retryAfterSeconds?: number };
 const nativeTransportErrors = new WeakMap<Error, TransportFacts>();
 /** Mark failures at the fetch boundary, not by their JavaScript error class. */
 export function markTransportError(error: unknown, facts: TransportFacts = {}): unknown {
@@ -110,6 +110,11 @@ export function markTransportError(error: unknown, facts: TransportFacts = {}): 
 }
 
 const loggedDiagnostics = new WeakSet<Error>();
+
+/** Contextual boundaries must not log an error already logged by an inner boundary. */
+export function hasLoggedDiagnostic(error: unknown): boolean {
+  return error instanceof Error && loggedDiagnostics.has(error);
+}
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
  * Copies may safely be annotated by callers, in every ID mode.
@@ -141,9 +146,9 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
       const facts = nativeTransportErrors.get(error as Error);
-      const detail = (facts?.completed
-        ? `${facts.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
-        : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `
+      const detail = ((facts?.operation === 'Upload' ? facts.refused : facts?.completed)
+        ? `${facts?.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
+        : (facts?.completed ? `${facts.operation ?? 'Request'} returned no confirmed usable result. ` : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `)
         + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
           : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
           : 'Retry reads; verify the outcome before repeating writes.'))
