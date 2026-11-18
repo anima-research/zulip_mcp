@@ -1,4 +1,5 @@
-import { messageIdError, markTransportError, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { messageIdError, markTransportError, attachmentWasRefused, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { parseRetryAfter } from './zulip-api.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -145,7 +146,8 @@ export async function fetchCapped(
   signal: AbortSignal,
 ): Promise<FetchedBytes> {
   const res = await fetch(url, { headers, redirect: 'follow', signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
-  if (!res.ok) throw markTransportError(new Error(`HTTP ${res.status}`), { operation: 'Attachment download', status: res.status, completed: true });
+  const retryAfterSeconds = parseRetryAfter(res.headers.get('retry-after'));
+  if (!res.ok) throw markTransportError(new Error(`HTTP ${res.status}`), { operation: 'Attachment download', status: res.status, completed: true, retryAfterSeconds });
   const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
   const declared = Number(res.headers.get('content-length') ?? '');
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -156,7 +158,7 @@ export async function fetchCapped(
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
-    const { done, value } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: res.status }); });
+    const { done, value } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: res.status, retryAfterSeconds }); });
     if (done) break;
     total += value.length;
     if (total > maxBytes) {
@@ -264,7 +266,8 @@ export async function buildAttachmentBlocks(
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
     } catch (err) {
-      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${messageIdError(err, messageIds).message}); fetch_attachment ${ref.path}]`));
+      const remedy = attachmentWasRefused(err) ? `check access and the attachment path ${ref.path} before retrying` : `fetch_attachment ${ref.path}`;
+      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${messageIdError(err, messageIds).message}); ${remedy}]`));
     }
   }
   return blocks;

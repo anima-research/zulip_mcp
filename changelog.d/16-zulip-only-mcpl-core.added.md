@@ -1,11 +1,10 @@
 - Closed-channel delivery (#16): mentions and DMs on channels the host has
   not opened arrive as `push/event` with the missed-ambient tally in the
   origin; ambient on closed channels is counted (`channel_missed`).
-- Catch-up: persisted per-channel watermarks that advance only on the host's
-  acceptance and never past a message the host was offered but did not
-  accept (a refusal, a batch lost to a transport failure) — such a message
-  is replayed from history once the host answers again, or by the next
-  connection's sweep; a `<missed>` block per channel on reconnect (full
+- Catch-up: persisted per-channel watermarks track host acceptance; refused
+  or failed messages pin progress until replay or an accepted later scan
+  acknowledges the same range (including declared omissions). Holds outside
+  an accepted scan still pin the watermark; a `<missed>` block per channel on reconnect (full
   backscroll for channels the host had open, mention ±7 otherwise), paged
   up to `ZULIP_CATCHUP_LIMIT` and hard-capped by
   `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry is healed from

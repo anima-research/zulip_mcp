@@ -78,7 +78,7 @@ ignored independently; diagnostics omit the returned payload, never settling an 
 All ID modes keep transport timeout seconds, HTTP status, retry advice and
 write-outcome uncertainty in agent-facing errors, but omit raw transport paths
 and bodies. Original transport diagnostics go to stderr. Errors marked at the native fetch boundary (not arbitrary local TypeErrors) are replaced with safe uncertainty guidance;
-ordinary Zulip refusals and validation messages remain unchanged. Completed HTTP
+ordinary Zulip refusals and validation messages retain their text; upload refusals append received Retry-After advice. Completed HTTP
 attachment refusals report their status and corrective checks, not an incomplete
 download or a blind retry. Complete upload responses with rejection statuses
 400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals. Other upload
@@ -95,19 +95,26 @@ When a long channel ID forces the bounded catch-up fallback, the compact notice
 names the omitted count and first/last message IDs. Its `fetch_around` pointer
 recovers the first message and context, including a pageable `channelId` for DMs; `fetch_history`
 can then page through the omitted range. Acceptance acknowledges the omissions,
-advances the watermark through the scan, including unselected messages and earlier
-holds within that scan. No-repeat across restart is guaranteed only for ranges at
-or below the saved watermark. An earlier hold outside the scan can pin that
-watermark: acceptance of a later range is not independently persisted, and that
+records progress through the scan, including unselected messages and earlier
+holds within that scan; the durable watermark advances only as far as remaining
+holds permit. Ordinary catch-up starts after the saved watermark, but Option B
+also persists up to 50 held IDs per channel and offers those passed by the
+watermark once by ID on the next start (see the README recovery limits).
+An earlier hold outside the scan can pin the watermark: acceptance of a later range is not independently persisted, and that
 range can be offered again, including after restart. Explicit history reads remain available. Recovery covers fetched rows only,
 not an unfetched interval or overflow beyond the existing held-ID cap.
 Unread aggregates are null when any channel check failed; summary counts are
 labelled “At least” in that case.
 
-Legacy compatibility corrections: ordinary catch-up pointers retain their original
-channel quoting bytes, and ordinary acknowledgement refusals retain their original
-reason without a context prefix. The compact-notice recovery error fix also makes
+Legacy compatibility corrections: catch-up pointers now JSON-escape channel
+arguments in every mode so quotes and backslashes remain usable. Ordinary
+acknowledgement refusals retain their original reason without a context prefix. The compact-notice recovery error fix also makes
 `fetch_around` return DM channel fields in every mode, rather than an unusable null.
 No successful stream read or message-ID representation changes in legacy mode.
 No earlier live-contract run is offered as evidence for this revision; its code,
 server and runtime versions were not recorded with the cited result.
+
+Pending catch-up offers do not exclude overlapping history scans: this can repeat
+already offered rows, but must not suppress an unoffered addressed tail. Catch-up
+answers from an older connection generation cannot clear or recreate current
+holds. Accepted answers still drain on shutdown before a replacement begins.

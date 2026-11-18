@@ -735,9 +735,9 @@ export class ChannelManager {
       byKey.set(m.key, entry);
     }
     if (rejected > 0) {
-      console.error(this.messageIds.mode === 'legacy'
-        ? `Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`
-        : `Host did not confirm acceptance of ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
+      console.error(`Host did not confirm acceptance of ${rejected} of ${allMessages.length} incoming message(s); delivery is unconfirmed`);
+      const synthetic = [...byKey.values()].flatMap(entry => entry.rejected).filter(m => !/^[0-9]+$/.test(m.messageId)).length;
+      if (synthetic > 0) console.error(`${synthetic} unconfirmed synthetic event(s) cannot be replayed from message history`);
     }
     for (const [key, entry] of byKey) {
       try {

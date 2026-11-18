@@ -109,11 +109,24 @@ export function markTransportError(error: unknown, facts: TransportFacts = {}): 
   return error;
 }
 
+export function attachmentWasRefused(error: unknown): boolean {
+  return error instanceof Error && nativeTransportErrors.get(error)?.operation === 'Attachment download' && nativeTransportErrors.get(error)?.completed === true;
+}
+
 const loggedDiagnostics = new WeakSet<Error>();
 
 /** Contextual boundaries must not log an error already logged by an inner boundary. */
 export function hasLoggedDiagnostic(error: unknown): boolean {
   return error instanceof Error && loggedDiagnostics.has(error);
+}
+
+/** Preserve operator-only originals and share ownership across contextual boundaries. */
+export function logDiagnostic(error: unknown, context = '[zulip diagnostic]'): void {
+  if (error instanceof Error) {
+    if (safeTransport in error || loggedDiagnostics.has(error)) return;
+    loggedDiagnostics.add(error);
+  }
+  console.error(context, error instanceof Error ? nativeTransportErrors.get(error)?.original ?? error : error);
 }
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
@@ -128,16 +141,14 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
   const nativeTransport = error instanceof Error && nativeTransportErrors.has(error);
   // Callers that already log contextual diagnostics opt out; keep original causes
   // on stderr only, never in the host-visible error copy.
-  if (log && error instanceof Error && !(safeTransport in error) && !loggedDiagnostics.has(error)) {
-    console.error('[zulip diagnostic]', nativeTransportErrors.get(error)?.original ?? error);
-    loggedDiagnostics.add(error);
-  }
+  if (log) logDiagnostic(error);
   if (error instanceof Error && (loggedDiagnostics.has(error) || !log)) loggedDiagnostics.add(copy);
   if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
       if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
-      if (copy.method === 'GET' && copy.kind !== 'no-self-id' && copy.retryAfterSeconds === undefined) detail += ' Retry the read.';
+      if (copy.method === 'GET' && [401, 403].includes(copy.status ?? 0)) detail += ' Correct the access configuration before retrying; repeating this read will not fix authorization.';
+      else if (copy.method === 'GET' && copy.kind !== 'no-self-id' && copy.retryAfterSeconds === undefined) detail += ' Retry the read.';
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;

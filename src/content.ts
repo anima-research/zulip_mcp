@@ -1,7 +1,7 @@
 import { markTransportError } from "./message-ids.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_TIMEOUT_MS } from "./zulip-api.js";
+import { DEFAULT_TIMEOUT_MS, parseRetryAfter } from "./zulip-api.js";
 
 /**
  * Node resolves the entry module to its realpath while process.argv[1] keeps
@@ -41,15 +41,17 @@ export async function fetchAttachmentBytes(
   const controller = new AbortController();
   let timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   let status: number | undefined;
-  const progressed = (receivedStatus?: number) => {
+  let retryAfterSeconds: number | undefined;
+  const progressed = (receivedStatus?: number, receivedRetryAfter?: number) => {
     if (receivedStatus !== undefined) status = receivedStatus;
+    if (receivedRetryAfter !== undefined) retryAfterSeconds = receivedRetryAfter;
     clearTimeout(timer);
     timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   };
   try {
     return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal, progressed);
   } catch (err) {
-    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`), { operation: 'Attachment download', status, timeoutSeconds: DEFAULT_TIMEOUT_MS / 1000, original: err });
+    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`), { operation: 'Attachment download', status, retryAfterSeconds, timeoutSeconds: DEFAULT_TIMEOUT_MS / 1000, original: err });
     throw err;
   } finally {
     clearTimeout(timer);
@@ -61,11 +63,12 @@ async function readAttachment(
   fallbackName: string,
   headers: Record<string, string>,
   signal: AbortSignal,
-  progressed: (status?: number) => void,
+  progressed: (status?: number, retryAfterSeconds?: number) => void,
 ): Promise<FetchedAttachment> {
   const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
-  progressed(resp.status);
-  if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status, completed: true });
+  const retryAfterSeconds = parseRetryAfter(resp.headers.get('retry-after'));
+  progressed(resp.status, retryAfterSeconds);
+  if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status, completed: true, retryAfterSeconds });
 
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
@@ -78,7 +81,7 @@ async function readAttachment(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status }); }));
+    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status, retryAfterSeconds }); }));
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
     }
@@ -86,7 +89,7 @@ async function readAttachment(
     const chunks: Buffer[] = [];
     let total = 0;
     while (true) {
-      const { value, done } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status }); });
+      const { value, done } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status, retryAfterSeconds }); });
       if (done) break;
       if (!value) continue;
       progressed();

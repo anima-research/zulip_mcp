@@ -96,9 +96,18 @@ export async function sendMessage(
   if (parts.length === 0) throw new NothingToSend();
   const chunks: SentChunk[] = [];
   let last: ZulipSuccess<{ id: number }> | undefined;
+  const receipt = uploaded.length === 0 ? '' : ` Attachment uploads confirmed: ${JSON.stringify(uploaded.map(file => file.path))}. Retrying the original send uploads those attachments again; reuse the confirmed paths after checking the message-post outcome.`;
   for (const part of parts) {
-    const answer = await api.requestAnswer<{ id: number }>('POST', '/messages', { ...destination, content: part });
-    if (isRefusal(answer)) throw new SendRefused(answer);
+    let answer: ZulipSuccess<{ id: number }> | ZulipRefusal;
+    try {
+      answer = await api.requestAnswer<{ id: number }>('POST', '/messages', { ...destination, content: part });
+    } catch (error) {
+      if (!receipt) throw error;
+      const safe = messageIdError(error, opts.messageIds ?? LEGACY_IDS);
+      safe.message += receipt;
+      throw safe;
+    }
+    if (isRefusal(answer)) throw new SendRefused(receipt ? { ...answer, msg: answer.msg + receipt } : answer);
     const chunk = { id: answer.id, content: part };
     chunks.push(chunk);
     last = answer;

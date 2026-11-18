@@ -623,3 +623,18 @@ test('failed unread checks make aggregates unknown and successful subtotals expl
     assert.match(summary.contents[0].text, /Unread state unknown for #broken/);
   }
 });
+
+
+test('every message-ID schema field follows the selected ID contract', () => {
+  const expected = ['send_message.reply_to', 'edit_message.message_id', 'move_messages.message_id', 'delete_message.message_id', 'add_reaction.message_id', 'remove_reaction.message_id', 'fetch_around.message_id', 'fetch_history.before', 'fetch_history.after'];
+  for (const mode of ['compat', 'strict'] as const) {
+    const definitions = idToolDefinitions(toolDefinitions, new MessageIds('alpha', mode));
+    const seen: string[] = [];
+    for (const tool of definitions) for (const [field, schema] of Object.entries(tool.inputSchema.properties)) {
+      if (!expected.includes(`${tool.name}.${field}`)) continue;
+      seen.push(`${tool.name}.${field}`);
+      assert.deepEqual(schema.type, mode === 'strict' ? 'string' : ['string', (toolDefinitions.find(t => t.name === tool.name)!.inputSchema.properties as any)[field].type]);
+    }
+    assert.deepEqual(seen.sort(), [...expected].sort());
+  }
+});

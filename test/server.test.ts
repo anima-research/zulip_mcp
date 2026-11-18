@@ -7824,8 +7824,11 @@ test('accepted compact notice does not recur when its durable watermark advances
     try {
       await initialize(restarted, true);
       await settled(restarted);
+      await until(() => restarted.adapter.historyCalls.some(c => c.query.afterMessageId === '201'), 'restart recovery read after durable watermark');
+      await restarted.server.quiet();
       assert.equal(restarted.delivery.watermark(channelId), 201);
-      assert.equal(restarted.pushed.filter(p => firstText(p).includes('messages omitted')).length, 0);
+      assert.equal(restarted.pushed.length, 0, 'no compact or ordinary replay of acknowledged rows');
+      assert.equal(restarted.incoming.length, 0, 'no individual replay of acknowledged rows');
     } finally { await restarted.close(); rmSync(dir, { recursive: true, force: true }); }
   }
 });
@@ -7931,6 +7934,7 @@ test('enabled incoming results reject non-boolean acceptance and normalized dupl
       [{ messageId: 'secret-host-payload', accepted: true }],
       [{ messageId: { credential: 'secret-host-payload'.repeat(1000) }, accepted: true }],
     ]) {
+      logs.length = 0;
       const h = harness({ messageIds: new MessageIds('alpha', mode), incomingResults: () => entries });
       try {
         await initialize(h, true);
@@ -8617,3 +8621,129 @@ for (const mode of ['legacy', 'strict'] as const) {
     }
   });
 }
+
+
+test('compat MCPL bare IDs warn on acknowledgement, open history, and itemized results', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const h = harness({ messageIds: new MessageIds('alpha', 'compat'), incomingResults: () => [{ messageId: '7', accepted: true }] });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: '7' });
+    assert.ok(logs.some(line => line.includes('Warning: bare messageId accepted; use alpha:<n>')));
+    logs.length = 0;
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 10, beforeMessageId: '7' } });
+    assert.ok(logs.some(line => line.includes('Warning: bare beforeMessageId accepted; use alpha:<n>')));
+    logs.length = 0;
+    await (h.server as any).sendIncomingToHost([streamMsg(7)]);
+    assert.ok(logs.some(line => line.includes('Warning: bare incoming result messageId accepted; use alpha:<n>')));
+  } finally { await h.close(); }
+});
+
+test('catch-up rechecks mute and allowlist changes after history returns', async () => {
+  for (const policy of ['mute', 'allowlist']) {
+    const dir = mkdtempSync(join(tmpdir(), 'catch-policy-'));
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60000 });
+    const h = harness({ filters: plane, history: [streamMsg(20, { mentioned: true })] });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const key = h.adapter.keyOf('zulip:general');
+      h.adapter.emit!(streamMsg(20, { mentioned: true }));
+      await until(() => h.delivery.watermark(key) === 20, 'initial acceptance');
+      h.adapter.history.push(streamMsg(21, { mentioned: true }));
+      const fetch = h.adapter.fetchHistory!.bind(h.adapter);
+      let release!: () => void;
+      let started!: () => void;
+      const fetching = new Promise<void>(resolve => { started = resolve; });
+      const finish = new Promise<void>(resolve => { release = resolve; });
+      h.adapter.fetchHistory = async (key, query) => {
+        const page = await fetch(key, query);
+        started();
+        await finish;
+        return page;
+      };
+      const before = h.pushed.length;
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+      await fetching;
+      plane.update(f => policy === 'mute' ? { ...f, mutedStreams: ['general'] } : { ...f, streams: ['other'] });
+      release();
+      await h.server.quiet();
+      assert.equal(h.pushed.length, before, 'new policy forbids fetched content');
+    } finally { plane.stop(); await h.close(); rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('an ended catch-up lane cannot recreate holds on a late refusal', async () => {
+  const h = harness({ history: [streamMsg(20, { mentioned: true })] });
+  try {
+    await initialize(h, true);
+    await settled(h);
+    const key = h.adapter.keyOf('zulip:general');
+    h.adapter.emit!(streamMsg(20, { mentioned: true }));
+    await until(() => h.delivery.watermark(key) === 20, 'initial acceptance');
+    h.adapter.history.push(streamMsg(21, { mentioned: true }));
+    h.policy.holdPushes = true;
+    h.policy.rejectPushes.add('21');
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+    await until(() => h.policy.heldPushes.length > 0, 'pending old offer');
+    (h.server as any).lanes.end();
+    h.delivery.releaseAll(key); // replacement connection's accepted scan released these holds
+    h.policy.heldPushes.splice(0).forEach(answer => answer());
+    await h.server.quiet();
+    assert.deepEqual(h.delivery.heldIds(key), [], 'late refusal has no authority over replacement holds');
+  } finally { h.policy.holdPushes = false; h.policy.heldPushes.splice(0).forEach(answer => answer()); await h.close(); }
+});
+
+test('late catch-up answers cannot change a replacement lane generation', async () => {
+  for (const accepted of [true, false]) {
+    const h = harness({ history: [streamMsg(20, { mentioned: true })] });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const key = h.adapter.keyOf('zulip:general');
+      h.adapter.emit!(streamMsg(20, { mentioned: true }));
+      await until(() => h.delivery.watermark(key) === 20, 'initial acceptance');
+      h.adapter.history.push(streamMsg(21, { mentioned: true }));
+      h.policy.holdPushes = true;
+      if (!accepted) h.policy.rejectPushes.add('21');
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+      await until(() => h.policy.heldPushes.length > 0, 'pending old offer');
+      const server = h.server as any;
+      server.lanes.end();
+      server.lanes = server.makeLanes(); // beginConnection's generation boundary
+      h.delivery.releaseAll(key);
+      h.delivery.hold(key, 21, 'queued'); // replacement pending offer owns this hold
+      h.policy.heldPushes.splice(0).forEach(answer => answer());
+      await h.server.quiet();
+      assert.deepEqual(h.delivery.heldIds(key), [21]);
+      assert.deepEqual(h.delivery.heldIds(key, { replayable: true }), [], 'old refusal cannot mark replacement hold rejected');
+      assert.equal(h.delivery.watermark(key), 20, 'old acceptance cannot clear replacement hold');
+    } finally { h.policy.holdPushes = false; h.policy.heldPushes.splice(0).forEach(answer => answer()); await h.close(); }
+  }
+});
+
+test('unconfirmed synthetic events have a distinguishing non-replayable diagnostic', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  for (const duplicate of [true, false]) {
+    logs.length = 0;
+    const eventId = 'reaction:add:7:2:123';
+    const h = harness({ messageIds: new MessageIds('alpha', 'strict'), incomingResults: () => duplicate
+      ? [{ messageId: eventId, accepted: true }, { messageId: eventId, accepted: true }]
+      : [{ messageId: eventId, accepted: 'true' }],
+    });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      h.adapter.emit!({ ...streamMsg(9), messageId: eventId });
+      await h.server.quiet();
+      assert.ok(logs.some(line => line.includes('delivery is unconfirmed')));
+      assert.ok(logs.some(line => line.includes('1 unconfirmed synthetic event(s) cannot be replayed from message history')));
+      assert.ok(logs.every(line => !line.includes('they are not delivered')));
+      if (duplicate) assert.ok(logs.some(line => line.includes('2 entries in host response')));
+    } finally { await h.close(); }
+  }
+});

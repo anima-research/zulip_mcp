@@ -445,14 +445,14 @@ test('a save after a failed load whose file is gone by then writes the state, wi
   });
 });
 
-test('enabled recovery advice escapes channel IDs; legacy preserves the original pointer bytes', () => {
-  const channelId = 'zulip:team "alpha"';
+test('recovery advice JSON-escapes channel IDs in every mode', () => {
+  const channelId = 'zulip:team \\ "alpha"';
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const text = renderMissedBlock([viewOf(msg(7, true, 'hello'))], {
       streamName: 'team "alpha"', channelId, reason: 'backscroll', count: 1,
       formatTime: () => '', moreBeyond: true, messageIds: new MessageIds('alpha', mode),
     }).text;
-    const channel = mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
+    const channel = JSON.stringify(channelId);
     assert.ok(text.includes(`fetch_history(channel=${channel}, after=${mode === 'legacy' ? '7' : '"alpha:7"'})`));
   }
 });

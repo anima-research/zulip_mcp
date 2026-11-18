@@ -584,7 +584,7 @@ export interface MissedBlockOptions {
 }
 
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
-  const channel = ids.mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
+  const channel = JSON.stringify(channelId);
   return `fetch_history(channel=${channel}, ${cursor}=${JSON.stringify(id === undefined ? id : ids.format(id))})`;
 }
 

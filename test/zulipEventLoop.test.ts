@@ -43,7 +43,7 @@ test('an HTML/proxy 502 backs off exponentially', async () => {
 
   const degraded = systemEvents.filter(e => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /not-json/);
+  assert.match(degraded[0].text, /received an unreadable response/);
 
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
 });
@@ -88,7 +88,7 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
   assert.deepEqual(delays, [2000, 4000, 8000]);
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /transport failure \(timeout\)/i);
+  assert.match(degraded[0].text, /poll timed out/i);
   assert.doesNotMatch(degraded[0].text, /\.\)/, 'no period inside the parentheses');
 });
 
@@ -508,7 +508,7 @@ test('stopping in a message handler drops all subsequent events in its batch', a
   assert.deepEqual(seen, ['message']);
 });
 
-test('degraded event text and metadata wrap transport failures in enabled modes', async () => {
+test('degraded event text and metadata describe polling without tool diagnostics', async () => {
   const { MessageIds } = await import('../src/message-ids.ts');
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     let loop: ZulipEventLoop;
@@ -522,7 +522,7 @@ test('degraded event text and metadata wrap transport failures in enabled modes'
     }).api, () => {}, e => events.push(e));
     const result = JSON.stringify(events.filter(e => e.kind === 'degraded'));
     {
-      assert.match(result, /Zulip transport failure/);
+      assert.match(result, /poll failed before a complete answer; polling retries automatically/);
       assert.doesNotMatch(result, /ECONNRESET|GET \/events/);
     }
   }
@@ -544,7 +544,7 @@ for (const mode of ['compat', 'strict'] as const) {
     const degraded = events.filter(e => e.kind === 'degraded');
     assert.equal(degraded.length, 1);
     assert.match(degraded[0].text, /HTTP 502/);
-    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). The server returned an unreadable response; contact the host operator if it persists. The server is retrying event polling. HTTP 502');
+    assert.equal(degraded[0].metadata?.reason, 'the poll received an unreadable response (HTTP 502); polling retries automatically');
     assert.doesNotMatch(JSON.stringify(degraded), /private upstream response body|GET|\/events/);
     assert.equal(failure.message, 'private upstream response body');
   });
@@ -563,7 +563,24 @@ test('event polling honors Retry-After even beyond the exponential-backoff cap',
     });
     await loop.start(api, () => {}, event => events.push(event));
     assert.deepEqual(delays, [Math.max(2000, seconds * 1000)]);
-    assert.match(events[0].text, new RegExp(`Retry after ${seconds} seconds, then the server retries event polling`));
+    assert.match(events[0].text, new RegExp(`retry after ${seconds} seconds`));
     assert.doesNotMatch(events[0].text, /retry the read/i);
   }
+});
+
+
+test('stop cancels the native Retry-After timer and lets the loop finish', async t => {
+  t.mock.method(console, 'error', () => {});
+  const loop = new ZulipEventLoop({ degradedThreshold: 1 });
+  let degraded!: () => void;
+  const sleeping = new Promise<void>(resolve => { degraded = resolve; });
+  const running = loop.start(standInApi({
+    'POST /register': { queue_id: 'q1', last_event_id: -1 },
+    'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, 2147484); },
+  }).api, () => {}, () => degraded());
+  await sleeping;
+  assert.equal(typeof (loop as any).cancelSleep, 'function');
+  loop.stop();
+  await running;
+  assert.equal((loop as any).cancelSleep, undefined);
 });

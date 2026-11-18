@@ -248,7 +248,7 @@ async function startLogging(env: Record<string, string>) {
   }
 }
 
-test('startup output matches main in legacy mode and announces only enabled realm tags', async () => {
+test('successful startup retains legacy output and announces only enabled realm tags', async () => {
   const z = await realm({});
   try {
     for (const mode of [undefined, 'legacy', 'compat', 'strict']) {
@@ -854,6 +854,8 @@ test("while the bot's own user id can't be read, the event loop's degraded notic
     const degraded = notices.find((n) => n.kind === 'degraded');
     assert.ok(degraded, 'a degraded notice within 3 s');
     assert.match(degraded.text, /HTTP 503/);
+    assert.match(degraded.text, /polling retries automatically/);
+    assert.doesNotMatch(degraded.text, /later call|no-self-id|transport failure/);
   } finally { console.error = original; s.done(); z.close(); }
 });
 
@@ -881,6 +883,7 @@ test('response-body failures retain received HTTP status and unobtrusive timeout
   for (const timedOut of [false, true]) {
     t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => ({
       status: 503,
+      headers: new Headers({ 'Retry-After': '120' }),
       text: async () => timedOut ? await new Promise((_resolve, reject) => {
         init.signal!.addEventListener('abort', () => reject(new Error('private body timeout')), { once: true });
       }) : await Promise.reject(new Error('private body failure')),
@@ -889,6 +892,7 @@ test('response-body failures retain received HTTP status and unobtrusive timeout
     await assert.rejects(transport('GET', '/streams', undefined, undefined), error => {
       assert.ok(error instanceof ZulipNoAnswer);
       assert.equal(error.status, 503);
+      assert.equal(error.retryAfterSeconds, 120);
       assert.equal(error.kind, timedOut ? 'timeout' : 'network');
       assert.equal(error.timeoutSeconds, timedOut ? 0.01 : undefined);
       assert.equal(Object.hasOwn(error, 'timeoutSeconds'), timedOut);
@@ -896,7 +900,7 @@ test('response-body failures retain received HTTP status and unobtrusive timeout
       for (const mode of ['legacy', 'compat', 'strict'] as const) {
         const safe = messageIdError(error, new MessageIds('alpha', mode));
         assert.match(safe.message, /HTTP 503/);
-        assert.match(safe.message, /Retry the read/);
+        assert.match(safe.message, /Retry after 120 seconds, then retry the read/);
         assert.doesNotMatch(safe.message, /private/);
       }
       return true;

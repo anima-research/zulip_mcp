@@ -1,4 +1,3 @@
-import { messageIdError, LEGACY_IDS } from '../message-ids.js';
 /**
  * Zulip offers no gap recovery for a dead queue (code BAD_EVENT_QUEUE_ID):
  * events between the last delivered message and re-registration are lost.
@@ -147,6 +146,7 @@ export class ZulipEventLoop {
   private readonly baseBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly degradedThreshold: number;
+  private cancelSleep?: () => void;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly pollTimeoutMs: number;
   private readonly directory: StreamDirectory | null;
@@ -156,7 +156,16 @@ export class ZulipEventLoop {
     this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
-    this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => {
+      const timer = setTimeout(done, ms);
+      const cancel = () => { clearTimeout(timer); done(); };
+      const self = this;
+      function done() {
+        if (self.cancelSleep === cancel) self.cancelSleep = undefined;
+        resolve();
+      }
+      this.cancelSleep = cancel;
+    }));
     this.pollTimeoutMs = options.pollTimeoutMs ?? LONG_TIMEOUT_MS;
   }
 
@@ -180,6 +189,7 @@ export class ZulipEventLoop {
 
   stop(): void {
     this.stopped = true;
+    this.cancelSleep?.();
   }
 
   private async pollLoop(
@@ -389,8 +399,10 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        const diagnostic = messageIdError(error, this.options.messageIds ?? LEGACY_IDS, false);
-        const errMsg = diagnostic instanceof Error ? diagnostic.message : String(diagnostic);
+        const errMsg = error instanceof ZulipNoAnswer
+          ? error.kind === 'no-self-id' ? `the bot's user ID is not yet available${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
+            : `the poll ${error.kind === 'not-json' ? 'received an unreadable response' : error.kind === 'timeout' ? 'timed out' : 'failed before a complete answer'}${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
+          : 'the poll failed; polling retries automatically';
 
         this.consecutiveFailures++;
         const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures),
@@ -405,7 +417,7 @@ export class ZulipEventLoop {
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          errMsg.replace(' Retry the read.', ' The server is retrying event polling.').replace(', then retry the read', ', then the server retries event polling').replace(/\.$/, ''),
+          errMsg + (error instanceof ZulipNoAnswer && error.retryAfterSeconds !== undefined ? `; retry after ${error.retryAfterSeconds} seconds` : ''),
         );
         await this.sleep(delay);
       }
@@ -453,6 +465,7 @@ export class ZulipEventLoop {
   }
 
   private sleep(ms: number): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     return this.sleepFn(ms);
   }
 }

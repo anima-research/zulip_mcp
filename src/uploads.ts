@@ -142,7 +142,7 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
       // redirects and server/proxy failures do not establish that nothing was stored.
       const refused = completed && [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(res.status);
       if (!res.ok || body.result !== 'success') {
-        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
+        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}${retryAfterSeconds === undefined ? '' : `. Retry after ${retryAfterSeconds} seconds.`}`);
         throw unreadable || !refused || body.result !== 'error'
           ? markTransportError(error, { operation: 'Upload', status: res.status, original, completed, refused, retryAfterSeconds }) : error;
       }
@@ -499,8 +499,11 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
 
 /** Retain confirmed receipts independently of the failing attempt's uncertainty. */
 function partialUploadError(error: unknown, confirmed: UploadedFile[], operation: 'send' | 'publish'): unknown {
-  if (confirmed.length === 0) return error;
   const safe = messageIdError(error, LEGACY_IDS);
+  if (confirmed.length === 0) {
+    safe.message += ' No message was sent: attachment upload failed before message posting began.';
+    return safe;
+  }
   safe.message += ` Earlier attachment uploads confirmed: ${JSON.stringify(confirmed.map(file => file.path))}. No message was sent. Retrying the original ${operation} uploads those attachments again; reuse the confirmed paths instead.`;
   return safe;
 }

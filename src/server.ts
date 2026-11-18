@@ -46,7 +46,7 @@ import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, P
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
-import { hasLoggedDiagnostic, describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { logDiagnostic, hasLoggedDiagnostic, describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
@@ -655,7 +655,7 @@ export class ZulipMcplServer {
             break;
           }
           try {
-            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, () => this.warnBareId('messageId'), 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
             const parserPrefix = `messageId=${describe(ack.messageId)}:`;
@@ -740,10 +740,14 @@ export class ZulipMcplServer {
     void conn;
   }
 
+  private warnBareId(field: string): void {
+    console.error(`[zulip-mcp] Warning: bare ${field} accepted; use ${this.messageIds.tag}:<n>.`);
+  }
+
   private parseOpenCursor(params: ChannelsOpenParams): ChannelsOpenParams {
     if (this.messageIds.mode === 'legacy' || params.history?.beforeMessageId === undefined) return params;
     try {
-      return { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, undefined, 'beforeMessageId')) } };
+      return { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, () => this.warnBareId('beforeMessageId'), 'beforeMessageId')) } };
     } catch (err) {
       throw new McplRpcError(-32602, (err as Error).message);
     }
@@ -1139,7 +1143,7 @@ export class ZulipMcplServer {
         });
       }
     } catch (err) {
-      console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
+      logDiagnostic(err, `[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`);
     }
     return async (ctx) => {
       if (ctx.ended) return;
@@ -1147,7 +1151,7 @@ export class ZulipMcplServer {
       try {
         await hand?.(ctx);
       } catch (err) {
-        console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
+        logDiagnostic(err, `[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`);
       }
       this.delivery.save();
     };
@@ -1240,7 +1244,7 @@ export class ZulipMcplServer {
       }
       return true;
     } catch (err) {
-      console.error('[zulip-mcp] push/event failed:', (err as Error).message);
+      logDiagnostic(err, '[zulip-mcp] push/event failed:');
       return false;
     }
   }
@@ -1356,7 +1360,7 @@ export class ZulipMcplServer {
       return { ...pass, fetched: await this.fetchAfter(r, key, pass.after, bound, passBudget) };
     } catch (err) {
       if (read.fill && triesAgain(err)) throw err;
-      console.error(`[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`, (err as Error).message);
+      logDiagnostic(err, `[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`);
       return pass;
     } finally {
       budget.remainingMs -= passMs - passBudget.remainingMs;
@@ -1365,11 +1369,11 @@ export class ZulipMcplServer {
 
   private handCatchUp(ctx: Ctx, key: ChannelKey, read: CatchUpRead, pass: CatchUpPass, window?: { through: number; truncated: boolean }, second?: CatchUpPass): void {
     const { after, fetched } = pass;
+    if (ctx.ended || this.isMuted(key) || !this.isAllowed(key)) return;
     if (!fetched) {
       read.onAttempt?.(ctx.w, Infinity);
       return;
     }
-    if (ctx.ended) return;
     if (fetched.scannedThrough === null || !window) {
       this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, Math.min(pass.bound ?? Infinity, read.through?.() ?? Infinity)), fetched);
       read.onAttempt?.(ctx.w, Infinity);
@@ -1470,9 +1474,13 @@ export class ZulipMcplServer {
       }
       this.delivery.save();
     };
+    const owner = this.lanes;
     const answer = sent.then((ok) => new Promise<boolean>((resolve) => ctx.lane.answer((c) => {
-      answered(c.w, ok);
-      resolve(ok);
+      // Drain an acceptance during shutdown, but never let an old connection's
+      // answer alter a replacement lane's holds. Ended refusals cannot re-hold.
+      const current = this.lanes === owner && (ok || !c.ended);
+      if (current) answered(c.w, ok);
+      resolve(current && ok);
     })));
     read.answers?.push(answer);
     if (blocked !== undefined) handSecond();
@@ -1506,7 +1514,7 @@ export class ZulipMcplServer {
         else gone.push(id);
       } catch (err) {
         // The ids after it wait: what fails one read mostly fails the next, and each could wait out its whole bound.
-        console.error(`[zulip-mcp] reading undelivered message ${this.messageIds.format(id)} of ${this.label(key)} by id failed:`, (err as Error).message);
+        logDiagnostic(err, `[zulip-mcp] reading undelivered message ${this.messageIds.format(id)} of ${this.label(key)} by id failed:`);
         failed = id;
         break;
       }
@@ -1667,7 +1675,7 @@ export class ZulipMcplServer {
       if (r.ended) return;
       const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
       const ms = Math.max(step, (err.retryAfterSeconds ?? 0) * 1000);
-      console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
+      logDiagnostic(err, `[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed; trying again in ${ms / 1000} s:`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
       const untold = this.toldReadWait === null || (this.toldReadWait === 'log' && this.openKeys().length > 0);
@@ -2514,7 +2522,7 @@ export class ZulipMcplServer {
       const results = result.results.flatMap(r => {
         let original = r && typeof r.messageId === 'string' ? originals.get(r.messageId) : undefined;
         if (original === undefined && r && typeof r.messageId === 'string') {
-          try { original = numericOriginals.get(this.messageIds.parse(r.messageId)); } catch { /* diagnosed below */ }
+          try { original = numericOriginals.get(this.messageIds.parse(r.messageId, () => this.warnBareId('incoming result messageId'))); } catch { /* diagnosed below */ }
         }
         if (original !== undefined) counts.set(original, (counts.get(original) ?? 0) + 1);
         if (original === undefined || typeof r.accepted !== 'boolean') {
@@ -2527,7 +2535,7 @@ export class ZulipMcplServer {
       // Refuse ambiguous duplicates after normalization, regardless of spelling.
       // Count recognized IDs even when their acceptance value is malformed.
       for (const [id, count] of counts) if (count > 1) {
-        console.error(`[zulip-mcp] Ignoring incoming result: duplicate normalized ID ${JSON.stringify(id)} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}); ${count} entries in offered batch.`);
+        console.error(`[zulip-mcp] Ignoring incoming result: duplicate normalized ID ${JSON.stringify(id)} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}); ${count} entries in host response.`);
       }
       return { ...result, results: results.filter(r => counts.get(r.messageId) === 1) };
     }
