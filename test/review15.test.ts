@@ -24,6 +24,11 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
             assert.doesNotMatch(safe.message, /refused|before a complete|private/);
           } else {
             assert.doesNotMatch(safe.message, /duplicate/);
+            assert.match(safe.message, /Retry after 120 seconds/);
+            if (text.startsWith('<')) {
+              assert.match(safe.message, new RegExp(`HTTP ${status}`));
+              assert.match(safe.message, /Upload was refused/);
+            }
           }
           return true;
         });

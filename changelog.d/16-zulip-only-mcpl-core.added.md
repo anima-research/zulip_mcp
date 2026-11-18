@@ -3,7 +3,10 @@
   origin; ambient on closed channels is counted (`channel_missed`).
 - Catch-up: persisted per-channel watermarks track host acceptance; refused
   or failed messages pin progress until replay or an accepted later scan
-  acknowledges the same range (including declared omissions). Holds outside
+  acknowledges the same range (including declared omissions), subject to the
+  50,000 held-ID cap: untracked overflow refusals may be passed and are not
+  guaranteed restart recovery. Empty-selection scans explicitly skip their
+  unselected rows. Holds outside
   an accepted scan still pin the watermark; a `<missed>` block per channel on reconnect (full
   backscroll for channels the host had open, mention ±7 otherwise), paged
   up to `ZULIP_CATCHUP_LIMIT` and hard-capped by

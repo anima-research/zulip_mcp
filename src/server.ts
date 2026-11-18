@@ -228,9 +228,16 @@ export class ZulipMcplServer {
     const host: HostClient = {
       registerChannels: (channels) => this.registerChannelsWithHost(channels),
       channelsChanged: (params, timeoutMs) => this.channelsChangedWithHost(params, timeoutMs),
-      sendIncoming: (messages) => this.sendIncomingToHost(messages),
+      sendIncoming: (messages, beforeOffer) => this.sendIncomingToHost(messages, beforeOffer),
     };
     const channels = new ChannelManager(host, this.adapters, this.grant, this.ids, options.batchWindowMs, {
+      onOffered: (key, messages) => this.lanes?.lane(key).answer((ctx) => {
+        const carried = new Set(ctx.w.delivery.carriedIds(key));
+        const offered = messages.map(numericId).filter((id): id is number => id !== null && carried.has(id) && id <= (ctx.w.delivery.watermark(key) ?? 0));
+        if (offered.length === 0) return;
+        ctx.w.delivery.uncarry(key, offered);
+        this.delivery.save();
+      }),
       onDelivered: (key, accepted, rejected) => this.lanes?.lane(key).answer((ctx) => this.onDelivered(ctx.w, key, accepted, rejected)),
       deliverable: (message) => this.mayDeliver(message),
       onWithheld: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onWithheld(ctx.w, key, messages)),
@@ -478,7 +485,7 @@ export class ZulipMcplServer {
     for (const key of keys) {
       const lane = lanes.lane(key);
       const answers: Promise<boolean>[] = [];
-      lane.enterReadFirst((r) => (r.ended ? undefined : this.fillRead(r, (r2) => this.readStart(r2, key, renamePushes.get(key) ?? null, answers))));
+      lane.enterReadFirst((r) => (r.ended ? undefined : this.readStart(r, key, renamePushes.get(key) ?? null, answers)));
     }
     for (const key of renamed) {
       lanes.lane(key).enterFirst((ctx) => {
@@ -1249,13 +1256,26 @@ export class ZulipMcplServer {
     }
   }
 
-  private async readStart(r: Reading, key: ChannelKey, renamePushes: Promise<boolean>[] | null, answers: Promise<boolean>[]): Promise<Hand> {
-    let carried: Hand | void;
+  private async readStart(r: Reading, key: ChannelKey, renamePushes: Promise<boolean>[] | null, answers: Promise<boolean>[]): Promise<Hand | void> {
+    if (!this.delivery.carriedIds(key).some((id) => id <= (this.delivery.watermark(key) ?? 0))) {
+      return this.fillRead(r, (r2) => this.readStartCatchUp(r2, key, renamePushes, answers));
+    }
+    const carried = this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
+      this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)
+      ? await this.readCarried(r, key) : undefined;
+    return async (ctx) => {
+      // Commit the completed by-id pass before starting any retryable catch-up.
+      await carried?.(ctx);
+      this.delivery.save();
+      ctx.lane.enterReadFirst((r2) => r2.ended ? undefined : this.fillRead(r2, (r3) => this.readStartCatchUp(r3, key, renamePushes, answers)));
+    };
+  }
+
+  private async readStartCatchUp(r: Reading, key: ChannelKey, renamePushes: Promise<boolean>[] | null, answers: Promise<boolean>[]): Promise<Hand> {
     let catchUp: Hand | void;
     let backfill: Hand | void;
     if (this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
         this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
-      carried = await this.readCarried(r, key);
       const place = this.placeOf(key);
       if (!r.ended && place !== undefined) {
         catchUp = await this.readCatchUp(r, key, {
@@ -1265,7 +1285,6 @@ export class ZulipMcplServer {
       if (!r.ended && this.delivery.tally(key)) backfill = await this.readBackfill(r, key);
     }
     return async (ctx) => {
-      await carried?.(ctx);
       await catchUp?.(ctx);
       if (!ctx.ended) await backfill?.(ctx);
       if (answers.length > 0) {
@@ -1497,8 +1516,9 @@ export class ZulipMcplServer {
     const watermark = this.delivery.watermark(key) ?? 0;
     const ids = this.delivery.carriedIds(key).filter((id) => id <= watermark);
     if (ids.length === 0) return;
-    if (this.isMuted(key) || !this.isAllowed(key)) return (ctx) => ctx.w.delivery.uncarry(key, ids);
-    // An offer that cannot be made would still count as the one offer.
+    if (this.isMuted(key) || !this.isAllowed(key)) return (ctx) => {
+      if (!ctx.ended && (this.isMuted(key) || !this.isAllowed(key))) ctx.w.delivery.uncarry(key, ids);
+    };
     const canOffer = () => this.ids.heldIdOf(key) !== undefined && this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
     if (!canOffer()) return;
     const rows: KeyedMessage[] = [];
@@ -1523,20 +1543,26 @@ export class ZulipMcplServer {
       if (ctx.ended) return;
       if (failed !== undefined) ctx.w.delivery.carriedReadFailed(key, failed);
       ctx.w.delivery.uncarry(key, gone);
+      if (this.isMuted(key) || !this.isAllowed(key)) {
+        ctx.w.delivery.uncarry(key, ids);
+        return;
+      }
       if (rows.length === 0 || !canOffer()) return;
       if (this.channelManager.isKeyOpen(key)) {
         for (const row of this.projectHistoryReactions(rows)) {
           if (ctx.ended || !canOffer()) return;
-          ctx.w.delivery.uncarry(key, [Number(row.messageId)]);
           await this.route(ctx, recovered(row));
         }
         return;
       }
       const first = Number(rows[0].messageId);
       const last = Number(rows[rows.length - 1].messageId);
-      ctx.w.delivery.uncarry(key, rows.map((row) => Number(row.messageId)));
       this.handCatchUp(
-        ctx, key, { keepAll: this.delivery.wasOpen(key) },
+        ctx, key, {
+          keepAll: this.delivery.wasOpen(key),
+          // Called at the actual push boundary, or on empty selection (withdrawal).
+          onAttempt: (w) => w.delivery.uncarry(key, rows.map((row) => Number(row.messageId))),
+        },
         { after: first - 1, bound: last, retry: false, fetched: { messages: rows, truncated: false, complete: true, scannedThrough: last, unverifiedMessageIds: [] } },
         { through: last, truncated: false },
       );
@@ -2508,9 +2534,10 @@ export class ZulipMcplServer {
     return answer;
   }
 
-  private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
+  private async sendIncomingToHost(messages: IncomingChannelMessage[], beforeOffer?: () => void): Promise<ChannelsIncomingResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
+    beforeOffer?.();
     const result = (await conn.sendRequest(method.CHANNELS_INCOMING, this.messageIds.project({ messages }))) as ChannelsIncomingResult | undefined;
     if (this.messageIds.mode !== 'legacy' && Array.isArray(result?.results)) {
       // Only reverse IDs actually sent in this batch. Synthetic events and bad

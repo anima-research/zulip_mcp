@@ -8221,12 +8221,25 @@ async function endedHoldingTwo(dir: string, ids: MessageIds, path: HeldReadPath)
   h.adapter.emit!(mention(22));
   await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).length === 2, '21 and 22 refused and held');
   await path.held?.(h);
+  let entered = 0;
+  const read = h.adapter.fetchHistory!.bind(h.adapter);
+  h.adapter.fetchHistory = (key, query) => {
+    if (h.adapter.wireOf(key) === 'zulip:general') entered++;
+    return read(key, query);
+  };
   if (path.enter) await path.enter(h);
   else {
     h.adapter.emit!(mention(23));
     await until(() => h.delivery.acceptedThrough('zulip:general') === 23, 'live 23 accepted');
   }
   await h.host.sendRequest('ping');
+  if (path.before) {
+    const lane = (h.server as any).lanes.lane(h.adapter.keyOf('zulip:general'));
+    assert.ok(lane.otherQueue.some((entry: any) => entry.read), 'the held read really queued behind the other channel');
+    assert.equal(entered, 0, 'it has not entered Zulip yet');
+  } else {
+    await until(() => entered > 0, 'the named waiting/failed held read actually entered');
+  }
   assert.equal(offers(h, wire(21)) + offers(h, wire(22)), 2, 'that run offered each once, and was refused');
   await h.close();
   const saved = savedDelivery(dir);
@@ -8289,6 +8302,103 @@ for (const mode of ['legacy', 'strict'] as const) {
   const ids = new MessageIds('alpha', mode);
   const wire = (id: number) => String(ids.format(id));
 
+  for (const carriedFails of [false, true]) {
+    test(`${mode}: a completed carried pass survives repeated catch-up failures (${carriedFails ? 'failed read' : 'offered row'})`, async t => {
+      t.mock.method(console, 'error', () => {});
+      const dir = mkdtempSync(join(tmpdir(), 'zulip-carried-retry-'));
+      const waits = heldWaits();
+      leaveState(dir, 31, { 21: 0 });
+      const h = harness({ messageIds: ids, stateDir: dir, history: [mention(21), mention(32)], readRetryWait: waits.wait });
+      const real = h.adapter.fetchHistory!.bind(h.adapter);
+      let carriedReads = 0;
+      let catchupReads = 0;
+      h.adapter.fetchHistory = async (key, query) => {
+        if (query.limit === 1) {
+          carriedReads++;
+          if (carriedFails) throw noAnswer();
+        } else if (++catchupReads <= 2) throw noAnswer();
+        return real(key, query);
+      };
+      try {
+        await initialize(h, true);
+        await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await awaitRegistered(h, false);
+        await until(() => waits.asked.length === 1, 'first failed catch-up');
+        assert.equal(carriedReads, 1);
+        assert.equal(offers(h, wire(21)), carriedFails ? 0 : 1, 'the earlier hand is not discarded');
+        assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], carriedFails ? { 21: 1 } : undefined, 'the earlier effects are already saved, without shutdown');
+        waits.release();
+        await until(() => waits.asked.length === 2, 'second failed catch-up');
+        assert.equal(carriedReads, 1, 'no repeated read by id');
+        assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], carriedFails ? { 21: 1 } : undefined, 'one failure per start, not per retry');
+        waits.release();
+        await h.server.quiet();
+        assert.equal(catchupReads, 3, 'the catch-up really retried and recovered');
+        assert.equal(carriedReads, 1);
+        assert.equal(offers(h, wire(32)), 1);
+      } finally { waits.release(); await h.close(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const withholding of ['no incoming grant', 'closed before flush'] as const) {
+    test(`${mode}: a carried open-channel row stays listed when ${withholding}`, async t => {
+      t.mock.method(console, 'error', () => {});
+      const dir = mkdtempSync(join(tmpdir(), 'zulip-carried-withheld-'));
+      leaveState(dir, 31, { 21: 0 }, { lastOpen: ['zulip:general'], watermarks: { 'zulip:aaa': 1, 'zulip:general': 31 }, streams: { 6: 'aaa', 7: 'general' } });
+      const history = [mention(21), mention(31)];
+      const h = harness({ messageIds: ids, stateDir: dir, history, visible: [AAA, DESCRIPTOR], batchWindowMs: 60_000 });
+      const turn = aaaHoldsTheTurn(h);
+      try {
+        await initialize(h, true);
+        await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await awaitRegistered(h, false);
+        await until(turn.reading, 'aaa owns history turn');
+        await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+        turn.release();
+        await until(() => (h.server as any).channelManager.pendingCount() === 1, 'carried row queued, not yet offered');
+        assert.deepEqual(h.delivery.carriedIds('zulip:general'), [21]);
+        if (withholding === 'no incoming grant') await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT.filter(c => c !== 'channels.incoming') });
+        if (withholding === 'closed before flush') await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+        await (h.server as any).channelManager.flush();
+        await h.server.quiet();
+        assert.equal(h.hostSaw.filter(r => r.method === method.CHANNELS_INCOMING).length, 0, 'no host request was made');
+        assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 21: 0 });
+      } finally { turn.release(); await h.close(); }
+      try {
+        await startOnce(dir, ids, history, again => {
+          assert.ok(again.adapter.historyCalls.some(c => c.query.limit === 1 && c.query.afterMessageId === '20'));
+          assert.equal(offers(again, wire(21)), 1, 'the next start still owes the row');
+        }, { visible: [AAA, DESCRIPTOR] });
+        assert.equal(savedDelivery(dir).held, undefined);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const failure of ['refusal', 'push failure'] as const) {
+    test(`${mode}: a live ${failure} saves its hold before shutdown despite an existing watermark`, async t => {
+      t.mock.method(console, 'error', () => {});
+      const dir = mkdtempSync(join(tmpdir(), 'zulip-live-hold-save-'));
+      leaveState(dir, 20, {});
+      const h = harness({ messageIds: ids, stateDir: dir });
+      try {
+        await initialize(h, true);
+        await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+        await awaitRegistered(h, false);
+        await h.server.quiet();
+        if (failure === 'refusal') h.policy.rejectPushes.add(wire(21));
+        else {
+          const conn = (h.server as any).conn;
+          const send = conn.sendRequest.bind(conn);
+          conn.sendRequest = (name: string, params: unknown) => name === method.PUSH_EVENT ? Promise.reject(new Error('host transport failed')) : send(name, params);
+        }
+        h.adapter.emit!(mention(21));
+        await until(() => h.delivery.heldIds('zulip:general', { replayable: true }).includes(21), 'live hold settled');
+        assert.equal(savedDelivery(dir).watermarks['zulip:general'], 20);
+        assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 21: 0 }, 'crash now would retain it; close has not run');
+      } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
   for (const [why, path] of Object.entries(HELD_READ_PATHS)) {
     test(`${mode}: two refused mentions whose read ${why} are offered by id, once, after the watermark has passed them, and not after a further restart`, async (t) => {
       t.mock.method(console, 'error', () => {});
@@ -8306,7 +8416,7 @@ for (const mode of ['legacy', 'strict'] as const) {
           assert.equal(third.delivery.watermark('zulip:general'), 31, 'the watermark is where it was');
         }, { visible: path.opts?.visible });
         assert.equal(savedDelivery(dir).held?.['zulip:general'], undefined, 'offered: off the list');
-        await startOnce(dir, ids, history, (fourth) => assert.deepEqual(onGeneral(fourth), [], 'a further restart offers neither again'), { visible: path.opts?.visible });
+        await startOnce(dir, ids, history, (fourth) => { assert.ok(fourth.adapter.historyCalls.some(c => c.channelId === 'zulip:general' && c.query.afterMessageId === '31')); assert.deepEqual(onGeneral(fourth), [], 'a further restart offers neither again'); }, { visible: path.opts?.visible });
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -8325,7 +8435,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         assert.equal(offers(second, wire(22)), 1);
       });
       assert.equal(savedDelivery(dir).held, undefined);
-      await startOnce(dir, ids, history, (third) => assert.deepEqual(third.pushed, []));
+      await startOnce(dir, ids, history, (third) => { assert.ok(third.adapter.historyCalls.some(c => c.channelId === 'zulip:general' && c.query.afterMessageId === '23')); assert.deepEqual(third.pushed, []); });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -8457,7 +8567,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         assert.equal(h.delivery.watermark('zulip:general'), 31, "an offer by id doesn't move the watermark");
       });
       leaveState(dir, 31, { 21: 0 });
-      await startOnce(dir, ids, history.slice(0, 3), (h) => assert.deepEqual(h.pushed, [], 'ambient on a channel the host had not open is not offered, as in any catch-up'));
+      await startOnce(dir, ids, history.slice(0, 3), (h) => { assert.ok(h.adapter.historyCalls.some(c => c.query.limit === 1 && c.query.afterMessageId === '20')); assert.deepEqual(h.pushed, [], 'ambient on a channel the host had not open is not offered, as in any catch-up'); });
       assert.equal(savedDelivery(dir).held, undefined);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -8480,6 +8590,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
         turn.release();
         await h.server.quiet();
+        assert.deepEqual(h.hostSaw.filter(r => r.method === method.CHANNELS_INCOMING).flatMap(r => (r.params as ChannelsIncomingParams).messages.map(m => m.messageId)), [wire(21), wire(22)], 'both rows were actually offered, including refused 22');
         assert.deepEqual(h.incoming.map((m) => m.messageId), [wire(21)]);
         assert.equal((h.incoming[0].metadata as { recovered?: boolean }).recovered, true);
         assert.deepEqual(h.pushed, []);
@@ -8488,7 +8599,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         await h.close();
       }
       assert.equal(savedDelivery(dir).held, undefined);
-      await startOnce(dir, ids, history, (again) => assert.deepEqual([again.pushed, again.incoming], [[], []]), { visible: [AAA, DESCRIPTOR] });
+      await startOnce(dir, ids, history, (again) => { assert.ok(again.adapter.historyCalls.some(c => c.channelId === 'zulip:general' && c.query.afterMessageId === '31')); assert.deepEqual([again.pushed, again.incoming], [[], []]); }, { visible: [AAA, DESCRIPTOR] });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

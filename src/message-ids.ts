@@ -152,7 +152,9 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
-      if (copy.retryAfterSeconds !== undefined) detail += ` Retry after ${copy.retryAfterSeconds} seconds${copy.method === 'GET' ? ', then retry the read' : ''}.`;
+      if (copy.retryAfterSeconds !== undefined) detail += copy.method === 'GET' && [401, 403].includes(copy.status ?? 0)
+        ? ` Server Retry-After: ${copy.retryAfterSeconds} seconds; access must be corrected first.`
+        : ` Retry after ${copy.retryAfterSeconds} seconds${copy.method === 'GET' ? ', then retry the read' : ''}.`;
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
@@ -161,7 +163,7 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
         ? `${facts?.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
         : (facts?.completed ? `${facts.operation ?? 'Request'} returned no confirmed usable result. ` : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `)
         + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
-          : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
+          : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying the attachment upload in the original operation; retrying may create a duplicate.'
           : 'Retry reads; verify the outcome before repeating writes.'))
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
         + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '')

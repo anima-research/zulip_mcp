@@ -22,7 +22,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
-  sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
+  sendIncoming(messages: IncomingChannelMessage[], beforeOffer?: () => void): Promise<ChannelsIncomingResult | undefined>;
 }
 
 /** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
@@ -45,6 +45,7 @@ export interface RegisterAdditionalResult {
 }
 
 export interface ChannelManagerHooks {
+  onOffered?: (key: ChannelKey, messages: KeyedMessage[]) => void;
   onDelivered?: (key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]) => void;
   deliverable?: (message: KeyedMessage) => boolean;
   onWithheld?: (key: ChannelKey, messages: KeyedMessage[]) => void;
@@ -694,7 +695,9 @@ export class ChannelManager {
 
     let result: ChannelsIncomingResult | undefined;
     try {
-      result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!));
+      result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!), () => {
+        for (const [key, messages] of groupByKey(allMessages)) this.report(this.hooks.onOffered, key, messages);
+      });
     } catch (error) {
       const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
       const givenUp = queued.filter((q) => q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);

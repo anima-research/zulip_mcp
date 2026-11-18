@@ -46,6 +46,8 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
       if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { channel: 'dm:9', topic: 'new', scope: 'one', emoji_name: 'warning', [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
     }
     await assert.rejects(tools.handleToolCall('send_message', { reply_to: 'alpha:7', content: '[[msg:alpha:7]] [[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
+    await assert.rejects(tools.handleToolCall('send_dm', { recipients: ['someone'], content: '[[msg:beta:8]]' }), /differs/);
+    await assert.rejects(tools.handleToolCall('edit_message', { message_id: 'alpha:7', content: '[[msg:beta:8]]' }), /differs/);
     assert.equal(calls.length, 0);
     assert.equal(writes, 0);
   }
@@ -294,7 +296,7 @@ test('move_messages read-back timeout retains success, duration and context in e
     assert.deepEqual(result, {
       moved: true,
       asked: { topic: 'new', scope: 'one' },
-      readBackError: `move_messages (message_id=${mode === 'legacy' ? 7 : 'alpha:7'}): Zulip transport failure (timeout). Retry the read. Timeout: 15 seconds.`,
+      readBackError: `move_messages (message_id=${mode === 'legacy' ? 7 : 'alpha:7'}): Zulip transport failure (timeout). Retry the read. Timeout: 15 seconds. Inspect the moved message with fetch_around(message_id=${JSON.stringify(mode === 'legacy' ? 7 : 'alpha:7')}); do not repeat the move to retry its read-back.`,
       note: 'To answer this message where it is now, use send_message with reply_to.',
     });
     assert.doesNotMatch(result.readBackError, /\/messages\/7/);
@@ -406,11 +408,12 @@ test('profile and all additional structured message cursors are projected, not u
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     const record = { ...Object.fromEntries(fields.map(key => [key, 7])),
-      unread_message_ids: [7, 0], unverifiedMessageIds: ['7'], user_id: 9, stream_id: 12, max_message_length: 10000 };
+      unread_message_ids: [7, 0], unverifiedMessageIds: ['7'], message_ids: [7], messageIds: ['7'], targetMessageIds: [7], user_id: 9, stream_id: 12, max_message_length: 10000 };
     const result = ids.project(record) as any;
     for (const field of fields) assert.equal(result[field], mode === 'legacy' ? 7 : 'alpha:7');
     assert.deepEqual(result.unread_message_ids, mode === 'legacy' ? [7, 0] : ['alpha:7', 0]);
     assert.deepEqual(result.unverifiedMessageIds, mode === 'legacy' ? ['7'] : ['alpha:7']);
+    for (const field of ['message_ids', 'messageIds', 'targetMessageIds']) assert.deepEqual(result[field], mode === 'legacy' ? record[field as keyof typeof record] : ['alpha:7']);
     assert.equal(result.user_id, 9);
     assert.equal(result.stream_id, 12);
     assert.equal(result.max_message_length, 10000);
@@ -631,10 +634,26 @@ test('every message-ID schema field follows the selected ID contract', () => {
     const definitions = idToolDefinitions(toolDefinitions, new MessageIds('alpha', mode));
     const seen: string[] = [];
     for (const tool of definitions) for (const [field, schema] of Object.entries(tool.inputSchema.properties)) {
-      if (!expected.includes(`${tool.name}.${field}`)) continue;
+      if (!expected.includes(`${tool.name}.${field}`)) {
+        assert.deepEqual(schema, (toolDefinitions.find(t => t.name === tool.name)!.inputSchema.properties as any)[field], `unrelated ${tool.name}.${field} stays unchanged`);
+        continue;
+      }
       seen.push(`${tool.name}.${field}`);
       assert.deepEqual(schema.type, mode === 'strict' ? 'string' : ['string', (toolDefinitions.find(t => t.name === tool.name)!.inputSchema.properties as any)[field].type]);
     }
     assert.deepEqual(seen.sort(), [...expected].sort());
+  }
+});
+
+test('compat warns on bare IDs for every message-ID tool', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'compat-tool-warnings-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const runtime = new ZulipToolRuntime({ api: standInApi({}).api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', 'compat') });
+  for (const name of ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around']) {
+    logs.length = 0;
+    try { await runtime.handleToolCall(name, { message_id: 7, content: 'edited', topic: 'new', scope: 'one', emoji_name: 'eyes' }); } catch { /* This test pins validation warnings, not the later operation. */ }
+    assert.ok(logs.some(line => /Warning:.*bare message_id/.test(line)), `${name} must warn`);
   }
 });

@@ -922,7 +922,7 @@ export class ZulipToolRuntime {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)} back`)).message;
         } catch (err) {
           const diagnostic = messageIdError(err, this.messageIds).message;
-          const readBackError = `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic}`;
+          const readBackError = `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic} Inspect the moved message with fetch_around(message_id=${JSON.stringify(this.messageIds.format(messageId))}); do not repeat the move to retry its read-back.`;
           return { moved: true, asked, readBackError, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;

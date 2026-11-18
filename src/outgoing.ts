@@ -107,7 +107,7 @@ export async function sendMessage(
       safe.message += receipt;
       throw safe;
     }
-    if (isRefusal(answer)) throw new SendRefused(receipt ? { ...answer, msg: answer.msg + receipt } : answer);
+    if (isRefusal(answer)) throw new SendRefused(receipt ? { ...answer, msg: (answer.msg ?? answer.code ?? 'Zulip refused the message') + receipt } : answer);
     const chunk = { id: answer.id, content: part };
     chunks.push(chunk);
     last = answer;

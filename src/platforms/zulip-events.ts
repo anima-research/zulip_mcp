@@ -399,10 +399,13 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        const errMsg = error instanceof ZulipNoAnswer
+        let errMsg = error instanceof ZulipNoAnswer
           ? error.kind === 'no-self-id' ? `the bot's user ID is not yet available${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
             : `the poll ${error.kind === 'not-json' ? 'received an unreadable response' : error.kind === 'timeout' ? 'timed out' : 'failed before a complete answer'}${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
           : 'the poll failed; polling retries automatically';
+        if (error instanceof ZulipNoAnswer && [401, 403].includes(error.status ?? 0)) {
+          errMsg += '; the host operator must repair authorization; retries alone cannot fix access';
+        }
 
         this.consecutiveFailures++;
         const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures),

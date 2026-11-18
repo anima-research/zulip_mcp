@@ -36,6 +36,7 @@ interface Held {
   status: HeldStatus;
   replayed: boolean;
   replyVerified: boolean;
+  saveDropped?: boolean;
 }
 
 const HELD_CAP_PER_CHANNEL = 50_000;
@@ -57,7 +58,6 @@ export class DeliveryState {
   private reached = new Map<ChannelKey, number>();
   // The holds the last run saved, with the failed reads of each.
   private carried = new Map<ChannelKey, Map<number, number>>();
-  private unsavedThrough = new Map<ChannelKey, number>();
 
   constructor(
     private readonly stateDir: string | null,
@@ -226,13 +226,16 @@ export class DeliveryState {
    */
   private savedHolds(key: ChannelKey): [number, number][] {
     const all = new Map<number, number>();
-    for (const [id, h] of this.held.get(key) ?? []) if (h.status !== 'queued') all.set(id, 0);
+    for (const [id, h] of this.held.get(key) ?? []) if (h.status !== 'queued' && !h.saveDropped) all.set(id, 0);
     for (const [id, failed] of this.carried.get(key) ?? []) all.set(id, failed);
     const kept = [...all].sort((a, b) => a[0] - b[0]);
     const dropped = kept.splice(0, Math.max(0, kept.length - HELD_SAVED_PER_CHANNEL)).map(([id]) => id);
     this.uncarry(key, dropped);
-    if (dropped.length > 0 && dropped[dropped.length - 1] > (this.unsavedThrough.get(key) ?? 0)) {
-      this.unsavedThrough.set(key, dropped[dropped.length - 1]);
+    for (const id of dropped) {
+      const h = this.held.get(key)?.get(id);
+      if (h) h.saveDropped = true;
+    }
+    if (dropped.length > 0) {
       console.error(
         `[zulip-mcp] ${this.fileKey(key) ?? key}: more than ${HELD_SAVED_PER_CHANNEL} undelivered message ids to save for a restart; ` +
           `the oldest ${dropped.length} (${dropped[0]}–${dropped[dropped.length - 1]}) are dropped from that list and will not be offered by id`,
@@ -330,7 +333,10 @@ export class DeliveryState {
       if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
       held.set(messageId, { status, replayed: false, replyVerified: false });
     }
-    if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
+    if (status !== 'queued') {
+      this.watermarkBelowHolds(key);
+      this.save();
+    }
   }
 
   watermarkBelowHolds(key: ChannelKey): boolean {
@@ -353,7 +359,8 @@ export class DeliveryState {
     const held = this.held.get(key);
     if (!held) return;
     for (const [id, h] of held) if (id > afterId && id <= messageId) h.status = 'rejected';
-    if (this.watermarkBelowHolds(key)) this.save();
+    this.watermarkBelowHolds(key);
+    this.save();
   }
 
   failQueued(): void {

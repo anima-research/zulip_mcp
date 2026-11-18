@@ -97,9 +97,10 @@ recovers the first message and context, including a pageable `channelId` for DMs
 can then page through the omitted range. Acceptance acknowledges the omissions,
 records progress through the scan, including unselected messages and earlier
 holds within that scan; the durable watermark advances only as far as remaining
-holds permit. Ordinary catch-up starts after the saved watermark, but Option B
-also persists up to 50 held IDs per channel and offers those passed by the
-watermark once by ID on the next start (see the README recovery limits).
+holds permit. Ordinary catch-up starts after the saved watermark, but a separate bounded list
+also persists up to 50 held IDs per channel and reads those passed by the
+watermark by ID on the next start, offering selected rows once and withdrawing
+unselected closed-stream ambient rows (see the README recovery limits).
 An earlier hold outside the scan can pin the watermark: acceptance of a later range is not independently persisted, and that
 range can be offered again, including after restart. Explicit history reads remain available. Recovery covers fetched rows only,
 not an unfetched interval or overflow beyond the existing held-ID cap.

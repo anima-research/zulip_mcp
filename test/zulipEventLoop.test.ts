@@ -581,6 +581,14 @@ test('stop cancels the native Retry-After timer and lets the loop finish', async
   await sleeping;
   assert.equal(typeof (loop as any).cancelSleep, 'function');
   loop.stop();
-  await running;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([running, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('stop did not cancel the native sleep within 1 second')), 1000);
+    })]);
+  } finally {
+    clearTimeout(timer);
+    (loop as any).cancelSleep?.();
+  }
   assert.equal((loop as any).cancelSleep, undefined);
 });

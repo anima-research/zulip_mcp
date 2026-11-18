@@ -54,7 +54,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   history still has it there; one still waiting for the lookup that places
   it is dropped, and the next catch-up recovers what it can. Recovery covers
   fetched rows only, within the catch-up ceiling and held-ID cap, not an
-  unfetched interval; a held message the watermark later passes is offered
+  unfetched interval; an eligible held message the watermark later passes is offered
   by id at the start after that (see Catch-up below). Accepted elision
   notices acknowledge omitted rows; use their recovery pointers to read them
   explicitly.
@@ -118,9 +118,11 @@ Discord and Slack adapters that once lived here moved to those servers.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 
-- Catch-up: a persisted per-channel watermark advances only when the host
-  has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). A channel the host has accepted nothing on gets one just
+- Catch-up: a persisted per-channel watermark tracks host acceptance
+  (itemized `channels/incoming` results, acknowledged `push/event`) and
+  explicitly skipped scans with no selected rows (for example, closed-stream
+  ambient-only history). It is not proof that every passed row was offered.
+  A channel the host has accepted nothing on gets one just
   below its first message that isn't accepted, and while `zulip.messaging`
   is disabled, as that message comes in. A refused or transport-lost offer holds
   the watermark back until replay or acceptance of a later catch-up scan that
@@ -136,19 +138,25 @@ Discord and Slack adapters that once lived here moved to those servers.
   ids and the current run's counted together; past 50 the oldest of them
   all leave it, with a line on stderr giving their id range. A restart
   forgets the holds themselves, so its catch-up runs from the watermark as
-  ever and offers every listed id it reaches. One it doesn't reach, because
+  ever, applying its normal selection and accepted/skip coverage to listed
+  IDs it reaches. One it doesn't reach, because
   the catch-up failed or stopped at its ceiling, is not read by id while it is
   still above the watermark; once the watermark has passed it (the host
-  accepted something newer), the next start reads it by id and offers it
-  once, before its catch-up: on a closed channel in a `<missed>` block of
+  accepted something newer), the next start reads it by id and offers eligible
+  rows once, before its catch-up: on a closed channel in a `<missed>` block of
   those ids alone, oldest first, chosen as any catch-up block is (every row
   for a channel the host had open, addressed ± 7 of the listed rows
-  otherwise); on a channel the host has opened by then, as messages. That
-  offer never moves the watermark, and it is the only one: an id leaves the
+  otherwise); on a channel the host has opened by then, as messages. Closed-stream
+  ambient rows outside the selected vicinity are withdrawn without an offer.
+  Queuing a message for the open-channel batcher is not an offer: it stays
+  listed until an actual host request, even if capability withdrawal or a
+  channel close withholds the batch. The by-ID result and its failure counter
+  are saved before any retryable catch-up read, so catch-up retries do not
+  repeat or discard the completed by-ID pass. That offer never moves the watermark, and it is the only one: an id leaves the
   list when it is offered this way, whatever the host answers, when the host
   accepts a catch-up block or an open's history page that covers it,
-  or when it is withdrawn (Zulip no longer has it in that channel, or the
-  channel is muted or outside the allowlist). While the offer cannot be made
+  or when it is withdrawn (unselected closed-stream ambient rows, IDs Zulip
+  no longer has in that channel, or a channel muted or outside the allowlist). While the offer cannot be made
   (`zulip.messaging` disabled, no `pushEvents`) the ids stay listed. A read
   by id that fails is counted against that id alone and stops the pass, the
   ids after it waiting for the next start; after three such starts the id is
