@@ -54,8 +54,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   history still has it there; one still waiting for the lookup that places
   it is dropped, and the next catch-up recovers what it can. Recovery covers
   fetched rows only, within the catch-up ceiling and held-ID cap, not an
-  unfetched interval. Accepted elision notices acknowledge omitted rows; use
-  their recovery pointers to read them explicitly.
+  unfetched interval; a held message the watermark later passes is offered
+  by id at the start after that (see Catch-up below). Accepted elision
+  notices acknowledge omitted rows; use their recovery pointers to read them
+  explicitly.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -128,6 +130,32 @@ Discord and Slack adapters that once lived here moved to those servers.
   Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.
+  The ids of the messages held this way are saved beside the watermark: those
+  the host refused or whose offer was lost, and, when the server stops in
+  order, those still waiting. The list keeps 50 per channel, the last run's
+  ids and the current run's counted together; past 50 the oldest of them
+  all leave it, with a line on stderr giving their id range. A restart
+  forgets the holds themselves, so its catch-up runs from the watermark as
+  ever and offers every listed id it reaches. One it doesn't reach, because
+  the catch-up failed or stopped at its ceiling, is not read by id while it is
+  still above the watermark; once the watermark has passed it (the host
+  accepted something newer), the next start reads it by id and offers it
+  once, before its catch-up: on a closed channel in a `<missed>` block of
+  those ids alone, oldest first, chosen as any catch-up block is (every row
+  for a channel the host had open, addressed ± 7 of the listed rows
+  otherwise); on a channel the host has opened by then, as messages. That
+  offer never moves the watermark, and it is the only one: an id leaves the
+  list when it is offered this way, whatever the host answers, when the host
+  accepts a catch-up block or an open's history page that covers it,
+  or when it is withdrawn (Zulip no longer has it in that channel, or the
+  channel is muted or outside the allowlist). While the offer cannot be made
+  (`zulip.messaging` disabled, no `pushEvents`) the ids stay listed. A read
+  by id that fails is counted against that id alone and stops the pass, the
+  ids after it waiting for the next start; after three such starts the id is
+  dropped with a line on stderr. The list holds only ids the server itself
+  held: a message that never reached it (one beyond a catch-up ceiling, say)
+  is not on it, and once the host accepts something newer only
+  `fetch_history` reaches it.
   On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
@@ -616,7 +644,8 @@ Under `ZULIP_STATE_DIR`, keyed by session:
 
 - `<session>.json` — the plain-MCP monitor (streams, last-read ids)
 - `<session>.delivery.json` — watermarks, missed tallies, last-open channels,
-  and the stream names they were saved under (written only with MCPL)
+  the ids of held messages (present only while something is held), and the
+  stream names they were saved under (written only with MCPL)
 - `<session>.filters.json` — the filters plane (unless `ZULIP_FILTERS_FILE`)
 
 Put `ZULIP_STATE_DIR` on storage that survives a redeploy. In a container
