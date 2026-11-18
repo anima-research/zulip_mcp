@@ -84,8 +84,8 @@ download or a blind retry. Complete upload responses with rejection statuses
 400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals. Other upload
 responses, including all 5xx/proxy failures, incomplete bodies and malformed
 successful responses, retain duplicate-upload uncertainty; a complete body alone
-does not prove that nothing was stored. Attachment URLs accept origin and
-`/api`-suffixed realm configurations; only the initial URL is checked for same-origin
+does not prove that nothing was stored. Attachment URLs use the origin of an HTTP(S) realm URL, including
+`/api` or other configured path suffixes; only the initial URL is checked for same-origin
 `/user_uploads/` authorization. Redirect destinations follow native fetch policy
 and are not revalidated. Credential-bearing URLs and encoded path separators are
 rejected before fetching. Failed unread

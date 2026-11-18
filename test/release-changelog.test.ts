@@ -80,6 +80,21 @@ function section(text: string, version: string): string {
 const changelog = (dir: string) => readFileSync(join(dir, "CHANGELOG.md"), "utf8");
 const pending = (dir: string) => readdirSync(join(dir, "changelog.d")).sort();
 
+test("repository held-ID recovery is an Added feature, separate from independent Fixed entries", () => {
+  const fragment = (name: string) => readFileSync(new URL(`../changelog.d/${name}`, import.meta.url), "utf8");
+  const added = fragment("held-ids-across-restart.added.md");
+  const fixed = fragment("carried-id-delivery.fixed.md");
+  assert.match(added, /Persist a bounded held-ID list/);
+  assert.doesNotMatch(fixed, /held-ID|watermark|restart|by-ID/);
+  const dir = setup({ fragments: {
+    "held-ids-across-restart.added.md": added,
+    "carried-id-delivery.fixed.md": fixed,
+  } });
+  const r = run(dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(section(changelog(dir), "1.1.0"), `### Added\n\n${added.trim()}\n\n### Fixed\n\n${fixed.trim()}`);
+});
+
 test("folds fragments into a versioned section in canonical order and deletes them", () => {
   const dir = setup({
     fragments: {

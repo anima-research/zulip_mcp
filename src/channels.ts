@@ -694,20 +694,25 @@ export class ChannelManager {
     }
 
     let result: ChannelsIncomingResult | undefined;
+    let offered = false;
     try {
       result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!), () => {
+        offered = true;
         for (const [key, messages] of groupByKey(allMessages)) this.report(this.hooks.onOffered, key, messages);
       });
     } catch (error) {
-      const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
-      const givenUp = queued.filter((q) => q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
+      const once = (q: Queued) => offered && q.message.carriedOffer === true;
+      const retry = queued.filter((q) => !once(q) && q.attempts + 1 < MAX_BATCH_ATTEMPTS);
+      const givenUp = queued.filter((q) => once(q) || q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
       console.error(
         `Failed to send ${allMessages.length} incoming message(s) to host` +
           (retry.length > 0 ? `; retrying ${retry.length}` : '') +
-          (givenUp.length > 0 ? `; giving up on ${givenUp.length} (held below the watermark for a later replay)` : '') +
+          (givenUp.length > 0 ? `; giving up on ${givenUp.length} (delivery unconfirmed; replayable messages remain held where applicable)` : '') +
           ':',
         (error as Error).message ?? error,
       );
+      const synthetic = givenUp.filter(m => !/^[0-9]+$/.test(m.messageId)).length;
+      if (synthetic > 0) console.error(`${synthetic} unconfirmed synthetic event(s) cannot be replayed from message history`);
       for (const [key, messages] of groupByKey(givenUp)) this.report(this.hooks.onGivenUp, key, messages);
       const requeued = new Map<ChannelKey, Queued[]>();
       for (const q of retry) {

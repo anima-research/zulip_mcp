@@ -7,8 +7,10 @@
   50,000 held-ID cap: untracked overflow refusals may be passed and are not
   guaranteed restart recovery. Empty-selection scans explicitly skip their
   unselected rows. Holds outside
-  an accepted scan still pin the watermark; a `<missed>` block per channel on reconnect (full
-  backscroll for channels the host had open, mention ±7 otherwise), paged
+  an accepted scan still pin the watermark; one or more `<missed>` blocks per channel on reconnect (full
+  backscroll for channels the host had open, addressed message ±7 otherwise;
+  mentions, replies and DMs are addressed, and deferred quote verification can
+  split a prefix block from a retry block), paged
   up to `ZULIP_CATCHUP_LIMIT` and hard-capped by
   `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry is healed from
   history for open and closed channels alike.

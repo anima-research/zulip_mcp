@@ -131,6 +131,7 @@ interface CatchUpPass {
 }
 
 interface CatchUpRead {
+  byId?: boolean;
   keepAll: boolean;
   after?: number;
   through?: () => number;
@@ -231,13 +232,15 @@ export class ZulipMcplServer {
       sendIncoming: (messages, beforeOffer) => this.sendIncomingToHost(messages, beforeOffer),
     };
     const channels = new ChannelManager(host, this.adapters, this.grant, this.ids, options.batchWindowMs, {
-      onOffered: (key, messages) => this.lanes?.lane(key).answer((ctx) => {
-        const carried = new Set(ctx.w.delivery.carriedIds(key));
-        const offered = messages.map(numericId).filter((id): id is number => id !== null && carried.has(id) && id <= (ctx.w.delivery.watermark(key) ?? 0));
+      // Commit the one-off saved-list removal synchronously at the request
+      // boundary; a busy channel lane must not postpone it until after send.
+      onOffered: (key, messages) => {
+        const carried = new Set(this.delivery.carriedIds(key));
+        const offered = messages.map(numericId).filter((id): id is number => id !== null && carried.has(id) && id <= (this.delivery.watermark(key) ?? 0));
         if (offered.length === 0) return;
-        ctx.w.delivery.uncarry(key, offered);
+        delivery.uncarry(key, offered);
         this.delivery.save();
-      }),
+      },
       onDelivered: (key, accepted, rejected) => this.lanes?.lane(key).answer((ctx) => this.onDelivered(ctx.w, key, accepted, rejected)),
       deliverable: (message) => this.mayDeliver(message),
       onWithheld: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onWithheld(ctx.w, key, messages)),
@@ -930,25 +933,26 @@ export class ZulipMcplServer {
     }
     for (const m of rejected) {
       const id = numericId(m);
-      if (id !== null) this.notAccepted(w, key, id, 'rejected', m);
+      if (id !== null) this.notAccepted(w, key, id, 'rejected', m, false);
     }
     if (high > 0) moved = w.delivery.advance(key, high) || moved;
-    if (moved) this.delivery.save();
+    if (moved || rejected.length > 0) this.delivery.save();
     if (accepted.length > 0) this.enterHeldReads();
   }
 
   private onGivenUp(w: DeliveryWriter, key: ChannelKey, messages: KeyedMessage[]): void {
     for (const m of messages) {
       const id = numericId(m);
-      if (id !== null) this.notAccepted(w, key, id, 'failed', m);
+      if (id !== null) this.notAccepted(w, key, id, 'failed', m, false);
     }
+    this.delivery.save();
   }
 
-  private notAccepted(w: DeliveryWriter, key: ChannelKey, id: number, status: 'failed' | 'rejected', message?: KeyedMessage): void {
+  private notAccepted(w: DeliveryWriter, key: ChannelKey, id: number, status: 'failed' | 'rejected', message?: KeyedMessage, save = true): void {
     if (this.isMuted(key) || !this.isAllowed(key, message)) {
-      this.letGo(w, key, id);
+      this.letGo(w, key, id, save);
     } else {
-      w.delivery.hold(key, id, status);
+      w.delivery.hold(key, id, status, save);
     }
   }
 
@@ -959,14 +963,14 @@ export class ZulipMcplServer {
       const id = numericId(m);
       if (id === null) continue;
       if (this.isMuted(key) || !this.isAllowed(key, m)) {
-        moved = w.delivery.release(key, id) || moved;
+        moved = w.delivery.release(key, id, 'channel is muted or outside the allowlist') || moved;
       } else {
-        w.delivery.hold(key, id, 'failed');
+        w.delivery.hold(key, id, 'failed', false);
         w.delivery.clearReplayed(key, [id]);
         held = true;
       }
     }
-    if (moved) this.delivery.save();
+    if (moved || held) this.delivery.save();
     if (held) this.enterHeldReads(true);
   }
 
@@ -1001,8 +1005,8 @@ export class ZulipMcplServer {
     }, { kind: 'message', ...(id !== null ? { id } : {}) });
   }
 
-  private letGo(w: DeliveryWriter, key: ChannelKey, id: number): void {
-    if (w.delivery.release(key, id)) this.delivery.save();
+  private letGo(w: DeliveryWriter, key: ChannelKey, id: number, save = true): void {
+    if (w.delivery.release(key, id, 'message is no longer deliverable or absent from fetched history') && save) this.delivery.save();
   }
 
   private placeOf(key: ChannelKey): number | undefined {
@@ -1260,7 +1264,7 @@ export class ZulipMcplServer {
     if (!this.delivery.carriedIds(key).some((id) => id <= (this.delivery.watermark(key) ?? 0))) {
       return this.fillRead(r, (r2) => this.readStartCatchUp(r2, key, renamePushes, answers));
     }
-    const carried = this.conn && this.mcplActive && this.adapter.fetchHistory && this.catchupLimit > 0 &&
+    const carried = this.conn && this.mcplActive && this.adapter.fetchHistory &&
       this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)
       ? await this.readCarried(r, key) : undefined;
     return async (ctx) => {
@@ -1416,8 +1420,10 @@ export class ZulipMcplServer {
     const keepAll = read.keepAll || isDmKey(key);
     const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
     if (kept.length === 0) {
+      ctx.w.delivery.uncarry(key, read.byId ? msgs.map(numericId).filter((id): id is number => id !== null)
+        : ctx.w.delivery.carriedIds(key).filter(id => id > after && id <= newestId), 'not selected by catch-up');
       read.onAttempt?.(ctx.w, newestId);
-      ctx.w.delivery.advanceThrough(key, newestId, after);
+      if (!read.byId) ctx.w.delivery.advanceThrough(key, newestId, after);
       if (blocked !== undefined) handSecond();
       return;
     }
@@ -1440,6 +1446,7 @@ export class ZulipMcplServer {
       moreBeyond: (truncated && !read.ceiling) || blocked !== undefined,
       newestScannedId: newestId,
       firstScannedId: after + 1,
+      byId: read.byId,
     });
     const synthetic: KeyedMessage = {
       key,
@@ -1472,13 +1479,17 @@ export class ZulipMcplServer {
       ...((truncated && !read.ceiling) || blocked !== undefined ? { truncated: true } : {}),
     }, () => {
       offered = true;
+      if (read.byId) {
+        const selected = new Set(kept.map(v => v.id));
+        ctx.w.delivery.uncarry(key, msgs.map(numericId).filter((id): id is number => id !== null && !selected.has(id)), 'not selected by catch-up');
+      }
       read.onAttempt?.(ctx.w, newestId);
       if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
         w.delivery.markReplayed(key, shownIds);
-        w.delivery.advanceThrough(key, newestId, after);
+        if (!read.byId) w.delivery.advanceThrough(key, newestId, after);
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
           if (w.channels.noteConversation(key, this.asLastSeen(key, msgs[i]))) break;
@@ -1489,7 +1500,7 @@ export class ZulipMcplServer {
         w.delivery.hold(key, firstId, 'rejected');
         w.delivery.refuse(key, after, newestId);
       } else {
-        for (const id of shownIds) w.delivery.hold(key, id, 'failed');
+        for (const id of shownIds) w.delivery.hold(key, id, 'failed', false);
       }
       this.delivery.save();
     };
@@ -1517,7 +1528,7 @@ export class ZulipMcplServer {
     const ids = this.delivery.carriedIds(key).filter((id) => id <= watermark);
     if (ids.length === 0) return;
     if (this.isMuted(key) || !this.isAllowed(key)) return (ctx) => {
-      if (!ctx.ended && (this.isMuted(key) || !this.isAllowed(key))) ctx.w.delivery.uncarry(key, ids);
+      if (!ctx.ended && (this.isMuted(key) || !this.isAllowed(key))) ctx.w.delivery.uncarry(key, ids, 'channel is muted or outside the allowlist');
     };
     const canOffer = () => this.ids.heldIdOf(key) !== undefined && this.grant.has('pushEvents') && this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET);
     if (!canOffer()) return;
@@ -1531,7 +1542,7 @@ export class ZulipMcplServer {
         if (page.unverifiedMessageIds?.includes(String(id))) throw new Error('whether it replies to the agent could not be checked');
         const row = page.messages.find((m) => numericId(m) === id);
         if (row) rows.push(row);
-        else gone.push(id);
+        else if (!page.policyFiltered) gone.push(id);
       } catch (err) {
         // The ids after it wait: what fails one read mostly fails the next, and each could wait out its whole bound.
         logDiagnostic(err, `[zulip-mcp] reading undelivered message ${this.messageIds.format(id)} of ${this.label(key)} by id failed:`);
@@ -1542,16 +1553,18 @@ export class ZulipMcplServer {
     return async (ctx) => {
       if (ctx.ended) return;
       if (failed !== undefined) ctx.w.delivery.carriedReadFailed(key, failed);
-      ctx.w.delivery.uncarry(key, gone);
+      ctx.w.delivery.uncarry(key, gone, 'message no longer exists in this channel');
       if (this.isMuted(key) || !this.isAllowed(key)) {
-        ctx.w.delivery.uncarry(key, ids);
+        ctx.w.delivery.uncarry(key, ids, 'channel is muted or outside the allowlist');
         return;
       }
       if (rows.length === 0 || !canOffer()) return;
       if (this.channelManager.isKeyOpen(key)) {
         for (const row of this.projectHistoryReactions(rows)) {
           if (ctx.ended || !canOffer()) return;
-          await this.route(ctx, recovered(row));
+          const message = recovered(row);
+          message.carriedOffer = true;
+          await this.route(ctx, message);
         }
         return;
       }
@@ -1560,8 +1573,14 @@ export class ZulipMcplServer {
       this.handCatchUp(
         ctx, key, {
           keepAll: this.delivery.wasOpen(key),
+          byId: true,
           // Called at the actual push boundary, or on empty selection (withdrawal).
-          onAttempt: (w) => w.delivery.uncarry(key, rows.map((row) => Number(row.messageId))),
+          onAttempt: (w) => {
+            w.delivery.uncarry(key, rows.map((row) => Number(row.messageId)));
+            // As with open-channel onOffered, persist before the host request:
+            // a crash without an answer must not restore the one-off offer.
+            w.delivery.save();
+          },
         },
         { after: first - 1, bound: last, retry: false, fetched: { messages: rows, truncated: false, complete: true, scannedThrough: last, unverifiedMessageIds: [] } },
         { through: last, truncated: false },
@@ -1665,7 +1684,7 @@ export class ZulipMcplServer {
     for (const id of ids) this.changesOnTurn.delete(id);
     const held = ids.filter(Number.isFinite);
     if (held.length > 0) {
-      for (const id of held) w.delivery.hold(key, id, 'failed');
+      for (const id of held) w.delivery.hold(key, id, 'failed', false);
       this.delivery.save();
     }
     const read = this.catchupLimit === 0

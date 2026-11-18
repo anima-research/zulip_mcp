@@ -833,3 +833,23 @@ test('an idle() taken while the batch waits for its window settles when flush() 
   assert.equal(settled, true, 'idle() settles once flush() has sent the batch');
   manager.destroy();
 });
+
+test('transport-exhausted synthetic events are labelled non-replayable', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const descriptor: ChannelDescriptor = { id: 'zulip:C1', type: 'zulip', label: '#general', direction: 'bidirectional' };
+  const { adapter, ids } = fakeAdapter('zulip', [descriptor]);
+  const manager = new ChannelManager({
+    registerChannels: async () => ({ results: [{ id: 'zulip:C1', accepted: true }] }),
+    sendIncoming: async () => { throw new Error('lost answer'); },
+  }, new Map([['zulip', adapter]]), grantedChannels(), ids, 60_000);
+  t.after(() => manager.destroy());
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+  deliver(manager, 'zulip:C1', { messageId: 'reaction_101', author: { id: 'system', name: 'system' }, timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'reaction' }] });
+  await manager.flush();
+  await manager.flush();
+  assert.equal(manager.pendingCount(), 0);
+  assert.ok(logs.some(line => /unconfirmed synthetic event\(s\) cannot be replayed/.test(line)));
+  assert.ok(!logs.some(line => /held below the watermark for a later replay/.test(line)));
+});

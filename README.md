@@ -155,12 +155,15 @@ Discord and Slack adapters that once lived here moved to those servers.
   repeat or discard the completed by-ID pass. That offer never moves the watermark, and it is the only one: an id leaves the
   list when it is offered this way, whatever the host answers, when the host
   accepts a catch-up block or an open's history page that covers it,
+  when an empty-selection catch-up explicitly skips its range,
   or when it is withdrawn (unselected closed-stream ambient rows, IDs Zulip
   no longer has in that channel, or a channel muted or outside the allowlist). While the offer cannot be made
   (`zulip.messaging` disabled, no `pushEvents`) the ids stay listed. A read
   by id that fails is counted against that id alone and stops the pass, the
   ids after it waiting for the next start; after three such starts the id is
-  dropped with a line on stderr. The list holds only ids the server itself
+  dropped with a line on stderr. `ZULIP_CATCHUP_LIMIT=0` disables ordinary
+  catch-up, not this separate recovery of listed IDs below the watermark.
+  The list holds only ids the server itself
   held: a message that never reached it (one beyond a catch-up ceiling, say)
   is not on it, and once the host accepts something newer only
   `fetch_history` reaches it.
@@ -179,8 +182,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   event-queue expiry is healed the same way — open channels replayed, closed
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
-  follows it, as a message, so a live delivery can never jump the watermark
-  over the offline gap. Past 5,000 waiting messages, the channel with the
+  follows it, as a message. If catch-up fails or stops at its ceiling, later
+  accepted live delivery can move the watermark past unfetched offline rows.
+  Never-held rows then require explicit `fetch_history`; the saved held-ID list
+  does not cover them. Past 5,000 waiting messages, the channel with the
   most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake

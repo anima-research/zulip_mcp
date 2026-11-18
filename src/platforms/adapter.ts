@@ -116,6 +116,8 @@ export interface ChannelHistoryQuery {
 }
 
 export interface ChannelHistoryPage {
+  /** Rows may be absent due to policy, not absence from remote history. */
+  policyFiltered?: boolean;
   messages: KeyedMessage[];
   scannedThrough: number | null;
   reachedNewest: boolean;

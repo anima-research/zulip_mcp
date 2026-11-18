@@ -8239,6 +8239,7 @@ async function endedHoldingTwo(dir: string, ids: MessageIds, path: HeldReadPath)
     assert.equal(entered, 0, 'it has not entered Zulip yet');
   } else {
     await until(() => entered > 0, 'the named waiting/failed held read actually entered');
+    if (path === HELD_READ_PATHS['failed before shutdown']) await h.server.quiet();
   }
   assert.equal(offers(h, wire(21)) + offers(h, wire(22)), 2, 'that run offered each once, and was refused');
   await h.close();
@@ -8407,6 +8408,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         const history = await endedHoldingTwo(dir, ids, path);
         await watermarkPasses(dir, ids, history, path.opts);
         await startOnce(dir, ids, history, (third) => {
+          assert.deepEqual(third.adapter.historyCalls.filter(c => c.channelId === 'zulip:general').slice(0, 3).map(c => [c.query.afterMessageId, c.query.limit === 1]), [['20', true], ['21', true], ['31', false]], 'both by-ID reads precede ordinary catch-up');
           const pushes = onGeneral(third);
           assert.deepEqual(pushes.map((p) => p.eventId), ['zulip_missed_zulip:general_22'], 'one block, of the two ids');
           assert.equal(pushes[0].origin?.messages, 2);
@@ -8465,8 +8467,9 @@ for (const mode of ['legacy', 'strict'] as const) {
       history.push(mention(21));
       h.adapter.emit!(mention(21));
       await until(() => h.policy.heldPushes.length === 1, 'the push of 21 waits for its answer');
+      const readsBeforeGap = h.adapter.historyCalls.length;
       h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
-      await h.host.sendRequest('ping');
+      await until(() => h.adapter.historyCalls.length > readsBeforeGap, 'gap recovery actually reads history');
       h.policy.holdPushes = false;
       h.policy.heldPushes.splice(0).forEach((answer) => answer());
       await h.server.quiet();
@@ -8699,6 +8702,7 @@ for (const mode of ['legacy', 'strict'] as const) {
         assert.deepEqual(opened.history!.map((m) => m.messageId), [wire(4), wire(5)]);
         turn.release();
         await second.server.quiet();
+        assert.ok(second.adapter.historyCalls.some(c => c.channelId === 'zulip:general' && c.query.afterMessageId === '5'), 'later catch-up really read after the open page');
         assert.deepEqual([second.incoming, second.pushed], [[], []], 'the page was the offer of 4 and 5');
       } finally {
         await second.close();
@@ -8857,4 +8861,128 @@ test('unconfirmed synthetic events have a distinguishing non-replayable diagnost
       if (duplicate) assert.ok(logs.some(line => line.includes('2 entries in host response')));
     } finally { await h.close(); }
   }
+});
+
+for (const mode of ['legacy', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  const wire = (id: number) => String(ids.format(id));
+  test(`${mode}: policy-filtered empty carried pages are retained, and zero catch-up limit still allows by-ID recovery`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-policy-empty-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    leaveState(dir, 31, { 21: 0 });
+    const history = [mention(21)];
+    await startOnce(dir, ids, history, h => {
+      assert.equal(offers(h, wire(21)), 0);
+      assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 21: 0 });
+    }, { catchupLimit: 0, prepare: h => {
+      h.adapter.fetchHistory = async () => ({ messages: [], scannedThrough: null, reachedNewest: true, policyFiltered: true });
+    } });
+    await startOnce(dir, ids, history, h => {
+      assert.deepEqual(h.adapter.historyCalls.map(c => [c.query.afterMessageId, c.query.limit]), [['20', 1]]);
+      assert.equal(offers(h, wire(21)), 1);
+      assert.equal(h.delivery.watermark('zulip:general'), 31);
+    }, { catchupLimit: 0 });
+    assert.equal(savedDelivery(dir).held, undefined);
+  });
+
+  test(`${mode}: carried closed messages save removal before the request and do not repeat after a crash`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-one-off-closed-'));
+    const restartDir = mkdtempSync(join(tmpdir(), 'zulip-one-off-closed-restart-'));
+    t.after(() => {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(restartDir, { recursive: true, force: true });
+    });
+    leaveState(dir, 31, { 21: 0 });
+    const history = [mention(21)];
+    const h = harness({ messageIds: ids, stateDir: dir, history });
+    h.policy.holdPushes = true;
+    const conn = h.serverSide;
+    const send = conn.sendRequest.bind(conn);
+    const snapshots: string[] = [];
+    t.mock.method(conn, 'sendRequest', (name, params) => {
+      if (name === method.PUSH_EVENT) {
+        // Preserve exactly what a process crash at dispatch would leave, before
+        // readStart's later save or any answer/shutdown settlement can mask it.
+        snapshots.push(readFileSync(join(dir, 'test.delivery.json'), 'utf8'));
+      }
+      return send(name, params);
+    });
+    try {
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(h, false);
+      await until(() => h.pushed.length === 1, 'the actual closed-channel offer');
+      assert.equal(offers(h, wire(21)), 1);
+      assert.equal(h.policy.heldPushes.length, 1, 'the host has not answered');
+      assert.equal(snapshots.length, 1);
+      writeFileSync(join(restartDir, 'test.delivery.json'), snapshots[0]);
+      await startOnce(restartDir, ids, history, restarted => {
+        assert.equal(offers(restarted, wire(21)), 0, 'restart from request-boundary state must not re-offer the ID');
+        assert.equal(restarted.delivery.watermark('zulip:general'), 31);
+        assert.ok(restarted.adapter.historyCalls.some(c => c.query.afterMessageId === '31'), 'ordinary catch-up really ran');
+        assert.ok(restarted.adapter.historyCalls.every(c => c.query.afterMessageId !== '20'), 'no repeated by-ID read');
+      });
+      assert.equal((JSON.parse(snapshots[0]) as SavedDelivery).held, undefined, 'removal is on disk before dispatch');
+    } finally {
+      for (const answer of h.policy.heldPushes.splice(0)) answer();
+      await h.close();
+    }
+  });
+
+  test(`${mode}: carried open messages commit removal before sending on a busy lane and do not retry lost answers`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'zulip-one-off-open-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    leaveState(dir, 31, { 21: 0 }, { lastOpen: ['zulip:general'], watermarks: { 'zulip:aaa': 1, 'zulip:general': 31 }, streams: { 6: 'aaa', 7: 'general' } });
+    const h = harness({ messageIds: ids, stateDir: dir, history: [mention(21)], visible: [AAA, DESCRIPTOR], batchWindowMs: 60_000 });
+    const turn = aaaHoldsTheTurn(h);
+    let release!: () => void;
+    try {
+      await initialize(h, true);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      await awaitRegistered(h, false);
+      await until(turn.reading, 'aaa reading');
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+      turn.release();
+      await until(() => h.server.channelManager.pendingCount() === 1, 'one carried row enqueued');
+      let busy = false;
+      const waiting = new Promise<void>(resolve => { release = resolve; });
+      (h.server as any).lanes.lane(h.adapter.keyOf('zulip:general')).enterRead(async () => { busy = true; await waiting; });
+      await until(() => busy, 'the channel lane is occupied');
+      const conn = (h.server as any).conn;
+      const send = conn.sendRequest.bind(conn);
+      let attempts = 0;
+      conn.sendRequest = (name: string, params: unknown) => {
+        if (name !== method.CHANNELS_INCOMING) return send(name, params);
+        attempts++;
+        assert.equal(savedDelivery(dir).held, undefined, 'durable removal precedes the actual request, not its answer');
+        return Promise.reject(new Error('host received the request but its answer was lost'));
+      };
+      await h.server.channelManager.flush();
+      await h.server.channelManager.flush();
+      assert.equal(attempts, 1, 'one offer even after uncertain transport failure');
+      assert.equal(h.server.channelManager.pendingCount(), 0);
+      assert.equal(savedDelivery(dir).held, undefined);
+    } finally { release?.(); turn.release(); await h.close(); }
+  });
+}
+
+test('empty by-ID selection logs actual withdrawals without discarding intervening policy-filtered IDs', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-empty-by-id-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  leaveState(dir, 200, { 10: 0, 50: 0, 100: 0 });
+  const ids = new MessageIds('alpha', 'strict');
+  await startOnce(dir, ids, [streamMsg(10), streamMsg(100)], h => {
+    assert.deepEqual(savedDelivery(dir).held?.['zulip:general'], { 50: 0 });
+    assert.equal(h.pushed.length, 0);
+    for (const id of [10, 100]) assert.ok(logs.some(line => line.includes(`ID ${id}: not selected by catch-up`)));
+  }, { prepare: h => {
+    const read = h.adapter.fetchHistory!.bind(h.adapter);
+    h.adapter.fetchHistory = (key, query) => query.afterMessageId === '49'
+      ? Promise.resolve({ messages: [], scannedThrough: null, reachedNewest: true, policyFiltered: true }) : read(key, query);
+  } });
 });

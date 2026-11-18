@@ -24,6 +24,7 @@ export interface ZulipApi {
 }
 
 export interface TransportAnswer {
+  retryAfterSeconds?: number;
   status: number;
   body: unknown;
 }
@@ -62,6 +63,16 @@ export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
 }
 
+const refusalMetadata = new WeakMap<ZulipRefusal, { status?: number; retryAfterSeconds?: number }>();
+
+/** HTTP facts stay out of the JSON answer's public fields. */
+export function refusalFacts(answer: ZulipRefusal): { status?: number; retryAfterSeconds?: number } {
+  const facts = refusalMetadata.get(answer);
+  const header = facts?.retryAfterSeconds;
+  const body = retryAfterOf(answer);
+  return { status: facts?.status, retryAfterSeconds: header === undefined ? body : body === undefined ? header : Math.max(header, body) };
+}
+
 export function refusalText(answer: ZulipRefusal): string {
   return answer.msg ? `${answer.msg}${answer.code ? ` (${answer.code})` : ''}` : answer.code ?? 'unknown error';
 }
@@ -88,7 +99,8 @@ export function mayHaveBeenApplied(err: unknown): boolean {
 
 export function zulipApi(transport: Transport): ZulipApi {
   const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) => {
-    const { status, body } = await transport(method, path, params, opts);
+    const { status, body, retryAfterSeconds } = await transport(method, path, params, opts);
+    if (isRefusal(body)) refusalMetadata.set(body, { status, retryAfterSeconds });
     if (method !== 'GET' && status >= 500 && isRefusal(body)) {
       const text = body.msg || body.code || 'unknown error';
       return { body: { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` }, serverError: true };
@@ -244,7 +256,7 @@ export function httpTransport(config: HttpTransportConfig): Transport {
       clearTimeout(timer);
     }
     try {
-      return { status, body: JSON.parse(text) };
+      return { status, body: JSON.parse(text), ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) };
     } catch (err) {
       throw new ZulipNoAnswer('not-json', method, path, write,
         `Zulip's answer to ${method} ${path} wasn't JSON (HTTP ${status}).`, status, retryAfterSeconds, undefined, err);

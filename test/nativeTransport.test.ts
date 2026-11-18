@@ -22,7 +22,7 @@ function assertFetchBoundaries(file: string, source: string): number {
       assert.ok([...source.matchAll(boundary)].some(m => start >= m.index! && start < m.index! + m[0].indexOf('} catch')), file);
     } else {
       assert.ok(['content.ts', 'attachments.ts', 'uploads.ts'].includes(file), file);
-      assert.match(statement, /\.catch\(error => \{ throw markTransportError\(error(?:, \{ operation: '[^']+' \})?\);/, file);
+      assert.match(statement, /\.catch\(error => \{ throw markTransportError\(error(?:, \{ operation: '[^']+'(?:, attachmentName: input\.name)? \})?\);/, file);
     }
   }
   return invocations.length;

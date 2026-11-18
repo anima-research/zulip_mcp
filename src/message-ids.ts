@@ -101,7 +101,7 @@ export function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
-type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean; refused?: boolean; retryAfterSeconds?: number };
+type TransportFacts = { attachmentName?: string; operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean; refused?: boolean; retryAfterSeconds?: number };
 const nativeTransportErrors = new WeakMap<Error, TransportFacts>();
 /** Mark failures at the fetch boundary, not by their JavaScript error class. */
 export function markTransportError(error: unknown, facts: TransportFacts = {}): unknown {
@@ -145,29 +145,35 @@ export function messageIdError(error: unknown, ids: MessageIds, log = true): Err
   if (error instanceof Error && (loggedDiagnostics.has(error) || !log)) loggedDiagnostics.add(copy);
   if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
     if (copy instanceof ZulipNoAnswer) {
-      let detail = `Zulip transport failure (${copy.kind}).`;
+      let detail = copy.kind === 'no-self-id'
+        ? "The server doesn't have the bot's own user id yet; it will retry on a later call."
+        : `Zulip transport failure (${copy.kind}).`;
       if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
-      if (copy.method === 'GET' && [401, 403].includes(copy.status ?? 0)) detail += ' Correct the access configuration before retrying; repeating this read will not fix authorization.';
+      if ((copy.method === 'GET' || copy.kind === 'no-self-id') && [401, 403].includes(copy.status ?? 0)) detail += ' Correct the access configuration before retrying; the host operator must repair authorization; repeating this read will not fix authorization.';
       else if (copy.method === 'GET' && copy.kind !== 'no-self-id' && copy.retryAfterSeconds === undefined) detail += ' Retry the read.';
-      if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
-      if (copy.retryAfterSeconds !== undefined) detail += copy.method === 'GET' && [401, 403].includes(copy.status ?? 0)
+      if (copy.retryAfterSeconds !== undefined) detail += (copy.method === 'GET' || copy.kind === 'no-self-id') && [401, 403].includes(copy.status ?? 0)
         ? ` Server Retry-After: ${copy.retryAfterSeconds} seconds; access must be corrected first.`
         : ` Retry after ${copy.retryAfterSeconds} seconds${copy.method === 'GET' ? ', then retry the read' : ''}.`;
       copy.message = new ZulipNoAnswer(copy.kind, copy.method, copy.path, copy.mayHaveBeenApplied,
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
       const facts = nativeTransportErrors.get(error as Error);
+      const authorization = [401, 403].includes(facts?.status ?? 0);
       const detail = ((facts?.operation === 'Upload' ? facts.refused : facts?.completed)
         ? `${facts?.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
         : (facts?.completed ? `${facts.operation ?? 'Request'} returned no confirmed usable result. ` : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `)
         + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
           : facts?.operation === 'Upload' ? 'No uploaded path was confirmed for this attempt. Ask the host operator to check Zulip uploads before retrying the attachment upload in the original operation; retrying may create a duplicate.'
           : 'Retry reads; verify the outcome before repeating writes.'))
+        + (facts?.attachmentName !== undefined ? ` Attachment: ${JSON.stringify(facts.attachmentName)}.` : '')
+        + (authorization ? ' The host operator must repair authorization; retries alone cannot fix access.' : '')
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
         + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '')
-        + (facts?.retryAfterSeconds !== undefined ? ` Retry after ${facts.retryAfterSeconds} seconds.` : '');
+        + (facts?.retryAfterSeconds !== undefined ? authorization
+          ? ` Server Retry-After: ${facts.retryAfterSeconds} seconds; access must be corrected first.`
+          : ` Retry after ${facts.retryAfterSeconds} seconds.` : '');
       Object.defineProperty(copy, 'message', { value: detail, writable: true, configurable: true });
     }
     Object.defineProperty(copy, 'cause', { value: undefined, configurable: true });

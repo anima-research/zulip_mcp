@@ -116,12 +116,12 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         method: 'POST',
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: multipartBody(input, boundary),
-      }).catch(error => { throw markTransportError(error, { operation: 'Upload' }); });
+      }).catch(error => { throw markTransportError(error, { operation: 'Upload', attachmentName: input.name }); });
       const retryAfterSeconds = parseRetryAfter(res.headers?.get('retry-after'));
       let completed = false;
       let unreadable = false;
       let original: unknown;
-      let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
+      let body: { result?: string; msg?: string; code?: string; uri?: string; url?: string } = {};
       try {
         let parsed: unknown;
         if (res.text) {
@@ -142,15 +142,20 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
       // redirects and server/proxy failures do not establish that nothing was stored.
       const refused = completed && [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(res.status);
       if (!res.ok || body.result !== 'success') {
-        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}${retryAfterSeconds === undefined ? '' : `. Retry after ${retryAfterSeconds} seconds.`}`);
+        const authorization = [401, 403].includes(res.status);
+        const advice = (authorization ? '. The host operator must repair authorization; retries alone cannot fix access.' : '')
+          + (retryAfterSeconds === undefined ? '' : authorization
+            ? `. Server Retry-After: ${retryAfterSeconds} seconds; access must be corrected first.`
+            : `. Retry after ${retryAfterSeconds} seconds.`);
+        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? body.code ?? `HTTP ${res.status}`}${advice}`);
         throw unreadable || !refused || body.result !== 'error'
-          ? markTransportError(error, { operation: 'Upload', status: res.status, original, completed, refused, retryAfterSeconds }) : error;
+          ? markTransportError(error, { operation: 'Upload', attachmentName: input.name, status: res.status, original, completed, refused, retryAfterSeconds }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.
       const path = body.url ?? body.uri;
       if (typeof path !== 'string' || !path.startsWith('/user_uploads/')) {
-        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', status: res.status, completed, retryAfterSeconds });
+        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', attachmentName: input.name, status: res.status, completed, retryAfterSeconds });
       }
       return { name: input.name, path, url: `${realm}${path}` };
     },

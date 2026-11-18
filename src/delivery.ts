@@ -37,6 +37,7 @@ interface Held {
   replayed: boolean;
   replyVerified: boolean;
   saveDropped?: boolean;
+  saveEligible?: boolean;
 }
 
 const HELD_CAP_PER_CHANNEL = 50_000;
@@ -122,7 +123,10 @@ export class DeliveryState {
       }
       for (const [chan, ids] of Object.entries(parsed.held ?? {})) {
         const tries = new Map<number, number>();
-        for (const [id, failed] of Object.entries(ids ?? {})) if (Number.isSafeInteger(Number(id)) && Number(id) > 0) tries.set(Number(id), num(failed));
+        for (const [id, failed] of Object.entries(ids ?? {})) {
+          if (Number.isSafeInteger(Number(id)) && Number(id) > 0) tries.set(Number(id), num(failed));
+          else console.error(`[zulip-mcp] ${chan}: dropping saved held ID ${JSON.stringify(id)}: not a positive safe integer`);
+        }
         if (tries.size === 0) continue;
         place(chan, (key) => {
           this.carried.set(key, tries);
@@ -226,7 +230,7 @@ export class DeliveryState {
    */
   private savedHolds(key: ChannelKey): [number, number][] {
     const all = new Map<number, number>();
-    for (const [id, h] of this.held.get(key) ?? []) if (h.status !== 'queued' && !h.saveDropped) all.set(id, 0);
+    for (const [id, h] of this.held.get(key) ?? []) if ((h.saveEligible || h.status !== 'queued') && !h.saveDropped) all.set(id, 0);
     for (const [id, failed] of this.carried.get(key) ?? []) all.set(id, failed);
     const kept = [...all].sort((a, b) => a[0] - b[0]);
     const dropped = kept.splice(0, Math.max(0, kept.length - HELD_SAVED_PER_CHANNEL)).map(([id]) => id);
@@ -253,10 +257,12 @@ export class DeliveryState {
   }
 
   /** Offered, accepted within a scan, or withdrawn: a later restart doesn't offer it by id. */
-  uncarry(key: ChannelKey, ids: number[]): void {
+  uncarry(key: ChannelKey, ids: number[], reason?: string): void {
     const carried = this.carried.get(key);
     if (!carried) return;
-    for (const id of ids) carried.delete(id);
+    for (const id of ids) {
+      if (carried.delete(id) && reason) console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: dropping saved held ID ${id}: ${reason}`);
+    }
     if (carried.size === 0) this.carried.delete(key);
   }
 
@@ -315,7 +321,8 @@ export class DeliveryState {
     return [...this.watermarks.keys()];
   }
 
-  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
+  /** Bulk callers defer saves until all statuses in their batch are updated. */
+  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued', save = true): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
     let held = this.held.get(key);
@@ -325,6 +332,7 @@ export class DeliveryState {
     }
     const existing = held.get(messageId);
     if (existing) {
+      existing.saveEligible ||= existing.status !== 'queued' || status !== 'queued';
       existing.status = status;
     } else if (held.size >= HELD_CAP_PER_CHANNEL && messageId >= Math.max(...held.keys())) {
       console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
@@ -335,7 +343,7 @@ export class DeliveryState {
     }
     if (status !== 'queued') {
       this.watermarkBelowHolds(key);
-      this.save();
+      if (save) this.save();
     }
   }
 
@@ -347,12 +355,14 @@ export class DeliveryState {
     return true;
   }
 
-  release(key: ChannelKey, messageId: number): boolean {
-    this.uncarry(key, [messageId]);
+  release(key: ChannelKey, messageId: number, reason?: string): boolean {
+    const carried = this.carried.get(key)?.has(messageId) ?? false;
+    this.uncarry(key, [messageId], reason);
     const held = this.held.get(key);
-    if (!held?.delete(messageId)) return false;
+    if (!held?.delete(messageId)) return carried;
     if (held.size === 0) this.held.delete(key);
-    return this.settle(key);
+    this.settle(key);
+    return true;
   }
 
   refuse(key: ChannelKey, afterId: number, messageId: number): void {
@@ -588,6 +598,7 @@ export interface MissedBlockOptions {
   moreBeyond?: boolean;
   newestScannedId?: number;
   firstScannedId?: number;
+  byId?: boolean;
 }
 
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
@@ -654,8 +665,8 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) to fit the catch-up budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); use that as fetch_history(channel=channelId) to page through the range. Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected messages and earlier holds within this scan. An older hold outside this scan can cause it to recur after restart.` +
-      `${opts.moreBeyond ? ' Newer messages also exist.' : ''}]\n</missed>`;
+      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) for budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); page with fetch_history(channel=channelId). ${opts.byId ? 'This is a by-ID offer of the listed messages only, not a scan of the intervening interval; it does not move the watermark.' : `Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected rows and earlier holds in this scan. An older hold outside this scan can cause it to recur after restart.`}` +
+      `${opts.moreBeyond ? ` Newer messages also exist; fetch_history(channel=channelId, after=${JSON.stringify(newestScanned === undefined ? newestScanned : ids.format(newestScanned))}) continues.` : ''}]\n</missed>`;
   }
   return { text: block, elided };
 }

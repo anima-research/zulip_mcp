@@ -150,9 +150,9 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   try {
     realm = new URL(zulipRealm);
     if (!['https:', 'http:'].includes(realm.protocol) || !realm.hostname ||
-        realm.username || realm.password || realm.search || realm.hash || !['/', '/api', '/api/'].includes(realm.pathname)) throw new Error();
+        realm.username || realm.password || realm.search || realm.hash) throw new Error();
   } catch {
-    throw new Error("Invalid configured realm URL; use an HTTP(S) origin, optionally suffixed /api, without credentials, query or fragment; ask the host operator to repair the configuration.");
+    throw new Error("Invalid configured realm URL; use an HTTP(S) URL without credentials, query or fragment; ask the host operator to repair the configuration.");
   }
   // Preserve main's input grammar: only lowercase http(s) prefixes denote
   // absolute URLs; other spellings must parse as /user_uploads/ paths when

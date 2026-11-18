@@ -9,7 +9,7 @@
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
-import { isRefusal, LONG_TIMEOUT_MS, refusalText, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, LONG_TIMEOUT_MS, refusalFacts, refusalText, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 import type { StreamDirectory, ZulipStreamEvent } from '../stream-directory.js';
 
 export interface ZulipEventMessage {
@@ -277,14 +277,20 @@ export class ZulipEventLoop {
 
         if (isRefusal(response) || !Array.isArray(response.events)) {
           this.consecutiveFailures++;
-          const delay = this.backoffDelay(this.consecutiveFailures);
+          const facts = isRefusal(response) ? refusalFacts(response) : {};
+          const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures), (facts.retryAfterSeconds ?? 0) * 1000));
           const refused = isRefusal(response) ? refusalText(response) : null;
           console.error(refused === null
             ? `Zulip events.retrieve returned no events array (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`
             : `Zulip refused events.retrieve: ${refused} (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`);
-          this.maybeEmitDegraded(onSystemEvent, refused === null
+          let reason = refused === null
             ? 'events.retrieve returned a malformed response (no events array)'
-            : `events.retrieve was refused: ${refused}`);
+            : `events.retrieve was refused: ${refused}`;
+          if (facts.status !== undefined) reason += ` (HTTP ${facts.status})`;
+          reason += '; polling retries automatically';
+          if ([401, 403].includes(facts.status ?? 0)) reason += '; the host operator must repair authorization; retries alone cannot fix access';
+          if (facts.retryAfterSeconds !== undefined) reason += `; server Retry-After: ${facts.retryAfterSeconds} seconds`;
+          this.maybeEmitDegraded(onSystemEvent, reason);
           await this.sleep(delay);
           continue;
         }

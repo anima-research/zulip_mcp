@@ -225,7 +225,7 @@ test('a refused poll, other than an expired queue, is logged and marked degraded
     `Zulip refused events.retrieve: Invalid API key (INVALID_API_KEY) (attempt ${n}); retrying in ${[2000, 4000, 8000][n - 1]}ms`));
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.equal((degraded[0].metadata as { reason?: string }).reason, 'events.retrieve was refused: Invalid API key (INVALID_API_KEY)');
+  assert.equal((degraded[0].metadata as { reason?: string }).reason, 'events.retrieve was refused: Invalid API key (INVALID_API_KEY) (HTTP 400); polling retries automatically');
 });
 
 test('well-formed response resets the backoff counter', async () => {

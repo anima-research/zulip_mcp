@@ -23,7 +23,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
       requested.push(url);
       return new Response('hello', { headers: { 'content-type': 'text/plain' } });
     });
-    for (const realm of ['https://alpha.example', 'https://alpha.example/', 'https://alpha.example/api', 'https://alpha.example/api/']) {
+    for (const realm of ['https://alpha.example', 'https://alpha.example/', 'https://alpha.example/api', 'https://alpha.example/api/', 'https://alpha.example/zulip']) {
       for (const path of ['https://alpha.example/user_uploads/a.txt', '/user_uploads/a.txt', 'user_uploads/a.txt']) {
         const url = parseZulipAttachmentUrl(path, realm);
         assert.equal(url.href, 'https://alpha.example/user_uploads/a.txt');
@@ -31,7 +31,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
         assert.equal((await fetchCapped(url.href, {}, 10, new AbortController().signal)).buf.toString(), 'hello');
       }
     }
-    assert.equal(requested.length, 24);
+    assert.equal(requested.length, 30);
     for (const path of ['https://u:p@alpha.example/user_uploads/a', '/user_uploads/%2e%2e%2fapi/v1/users/me', '/user_uploads/..%5capi/v1/users/me']) {
       assert.throws(() => parseZulipAttachmentUrl(path, 'https://alpha.example/api'), /credentials|only serves/);
     }
@@ -149,16 +149,24 @@ test('non-JSON transport failures retain numeric and date Retry-After headers', 
 
 test('native socket resets retain response status and upload uncertainty', async t => {
   t.mock.method(console, 'error', () => {});
+  let breakBody: (() => void) | undefined;
   const server = createServer((req, res) => {
     if (req.method === 'POST') { req.socket.destroy(); return; }
     res.writeHead(206, { 'content-type': 'text/plain', 'content-length': '100' });
     res.write('partial');
-    setTimeout(() => res.destroy(), 30);
+    breakBody = () => res.destroy();
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
   const realm = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const nativeFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (...args: Parameters<typeof fetch>) => {
+    const response = await nativeFetch(...args);
+    assert.equal(response.status, 206, 'the client has received the headers before resetting the body');
+    breakBody!();
+    return response;
+  });
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     await assert.rejects(fetchCapped(`${realm}/user_uploads/a`, {}, 200, new AbortController().signal), error => {

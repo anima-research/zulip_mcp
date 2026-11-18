@@ -46,7 +46,7 @@ test('foreign and strict bare fields and tokens fail before any API or write', a
       if (mode === 'strict') await assert.rejects(tools.handleToolCall(name, { channel: 'dm:9', topic: 'new', scope: 'one', emoji_name: 'warning', [field]: 7, content: 'hello', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /bare/);
     }
     await assert.rejects(tools.handleToolCall('send_message', { reply_to: 'alpha:7', content: '[[msg:alpha:7]] [[msg:beta:8]]', attachments: [{ name: 'a.txt', data: 'YQ==', mimeType: 'text/plain' }] }), /differs/);
-    await assert.rejects(tools.handleToolCall('send_dm', { recipients: ['someone'], content: '[[msg:beta:8]]' }), /differs/);
+    await assert.rejects(tools.handleToolCall('send_dm', { to: ['someone'], content: '[[msg:beta:8]]' }), /differs/);
     await assert.rejects(tools.handleToolCall('edit_message', { message_id: 'alpha:7', content: '[[msg:beta:8]]' }), /differs/);
     assert.equal(calls.length, 0);
     assert.equal(writes, 0);
@@ -586,7 +586,7 @@ test('local TypeErrors are not transport failures and malformed attachment URLs 
     await assert.rejects(runtime.handleToolCall('fetch_attachment', { path: 'https://[' }), /Invalid attachment path: use a \/user_uploads\/ path/);
     assert.equal(calls.length, 0);
     assert.equal(downloads, 0);
-    for (const realm of ['https://alpha.example?x=1', 'https://alpha.example/#x', 'https://alpha.example/not-api', 'file:///tmp']) {
+    for (const realm of ['https://alpha.example?x=1', 'https://alpha.example/#x', 'file:///tmp']) {
       const broken = new ZulipToolRuntime({ api, selfUserId: 1, realm, authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
       await assert.rejects(broken.handleToolCall('fetch_attachment', { path: '/user_uploads/a' }), /Invalid configured realm URL.*host operator/);
     }
@@ -630,16 +630,23 @@ test('failed unread checks make aggregates unknown and successful subtotals expl
 
 test('every message-ID schema field follows the selected ID contract', () => {
   const expected = ['send_message.reply_to', 'edit_message.message_id', 'move_messages.message_id', 'delete_message.message_id', 'add_reaction.message_id', 'remove_reaction.message_id', 'fetch_around.message_id', 'fetch_history.before', 'fetch_history.after'];
+  const original = structuredClone(toolDefinitions);
   for (const mode of ['compat', 'strict'] as const) {
     const definitions = idToolDefinitions(toolDefinitions, new MessageIds('alpha', mode));
+    assert.deepEqual(toolDefinitions, original, 'source definitions must not mutate');
+    assert.deepEqual(definitions.map(t => t.name), original.map(t => t.name));
+    for (const tool of definitions) {
+      const source = original.find(t => t.name === tool.name)!;
+      assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), Object.keys(source.inputSchema.properties).sort(), 'all properties survive');
+    }
     const seen: string[] = [];
     for (const tool of definitions) for (const [field, schema] of Object.entries(tool.inputSchema.properties)) {
       if (!expected.includes(`${tool.name}.${field}`)) {
-        assert.deepEqual(schema, (toolDefinitions.find(t => t.name === tool.name)!.inputSchema.properties as any)[field], `unrelated ${tool.name}.${field} stays unchanged`);
+        assert.deepEqual(schema, (original.find(t => t.name === tool.name)!.inputSchema.properties as any)[field], `unrelated ${tool.name}.${field} stays unchanged`);
         continue;
       }
       seen.push(`${tool.name}.${field}`);
-      assert.deepEqual(schema.type, mode === 'strict' ? 'string' : ['string', (toolDefinitions.find(t => t.name === tool.name)!.inputSchema.properties as any)[field].type]);
+      assert.deepEqual(schema.type, mode === 'strict' ? 'string' : ['string', (original.find(t => t.name === tool.name)!.inputSchema.properties as any)[field].type]);
     }
     assert.deepEqual(seen.sort(), [...expected].sort());
   }
@@ -650,10 +657,17 @@ test('compat warns on bare IDs for every message-ID tool', async t => {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const logs: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-  const runtime = new ZulipToolRuntime({ api: standInApi({}).api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', 'compat') });
+  const runtime = new ZulipToolRuntime({ api: standInApi({
+    'PATCH /messages/:id': { result: 'success' }, 'DELETE /messages/:id': { result: 'success' },
+    'POST /messages/:id/reactions': { result: 'success' }, 'DELETE /messages/:id/reactions': { result: 'success' },
+    'GET /messages/:id': { result: 'success', message },
+    'GET /messages': { result: 'success', messages: [message], found_newest: true, found_oldest: true },
+    'GET /users/me/subscriptions': { result: 'success', subscriptions: [] },
+  }).api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', 'compat') });
   for (const name of ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around']) {
     logs.length = 0;
-    try { await runtime.handleToolCall(name, { message_id: 7, content: 'edited', topic: 'new', scope: 'one', emoji_name: 'eyes' }); } catch { /* This test pins validation warnings, not the later operation. */ }
+    const result = await runtime.handleToolCall(name, { message_id: 7, content: 'edited', topic: 'new', scope: 'one', emoji_name: 'eyes' });
+    assert.match(JSON.stringify(result), /Warning:.*bare message_id/, `${name} returns its warning on success`);
     assert.ok(logs.some(line => /Warning:.*bare message_id/.test(line)), `${name} must warn`);
   }
 });

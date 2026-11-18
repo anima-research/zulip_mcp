@@ -74,7 +74,7 @@ test('fetchHistory withholds the bot\'s own messages and disallowed senders, and
   const adapter = new ZulipAdapter(client, { selfUserId: SELF, sessionId: 's' }, { filters: onlyDev, directory: directoryOf() });
 
   const none = await adapter.fetchHistory(GENERAL, { limit: 10 });
-  assert.deepEqual(none, { messages: [], scannedThrough: null, reachedNewest: true });
+  assert.deepEqual(none, { messages: [], scannedThrough: null, reachedNewest: true, policyFiltered: true });
 
   const page = await adapter.fetchHistory(dmKey([7, 42]), { limit: 10, afterMessageId: '3' });
   assert.deepEqual(page.messages.map((m) => m.messageId), ['5']);
