@@ -266,7 +266,7 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     ];
     const open = new AbortController().signal;
     const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 }, open);
-    assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(HTTP 404\)/);
+    assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(Attachment download was refused.*HTTP 404/);
     assert.equal(blocks[1].type, 'image');
     assert.equal((blocks[1] as { mimeType: string }).mimeType, 'image/jpeg');
     assert.equal((blocks[2] as { text: string }).text, '[image attachment: shot.png]');

@@ -45,10 +45,12 @@ export class ZulipNoAnswer extends Error {
     readonly status?: number,
     readonly retryAfterSeconds?: number,
     timeoutSeconds?: number,
+    cause?: unknown,
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
       : method === 'GET' && kind !== 'no-self-id' ? '' : 'The request was not sent.'}`.trim());
+    if (cause !== undefined) Object.defineProperty(this, 'cause', { value: cause, configurable: true });
     this.name = 'ZulipNoAnswer';
     if (timeoutSeconds !== undefined) Object.defineProperty(this, 'timeoutSeconds', { value: timeoutSeconds, enumerable: false });
   }
@@ -108,7 +110,7 @@ export function zulipApi(transport: Transport): ZulipApi {
 export interface SelfIdGate {
   readonly selfUserId: number | null;
   readonly transport: Transport;
-  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number } | null>;
+  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number; cause?: unknown } | null>;
 }
 
 export function selfIdGate(inner: Transport): SelfIdGate {
@@ -121,7 +123,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
     try {
       answer = await inner('GET', '/users/me', undefined, opts);
     } catch (err) {
-      return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
+      return { cause: err, reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
         ...(err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
     }
     const { status, body } = answer;
@@ -152,7 +154,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
         if (failure) {
           throw new ZulipNoAnswer('no-self-id', method, path, false,
             `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. A later call reads it again.`,
-            failure.status, failure.retryAfterSeconds, failure.timeoutSeconds);
+            failure.status, failure.retryAfterSeconds, failure.timeoutSeconds, failure.cause);
         }
       }
       return inner(method, path, params, opts);
@@ -213,28 +215,34 @@ export function httpTransport(config: HttpTransportConfig): Transport {
     const write = method !== 'GET';
     let status: number | undefined;
     let text: string;
+    let retryAfterSeconds: number | undefined;
     try {
       const response = await fetch(url, init);
       status = response.status;
+      const after = response.headers?.get('retry-after');
+      if (after) {
+        const seconds = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) : (Date.parse(after) - Date.now()) / 1000;
+        if (Number.isFinite(seconds)) retryAfterSeconds = Math.max(0, seconds);
+      }
       text = await response.text();
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, status, undefined, timeoutMs / 1000);
+        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, status, retryAfterSeconds, timeoutMs / 1000, err);
       }
       const code = causeCode(err);
       const unsent = code !== undefined && notSent(code);
       throw new ZulipNoAnswer('network', method, path, write && !unsent,
         unsent
           ? `Couldn't reach Zulip for ${method} ${path} (${code}).`
-          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`, status);
+          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`, status, retryAfterSeconds, undefined, err);
     } finally {
       clearTimeout(timer);
     }
     try {
       return { status, body: JSON.parse(text) };
-    } catch {
+    } catch (err) {
       throw new ZulipNoAnswer('not-json', method, path, write,
-        `Zulip's answer to ${method} ${path} wasn't JSON (HTTP ${status}).`, status);
+        `Zulip's answer to ${method} ${path} wasn't JSON (HTTP ${status}).`, status, retryAfterSeconds, undefined, err);
     }
   };
 }

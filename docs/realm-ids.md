@@ -71,21 +71,38 @@ is a server self-description, not cryptographic provenance of its executable.
 
 Itemized host results are correlated only to IDs in the delivered batch. Compat
 accepts bare decimal string references too; strict requires the matching tag.
-Synthetic event IDs must be echoed exactly. Invalid/unmatched entries are logged
-and ignored independently, never settling an unrelated message.
+Synthetic event IDs must be echoed exactly. Invalid/unmatched entries, non-boolean acceptance and duplicate normalized IDs are
+ignored independently; diagnostics omit the returned payload, never settling an unrelated message.
 
 All ID modes keep transport timeout seconds, HTTP status, retry advice and
 write-outcome uncertainty in agent-facing errors, but omit raw transport paths
 and bodies. Original transport diagnostics go to stderr. Errors marked at the native fetch boundary (not arbitrary local TypeErrors) are replaced with safe uncertainty guidance;
-ordinary Zulip refusals and validation messages remain unchanged. Failed unread
+ordinary Zulip refusals and validation messages remain unchanged. Completed HTTP
+attachment refusals report their status and corrective checks, not an incomplete
+download or a blind retry. Upload proxy failures and malformed successful upload
+responses retain duplicate-upload uncertainty. Attachment URLs accept origin and
+`/api`-suffixed realm configurations; only the initial URL is checked for same-origin
+`/user_uploads/` authorization. Redirect destinations follow native fetch policy
+and are not revalidated. Credential-bearing URLs and encoded path separators are
+rejected before fetching. Failed unread
 checks report unknown state instead of claiming that no messages are unread.
 
 When a long channel ID forces the bounded catch-up fallback, the compact notice
 names the omitted count and first/last message IDs. Its `fetch_around` pointer
-recovers the first message and context, including its channel; `fetch_history`
+recovers the first message and context, including a pageable `channelId` for DMs; `fetch_history`
 can then page through the omitted range. Acceptance acknowledges the omissions,
-advances the watermark through the scan and prevents repeated notices or automatic
-replay. Explicit history reads remain available. Recovery covers fetched rows only,
+advances the watermark through the scan, including unselected messages and earlier
+holds within that scan. This normally prevents repeated notices or automatic replay,
+but an earlier hold outside the scan can pin the durable watermark: acceptance of
+a later range is not independently persisted, and that range can recur after restart. Explicit history reads remain available. Recovery covers fetched rows only,
 not an unfetched interval or overflow beyond the existing held-ID cap.
 Unread aggregates are null when any channel check failed; summary counts are
 labelled “At least” in that case.
+
+Legacy compatibility corrections: ordinary catch-up pointers retain their original
+channel quoting bytes, and ordinary acknowledgement refusals retain their original
+reason without a context prefix. The compact-notice recovery error fix also makes
+`fetch_around` return DM channel fields in every mode, rather than an unusable null.
+No successful stream read or message-ID representation changes in legacy mode.
+No earlier live-contract run is offered as evidence for this revision; its code,
+server and runtime versions were not recorded with the cited result.

@@ -389,7 +389,7 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        const diagnostic = messageIdError(error, this.options.messageIds ?? LEGACY_IDS);
+        const diagnostic = messageIdError(error, this.options.messageIds ?? LEGACY_IDS, false);
         const errMsg = diagnostic instanceof Error ? diagnostic.message : String(diagnostic);
 
         this.consecutiveFailures++;
@@ -404,7 +404,7 @@ export class ZulipEventLoop {
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          (error instanceof Error ? messageIdError(error, this.options.messageIds ?? LEGACY_IDS).message : errMsg).replace(/\.$/, ''),
+          errMsg.replace(' Retry the read.', ' The server is retrying event polling.').replace(/\.$/, ''),
         );
         await this.sleep(delay);
       }

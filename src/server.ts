@@ -655,7 +655,9 @@ export class ZulipMcplServer {
             const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
-            conn.sendResponse(req.id, { acknowledged: false, reason: `channels/acknowledge (messageId=${describe(ack.messageId)}): ${messageIdError(error, this.messageIds).message}` });
+            conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' && !(error instanceof ZulipNoAnswer)
+              ? messageIdError(error, this.messageIds).message
+              : `channels/acknowledge (messageId=${describe(ack.messageId)}): ${messageIdError(error, this.messageIds).message}` });
           }
           break;
         }
@@ -686,9 +688,9 @@ export class ZulipMcplServer {
       conn.sendError(req.id, err.code, err.message, err.data);
       return;
     }
-    const e = messageIdError(err, this.messageIds);
+    const e = messageIdError(err, this.messageIds, false);
     console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
-    conn.sendError(req.id, -32603, err instanceof Error ? messageIdError(err, this.messageIds).message : e.message ?? String(err));
+    conn.sendError(req.id, -32603, e.message);
   }
 
   private async handleNotification(conn: McplConnection, notif: JsonRpcNotification): Promise<void> {
@@ -1405,6 +1407,7 @@ export class ZulipMcplServer {
       messageIds: this.messageIds,
       moreBeyond: (truncated && !read.ceiling) || blocked !== undefined,
       newestScannedId: newestId,
+      firstScannedId: after + 1,
     });
     const synthetic: KeyedMessage = {
       key,
@@ -2012,7 +2015,7 @@ export class ZulipMcplServer {
       void this.reconcileHostIds();
       return result;
     } catch (error) {
-      const reason = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
+      const reason = error instanceof Error ? messageIdError(error, this.messageIds, false).message : String(error);
       console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
       return { ...empty, reason };
     }
@@ -2445,13 +2448,16 @@ export class ZulipMcplServer {
         if (original === undefined && r && typeof r.messageId === 'string') {
           try { original = numericOriginals.get(this.messageIds.parse(r.messageId)); } catch { /* diagnosed below */ }
         }
-        if (original === undefined) {
-          console.error(`[zulip-mcp] Ignoring incoming result: messageId=${JSON.stringify(r?.messageId)} does not match this batch under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
+        if (original === undefined || typeof r.accepted !== 'boolean') {
+          console.error(`[zulip-mcp] Ignoring incoming result: malformed or unmatched under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
           return [];
         }
         return [{ ...r, messageId: original }];
       });
-      return { ...result, results };
+      // Refuse ambiguous duplicates after normalization, regardless of spelling.
+      const counts = new Map<string, number>();
+      for (const r of results) counts.set(r.messageId, (counts.get(r.messageId) ?? 0) + 1);
+      return { ...result, results: results.filter(r => counts.get(r.messageId) === 1) };
     }
     return result;
   }

@@ -544,7 +544,7 @@ for (const mode of ['compat', 'strict'] as const) {
     const degraded = events.filter(e => e.kind === 'degraded');
     assert.equal(degraded.length, 1);
     assert.match(degraded[0].text, /HTTP 502/);
-    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). The server returned an unreadable response; contact the host operator if it persists. Retry the read. HTTP 502');
+    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). The server returned an unreadable response; contact the host operator if it persists. The server is retrying event polling. HTTP 502');
     assert.doesNotMatch(JSON.stringify(degraded), /private upstream response body|GET|\/events/);
     assert.equal(failure.message, 'private upstream response body');
   });

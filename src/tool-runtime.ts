@@ -485,7 +485,8 @@ export class ZulipToolRuntime {
         if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
       }
       const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
-      return warnings.length ? { ...result, warnings } : result;
+      return warnings.length && result !== null && typeof result === 'object' && !Array.isArray(result)
+        ? { ...result, warnings } : result;
     } catch (error) {
       // Keep API error types and uncertainty flags intact for callers.
       const err = messageIdError(error, this.messageIds);
@@ -1104,13 +1105,15 @@ export class ZulipToolRuntime {
         const limit = clampInt(args.limit, 50, 1, 200);
         const page = await fetchAround(api, messageId, limit, this.messageIds.format(messageId));
         const anchor = page.messages.find((m) => m.id === messageId);
-        const shown = anchor?.streamNameShown ?? null;
+        const dmChannel = anchor?.isDm
+          ? dmChannelIdFor(dmCounterparts(anchor.recipients, this.session.selfUserId).map(r => r.id)) : null;
+        const shown = dmChannel ?? anchor?.streamNameShown ?? null;
         const known = this.channelIds != null && anchor?.streamId != null;
         const held = known ? this.channelIds!.channelIdOf(streamKey(anchor!.streamId!)) : null;
         return {
           message_id: messageId,
           channel: shown,
-          channelId: known ? held : shown ? `zulip:${shown}` : null,
+          channelId: dmChannel ?? (known ? held : shown ? `zulip:${shown}` : null),
           topic: anchor?.topic ?? null,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,

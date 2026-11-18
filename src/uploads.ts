@@ -120,20 +120,23 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
       let original: unknown;
       let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
       try {
-        body = (await res.json()) as typeof body;
+        const parsed = await res.json();
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as typeof body;
+        else unreadable = true;
       } catch (error) {
         original = error;
         unreadable = true;
       }
       if (!res.ok || body.result !== 'success') {
         const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
-        throw unreadable ? markTransportError(error, { operation: 'Upload', status: res.status, original }) : error;
+        throw unreadable || res.status >= 500 || body.result !== 'error'
+          ? markTransportError(error, { operation: 'Upload', status: res.status, original }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.
       const path = body.url ?? body.uri;
       if (typeof path !== 'string' || !path.startsWith('/user_uploads/')) {
-        throw new Error(`upload of "${input.name}" returned no usable path`);
+        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', status: res.status });
       }
       return { name: input.name, path, url: `${realm}${path}` };
     },

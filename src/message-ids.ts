@@ -101,7 +101,7 @@ export function describe(value: unknown): string {
 }
 
 const safeTransport = Symbol('safeTransport');
-type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown };
+type TransportFacts = { operation?: 'Upload' | 'Attachment download'; status?: number; timeoutSeconds?: number; original?: unknown; completed?: boolean };
 const nativeTransportErrors = new WeakMap<Error, TransportFacts>();
 /** Mark failures at the fetch boundary, not by their JavaScript error class. */
 export function markTransportError(error: unknown, facts: TransportFacts = {}): unknown {
@@ -109,24 +109,26 @@ export function markTransportError(error: unknown, facts: TransportFacts = {}): 
   return error;
 }
 
-const loggedTransport = new WeakSet<Error>();
+const loggedDiagnostics = new WeakSet<Error>();
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
  * Copies may safely be annotated by callers, in every ID mode.
  */
-export function messageIdError(error: unknown, ids: MessageIds): Error {
+export function messageIdError(error: unknown, ids: MessageIds, log = true): Error {
   const copy: Error = error instanceof DOMException
     ? Object.defineProperties(new DOMException(error.message, error.name), Object.getOwnPropertyDescriptors(error))
     : error instanceof Error
     ? Object.create(Object.getPrototypeOf(error), Object.getOwnPropertyDescriptors(error))
     : new Error(String(error));
   const nativeTransport = error instanceof Error && nativeTransportErrors.has(error);
+  // Callers that already log contextual diagnostics opt out; keep original causes
+  // on stderr only, never in the host-visible error copy.
+  if (log && error instanceof Error && !(safeTransport in error) && !loggedDiagnostics.has(error)) {
+    console.error('[zulip diagnostic]', nativeTransportErrors.get(error)?.original ?? error);
+    loggedDiagnostics.add(error);
+  }
+  if (error instanceof Error && (loggedDiagnostics.has(error) || !log)) loggedDiagnostics.add(copy);
   if ((copy instanceof ZulipNoAnswer || nativeTransport) && !(safeTransport in copy)) {
-    // Stderr is diagnostic-only; never send request paths or bodies to the host.
-    if (error instanceof Error && !loggedTransport.has(error)) {
-      console.error('[zulip transport]', nativeTransportErrors.get(error)?.original ?? error);
-      loggedTransport.add(error);
-    }
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
       if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
@@ -139,14 +141,18 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
       const facts = nativeTransportErrors.get(error as Error);
-      const detail = `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `
+      const detail = (facts?.completed
+        ? `${facts.operation ?? 'Request'} was refused by the server. Check the path, access permissions and server availability; ask the host operator if it persists.`
+        : `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `
         + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
           : facts?.operation === 'Upload' ? 'No uploaded path was confirmed. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
-          : 'Retry reads; verify the outcome before repeating writes.')
+          : 'Retry reads; verify the outcome before repeating writes.'))
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
         + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '');
       Object.defineProperty(copy, 'message', { value: detail, writable: true, configurable: true });
     }
+    Object.defineProperty(copy, 'cause', { value: undefined, configurable: true });
+    Object.defineProperty(copy, 'stack', { value: `${copy.name}: ${copy.message}`, configurable: true });
     Object.defineProperty(copy, safeTransport, { value: true });
   }
   return copy;

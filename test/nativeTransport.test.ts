@@ -18,7 +18,7 @@ function assertFetchBoundaries(file: string, source: string): number {
     if (file === 'zulip-api.ts') {
       // The entire request + body read must be inside this specific try/catch;
       // a second call elsewhere cannot borrow the first call's catch.
-      const boundary = /try\s*\{\s*const response = await fetch\(url, init\);\s*status = response.status;\s*text = await response.text\(\);\s*\} catch \(err\) \{[\s\S]*?throw new ZulipNoAnswer\('network'[\s\S]*?\} finally/g;
+      const boundary = /try\s*\{\s*const response = await fetch\(url, init\);\s*status = response.status;(?:(?!\bfetch\s*\()[\s\S])*?text = await response.text\(\);\s*\} catch \(err\) \{[\s\S]*?throw new ZulipNoAnswer\('network'[\s\S]*?\} finally/g;
       assert.ok([...source.matchAll(boundary)].some(m => start >= m.index! && start < m.index! + m[0].indexOf('} catch')), file);
     } else {
       assert.ok(['content.ts', 'attachments.ts', 'uploads.ts'].includes(file), file);

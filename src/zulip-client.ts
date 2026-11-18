@@ -62,7 +62,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   }
 
   const messageIds = MessageIds.fromEnv(realm, env); // validate before any request
-  console.error(`message IDs: ${messageIds.mode}, tag "${messageIds.tag}"`);
+  if (messageIds.mode !== 'legacy') console.error(`message IDs: ${messageIds.mode}, tag "${messageIds.tag}"`);
 
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
@@ -85,6 +85,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   const failure = await gate.read({ timeoutMs: LONG_TIMEOUT_MS });
   if (failure) {
     console.error(`Failed to read the bot's own user id: ${failure.reason}. A later request reads it again, and fails if that read does.`);
+    if (failure.cause !== undefined) console.error('[zulip self-id]', failure.cause);
   }
 
   let maxUploadBytes: number | null = null;

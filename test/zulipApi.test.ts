@@ -248,6 +248,30 @@ async function startLogging(env: Record<string, string>) {
   }
 }
 
+test('startup output matches main in legacy mode and announces only enabled realm tags', async () => {
+  const z = await realm({});
+  try {
+    for (const mode of [undefined, 'legacy', 'compat', 'strict']) {
+      const env: Record<string, string> = {
+        ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests',
+        // Even a configured tag must be silent while tagging is disabled.
+        ZULIP_REALM_TAG: 'test-realm',
+      };
+      if (mode !== undefined) env.ZULIP_ID_MODE = mode;
+      const { session, lines } = await startLogging(env);
+      assert.deepEqual(lines, [
+        ...(mode === 'compat' || mode === 'strict' ? [`message IDs: ${mode}, tag "test-realm"`] : []),
+        'Zulip MCP bot user_id: 790',
+        'Zulip MCP initialized with session: bot@example.com',
+      ], `startup stderr for ${mode ?? 'default'}`);
+      assert.equal(session.selfUserId, 790);
+      assert.equal(session.maxUploadBytes, 25 * 1024 * 1024);
+    }
+    assert.deepEqual(z.requests.map(r => `${r.method} ${r.path}`),
+      Array.from({ length: 4 }, () => ['GET /users/me', 'GET /server_settings']).flat());
+  } finally { z.close(); }
+});
+
 test('a password exchange that Zulip refuses is logged with Zulip\'s words and the missing key, the start goes on, and no line shows the password', async () => {
   const password = 'pw-that-must-not-show';
   const z = await realm({

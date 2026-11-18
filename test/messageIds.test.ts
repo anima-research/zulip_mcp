@@ -580,7 +580,7 @@ test('local TypeErrors are not transport failures and malformed attachment URLs 
     await assert.rejects(runtime.handleToolCall('fetch_attachment', { path: 'https://[' }), /Invalid attachment path: use a \/user_uploads\/ path/);
     assert.equal(calls.length, 0);
     assert.equal(downloads, 0);
-    for (const realm of ['https://alpha.example?x=1', 'https://alpha.example/#x', 'https://alpha.example/api', 'file:///tmp']) {
+    for (const realm of ['https://alpha.example?x=1', 'https://alpha.example/#x', 'https://alpha.example/not-api', 'file:///tmp']) {
       const broken = new ZulipToolRuntime({ api, selfUserId: 1, realm, authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
       await assert.rejects(broken.handleToolCall('fetch_attachment', { path: '/user_uploads/a' }), /Invalid configured realm URL.*host operator/);
     }

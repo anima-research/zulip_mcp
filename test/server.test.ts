@@ -7826,6 +7826,7 @@ test('pending compact scan reserves ambient holds and acceptance advances past u
       if (!accepted) h.policy.rejectPushes.add('alpha:200');
       h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
       await until(() => h.pushed.some(p => firstText(p).includes('messages omitted')), 'compact stream notice');
+      assert.match(h.pushed.map(firstText).find(t => t.includes('messages omitted'))!, /entire scanned interval alpha:101–alpha:200/);
       assert.deepEqual(h.delivery.heldIds(key, { replayable: true }), []);
       await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
       assert.equal(h.pushed.filter(p => firstText(p).includes('messages omitted')).length, 1, 'no second offer while the first is pending');
@@ -7859,5 +7860,25 @@ test('public request failures retain the original local error and stack on stder
       assert.ok(logs.some(args => args[1] === failure && String(args[0]).includes('handleRequest')));
       assert.match(failure.stack!, /TypeError: local publish processing failed/);
     } finally { await h.close(); }
+  }
+});
+
+test('enabled incoming results reject non-boolean acceptance and normalized duplicates without logging payloads', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  for (const mode of ['compat', 'strict'] as const) {
+    for (const entries of [
+      [{ messageId: 'alpha:7', accepted: 'false' }],
+      [{ messageId: 'alpha:7', accepted: false }, { messageId: mode === 'compat' ? '0007' : 'alpha:007', accepted: true }],
+      [{ messageId: { credential: 'secret-host-payload'.repeat(1000) }, accepted: true }],
+    ]) {
+      const h = harness({ messageIds: new MessageIds('alpha', mode), incomingResults: () => entries });
+      try {
+        await initialize(h, true);
+        const result = await (h.server as any).sendIncomingToHost([streamMsg(7)]);
+        assert.deepEqual(result.results, []);
+        assert.ok(logs.every(line => !line.includes('secret-host-payload')));
+      } finally { await h.close(); }
+    }
   }
 });

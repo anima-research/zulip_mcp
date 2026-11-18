@@ -145,7 +145,7 @@ export async function fetchCapped(
   signal: AbortSignal,
 ): Promise<FetchedBytes> {
   const res = await fetch(url, { headers, redirect: 'follow', signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw markTransportError(new Error(`HTTP ${res.status}`), { operation: 'Attachment download', status: res.status, completed: true });
   const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
   const declared = Number(res.headers.get('content-length') ?? '');
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -156,7 +156,7 @@ export async function fetchCapped(
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
-    const { done, value } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
+    const { done, value } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: res.status }); });
     if (done) break;
     total += value.length;
     if (total > maxBytes) {

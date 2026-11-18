@@ -65,7 +65,7 @@ async function readAttachment(
 ): Promise<FetchedAttachment> {
   const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
   progressed(resp.status);
-  if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status });
+  if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status, completed: true });
 
   const declared = resp.headers.get("content-length");
   if (declared !== null) {
@@ -147,20 +147,21 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   try {
     realm = new URL(zulipRealm);
     if (!['https:', 'http:'].includes(realm.protocol) || !realm.hostname ||
-        realm.username || realm.password || realm.search || realm.hash || realm.pathname !== '/') throw new Error();
+        realm.username || realm.password || realm.search || realm.hash || !['/', '/api', '/api/'].includes(realm.pathname)) throw new Error();
   } catch {
-    throw new Error("Invalid configured realm URL; use an HTTP(S) origin without credentials, path, query or fragment; ask the host operator to repair the configuration.");
+    throw new Error("Invalid configured realm URL; use an HTTP(S) origin, optionally suffixed /api, without credentials, query or fragment; ask the host operator to repair the configuration.");
   }
   // Check the resolved URL, not its spelling: protocol-relative paths and
   // WHATWG backslash/host normalization can change the origin during parsing.
-  const url = new URL(rawPath, realm);
+  const url = new URL(rawPath, realm.origin + '/');
+  if (url.username || url.password) throw new Error('fetch_attachment URLs must not contain credentials');
   if (url.origin !== realm.origin) {
     if (url.host !== realm.host) {
       throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realm.host}`);
     }
     throw new Error(`refusing to fetch over ${url.protocol.replace(/:$/, "")}; the realm is ${realm.protocol.replace(/:$/, "")}`);
   }
-  if (!url.pathname.startsWith("/user_uploads/")) {
+  if (!url.pathname.startsWith("/user_uploads/") || /%2f|%5c/i.test(url.pathname)) {
     throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);
   }
   return url;

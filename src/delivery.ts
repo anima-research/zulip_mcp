@@ -499,10 +499,11 @@ export interface MissedBlockOptions {
   maxChars?: number;
   moreBeyond?: boolean;
   newestScannedId?: number;
+  firstScannedId?: number;
 }
 
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
-  const channel = JSON.stringify(channelId);
+  const channel = ids.mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
   return `fetch_history(channel=${channel}, ${cursor}=${JSON.stringify(id === undefined ? id : ids.format(id))})`;
 }
 
@@ -565,7 +566,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) to fit the catch-up budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) recovers the first message and its context; use fetch_history on that channel to page through the range. Accepting this notice acknowledges the omitted range.` +
+      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) to fit the catch-up budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); use that as fetch_history(channel=channelId) to page through the range. Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected messages and earlier holds within this scan.` +
       `${opts.moreBeyond ? ' Newer messages also exist.' : ''}]\n</missed>`;
   }
   return { text: block, elided };
