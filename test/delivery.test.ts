@@ -445,14 +445,14 @@ test('a save after a failed load whose file is gone by then writes the state, wi
   });
 });
 
-test('enabled recovery advice quotes channel IDs while legacy stays unchanged', () => {
+test('recovery advice quotes channel IDs in every mode', () => {
   const channelId = 'zulip:team "alpha"';
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const text = renderMissedBlock([viewOf(msg(7, true, 'hello'))], {
       streamName: 'team "alpha"', channelId, reason: 'backscroll', count: 1,
       formatTime: () => '', moreBeyond: true, messageIds: new MessageIds('alpha', mode),
     }).text;
-    const channel = mode === 'legacy' ? `"${channelId}"` : JSON.stringify(channelId);
+    const channel = JSON.stringify(channelId);
     assert.ok(text.includes(`fetch_history(channel=${channel}, after=${mode === 'legacy' ? '7' : '"alpha:7"'})`));
   }
 });
@@ -462,11 +462,11 @@ test('enabled catch-up bounds long channel identifiers and realm tags', () => {
   for (const mode of ['compat', 'strict'] as const) {
     const ids = new MessageIds('a'.repeat(64), mode);
     const block = renderMissedBlock([viewOf(msg(7, false, 'x'.repeat(2000))), viewOf(msg(8, false, 'y'.repeat(2000)))], {
-      streamName: 'group', channelId: 'zulip:dm:' + '12345,'.repeat(400), reason: 'backscroll', count: 2,
+      streamName: 'group', channelId: 'zulip:dm:' + Array.from({ length: 400 }, (_, i) => 10000 + i).join('+'), reason: 'backscroll', count: 2,
       formatTime: () => '', maxChars: 1000, moreBeyond: true, newestScannedId: 8, messageIds: ids,
     }).text;
     assert.ok(block.length <= 1000);
-    assert.ok(block.includes(`fetch_around(message_id="${'a'.repeat(64)}:8")`));
+    assert.ok(block.includes(`fetch_around(message_id="${'a'.repeat(64)}:7")`));
     assert.match(block, /Newer messages also exist/);
   }
 });

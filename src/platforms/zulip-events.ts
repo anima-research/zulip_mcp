@@ -397,14 +397,14 @@ export class ZulipEventLoop {
         const nonJson = error instanceof ZulipNoAnswer && error.kind === 'not-json';
         if (nonJson) {
           console.error(
-            `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms: ${errMsg}`,
+            `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, error,
           );
         } else {
-          console.error(`Zulip event poll error (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, (this.options.messageIds ?? LEGACY_IDS).mode === 'legacy' ? error : diagnostic.message);
+          console.error(`Zulip event poll error (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, error);
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          nonJson && (this.options.messageIds ?? LEGACY_IDS).mode === 'legacy' ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : (error instanceof Error ? messageIdError(error, this.options.messageIds ?? LEGACY_IDS).message : errMsg).replace(/\.$/, ''),
+          (error instanceof Error ? messageIdError(error, this.options.messageIds ?? LEGACY_IDS).message : errMsg).replace(/\.$/, ''),
         );
         await this.sleep(delay);
       }

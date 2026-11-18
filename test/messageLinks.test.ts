@@ -219,7 +219,7 @@ test('R3: a tool refuses a token for a message Zulip doesn\'t show, or for a dir
 
 test('R3: a read that gets no answer, or any refused read, refuses the call and says nothing was sent or edited', async () => {
   const z = zulip(PUBLIC, MESSAGES, undefined, { noAnswer: [5005] });
-  const noAnswer = "[[msg:5005]] can't become a link: Zulip gave no answer to GET /messages/5005 within 15 s.";
+  const noAnswer = "[[msg:5005]] can't become a link: Zulip transport failure (timeout). Retry the read.";
   await assert.rejects(z.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'see [[msg:5005]]', attachments: file }), (err: Error) => err.message === `${noAnswer} Nothing was sent.`);
   await assert.rejects(z.runtime.handleToolCall('edit_message', { message_id: 1001, content: 'see [[msg:5005]]' }), (err: Error) => err.message === `${noAnswer} The message wasn't edited.`);
   await assert.rejects(z.runtime.handleToolCall('edit_message', { message_id: 6006, content: 'see [[msg:1001]]' }), (err: Error) => err.message === "[[msg:1001]] can't become a link: Zulip refused reading message 6006: Invalid message(s). The message wasn't edited.");

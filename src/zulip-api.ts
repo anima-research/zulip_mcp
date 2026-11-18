@@ -35,6 +35,7 @@ export type Transport = (
 export type NoAnswerKind = 'timeout' | 'network' | 'not-json' | 'no-self-id';
 
 export class ZulipNoAnswer extends Error {
+  declare readonly timeoutSeconds?: number;
   constructor(
     readonly kind: NoAnswerKind,
     readonly method: Method,
@@ -43,12 +44,13 @@ export class ZulipNoAnswer extends Error {
     detail: string,
     readonly status?: number,
     readonly retryAfterSeconds?: number,
-    readonly timeoutSeconds?: number,
+    timeoutSeconds?: number,
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
       : method === 'GET' && kind !== 'no-self-id' ? '' : 'The request was not sent.'}`.trim());
     this.name = 'ZulipNoAnswer';
+    if (timeoutSeconds !== undefined) Object.defineProperty(this, 'timeoutSeconds', { value: timeoutSeconds, enumerable: false });
   }
 }
 
@@ -109,7 +111,7 @@ export interface SelfIdGate {
   read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number } | null>;
 }
 
-export function selfIdGate(inner: Transport, retainDiagnostics = false): SelfIdGate {
+export function selfIdGate(inner: Transport): SelfIdGate {
   let selfUserId: number | null = null;
   let refused = false;
   let pending: ReturnType<SelfIdGate['read']> | null = null;
@@ -120,7 +122,7 @@ export function selfIdGate(inner: Transport, retainDiagnostics = false): SelfIdG
       answer = await inner('GET', '/users/me', undefined, opts);
     } catch (err) {
       return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
-        ...(retainDiagnostics && err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
+        ...(err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
     }
     const { status, body } = answer;
     const id = (body as { user_id?: unknown } | null)?.user_id;
@@ -209,7 +211,7 @@ export function httpTransport(config: HttpTransportConfig): Transport {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     init.signal = controller.signal;
     const write = method !== 'GET';
-    let status: number;
+    let status: number | undefined;
     let text: string;
     try {
       const response = await fetch(url, init);
@@ -217,14 +219,14 @@ export function httpTransport(config: HttpTransportConfig): Transport {
       text = await response.text();
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, undefined, undefined, timeoutMs / 1000);
+        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, status, undefined, timeoutMs / 1000);
       }
       const code = causeCode(err);
       const unsent = code !== undefined && notSent(code);
       throw new ZulipNoAnswer('network', method, path, write && !unsent,
         unsent
           ? `Couldn't reach Zulip for ${method} ${path} (${code}).`
-          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`);
+          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`, status);
     } finally {
       clearTimeout(timer);
     }

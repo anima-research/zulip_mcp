@@ -22,7 +22,7 @@ import { initializeZulipClient, subscribeConfigured } from './zulip-client.js';
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
 
-const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
+const SERVER_INFO = { name: 'zulip-mcp-server', version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version };
 
 function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
@@ -104,9 +104,7 @@ async function main(): Promise<void> {
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
   const server = new ZulipMcplServer(adapter, tools, {
-    serverInfo: messageIds.mode === 'legacy' ? SERVER_INFO : {
-      ...SERVER_INFO, version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
-    },
+    serverInfo: SERVER_INFO,
     mcplEnabled: process.env.MCPL_ENABLED !== 'false',
     batchWindowMs: intEnv('MCPL_BATCH_WINDOW_MS', 500),
     contextHistorySize: intEnv('MCPL_CONTEXT_HISTORY_SIZE', 20),

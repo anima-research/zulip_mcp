@@ -52,7 +52,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   stops, a message the server already holds is offered by the next
   connection's catch-up, as any message above the watermark is, if Zulip's
   history still has it there; one still waiting for the lookup that places
-  it is dropped, and the next catch-up recovers what it can.
+  it is dropped, and the next catch-up recovers what it can. Recovery covers
+  fetched rows only, within the catch-up ceiling and held-ID cap, not an
+  unfetched interval. Accepted elision notices acknowledge omitted rows; use
+  their recovery pointers to read them explicitly.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -181,6 +184,8 @@ are likely to touch:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `ZULIP_ID_MODE` | `legacy` | Message-ID format: `legacy`, `compat` (tagged output, bare inputs warn), or `strict` (tagged only) |
+| `ZULIP_REALM_TAG` | — | Required in compat/strict; choose a distinct, stable tag per realm |
 | `ZULIP_SESSION_ID` | bot email (from env or zuliprc) | Keys the persistent state files (monitoring, delivery, filters); set it when two sessions of one bot share a state dir |
 | `ZULIP_STATE_DIR` | `~/.zulip_mcp_state` | Where those files live |
 | `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read, or, for a client without MCPL, once its read of the list got no answer |
@@ -188,7 +193,7 @@ are likely to touch:
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
-| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
+| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer, or a compact omitted-range notice with a `fetch_around` anchor and history paging guidance when the header cannot fit; acceptance acknowledges omissions |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
@@ -196,6 +201,16 @@ are likely to touch:
 | `ZULIP_UPLOAD_MAX_BYTES` | realm's cap, else 25 MiB | Per-file ceiling for outbound uploads; the realm's `max_file_upload_size_mib` is read at start. A message carries at most 10 files within 4× this |
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
+
+### Realm-tagged message IDs (opt-in)
+
+For multi-realm deployments, `ZULIP_ID_MODE=compat` or `strict` and a distinct
+`ZULIP_REALM_TAG` enable scoped message IDs such as `research:123`. The default
+keeps numeric IDs. Enabled modes require an explicit tag. See
+[the ID contract and host handshake check](docs/realm-ids.md).
+
+In strict realm-ID mode, reply with `{"reply_to":"research:12345","content":"Thanks!"}`
+(using your configured realm tag) rather than a legacy integer reply reference.
 
 ### Plain MCP client (Claude Code, Cursor)
 
@@ -640,12 +655,3 @@ catch-up, and the tools — the fastest way to see the wire behaviour.
 ## License
 
 MIT
-
-### Realm-tagged message IDs (opt-in)
-
-For multi-realm deployments, `ZULIP_ID_MODE=compat` or `strict` and a distinct
-`ZULIP_REALM_TAG` enable scoped message IDs such as `research:123`. The default
-remains unchanged. See [the ID contract and host handshake check](docs/realm-ids.md).
-
-In strict realm-ID mode, reply with `{"reply_to":"research:12345","content":"Thanks!"}`
-(using your configured realm tag) rather than the legacy integer example above.

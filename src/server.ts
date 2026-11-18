@@ -46,7 +46,7 @@ import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, P
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
-import { messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
@@ -655,8 +655,7 @@ export class ZulipMcplServer {
             const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, undefined, 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
-            conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' ? (error as Error).message
-              : `channels/acknowledge (messageId=${ack.messageId}): ${messageIdError(error, this.messageIds).message}` });
+            conn.sendResponse(req.id, { acknowledged: false, reason: `channels/acknowledge (messageId=${describe(ack.messageId)}): ${messageIdError(error, this.messageIds).message}` });
           }
           break;
         }
@@ -688,7 +687,7 @@ export class ZulipMcplServer {
       return;
     }
     const e = messageIdError(err, this.messageIds);
-    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, this.messageIds.mode === "legacy" ? e.stack ?? e.message : e.message);
+    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
     conn.sendError(req.id, -32603, err instanceof Error ? messageIdError(err, this.messageIds).message : e.message ?? String(err));
   }
 
@@ -1425,8 +1424,10 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    const omittedBacklog = this.messageIds.mode !== 'legacy' && elided === kept.length;
-    const shownIds = omittedBacklog ? kept.map(v => v.id) : [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
+    // Reserve existing holds across the whole scan, including unselected ambient
+    // rows, so held reads cannot offer this interval again while it is pending.
+    const shownIds = [...new Set([...this.heldBetween(key, after, newestId), firstId,
+      ...kept.slice(Math.max(1, elided)).map(v => v.id)])];
     for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
@@ -1435,15 +1436,12 @@ export class ZulipMcplServer {
       ...((truncated && !read.ceiling) || blocked !== undefined ? { truncated: true } : {}),
     }, () => {
       offered = true;
-      if (!omittedBacklog) read.onAttempt?.(ctx.w, newestId);
-      if (read.onAttempt && !omittedBacklog) ctx.w.delivery.markReplayed(key, shownIds);
+      read.onAttempt?.(ctx.w, newestId);
+      if (read.onAttempt) ctx.w.delivery.markReplayed(key, shownIds);
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
-      if (ok && omittedBacklog) {
-        // The bounded fallback only recovers its anchor, not the backlog.
-        // Keep every omitted row replayable and do not acknowledge the scan.
-        for (const id of shownIds) w.delivery.hold(key, id, 'failed');
-      } else if (ok) {
+      if (ok) {
+        w.delivery.markReplayed(key, shownIds);
         w.delivery.advanceThrough(key, newestId, after);
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
@@ -2015,7 +2013,7 @@ export class ZulipMcplServer {
       return result;
     } catch (error) {
       const reason = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
-      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, this.messageIds.mode === 'legacy' ? error : reason);
+      console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
       return { ...empty, reason };
     }
   }

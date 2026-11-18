@@ -43,7 +43,7 @@ test('an HTML/proxy 502 backs off exponentially', async () => {
 
   const degraded = systemEvents.filter(e => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /non-JSON/);
+  assert.match(degraded[0].text, /not-json/);
 
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
 });
@@ -88,7 +88,7 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
   assert.deepEqual(delays, [2000, 4000, 8000]);
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /no answer/i);
+  assert.match(degraded[0].text, /transport failure \(timeout\)/i);
   assert.doesNotMatch(degraded[0].text, /\.\)/, 'no period inside the parentheses');
 });
 
@@ -521,8 +521,7 @@ test('degraded event text and metadata wrap transport failures in enabled modes'
       'GET /events': async () => { throw failure; },
     }).api, () => {}, e => events.push(e));
     const result = JSON.stringify(events.filter(e => e.kind === 'degraded'));
-    if (mode === 'legacy') assert.match(result, /ECONNRESET/);
-    else {
+    {
       assert.match(result, /Zulip transport failure/);
       assert.doesNotMatch(result, /ECONNRESET|GET \/events/);
     }
@@ -545,7 +544,7 @@ for (const mode of ['compat', 'strict'] as const) {
     const degraded = events.filter(e => e.kind === 'degraded');
     assert.equal(degraded.length, 1);
     assert.match(degraded[0].text, /HTTP 502/);
-    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). The server returned an unreadable response; verify the outcome before repeating writes, or contact the host operator if it persists. HTTP 502');
+    assert.equal(degraded[0].metadata?.reason, 'Zulip transport failure (not-json). The server returned an unreadable response; contact the host operator if it persists. Retry the read. HTTP 502');
     assert.doesNotMatch(JSON.stringify(degraded), /private upstream response body|GET|\/events/);
     assert.equal(failure.message, 'private upstream response body');
   });

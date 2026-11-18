@@ -9,16 +9,16 @@ export ZULIP_REALM_TAG=research
 ```
 
 - Unset, empty, or `legacy`: existing numeric IDs, tool schemas, message-link handling,
-  and handshake identity are unchanged. `ZULIP_REALM_TAG` is unused.
+  and handshake metadata are unchanged. `ZULIP_REALM_TAG` is unused.
 - `compat`: emit `research:123`, accept matching tagged IDs and bare positive safe
   integers (including decimal strings). Bare tool inputs warn on stderr and in
   successful results' `warnings` array, or in the error text when a call fails.
 - `strict`: emit tagged IDs and reject bare inputs.
 
-Tags match `[a-z0-9][a-z0-9_-]{0,63}`. If omitted or empty in an enabled mode, the tag is
-inferred from the first hostname label. **Set an explicit, distinct tag per realm**:
-that inference is not globally unique. Tags are routing guards, not authentication.
-Invalid enabled configuration fails before Zulip requests.
+Tags match `[a-z0-9][a-z0-9_-]{0,63}`. Enabled modes require an explicit,
+distinct, stable `ZULIP_REALM_TAG` per realm; there is no hostname inference.
+Tags are routing guards, not authentication. Invalid enabled configuration fails
+before Zulip requests. Startup logs the active mode and tag once.
 
 The contract covers message-ID tool inputs (`message_id`, `reply_to`, history
 `before`/`after`), receipts, raw/history output, MCPL message delivery and history,
@@ -32,7 +32,9 @@ IDs, event IDs and checkpoint tokens are not rewritten. Zero/negative sentinel
 values remain numeric, not usable message references. MCPL publish retains its
 as-typed policy: invalid, foreign and strict bare link tokens remain literal;
 tool calls reject them. Zulip API calls, routing
-cursors and persisted state remain numeric. No state migration is needed.
+cursors and persisted state remain numeric. No server-state migration is needed.
+For existing agents, transition through compat until bare IDs in the host
+chronicle and agent context have been replaced or aged out, then switch to strict.
 
 ## Host compatibility check
 
@@ -72,16 +74,18 @@ accepts bare decimal string references too; strict requires the matching tag.
 Synthetic event IDs must be echoed exactly. Invalid/unmatched entries are logged
 and ignored independently, never settling an unrelated message.
 
-Enabled modes keep transport timeout seconds, HTTP status, retry advice and
+All ID modes keep transport timeout seconds, HTTP status, retry advice and
 write-outcome uncertainty in agent-facing errors, but omit raw transport paths
 and bodies. Original transport diagnostics go to stderr. Errors marked at the native fetch boundary (not arbitrary local TypeErrors) are replaced with safe uncertainty guidance;
 ordinary Zulip refusals and validation messages remain unchanged. Failed unread
 checks report unknown state instead of claiming that no messages are unread.
 
-When a long channel ID forces the bounded catch-up fallback, the anchor only
-recovers its newest message. Omitted rows in the fetched page remain held and
-unacknowledged for replay; accepting that notice does not advance its watermark
-or mark those rows replayed. This is not an interval barrier for unfetched pages
-or overflow beyond the existing held-ID cap; those delivery limitations remain.
+When a long channel ID forces the bounded catch-up fallback, the compact notice
+names the omitted count and first/last message IDs. Its `fetch_around` pointer
+recovers the first message and context, including its channel; `fetch_history`
+can then page through the omitted range. Acceptance acknowledges the omissions,
+advances the watermark through the scan and prevents repeated notices or automatic
+replay. Explicit history reads remain available. Recovery covers fetched rows only,
+not an unfetched interval or overflow beyond the existing held-ID cap.
 Unread aggregates are null when any channel check failed; summary counts are
 labelled “At least” in that case.

@@ -460,7 +460,6 @@ export class ZulipToolRuntime {
   }
 
   async handleToolCall(name: string, args: any): Promise<any> {
-    if (this.messageIds.mode === 'legacy') return this.handleValidatedCall(name, args);
     args = { ...(args ?? {}) };
     const warnings: string[] = [];
     const bare = (field: string) => () => {
@@ -473,16 +472,18 @@ export class ZulipToolRuntime {
     const fields = name === 'send_message' ? ['reply_to'] : name === 'fetch_history' ? ['before', 'after']
       : ['edit_message', 'move_messages', 'delete_message', 'add_reaction', 'remove_reaction', 'fetch_around'].includes(name) ? ['message_id'] : [];
     try {
-      for (const field of fields) {
-        // Compat preserves padded decimal read anchors and empty/default history cursors.
-        if (['fetch_history', 'fetch_around'].includes(name) && this.messageIds.mode === 'compat' && typeof args[field] === 'string') {
-          const trimmed = args[field].trim();
-          if (trimmed === '') args[field] = undefined;
-          else if (/^[0-9]+$/.test(trimmed)) args[field] = trimmed;
+      if (this.messageIds.mode !== 'legacy') {
+        for (const field of fields) {
+          // Compat preserves padded decimal read anchors and empty/default history cursors.
+          if (['fetch_history', 'fetch_around'].includes(name) && this.messageIds.mode === 'compat' && typeof args[field] === 'string') {
+            const trimmed = args[field].trim();
+            if (trimmed === '') args[field] = undefined;
+            else if (/^[0-9]+$/.test(trimmed)) args[field] = trimmed;
+          }
+          if (args[field] != null || field === 'message_id') args[field] = this.messageIds.parse(args[field], bare(field), field);
         }
-        if (args[field] != null || field === 'message_id') args[field] = this.messageIds.parse(args[field], bare(field), field);
+        if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
       }
-      if (['send_message', 'send_dm', 'edit_message'].includes(name) && typeof args.content === 'string') validateMessageLinks(prepareOutgoing(args.content), this.messageIds, bare('message-link token'));
       const result = this.messageIds.project(await this.handleValidatedCall(name, args), ['send_message', 'send_dm'].includes(name));
       return warnings.length ? { ...result, warnings } : result;
     } catch (error) {
@@ -582,74 +583,58 @@ export class ZulipToolRuntime {
       case "listen": {
         const channels: string[] = args.channels;
         if (!Array.isArray(channels) || channels.length === 0) {
-          if (this.messageIds.mode !== "legacy") throw new Error("channels array is required and must be non-empty");
-          return { error: "channels array is required and must be non-empty" };
+          throw new Error("channels array is required and must be non-empty");
         }
-        try {
-          await this.streamIdsByName(channels);
-          const result = await api.requestAnswer<any>("POST", "/users/me/subscriptions", {
-            subscriptions: channels.map(name => ({ name })),
-          });
-          // A stream the bot just joined is not in the host's channel list
-          // yet; registering it here is what makes it openable without a
-          // refresh or a restart (#20).
-          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
-          const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
-          const joined = channels.filter((name) => !unauthorized.includes(name));
-          const registration = result?.result === "success" && joined.length > 0
-            ? await this.onSubscribed?.(joined)
-            : undefined;
-          return {
-            result: result?.result,
-            subscribed: result?.subscribed ?? {},
-            already_subscribed: result?.already_subscribed ?? {},
-            unauthorized: result?.unauthorized ?? [],
-            msg: result?.msg,
-            ...(registration
-              ? {
-                  registration,
-                  note: registration.announced.length > 0
-                    ? `Registered ${registration.announced.length} channel(s) with the host; they can be opened now.`
-                    : registration.refused.length > 0
-                      ? `The host refused ${registration.refused.join(", ")}.`
-                      : registration.local.length > 0
-                        ? `The host did not confirm ${registration.local.join(", ")} (${registration.reason ?? "no answer"}); usable here and re-announced on the next refresh.`
-                        : undefined,
-                }
-              : {}),
-          };
-        } catch (error) {
-          if (this.messageIds.mode !== "legacy") throw messageIdError(error, this.messageIds);
-          return {
-            error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
-          };
-        }
+        await this.streamIdsByName(channels);
+        const result = await api.requestAnswer<any>("POST", "/users/me/subscriptions", {
+          subscriptions: channels.map(name => ({ name })),
+        });
+        // A stream the bot just joined is not in the host's channel list
+        // yet; registering it here is what makes it openable without a
+        // refresh or a restart (#20).
+        if (result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
+        const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+        const joined = channels.filter((name) => !unauthorized.includes(name));
+        const registration = result?.result === "success" && joined.length > 0
+          ? await this.onSubscribed?.(joined)
+          : undefined;
+        return {
+          result: result?.result,
+          subscribed: result?.subscribed ?? {},
+          already_subscribed: result?.already_subscribed ?? {},
+          unauthorized: result?.unauthorized ?? [],
+          msg: result?.msg,
+          ...(registration
+            ? {
+                registration,
+                note: registration.announced.length > 0
+                  ? `Registered ${registration.announced.length} channel(s) with the host; they can be opened now.`
+                  : registration.refused.length > 0
+                    ? `The host refused ${registration.refused.join(", ")}.`
+                    : registration.local.length > 0
+                      ? `The host did not confirm ${registration.local.join(", ")} (${registration.reason ?? "no answer"}); usable here and re-announced on the next refresh.`
+                      : undefined,
+              }
+            : {}),
+        };
       }
 
       case "unlisten": {
         const channels: string[] = args.channels;
         if (!Array.isArray(channels) || channels.length === 0) {
-          if (this.messageIds.mode !== "legacy") throw new Error("channels array is required and must be non-empty");
-          return { error: "channels array is required and must be non-empty" };
+          throw new Error("channels array is required and must be non-empty");
         }
-        try {
-          await this.streamIdsByName(channels);
-          const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
-            subscriptions: channels,
-          });
-          if (this.messageIds.mode !== "legacy" && result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
-          return {
-            result: result?.result,
-            removed: result?.removed ?? [],
-            not_removed: result?.not_removed ?? [],
-            msg: result?.msg,
-          };
-        } catch (error) {
-          if (this.messageIds.mode !== "legacy") throw messageIdError(error, this.messageIds);
-          return {
-            error: error instanceof Error ? messageIdError(error, this.messageIds).message : String(error),
-          };
-        }
+        await this.streamIdsByName(channels);
+        const result = await api.requestAnswer<any>("DELETE", "/users/me/subscriptions", {
+          subscriptions: channels,
+        });
+        if (result?.result === "error") throw new Error(result.msg || "Zulip refused the subscription change.");
+        return {
+          result: result?.result,
+          removed: result?.removed ?? [],
+          not_removed: result?.not_removed ?? [],
+          msg: result?.msg,
+        };
       }
 
       case "get_monitored_channels": {
@@ -801,7 +786,7 @@ export class ZulipToolRuntime {
         const formattedOutput = formatMessages(stripSuppressedReactions(allUnreadMessages, this.reactionPolicy), format, this.messageIds);
 
         return {
-          total_unread: this.messageIds.mode !== "legacy" && channelResults.some(c => c.status === "error") ? null : allUnreadMessages.length,
+          total_unread: channelResults.some(c => c.status === "error") ? null : allUnreadMessages.length,
           channels_checked: channelResults,
           formatted_messages: formattedOutput,
         };
@@ -930,13 +915,12 @@ export class ZulipToolRuntime {
           message = (await api.request<{ message?: any }>("GET", `/messages/${messageId}`, `reading message ${this.messageIds.format(messageId)} back`)).message;
         } catch (err) {
           const diagnostic = messageIdError(err, this.messageIds).message;
-          const readBackError = this.messageIds.mode === 'legacy' ? diagnostic
-            : `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic}`;
+          const readBackError = `move_messages (message_id=${this.messageIds.format(messageId)}): ${diagnostic}`;
           return { moved: true, asked, readBackError, note: MOVE_NOTE };
         }
         const name = message?.display_recipient;
         if (message?.type !== "stream" || typeof name !== "string" || name === "" || typeof message.subject !== "string" || !Number.isSafeInteger(message.stream_id) || message.stream_id <= 0) {
-          return { moved: true, asked, readBackError: `${this.messageIds.mode === 'legacy' ? '' : 'move_messages: '}Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
+          return { moved: true, asked, readBackError: `move_messages: Zulip's answer gave no stream and topic for message ${this.messageIds.format(messageId)}.`, note: MOVE_NOTE };
         }
         const answersFollow = stream === undefined && (await this.followOwnMove(messageId, message.stream_id, message.subject, scope));
         return {
@@ -1137,13 +1121,9 @@ export class ZulipToolRuntime {
 
       case "fetch_attachment": {
         let url: URL;
-        if (this.messageIds.mode !== "legacy") {
-          try { new URL(this.session.realm); }
-          catch { throw new Error("Invalid configured realm URL; ask the host operator to repair the configuration."); }
-        }
         try { url = parseZulipAttachmentUrl(String(args.path || ""), this.session.realm); }
         catch (error) {
-          if (this.messageIds.mode !== "legacy" && error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or a valid absolute URL on the configured realm.");
+          if (error instanceof TypeError) throw new Error("Invalid attachment path: use a /user_uploads/ path or a valid absolute URL on the configured realm.");
           throw error;
         }
 
@@ -1260,8 +1240,8 @@ export class ZulipToolRuntime {
             channelSummaries.push(`📬 #${channelName}: ${unread.length} unread`);
           }
         } catch (error) {
-          if (this.messageIds.mode !== "legacy") partial = true;
-          if (this.messageIds.mode !== "legacy") channelSummaries.push(`Unread state unknown for #${channelName}: ${messageIdError(error, this.messageIds).message}`);
+          partial = true;
+          channelSummaries.push(`Unread state unknown for #${channelName}: ${messageIdError(error, this.messageIds).message}`);
         }
       }
 
@@ -1311,7 +1291,7 @@ export class ZulipToolRuntime {
 
         return { contents: [{ uri, mimeType: "text/plain", text }] };
       } catch (error) {
-        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${this.messageIds.mode === "legacy" ? error : messageIdError(error, this.messageIds).message}` }] };
+        return { contents: [{ uri, mimeType: "text/plain", text: `Error checking #${channelName}: ${messageIdError(error, this.messageIds).message}` }] };
       }
     }
 

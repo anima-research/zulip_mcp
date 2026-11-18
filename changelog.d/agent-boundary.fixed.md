@@ -1,0 +1,28 @@
+- In every ID mode, listen/unlisten validation, Zulip refusals and transport failures now set the tool error flag instead of returning successful error objects.
+- Unread totals are null if any channel check fails; the unread summary reports unknown state and labels partial counts “At least”, rather than claiming no unread messages. Per-channel resource errors use the same safe diagnostics.
+- Attachment downloads distinguish invalid input paths from invalid configured realm origins (including queries, fragments, credentials and non-root paths), before any fetch.
+- Transport diagnostics are sanitized on every agent-facing path in every ID mode, preserving HTTP status, timeout duration, retry facts and write uncertainty. Read failures recommend retrying the read; upload failures explain that no path was confirmed and require an operator check before retrying. Response-body failures retain known HTTP status, and self-ID gates retain transport facts and refusal status in every mode.
+- Operator stderr keeps full original errors and stacks in every ID mode. Timeout duration metadata is non-enumerable and absent when unknown, avoiding extra error-inspection fields.
+- Move read-back failures retain successful move outcomes with operation/ID context and safe transport facts in every mode.
+- Server version comes from package.json in every mode.
+- Oversized catch-up headers use a bounded notice naming the omitted count/range and a fetch_around recovery anchor with fetch_history paging guidance. Acceptance acknowledges the scan like ordinary elision, without repeated notices or automatic replay. Existing ambient holds are reserved while the notice is pending; failed or rejected delivery still holds the range back. Recovery is limited to fetched rows and existing caps.
+- Invalid acknowledgement IDs are described safely even when their JSON value cannot be string-converted.
+- Attachment URL authorization is guarded after resolving against the realm: protocol-relative URLs, backslashes and percent-encoded foreign hosts cannot bypass the same-origin check in any ID mode. Attachment body-read failures and stalls preserve an already-received HTTP status (including 206).
+
+  Main-suite legacy contract audit (main `1d1ce5d5559b20ddaad6098a204e8bd94a8bafcd`, 856 tests; the 16 differences identified at r12):
+  - 103, `renderMissedBlock` hard-cap hint: reverted the unrelated legacy wording change; ordinary legacy truncation still says `fetch_around(7)`. Tagged hints still name the tagged argument. This is not an R1-2 bug fix.
+  - 181, message-link read failure: R1-2 safe transport text replaces raw request details; “Nothing was sent” remains.
+  - 197, multipart send timeout: R1-2 sanitized text keeps the posted-part receipt and write uncertainty.
+  - 198, multipart send error identity: R1-2 returns a safe copy, preserving error kind/metadata instead of mutating/reusing the raw error.
+  - 200, publish error identity: the same R1-2 safe-copy rule; posted-part receipt and error kind remain.
+  - 668, refused listen: R1-2 throws instead of returning a successful `{error}` object; no registration occurs.
+  - 733, move read-back: R1-2 adds operation/ID context and safe facts while retaining `moved:true`, the requested move and reply guidance.
+  - 737, move stream lookup failure: R1-2 sanitizes transport text with operation/ID context; no move or misleading list-streams hint.
+  - 792, bounded request timeout: R1-2 safe text keeps the known duration and retry guidance; connection closure remains.
+  - 808, attachment idle timeout: R1-2 safe download diagnostic replaces the filename/raw text and keeps the duration and retry guidance; progressing downloads still finish.
+  - 809, default timeout: R1-2 reports the same 15-second bound as a safe fact instead of raw request text.
+  - 822, listen/unlisten refusals: R1-2 rejects the tool call instead of returning refusal data as success.
+  - 832, self-ID tool gate: R1-2 removes raw request/refusal text, keeps status and the unsent guarantee.
+  - 838, self-ID degraded notice: R1-2 uses the same safe self-ID reason/status; degradation/recovery semantics remain.
+  - 840, HTML/proxy poll failure: R1-2 safe `not-json` diagnostic replaces raw non-JSON text, preserving HTTP 502 and backoff.
+  - 842, poll timeout: R1-2 safe timeout diagnostic replaces raw “no answer” text; backoff and degraded accounting remain.

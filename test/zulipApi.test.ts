@@ -76,8 +76,8 @@ test('a call that gets no answer ends with an error at its bound, and its connec
   try {
     const started = Date.now();
     await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
-      assert.match(err.message, /no answer/i);
-      assert.match(err.message, /within 2 s/);
+      assert.match(err.message, /transport failure \(timeout\)/i);
+      assert.match(err.message, /Timeout: 2 seconds/);
       assert.equal(err.kind, 'timeout');
       return true;
     });
@@ -357,7 +357,8 @@ test('fetch_attachment ends a download that gets no data for 15 s, and a slow on
   try {
     for (const name of ['never.png', 'stalls.png']) {
       await assert.rejects(s.tools.handleToolCall('fetch_attachment', { path: `/user_uploads/2/ab/${name}` }), (err: Error) => {
-        assert.equal(err.message, `The download of ${name} got no data for 15 s.`);
+        assert.equal(err.message, 'Attachment download failed before a complete answer was received. Retry fetch_attachment with the same path.'
+          + (name === 'stalls.png' ? ' HTTP 200.' : '') + ' Timeout: 15 seconds.');
         return true;
       }, name);
     }
@@ -375,7 +376,7 @@ test('a call with no bound of its own ends at 15 s', async () => {
   globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 50 : ms, ...rest)) as typeof setTimeout;
   try {
     await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
-      assert.match(err.message, /within 15 s\./);
+      assert.match(err.message, /Timeout: 15 seconds\./);
       assert.equal(err.kind, 'timeout');
       return true;
     });
@@ -534,7 +535,7 @@ test('a realm that ends with /api is addressed at /api/v1', async () => {
   } finally { s.done(); z.close(); }
 });
 
-test('listen and unlisten return Zulip\'s refusal as data, as they do today', async () => {
+test('listen and unlisten throw Zulip refusals for tool error reporting', async () => {
   const refusal = { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid stream name' };
   const z = await realm({
     'POST /users/me/subscriptions': { status: 400, json: refusal },
@@ -542,12 +543,8 @@ test('listen and unlisten return Zulip\'s refusal as data, as they do today', as
   });
   const s = await serverOn(z.url);
   try {
-    const joined = await s.tools.handleToolCall('listen', { channels: ['general'] });
-    assert.equal(joined.result, 'error');
-    assert.equal(joined.msg, 'Invalid stream name');
-    const left = await s.tools.handleToolCall('unlisten', { channels: ['general'] });
-    assert.equal(left.result, 'error');
-    assert.equal(left.msg, 'Invalid stream name');
+    await assert.rejects(s.tools.handleToolCall('listen', { channels: ['general'] }), /Invalid stream name/);
+    await assert.rejects(s.tools.handleToolCall('unlisten', { channels: ['general'] }), /Invalid stream name/);
   } finally { s.done(); z.close(); }
 });
 
@@ -704,7 +701,7 @@ test("while the bot's own user id is unknown and reading it fails, a tool call f
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
       (err: Error & { mayHaveBeenApplied?: boolean }) => {
-        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.match(err.message, /HTTP 503/);
         assert.ok(err.message.endsWith('The request was not sent.'), err.message);
         assert.equal(err.mayHaveBeenApplied, false);
         return true;
@@ -712,7 +709,7 @@ test("while the bot's own user id is unknown and reading it fails, a tool call f
     );
     for (const [name, args] of [['list_streams', {}], ['send_message', { reply_to: 55, content: 'hi' }]] as const) {
       await assert.rejects(s.tools.handleToolCall(name, args), (err: Error) => {
-        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.match(err.message, /HTTP 503/);
         assert.ok(err.message.endsWith('The request was not sent.'), err.message);
         return true;
       }, name);
@@ -832,7 +829,7 @@ test("while the bot's own user id can't be read, the event loop's degraded notic
     await running;
     const degraded = notices.find((n) => n.kind === 'degraded');
     assert.ok(degraded, 'a degraded notice within 3 s');
-    assert.match(degraded.text, /GET \/users\/me with HTTP 503: Service unavailable/);
+    assert.match(degraded.text, /HTTP 503/);
   } finally { console.error = original; s.done(); z.close(); }
 });
 
@@ -851,4 +848,34 @@ test("ZULIP_SUBSCRIBE's subscribe goes out while the bot's own user id can't be 
     assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['POST /users/me/subscriptions']);
     assert.equal(s.session.selfUserId, null);
   } finally { console.error = original; s.done(); z.close(); }
+});
+
+test('response-body failures retain received HTTP status and unobtrusive timeout facts', async t => {
+  const { messageIdError, MessageIds } = await import('../src/message-ids.ts');
+  const { inspect } = await import('node:util');
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  for (const timedOut of [false, true]) {
+    t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => ({
+      status: 503,
+      text: async () => timedOut ? await new Promise((_resolve, reject) => {
+        init.signal!.addEventListener('abort', () => reject(new Error('private body timeout')), { once: true });
+      }) : await Promise.reject(new Error('private body failure')),
+    }));
+    const transport = httpTransport({ apiUrl: 'https://example.invalid/api/v1', authHeader: '', timeoutMs: 10 });
+    await assert.rejects(transport('GET', '/streams', undefined, undefined), error => {
+      assert.ok(error instanceof ZulipNoAnswer);
+      assert.equal(error.status, 503);
+      assert.equal(error.kind, timedOut ? 'timeout' : 'network');
+      assert.equal(error.timeoutSeconds, timedOut ? 0.01 : undefined);
+      assert.equal(Object.hasOwn(error, 'timeoutSeconds'), timedOut);
+      assert.doesNotMatch(inspect(error), /timeoutSeconds/);
+      for (const mode of ['legacy', 'compat', 'strict'] as const) {
+        const safe = messageIdError(error, new MessageIds('alpha', mode));
+        assert.match(safe.message, /HTTP 503/);
+        assert.match(safe.message, /Retry the read/);
+        assert.doesNotMatch(safe.message, /private/);
+      }
+      return true;
+    });
+  }
 });

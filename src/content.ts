@@ -40,14 +40,16 @@ export async function fetchAttachmentBytes(
 ): Promise<FetchedAttachment> {
   const controller = new AbortController();
   let timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-  const progressed = () => {
+  let status: number | undefined;
+  const progressed = (receivedStatus?: number) => {
+    if (receivedStatus !== undefined) status = receivedStatus;
     clearTimeout(timer);
     timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   };
   try {
     return await readAttachment(url, fallbackName, opts.headers ?? {}, controller.signal, progressed);
   } catch (err) {
-    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`), { operation: 'Attachment download', timeoutSeconds: DEFAULT_TIMEOUT_MS / 1000, original: err });
+    if (controller.signal.aborted) throw markTransportError(new Error(`The download of ${fallbackName} got no data for ${DEFAULT_TIMEOUT_MS / 1000} s.`), { operation: 'Attachment download', status, timeoutSeconds: DEFAULT_TIMEOUT_MS / 1000, original: err });
     throw err;
   } finally {
     clearTimeout(timer);
@@ -59,10 +61,10 @@ async function readAttachment(
   fallbackName: string,
   headers: Record<string, string>,
   signal: AbortSignal,
-  progressed: () => void,
+  progressed: (status?: number) => void,
 ): Promise<FetchedAttachment> {
   const resp = await fetch(url, { headers, redirect: "follow", signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
-  progressed();
+  progressed(resp.status);
   if (!resp.ok) throw markTransportError(new Error(`fetch failed: ${resp.status} ${resp.statusText}`), { operation: 'Attachment download', status: resp.status });
 
   const declared = resp.headers.get("content-length");
@@ -76,7 +78,7 @@ async function readAttachment(
   const reader = resp.body?.getReader();
   let buf: Buffer;
   if (!reader) {
-    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); }));
+    buf = Buffer.from(await resp.arrayBuffer().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status }); }));
     if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
       throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
     }
@@ -84,7 +86,7 @@ async function readAttachment(
     const chunks: Buffer[] = [];
     let total = 0;
     while (true) {
-      const { value, done } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
+      const { value, done } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: resp.status }); });
       if (done) break;
       if (!value) continue;
       progressed();
@@ -141,20 +143,22 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   if (!rawPath) throw new Error("path is required");
   if (!zulipRealm) throw new Error("Zulip realm not configured");
 
-  let url: URL;
-  if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-    url = new URL(rawPath);
-    const realm = new URL(zulipRealm);
+  let realm: URL;
+  try {
+    realm = new URL(zulipRealm);
+    if (!['https:', 'http:'].includes(realm.protocol) || !realm.hostname ||
+        realm.username || realm.password || realm.search || realm.hash || realm.pathname !== '/') throw new Error();
+  } catch {
+    throw new Error("Invalid configured realm URL; use an HTTP(S) origin without credentials, path, query or fragment; ask the host operator to repair the configuration.");
+  }
+  // Check the resolved URL, not its spelling: protocol-relative paths and
+  // WHATWG backslash/host normalization can change the origin during parsing.
+  const url = new URL(rawPath, realm);
+  if (url.origin !== realm.origin) {
     if (url.host !== realm.host) {
       throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realm.host}`);
     }
-    // Same host over a weaker scheme would send the bot's credentials in clear.
-    if (url.protocol !== realm.protocol) {
-      throw new Error(`refusing to fetch over ${url.protocol.replace(/:$/, "")}; the realm is ${realm.protocol.replace(/:$/, "")}`);
-    }
-  } else {
-    const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-    url = new URL(zulipRealm + path);
+    throw new Error(`refusing to fetch over ${url.protocol.replace(/:$/, "")}; the realm is ${realm.protocol.replace(/:$/, "")}`);
   }
   if (!url.pathname.startsWith("/user_uploads/")) {
     throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);

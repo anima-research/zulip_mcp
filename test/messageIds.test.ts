@@ -16,7 +16,7 @@ const message = { id: 7, type: 'stream', stream_id: 12, display_recipient: 'gene
   content: 'hello', sender_id: 9, sender_full_name: 'Test User', sender_email: 'user@example.invalid', timestamp: 1700000000 };
 
 test('realm modes validate configuration and positive safe IDs', () => {
-  assert.equal(MessageIds.fromEnv('https://alpha.example.invalid', { ZULIP_ID_MODE: 'strict' }).tag, 'alpha');
+  assert.equal(MessageIds.fromEnv('https://alpha.example.invalid', { ZULIP_ID_MODE: 'strict', ZULIP_REALM_TAG: 'alpha' }).tag, 'alpha');
   for (const mode of ['compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     assert.equal(ids.parse('alpha:7'), 7);
@@ -76,7 +76,7 @@ test('invalid realm config fails before profile, settings or password exchange',
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => { calls++; throw new Error('unexpected request'); });
   await assert.rejects(initializeZulipClient({ ZULIP_REALM: 'https://alpha.example.invalid', ZULIP_EMAIL: 'bot@example.invalid', ZULIP_PASSWORD: 'test', ZULIP_ID_MODE: 'bad' }), /ZULIP_ID_MODE/);
-  await assert.rejects(initializeZulipClient({ ZULIP_REALM: 'file:///tmp/zulip', ZULIP_EMAIL: 'bot@example.invalid', ZULIP_PASSWORD: 'test', ZULIP_ID_MODE: 'strict' }), /hostname/);
+  await assert.rejects(initializeZulipClient({ ZULIP_REALM: 'file:///tmp/zulip', ZULIP_EMAIL: 'bot@example.invalid', ZULIP_PASSWORD: 'test', ZULIP_ID_MODE: 'strict' }), /ZULIP_REALM_TAG/);
   assert.equal(calls, 0);
 });
 
@@ -185,8 +185,8 @@ test('strict invalid IDs recommend the usable tagged form', () => {
 
 test('enabled configuration identifies invalid mode and realm', () => {
   assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'bad' }), /ZULIP_ID_MODE/);
-  assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict' }), /Zulip realm.*URL/);
-  assert.throws(() => MessageIds.fromEnv('file:///tmp/zulip', { ZULIP_ID_MODE: 'strict' }), /hostname/);
+  assert.throws(() => MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict' }), /ZULIP_REALM_TAG/);
+  assert.throws(() => MessageIds.fromEnv('file:///tmp/zulip', { ZULIP_ID_MODE: 'strict' }), /ZULIP_REALM_TAG/);
   assert.equal(MessageIds.fromEnv('bad realm', { ZULIP_ID_MODE: 'strict', ZULIP_REALM_TAG: 'alpha' }).tag, 'alpha');
 });
 
@@ -274,10 +274,10 @@ test('enabled transport errors retain tagged operation context and uncertainty',
   });
 });
 
-test('move_messages read-back timeout retains success and adds context only in enabled modes', async t => {
+test('move_messages read-back timeout retains success, duration and context in every mode', async t => {
   const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
-    const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.');
+    const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.', undefined, undefined, 15);
     const calls: string[] = [];
     const api = zulipApi(async (method, path) => {
       calls.push(`${method} ${path}`);
@@ -294,11 +294,10 @@ test('move_messages read-back timeout retains success and adds context only in e
     assert.deepEqual(result, {
       moved: true,
       asked: { topic: 'new', scope: 'one' },
-      readBackError: mode === 'legacy' ? error.message : `move_messages (message_id=alpha:7): Zulip transport failure (timeout).`,
+      readBackError: `move_messages (message_id=${mode === 'legacy' ? 7 : 'alpha:7'}): Zulip transport failure (timeout). Retry the read. Timeout: 15 seconds.`,
       note: 'To answer this message where it is now, use send_message with reply_to.',
     });
-    if (mode === 'legacy') assert.equal(result.readBackError, error.message);
-    else assert.doesNotMatch(result.readBackError, /\/messages\/7/);
+    assert.doesNotMatch(result.readBackError, /\/messages\/7/);
     assert.deepEqual(calls, ['PATCH /messages/7', 'GET /messages/7']);
   }
 });
@@ -321,7 +320,7 @@ test('reused transport errors do not leak compat warnings into tagged calls', as
   assert.equal(error.message, original);
 });
 
-test('malformed move read-back names the operation only in enabled modes', async t => {
+test('malformed move read-back names the operation in every mode', async t => {
   for (const mode of ['legacy', 'strict', 'compat'] as const) {
     const { api } = standInApi({
       'PATCH /messages/:id': { result: 'success' },
@@ -333,7 +332,7 @@ test('malformed move read-back names the operation only in enabled modes', async
       { messageIds: new MessageIds('alpha', mode) });
     const result = await runtime.handleToolCall('move_messages', { message_id: mode === 'legacy' ? 7 : 'alpha:7', topic: 'new', scope: 'one' });
     assert.equal(result.moved, true);
-    assert.equal(result.readBackError, (mode === 'legacy' ? '' : 'move_messages: ') +
+    assert.equal(result.readBackError, 'move_messages: ' +
       "Zulip's answer gave no stream and topic for message " + (mode === 'legacy' ? '7' : 'alpha:7') + '.');
   }
 });
@@ -341,7 +340,7 @@ test('malformed move read-back names the operation only in enabled modes', async
 
 test('empty configuration uses defaults', () => {
   assert.equal(MessageIds.fromEnv('not a URL', { ZULIP_ID_MODE: '' }).mode, 'legacy');
-  assert.equal(MessageIds.fromEnv('https://alpha.example', { ZULIP_ID_MODE: 'compat', ZULIP_REALM_TAG: '' }).tag, 'alpha');
+  assert.throws(() => MessageIds.fromEnv('https://alpha.example', { ZULIP_ID_MODE: 'compat', ZULIP_REALM_TAG: '' }), /ZULIP_REALM_TAG/);
 });
 
 test('numeric token escaping is consistent in enabled modes, legacy remains upstream', async () => {
@@ -446,15 +445,15 @@ test('partial sends never contaminate a reused transport error in enabled modes'
   }
 });
 
-test('link lookup transport failures hide raw text only in enabled modes', async () => {
+test('link lookup transport failures hide raw text in every mode', async () => {
   const { ZulipNoAnswer, zulipApi } = await import('../src/zulip-api.ts');
-  const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.');
+  const error = new ZulipNoAnswer('timeout', 'GET', '/messages/7', false, 'GET /messages/7 timed out.', undefined, undefined, 15);
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     await assert.rejects(linkMessages(zulipApi(async () => { throw error; }),
       `[[msg:${ids.format(7)}]]`, async () => ({ kind: 'stream', id: 12 }), 'refuse', ids), (err: Error) => {
-      if (mode === 'legacy') assert.match(err.message, /GET \/messages\/7/);
-      else { assert.match(err.message, /alpha:7/); assert.doesNotMatch(err.message, /\/messages\/7/); }
+      assert.ok(err.message.includes(mode === 'legacy' ? 'msg:7' : 'alpha:7'));
+      assert.doesNotMatch(err.message, /\/messages\/7/);
       return true;
     });
   }
@@ -484,7 +483,7 @@ test('two sends sharing a transport exception report only their own posted chunk
   }
 });
 
-test('caught tool transport errors are safe data in enabled modes, unchanged in legacy', async t => {
+test('caught tool transport errors are safe data in every mode', async t => {
   const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     for (const name of ['start_monitoring', 'listen', 'unlisten', 'get_unread_messages']) {
@@ -505,7 +504,7 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
         { messageIds: new MessageIds('alpha', mode) });
       if (name === 'get_unread_messages') await runtime.handleToolCall('start_monitoring', { channels: ['general'] });
       fail = true;
-      if (mode !== 'legacy' && (name === 'listen' || name === 'unlisten')) {
+      if (name === 'listen' || name === 'unlisten') {
         await assert.rejects(runtime.handleToolCall(name, { channels: ['general'] }), /Zulip transport failure/);
         continue;
       }
@@ -513,8 +512,7 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
       const error = name === 'start_monitoring' ? result.channels[0].error
         : name === 'get_unread_messages' ? result.channels_checked[0].error : result.error;
       assert.equal(calls.at(-1)?.path, path);
-      if (mode === 'legacy') assert.equal(error, original);
-      else {
+      {
         assert.match(error, /Zulip transport failure \(timeout\)/);
         assert.doesNotMatch(JSON.stringify(result), /\/messages|\/users\/me\/subscriptions/);
         if (method !== 'GET') assert.match(error, /may have been applied: check before sending it again/);
@@ -522,8 +520,7 @@ test('caught tool transport errors are safe data in enabled modes, unchanged in 
       if (name === 'get_unread_messages') {
         const resource = await runtime.readResource('zulip://channel/general/unread');
         const text = resource.contents[0].text;
-        if (mode === 'legacy') assert.equal(text, `Error checking #general: ${failure}`);
-        else {
+        {
           assert.match(text, /Zulip transport failure/);
           assert.ok(!text.includes('/messages'));
           assert.ok(!text.includes('ZulipNoAnswer:'));
@@ -551,9 +548,9 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
       [new ZulipNoAnswer('timeout', 'POST', '/private', true, 'secret body', undefined, undefined, 1.5),
         'Zulip transport failure (timeout). Timeout: 1.5 seconds. The request may have been applied: check before sending it again.'],
       [new ZulipNoAnswer('not-json', 'GET', '/private', false, 'secret body', 502),
-        'Zulip transport failure (not-json). The server returned an unreadable response; verify the outcome before repeating writes, or contact the host operator if it persists. HTTP 502.'],
-      [markTransportError(new TypeError('secret URL')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
-      [markTransportError(new DOMException('secret URL', 'AbortError')) as Error, 'Transport failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.'],
+        'Zulip transport failure (not-json). The server returned an unreadable response; contact the host operator if it persists. Retry the read. HTTP 502.'],
+      [markTransportError(new TypeError('secret URL')) as Error, 'Transport failed before a complete answer was received. Retry reads; verify the outcome before repeating writes.'],
+      [markTransportError(new DOMException('secret URL', 'AbortError')) as Error, 'Transport failed before a complete answer was received. Retry reads; verify the outcome before repeating writes.'],
     ] as const;
     for (const [error, expected] of cases) {
       const original = error.message;
@@ -565,12 +562,14 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
       assert.equal(logs.length, before + 1);
       assert.equal(logs.at(-1)?.[1], error);
       assert.equal(error.message, original);
-      assert.equal(messageIdError(error, new MessageIds('alpha', 'legacy')), error);
+      assert.equal(messageIdError(error, new MessageIds('alpha', 'legacy')).message, expected);
     }
   }
 });
 
 test('local TypeErrors are not transport failures and malformed attachment URLs are actionable', async t => {
+  let downloads = 0;
+  t.mock.method(globalThis, 'fetch', async () => { downloads++; throw new Error('unexpected download'); });
   for (const mode of ['compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
     assert.equal(messageIdError(new TypeError('local processing failed'), ids).message, 'local processing failed');
@@ -580,12 +579,18 @@ test('local TypeErrors are not transport failures and malformed attachment URLs 
     const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
     await assert.rejects(runtime.handleToolCall('fetch_attachment', { path: 'https://[' }), /Invalid attachment path: use a \/user_uploads\/ path/);
     assert.equal(calls.length, 0);
+    assert.equal(downloads, 0);
+    for (const realm of ['https://alpha.example?x=1', 'https://alpha.example/#x', 'https://alpha.example/api', 'file:///tmp']) {
+      const broken = new ZulipToolRuntime({ api, selfUserId: 1, realm, authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+      await assert.rejects(broken.handleToolCall('fetch_attachment', { path: '/user_uploads/a' }), /Invalid configured realm URL.*host operator/);
+    }
+    assert.equal(downloads, 0);
   }
 });
 
 test('self-ID transport failures retain timeout and HTTP facts', async () => {
   const { selfIdGate, ZulipNoAnswer } = await import('../src/zulip-api.ts');
-  const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); }, true);
+  const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); });
   await assert.rejects(gate.transport('POST', '/messages', {}, undefined), (error: Error) => {
     const safe = messageIdError(error, new MessageIds('alpha', 'strict'));
     assert.match(safe.message, /Timeout: 15 seconds/);
@@ -597,19 +602,21 @@ test('self-ID transport failures retain timeout and HTTP facts', async () => {
 });
 
 test('failed unread checks make aggregates unknown and successful subtotals explicit', async t => {
-  const { api } = standInApi({ 'GET /messages': (params: any) => {
-    if (JSON.stringify(params.narrow).includes('broken')) throw new Error('unavailable');
-    return { result: 'success', messages: [message] };
-  } });
-  const dir = mkdtempSync(join(tmpdir(), 'partial-unread-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', 'strict') });
-  // Seed monitoring directly so failed baseline reads do not exclude the channel.
-  (runtime as any).monitoredChannels.set('general', { lastReadMessageId: 0 });
-  (runtime as any).monitoredChannels.set('broken', { lastReadMessageId: 0 });
-  const result = await runtime.handleToolCall('get_unread_messages', { mark_as_read: false });
-  assert.equal(result.total_unread, null);
-  const summary = await runtime.readResource('zulip://unread/summary');
-  assert.match(summary.contents[0].text, /At least 1 unread message/);
-  assert.match(summary.contents[0].text, /Unread state unknown for #broken/);
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const { api } = standInApi({ 'GET /messages': (params: any) => {
+      if (JSON.stringify(params.narrow).includes('broken')) throw new Error('unavailable');
+      return { result: 'success', messages: [message] };
+    } });
+    const dir = mkdtempSync(join(tmpdir(), 'partial-unread-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: new MessageIds('alpha', mode) });
+    // Seed monitoring directly so failed baseline reads do not exclude the channel.
+    (runtime as any).monitoredChannels.set('general', { lastReadMessageId: 0 });
+    (runtime as any).monitoredChannels.set('broken', { lastReadMessageId: 0 });
+    const result = await runtime.handleToolCall('get_unread_messages', { mark_as_read: false });
+    assert.equal(result.total_unread, null);
+    const summary = await runtime.readResource('zulip://unread/summary');
+    assert.match(summary.contents[0].text, /At least 1 unread message/);
+    assert.match(summary.contents[0].text, /Unread state unknown for #broken/);
+  }
 });

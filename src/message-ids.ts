@@ -18,14 +18,8 @@ export class MessageIds {
   static fromEnv(realm: string, env: NodeJS.ProcessEnv = process.env): MessageIds {
     if (!env.ZULIP_ID_MODE || env.ZULIP_ID_MODE === 'legacy') return LEGACY_IDS;
     if (!['compat', 'strict'].includes(env.ZULIP_ID_MODE)) throw new Error('ZULIP_ID_MODE must be legacy, compat or strict');
-    if (env.ZULIP_REALM_TAG) return new MessageIds(env.ZULIP_REALM_TAG, env.ZULIP_ID_MODE as IdMode);
-    let url: URL;
-    try { url = new URL(realm); }
-    catch { throw new Error('Zulip realm (ZULIP_REALM or zuliprc site) must be an absolute URL to infer ZULIP_REALM_TAG'); }
-    if (!url.hostname) throw new Error('Zulip realm URL must have a hostname to infer ZULIP_REALM_TAG');
-    const label = url.hostname.split('.')[0].toLowerCase()
-      .replace(/[^a-z0-9_-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'realm';
-    return new MessageIds(label, (env.ZULIP_ID_MODE ?? 'legacy') as IdMode);
+    if (!env.ZULIP_REALM_TAG) throw new Error('ZULIP_REALM_TAG is required when ZULIP_ID_MODE is compat or strict');
+    return new MessageIds(env.ZULIP_REALM_TAG, env.ZULIP_ID_MODE as IdMode);
   }
 
   format(id: number | string): number | string {
@@ -101,7 +95,7 @@ export function messageIdServerInfo<T extends { name: string; version: string; _
   } };
 }
 
-function describe(value: unknown): string {
+export function describe(value: unknown): string {
   try { return JSON.stringify(value) ?? String(value); }
   catch { return typeof value === 'bigint' ? `${value}n` : '<unserializable value>'; }
 }
@@ -118,10 +112,9 @@ export function markTransportError(error: unknown, facts: TransportFacts = {}): 
 const loggedTransport = new WeakSet<Error>();
 
 /** Agent-facing transport diagnostics: retain type/metadata, never expose raw transport text.
- * Legacy returns the original unchanged; enabled copies may safely be annotated by callers.
+ * Copies may safely be annotated by callers, in every ID mode.
  */
 export function messageIdError(error: unknown, ids: MessageIds): Error {
-  if (ids.mode === 'legacy') return error as Error;
   const copy: Error = error instanceof DOMException
     ? Object.defineProperties(new DOMException(error.message, error.name), Object.getOwnPropertyDescriptors(error))
     : error instanceof Error
@@ -136,7 +129,8 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
     }
     if (copy instanceof ZulipNoAnswer) {
       let detail = `Zulip transport failure (${copy.kind}).`;
-      if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; verify the outcome before repeating writes, or contact the host operator if it persists.';
+      if (copy.kind === 'not-json') detail += ' The server returned an unreadable response; contact the host operator if it persists.';
+      if (copy.method === 'GET' && copy.kind !== 'no-self-id') detail += ' Retry the read.';
       if (copy.kind === 'no-self-id') detail = "The server doesn't have the bot's own user id yet; it will retry on a later call.";
       if (copy.timeoutSeconds !== undefined) detail += ` Timeout: ${copy.timeoutSeconds} seconds.`;
       if (copy.status !== undefined) detail += ` HTTP ${copy.status}.`;
@@ -145,7 +139,10 @@ export function messageIdError(error: unknown, ids: MessageIds): Error {
         detail, copy.status, copy.retryAfterSeconds, copy.timeoutSeconds).message;
     } else {
       const facts = nativeTransportErrors.get(error as Error);
-      const detail = `${facts?.operation ?? 'Transport'} failed before a complete answer was received; retry reads, but verify the outcome before repeating writes.`
+      const detail = `${facts?.operation ?? 'Transport'} failed before a complete answer was received. `
+        + (facts?.operation === 'Attachment download' ? 'Retry fetch_attachment with the same path.'
+          : facts?.operation === 'Upload' ? 'No uploaded path was confirmed. Ask the host operator to check Zulip uploads before retrying upload_file; retrying may create a duplicate.'
+          : 'Retry reads; verify the outcome before repeating writes.')
         + (facts?.status !== undefined ? ` HTTP ${facts.status}.` : '')
         + (facts?.timeoutSeconds !== undefined ? ` Timeout: ${facts.timeoutSeconds} seconds.` : '');
       Object.defineProperty(copy, 'message', { value: detail, writable: true, configurable: true });

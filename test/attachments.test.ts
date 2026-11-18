@@ -292,8 +292,7 @@ test('inline attachment transport diagnostics use the shared mode-aware wrapper'
       { fetch: async () => { throw failure; } }, resolveInlineOptions(), new AbortController().signal,
       new MessageIds('alpha', mode));
     const result = JSON.stringify(blocks);
-    if (mode === 'legacy') assert.ok(result.includes(failure.message));
-    else {
+    {
       assert.match(result, /Zulip transport failure/);
       assert.doesNotMatch(result, /raw GET|\/messages\/7/);
     }
@@ -311,9 +310,8 @@ test('inline native fetch failures hide raw URLs in enabled modes', async t => {
         { fetch: (path, maxBytes, signal) => fetchCapped('https://private.invalid' + path, {}, maxBytes, signal) }, resolveInlineOptions(), new AbortController().signal,
         new MessageIds('alpha', mode));
       const text = JSON.stringify(blocks);
-      if (mode === 'legacy') assert.ok(text.includes(failure.message));
-      else {
-        assert.match(text, /Transport failed before a complete answer/);
+      {
+        assert.match(text, /Attachment download failed before a complete answer/);
         assert.doesNotMatch(text, /private|secret/);
       }
     }

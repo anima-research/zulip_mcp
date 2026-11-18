@@ -65,6 +65,7 @@ try {
     if (!failure && (status[0] !== 0 || status[1] !== null)) {
       failure = new Error(`Child exited with code ${status[0]}, signal ${status[1]}`);
     }
+    assert.equal(diagnostics.split(`message IDs: ${mode}, tag "alpha"`).length - 1, 1, 'startup names the explicit mode and tag once');
     if (failure) throw new Error(`${failure.message}\n${diagnostics}`, { cause: failure });
   }
   console.log('Built MCP/MCPL handshake matches package version in compat and strict.');

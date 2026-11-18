@@ -7664,7 +7664,7 @@ test('acknowledgment transport errors share safe diagnostics in enabled modes', 
       const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE,
         { channelId: 'zulip:general', messageId: String(ids.format(7)) }) as { acknowledged: boolean; reason: string };
       assert.equal(result.acknowledged, false);
-      if (mode === 'legacy') assert.equal(result.reason, error.message);
+      if (mode === 'legacy') assert.match(result.reason, /Zulip transport failure/);
       else {
         assert.match(result.reason, /channels\/acknowledge.*alpha:7/);
         assert.match(result.reason, /check before sending it again/);
@@ -7691,7 +7691,7 @@ test('channels/open wraps subscription errors before RPC conversion', async () =
           { channelId: 'zulip:general', type: 'zulip', address: {} }), (error: any) => {
           assert.equal(error.code, ERR_CHANNEL_OPEN_FAILED);
           assert.deepEqual(error.data, { channelId: 'zulip:general' });
-          if (mode === 'legacy' || failure instanceof ZulipRefused) {
+          if (failure instanceof ZulipRefused) {
             assert.equal(error.message, `RPC error ${ERR_CHANNEL_OPEN_FAILED}: Cannot open zulip:general: ${original}`);
           } else {
             assert.match(error.message, /Cannot open zulip:general: Zulip transport failure \(timeout\)/);
@@ -7707,9 +7707,9 @@ test('channels/open wraps subscription errors before RPC conversion', async () =
 });
 
 
-test('enabled listen and unlisten transport failures set the MCP isError flag', async () => {
+test('listen and unlisten transport failures set the MCP isError flag', async () => {
   const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
-  for (const mode of ['compat', 'strict'] as const) {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const dir = mkdtempSync(join(tmpdir(), 'listen-error-'));
     const ids = new MessageIds('alpha', mode);
     const fail = () => { throw new ZulipNoAnswer('timeout', 'POST', '/users/me/subscriptions', true, 'private path', undefined, undefined, 15); };
@@ -7728,13 +7728,15 @@ test('enabled listen and unlisten transport failures set the MCP isError flag', 
   }
 });
 
-test('accepted bounded fallback retains the entire 101–200 group-DM backlog', async () => {
-  for (const mode of ['compat', 'strict'] as const) {
-    const users = Array.from({ length: 400 }, (_, i) => i + 10000);
-    const channelId = 'zulip:dm:' + users.join(',');
+test('accepted compact notice acknowledges its range once, without replay on open or restart', async () => {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const users = [42, ...Array.from({ length: 399 }, (_, i) => i + 10000)];
+    const channelId = 'zulip:dm:' + users.join('+');
     const descriptor = { ...BO_DM, id: channelId, address: { dm: true, user_ids: users } };
     const message = (id: number) => ({ ...boDm(id), channelId });
-    const h = harness({ messageIds: new MessageIds('alpha', mode), visible: [descriptor],
+    const dir = mkdtempSync(join(tmpdir(), 'compact-'));
+    const ids = new MessageIds('alpha', mode);
+    const h = harness({ messageIds: ids, stateDir: dir, sessionId: 'compact', visible: [descriptor],
       history: [message(100)], missedBlockMaxChars: 1000 });
     try {
       await initialize(h, true);
@@ -7743,30 +7745,36 @@ test('accepted bounded fallback retains the entire 101–200 group-DM backlog', 
       await until(() => h.delivery.watermark(channelId) === 100, 'initial accepted DM');
       for (let id = 101; id <= 200; id++) h.adapter.history.push(message(id));
       h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
-      await until(() => h.pushed.some(p => firstText(p).includes('Catch-up omitted')), 'bounded fallback');
+      await until(() => h.pushed.some(p => firstText(p).includes('100 messages omitted')), 'compact notice');
       await h.server.quiet();
-      assert.equal(h.delivery.watermark(channelId), 100);
-      assert.deepEqual(h.delivery.heldIds(channelId), Array.from({ length: 100 }, (_, i) => i + 101));
-      const block = h.pushed.map(firstText).find(t => t.includes('Catch-up omitted'))!;
+      assert.equal(h.delivery.watermark(channelId), 200);
+      assert.deepEqual(h.delivery.heldIds(channelId), []);
+      const block = h.pushed.map(firstText).find(t => t.includes('100 messages omitted'))!;
       assert.ok(block.length <= 1000);
-      assert.match(block, /message_id="alpha:200"/);
-      // A newer accepted closed-channel message triggers a second held read.
+      assert.ok(block.includes(`ids ${ids.format(101)}–${ids.format(200)}`));
+      assert.ok(block.includes(`message_id=${JSON.stringify(ids.format(101))}`));
+      assert.match(block, /fetch_history/);
       h.adapter.history.push(message(201));
       h.adapter.emit!(message(201));
-      await until(() => h.pushed.filter(p => firstText(p).includes('Catch-up omitted')).length >= 2, 'repeated compact notice');
+      await until(() => h.delivery.watermark(channelId) === 201, 'newer message accepted');
+      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: 'zulip', address: {} });
       await h.server.quiet();
-      assert.equal(h.delivery.heldIds(channelId, { replayable: true }).length, 100);
-      await h.host.sendRequest(method.CHANNELS_OPEN, { channelId, type: "zulip", address: {} });
-      h.adapter.emit!(message(202));
-      await until(() => h.delivery.watermark(channelId) >= 201, "held backlog replayed");
-      assert.deepEqual(h.incoming.filter(m => Number(m.messageId.split(":").at(-1)) >= 101 && Number(m.messageId.split(":").at(-1)) <= 200).map(m => m.messageId),
-        Array.from({ length: 100 }, (_, i) => "alpha:" + (101 + i)));
+      assert.equal(h.pushed.filter(p => firstText(p).includes('100 messages omitted')).length, 1);
+      assert.equal(h.incoming.length, 0, 'acknowledged omissions are not replayed on open');
     } finally { await h.close(); }
+    const restarted = harness({ messageIds: ids, stateDir: dir, sessionId: 'compact', visible: [descriptor],
+      history: Array.from({ length: 102 }, (_, i) => message(i + 100)), missedBlockMaxChars: 1000 });
+    try {
+      await initialize(restarted, true);
+      await settled(restarted);
+      assert.equal(restarted.delivery.watermark(channelId), 201);
+      assert.equal(restarted.pushed.filter(p => firstText(p).includes('messages omitted')).length, 0);
+    } finally { await restarted.close(); rmSync(dir, { recursive: true, force: true }); }
   }
 });
 
-test('enabled listen/unlisten validation and refusals set isError', async () => {
-  for (const mode of ['compat', 'strict'] as const) {
+test('listen/unlisten validation and refusals set isError', async () => {
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const dir = mkdtempSync(join(tmpdir(), 'listen-refusal-'));
     const ids = new MessageIds('alpha', mode);
     const refusal = { result: 'error', msg: 'Subscription refused' };
@@ -7781,5 +7789,75 @@ test('enabled listen/unlisten validation and refusals set isError', async () => 
         assert.match(result.content[0].text, channels.length ? /Subscription refused/ : /non-empty/);
       }
     } finally { await h.close(); rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('malformed acknowledgement JSON returns a negative result without string conversion', async () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const h = harness({ messageIds: new MessageIds('alpha', mode) });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const result = await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, {
+        channelId: 'zulip:general', messageId: { toString: null },
+      }) as any;
+      assert.equal(result.acknowledged, false);
+      assert.match(result.reason, /messageId=.*toString.*Nothing was written/);
+      assert.deepEqual(h.adapter.acked, []);
+    } finally { await h.close(); }
+  }
+});
+
+test('pending compact scan reserves ambient holds and acceptance advances past unselected rows', async () => {
+  for (const accepted of [true, false]) {
+    const channelId = 'zulip:' + 'long'.repeat(400);
+    const descriptor = { ...DESCRIPTOR, id: channelId, label: '#long', address: { stream_id: 7, stream_name: channelId.slice(6) } };
+    const message = (id: number) => streamMsg(id, { channelId, metadata: { topic: 't', mentioned: id === 120, isDM: false },
+      tags: id === 120 ? ['chat:mention'] : ['chat:ambient'] });
+    const h = harness({ messageIds: new MessageIds('alpha', 'strict'), visible: [descriptor], history: [message(100)], missedBlockMaxChars: 1000 });
+    try {
+      await initialize(h, true);
+      await settled(h);
+      const key = h.adapter.keyOf(channelId);
+      h.delivery.advance(key, 100);
+      h.delivery.hold(key, 101, 'failed');
+      for (let id = 101; id <= 200; id++) h.adapter.history.push(message(id));
+      h.policy.holdPushes = true;
+      if (!accepted) h.policy.rejectPushes.add('alpha:200');
+      h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+      await until(() => h.pushed.some(p => firstText(p).includes('messages omitted')), 'compact stream notice');
+      assert.deepEqual(h.delivery.heldIds(key, { replayable: true }), []);
+      await h.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+      assert.equal(h.pushed.filter(p => firstText(p).includes('messages omitted')).length, 1, 'no second offer while the first is pending');
+      h.policy.holdPushes = false;
+      h.policy.heldPushes.splice(0).forEach(answer => answer());
+      await h.server.quiet();
+      if (accepted) {
+        assert.equal(h.delivery.watermark(key), 200, 'scanned ambient tail was acknowledged');
+        assert.deepEqual(h.delivery.heldIds(key), []);
+      } else {
+        assert.equal(h.delivery.watermark(key), 100, 'a refused notice never acknowledges omissions');
+        assert.ok(h.delivery.heldIds(key).includes(101));
+      }
+    } finally { await h.close(); }
+  }
+});
+
+test('public request failures retain the original local error and stack on stderr', async t => {
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const h = harness({ messageIds: new MessageIds('alpha', mode) });
+    const failure = new TypeError('local publish processing failed');
+    h.adapter.publish = async () => { throw failure; };
+    try {
+      await initialize(h, true);
+      await settled(h);
+      await assert.rejects(h.host.sendRequest(method.CHANNELS_PUBLISH, {
+        channelId: 'zulip:general', conversationId: 'test', content: [{ type: 'text', text: 'hello' }],
+      }), /local publish processing failed/);
+      assert.ok(logs.some(args => args[1] === failure && String(args[0]).includes('handleRequest')));
+      assert.match(failure.stack!, /TypeError: local publish processing failed/);
+    } finally { await h.close(); }
   }
 });

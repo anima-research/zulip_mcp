@@ -175,17 +175,17 @@ test('R3: a refusal at the second of three chunks keeps each caller\'s error tex
 
 test('R3b: no answer at the second of three chunks throws that error, and the first chunk is on record', async () => {
   const sm = tools(messagesApi(noAnswerSecond).api);
-  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), (e) => e === noAnswer);
+  await assert.rejects(sm.runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: threeChunks }), (e) => e instanceof ZulipNoAnswer && e !== noAnswer && e.message.includes('Posted as message 901'));
   assert.deepEqual(sm.sent.map((s) => s.messageId), ['901']);
   sm.done();
 
   const dm = tools(messagesApi(noAnswerSecond).api);
-  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), (e) => e === noAnswer);
+  await assert.rejects(dm.runtime.handleToolCall('send_dm', { to: ['42'], content: threeChunks }), (e) => e instanceof ZulipNoAnswer && e !== noAnswer && e.message.includes('Posted as message 901'));
   assert.deepEqual(dm.sent.map((s) => s.messageId), ['901']);
   dm.done();
 
   const pub = adapter(messagesApi(noAnswerSecond).api);
-  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e === noAnswer);
+  await assert.rejects(pub.publish('zulip:general', undefined, text(threeChunks), { threadId: 't' }), (e) => e instanceof ZulipNoAnswer && e !== noAnswer && e.message.includes('Posted as message 901'));
   assert.deepEqual(pub.sent.map((s) => s.messageId), ['901']);
 });
 
@@ -204,9 +204,9 @@ test('R2 (109): a send that fails after a part was posted names that part by id,
     refused.done();
     const silent = tools(messagesApi(noAnswerSecond).api);
     await assert.rejects(silent.runtime.handleToolCall(tool, args), (e: Error) => {
-      assert.equal(e, noAnswer, `${tool}: the same error`);
-      assert.ok(e.message.startsWith(`${ONE_POSTED} Zulip gave no answer`), `${tool}: the posted part, then the error's own words`);
-      assert.match(e.message, /within 15 s/, `${tool}: the error's own words`);
+      assert.notEqual(e, noAnswer, `${tool}: the original remains unmodified`);
+      assert.ok(e.message.startsWith(`${tool}: ${ONE_POSTED} Zulip transport failure (timeout).`));
+      assert.match(e.message, /check before sending it again/);
       return true;
     });
     silent.done();
@@ -237,8 +237,8 @@ test('R4 (109, publish): a plain answer that fails after a part was posted names
   });
   const silent = adapter(messagesApi(noAnswerSecond).api);
   await assert.rejects(silent.publish('zulip:dm:42', undefined, text(threeChunks)), (e: Error) => {
-    assert.equal(e, noAnswer, 'the same error');
-    assert.ok(e.message.startsWith(`${ONE_POSTED} Zulip gave no answer`));
+    assert.notEqual(e, noAnswer, 'the original remains unmodified');
+    assert.ok(e.message.startsWith(`${ONE_POSTED} Zulip transport failure (timeout).`));
     return true;
   });
   const first = adapter(messagesApi(refuseAt(1)).api);
@@ -274,13 +274,13 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
               const parts = count === 1 ? 'part 1' : count === 2 ? 'parts 1 and 2' : 'parts 1 to 3';
               const prefix = count === 0 ? '' :
                 `Posted as message${count === 1 ? '' : 's'} ${names} (${parts}) before the send stopped; sending the whole text again posts ${count === 1 ? 'that part' : 'those parts'} twice. `;
-              const suffix = failure === 'transport' ? (mode === 'legacy' ? transportMessage : 'Zulip transport failure (timeout). Timeout: 15 seconds. The request may have been applied: check before sending it again.') : path === 'publish'
+              const suffix = failure === 'transport' ? 'Zulip transport failure (timeout). Timeout: 15 seconds. The request may have been applied: check before sending it again.' : path === 'publish'
                 ? `Zulip refused message to #general: ${original}`
                 : `${count ? 'Zulip: ' : ''}${original}`;
-              const context = failure === 'transport' && mode !== 'legacy' && path !== 'publish' ? `${path}: ` : '';
+              const context = failure === 'transport' && path !== 'publish' ? `${path}: ` : '';
               assert.equal(err.message, context + prefix + suffix);
-              if (mode !== 'legacy') assert.equal(transport.message, transportMessage);
-              if (failure === 'transport' && mode === 'legacy') assert.equal(err, transport);
+              assert.equal(transport.message, transportMessage);
+              if (failure === 'transport') assert.notEqual(err, transport);
               if (failure === 'refusal' && path === 'publish') {
                 assert.ok(err instanceof ZulipRefused);
                 assert.equal(err.code, 'BAD_REQUEST');
