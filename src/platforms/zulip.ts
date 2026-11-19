@@ -855,7 +855,7 @@ export class ZulipAdapter implements PlatformAdapter {
   async fetchHistory(key: ChannelKey, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
     const parsed = parseKey(key);
     if (parsed.kind === 'stream' && !this.streamAllowed(parsed.streamId)) {
-      return { messages: [], scannedThrough: null, reachedNewest: true, policyFiltered: true };
+      return { messages: [], scannedThrough: null, reachedNewest: true };
     }
     const page = await fetchHistory(this.api, {
       ...(parsed.kind === 'dm' ? { dmUserIds: parsed.userIds } : { streamId: parsed.streamId }),
@@ -891,15 +891,14 @@ export class ZulipAdapter implements PlatformAdapter {
       if (verdict === 'budget-skipped') unverifiedMessageIds.push(String(m.id));
     }
     for (const m of page.messages) this.remember(key, m);
-    const allowed = page.messages.filter((m) => this.allowed(m));
-    const messages = allowed
+    const messages = page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
+      .filter((m) => this.allowed(m))
       .map((m) => toIncoming(key, m, this.identity, { backscroll: true }));
     return {
       messages,
       scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
       reachedNewest: page.foundNewest,
-      ...(allowed.length < page.messages.length ? { policyFiltered: true } : {}),
       ...(unverifiedMessageIds.length > 0 ? { unverifiedMessageIds } : {}),
     };
   }

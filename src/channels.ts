@@ -22,7 +22,7 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
   channelsChanged(params: ChannelsChangedParams, timeoutMs?: number): Promise<ChannelsRegisterResult | undefined>;
-  sendIncoming(messages: IncomingChannelMessage[], onWritten?: () => void): Promise<ChannelsIncomingResult | undefined>;
+  sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
 
 /** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
@@ -45,7 +45,6 @@ export interface RegisterAdditionalResult {
 }
 
 export interface ChannelManagerHooks {
-  onOffered?: (key: ChannelKey, messages: KeyedMessage[]) => void;
   onDelivered?: (key: ChannelKey, accepted: KeyedMessage[], rejected: KeyedMessage[]) => void;
   deliverable?: (message: KeyedMessage) => boolean;
   onWithheld?: (key: ChannelKey, messages: KeyedMessage[]) => void;
@@ -694,16 +693,11 @@ export class ChannelManager {
     }
 
     let result: ChannelsIncomingResult | undefined;
-    let offered = false;
     try {
-      result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!), () => {
-        offered = true;
-        for (const [key, messages] of groupByKey(allMessages)) this.report(this.hooks.onOffered, key, messages);
-      });
+      result = await this.host.sendIncoming(allMessages.map((m) => wire.get(m)!));
     } catch (error) {
-      const once = (q: Queued) => offered && q.message.carriedOffer === true;
-      const retry = queued.filter((q) => !once(q) && q.attempts + 1 < MAX_BATCH_ATTEMPTS);
-      const givenUp = queued.filter((q) => once(q) || q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
+      const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
+      const givenUp = queued.filter((q) => q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
       console.error(
         `Failed to send ${allMessages.length} incoming message(s) to host` +
           (retry.length > 0 ? `; retrying ${retry.length}` : '') +

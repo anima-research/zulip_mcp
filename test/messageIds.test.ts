@@ -147,6 +147,23 @@ test('enabled link expansion preserves escaped literals and as-typed invalid tok
   assert.equal(expanded, String.raw`\[[msg:literal [#general > topic @ 💬](#narrow/channel/12-general/topic/topic/near/7)`);
 });
 
+test('as-typed publish warns once on stderr for bare compat link tokens only', async t => {
+  const logs: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
+  const { api } = standInApi({ 'GET /messages/:id': { result: 'success', message } });
+  const audience = async () => ({ kind: 'stream' as const, id: 12 });
+  const compat = new MessageIds('alpha', 'compat');
+  const linked = await linkMessages(api, '[[msg:7]] and [[msg:7]]', audience, 'as-typed', compat);
+  assert.ok(linked.includes('/near/7'), 'compat still links the bare token');
+  assert.equal(logs.filter(line => line.includes('bare message-link token')).length, 1, 'one warning per published text');
+  assert.ok(logs.some(line => line.includes('[[msg:alpha:<n>]]')));
+  logs.length = 0;
+  for (const [mode, text] of [['compat', '[[msg:alpha:7]] \\[[msg:7]] [[msg:beta:7]]'], ['strict', '[[msg:7]]'], ['legacy', '[[msg:7]]']] as const) {
+    await linkMessages(api, text, audience, 'as-typed', new MessageIds('alpha', mode));
+  }
+  assert.deepEqual(logs.filter(line => line.includes('bare message-link token')), [], 'tagged, escaped, foreign, strict and legacy tokens do not warn');
+});
+
 test('normalized Markdown validates before reply lookup; optional null IDs are omitted', async t => {
   const { api, calls } = standInApi({
     'POST /messages': { result: 'success', id: 8 },

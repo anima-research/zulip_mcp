@@ -266,7 +266,7 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     ];
     const open = new AbortController().signal;
     const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 }, open);
-    assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(Attachment download was refused.*HTTP 404/);
+    assert.equal((blocks[0] as { text: string }).text, '[attachment: missing.png — could not fetch (refused, HTTP 404, /user_uploads/1/a/missing.png); check access and the path before retrying]');
     assert.equal(blocks[1].type, 'image');
     assert.equal((blocks[1] as { mimeType: string }).mimeType, 'image/jpeg');
     assert.equal((blocks[2] as { text: string }).text, '[image attachment: shot.png]');
@@ -311,7 +311,7 @@ test('inline native fetch failures hide raw URLs in enabled modes', async t => {
         new MessageIds('alpha', mode));
       const text = JSON.stringify(blocks);
       {
-        assert.match(text, /Attachment download failed before a complete answer/);
+        assert.match(text, /could not fetch \(incomplete, \/user_uploads\/note\.txt\); retry with fetch_attachment\]/);
         assert.doesNotMatch(text, /private|secret/);
       }
     }

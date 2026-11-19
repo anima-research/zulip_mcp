@@ -271,12 +271,19 @@ export async function linkMessages(
   ids: MessageIds = LEGACY_IDS,
 ): Promise<string> {
   if (unlinkable === 'refuse') validateMessageLinks(text, ids);
+  // Tool calls warn while validating; as-typed publish warns here, once per text.
+  let warned = false;
+  const bare = () => {
+    if (warned) return;
+    warned = true;
+    console.error(`[zulip-mcp] Warning: bare message-link token accepted in a publish; use [[msg:${ids.tag}:<n>]].`);
+  };
   const tokens = messageTokens(text, ids.mode !== 'legacy').filter(token => {
     let slashes = 0;
     for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
     if (ids.mode !== 'legacy' && slashes % 2) return false;
     if (ids.mode !== 'legacy' && unlinkable === 'as-typed') {
-      try { ids.parse(token.digits); } catch { return false; }
+      try { ids.parse(token.digits, bare); } catch { return false; }
     }
     return true;
   });

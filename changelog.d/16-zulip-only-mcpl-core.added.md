@@ -1,19 +1,16 @@
 - Closed-channel delivery (#16): mentions and DMs on channels the host has
   not opened arrive as `push/event` with the missed-ambient tally in the
   origin; ambient on closed channels is counted (`channel_missed`).
-- Catch-up: persisted per-channel watermarks track host acceptance; refused
-  or failed messages pin progress until replay or an accepted later scan
-  acknowledges the same range (including declared omissions), subject to the
-  50,000 held-ID cap: untracked overflow refusals may be passed and are not
-  guaranteed restart recovery. Empty-selection scans explicitly skip their
-  unselected rows. Holds outside
-  an accepted scan still pin the watermark; one or more `<missed>` blocks per channel on reconnect (full
-  backscroll for channels the host had open, addressed message ±7 otherwise;
-  mentions, replies and DMs are addressed, and deferred quote verification can
-  split a prefix block from a retry block), paged
-  up to `ZULIP_CATCHUP_LIMIT` and hard-capped by
-  `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry is healed from
-  history for open and closed channels alike.
+- Catch-up: persisted per-channel watermarks that advance on the host's
+  acceptance. A refused message, or one whose offer was lost, holds the
+  watermark back until it is replayed from history or the host accepts a
+  later catch-up that covers it, including what that block declares omitted;
+  past 50,000 held messages in one channel, newer refusals are not tracked.
+  One or more `<missed>` blocks per channel on reconnect (full backscroll for
+  channels the host had open, addressed messages ±7 otherwise; mentions,
+  replies and DMs are addressed), paged up to `ZULIP_CATCHUP_LIMIT` and
+  hard-capped by `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry
+  is healed from history for open and closed channels alike.
 - DM conversations are channels (`zulip:dm:<ids>`), discovered from history
   and announced on the fly; `send_dm` by name, email or id (closes #5).
 - History on `channels/open` (`limit`, `beforeMessageId`, `sinceLastSeen`),

@@ -44,7 +44,7 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
       fetch: (path, max, signal) => fetchCapped('https://example.invalid' + path, {}, max, signal),
     }, { inlineImages: false, maxImages: 0, inlineTextMaxBytes: 100 }, new AbortController().signal, ids);
     const text = (blocks[0] as { text: string }).text;
-    assert.match(text, /HTTP 403.*check access and the attachment path/);
+    assert.equal(text, '[attachment: a.txt — could not fetch (refused, HTTP 403, /user_uploads/a); check access and the path before retrying]');
     assert.doesNotMatch(text, /fetch_attachment/);
   });
 

@@ -30,11 +30,9 @@ export function streamIdOfKey(key: ChannelKey): number | null {
 export type KeyedMessage = Omit<IncomingChannelMessage, 'channelId'> & {
   key: ChannelKey;
   streamNameShown?: string;
-  /** Restart by-ID recovery gets one host request, not batch transport retries. */
-  carriedOffer?: boolean;
 };
 
 export function toWire(message: KeyedMessage, channelId: string): IncomingChannelMessage {
-  const { key: _key, streamNameShown: _shown, carriedOffer: _once, ...rest } = message;
+  const { key: _key, streamNameShown: _shown, ...rest } = message;
   return { ...rest, channelId };
 }

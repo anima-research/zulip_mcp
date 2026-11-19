@@ -54,10 +54,8 @@ Discord and Slack adapters that once lived here moved to those servers.
   history still has it there; one still waiting for the lookup that places
   it is dropped, and the next catch-up recovers what it can. Recovery covers
   fetched rows only, within the catch-up ceiling and held-ID cap, not an
-  unfetched interval; an eligible held message the watermark later passes is offered
-  by id at the start after that (see Catch-up below). Accepted elision
-  notices acknowledge omitted rows; use their recovery pointers to read them
-  explicitly.
+  unfetched interval. Accepted elision notices acknowledge omitted rows; use
+  their recovery pointers to read them explicitly.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -132,41 +130,6 @@ Discord and Slack adapters that once lived here moved to those servers.
   Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.
-  The ids of the messages held this way are saved beside the watermark: those
-  the host refused or whose offer was lost, and, when the server stops in
-  order, those still waiting. The list keeps 50 per channel, the last run's
-  ids and the current run's counted together; past 50 the oldest of them
-  all leave it, with a line on stderr giving their id range. A restart
-  forgets the holds themselves, so its catch-up runs from the watermark as
-  ever, applying its normal selection and accepted/skip coverage to listed
-  IDs it reaches. One it doesn't reach, because
-  the catch-up failed or stopped at its ceiling, is not read by id while it is
-  still above the watermark; once the watermark has passed it (the host
-  accepted something newer), the next start reads it by id and offers eligible
-  rows once, before its catch-up: on a closed channel in a `<missed>` block of
-  those ids alone, oldest first, chosen as any catch-up block is (every row
-  for a channel the host had open, addressed ± 7 of the listed rows
-  otherwise); on a channel the host has opened by then, as messages. Closed-stream
-  ambient rows outside the selected vicinity are withdrawn without an offer.
-  Queuing a message for the open-channel batcher is not an offer: it stays
-  listed until an actual host request, even if capability withdrawal or a
-  channel close withholds the batch. The by-ID result and its failure counter
-  are saved before any retryable catch-up read, so catch-up retries do not
-  repeat or discard the completed by-ID pass. That offer never moves the watermark, and it is the only one: an id leaves the
-  list when it is offered this way, whatever the host answers, when the host
-  accepts a catch-up block or an open's history page that covers it,
-  when an empty-selection catch-up explicitly skips its range,
-  or when it is withdrawn (unselected closed-stream ambient rows, IDs Zulip
-  no longer has in that channel, or a channel muted or outside the allowlist). While the offer cannot be made
-  (`zulip.messaging` disabled, no `pushEvents`) the ids stay listed. A read
-  by id that fails is counted against that id alone and stops the pass, the
-  ids after it waiting for the next start; after three such starts the id is
-  dropped with a line on stderr. `ZULIP_CATCHUP_LIMIT=0` disables ordinary
-  catch-up, not this separate recovery of listed IDs below the watermark.
-  The list holds only ids the server itself
-  held: a message that never reached it (one beyond a catch-up ceiling, say)
-  is not on it, and once the host accepts something newer only
-  `fetch_history` or `fetch_around` (with a known ID) reaches it.
   On the next connection one or more `<missed>` blocks per channel
   deliver what arrived meanwhile (full backscroll for channels the host had
   open, addressed message ± 7 for the rest). Deferred quote verification
@@ -183,9 +146,10 @@ Discord and Slack adapters that once lived here moved to those servers.
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
   follows it, as a message. If catch-up fails or stops at its ceiling, later
-  accepted live delivery can move the watermark past unfetched offline rows.
-  Never-held rows then require explicit `fetch_history` or `fetch_around` with a known ID; the saved held-ID list
-  does not cover them. Past 5,000 waiting messages, the channel with the
+  accepted live delivery can move the watermark past unfetched offline rows,
+  including a message held before a restart (a restart forgets its holds);
+  those then need an explicit `fetch_history`, or `fetch_around` with a known
+  ID. Past 5,000 waiting messages, the channel with the
   most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
@@ -236,7 +200,7 @@ are likely to touch:
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
-| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer, or a compact omitted-range notice with a `fetch_around` anchor and history paging guidance when the header cannot fit; acceptance acknowledges omissions |
+| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer, or, when even the header cannot fit, replaced by a notice naming the omitted range and a `fetch_around` anchor |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
@@ -657,8 +621,7 @@ Under `ZULIP_STATE_DIR`, keyed by session:
 
 - `<session>.json` — the plain-MCP monitor (streams, last-read ids)
 - `<session>.delivery.json` — watermarks, missed tallies, last-open channels,
-  the ids of held messages (present only while something is held), and the
-  stream names they were saved under (written only with MCPL)
+  and the stream names they were saved under (written only with MCPL)
 - `<session>.filters.json` — the filters plane (unless `ZULIP_FILTERS_FILE`)
 
 Put `ZULIP_STATE_DIR` on storage that survives a redeploy. In a container
@@ -694,6 +657,26 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **A message's attachments share one bound on live delivery:** 15 s for
   all its fetches together. An attachment not fetched by then gets a note
   with its path for `fetch_attachment`.
+- **Elided catch-up is acknowledged.** When the host accepts a `<missed>`
+  block, the watermark covers everything that block's scan read, including
+  elided lines and the rows a compact omitted-range notice stands for. Only
+  the explicit `fetch_history`/`fetch_around` pointers in the block reach them
+  afterwards. A hold older than the scan can still keep the watermark below
+  it, so the same range may be offered again after a restart. Overlapping
+  catch-up scans can repeat a row rather than drop one.
+- **Uploads and attachments.** Only complete upload responses with status
+  400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals; anything
+  else, 5xx and proxy failures included, may have stored the file, and the
+  error says so before a retry duplicates it. Before fetching, `fetch_attachment`
+  and inline attachments check that the resolved URL is on the configured
+  realm's origin and under `/user_uploads/`. Redirects follow native fetch
+  behavior and are not checked again. An inline failure marker gives the
+  path and one remedy, plus the HTTP status when available.
+- **Agent-facing errors** keep the HTTP status, timeout, Retry-After and
+  whether a write may have been applied, but not raw request paths, bodies or
+  stacks; the original error goes to stderr. For explicit Zulip refusals,
+  `listen` and `unlisten` show Zulip's message if present, or a generic
+  error if not, without showing the refusal code.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

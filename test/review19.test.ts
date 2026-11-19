@@ -4,7 +4,6 @@ import { MessageIds, messageIdError, markTransportError } from '../src/message-i
 import { sendMessage, SendRefused } from '../src/outgoing.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 import { ZulipEventLoop } from '../src/platforms/zulip-events.ts';
-import { ZulipMcplServer } from '../src/server.ts';
 import { standInApi } from './zulip-stand-in.ts';
 
 for (const mode of ['legacy', 'compat', 'strict'] as const) {
@@ -32,16 +31,6 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
     assert.doesNotMatch(upload, /retrying upload_file/);
   });
 }
-
-test('a muted carried withdrawal rechecks policy before discarding IDs', async () => {
-  let muted = true;
-  const discarded: number[] = [];
-  const server = { delivery: { watermark: () => 31, carriedIds: () => [21] }, isMuted: () => muted, isAllowed: () => true };
-  const hand = await (ZulipMcplServer.prototype as any).readCarried.call(server, {}, 's:7');
-  muted = false;
-  hand({ ended: false, w: { delivery: { uncarry: (_key: unknown, ids: number[]) => discarded.push(...ids) } } });
-  assert.deepEqual(discarded, [], 'a now-allowed channel retains its owed IDs');
-});
 
 test('degraded polling authorization errors require operator repair', async t => {
   t.mock.method(console, 'error', () => {});

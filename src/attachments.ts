@@ -1,4 +1,4 @@
-import { messageIdError, markTransportError, attachmentWasRefused, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { messageIdError, markTransportError, attachmentDownloadFailure, logDiagnostic, LEGACY_IDS, type MessageIds } from './message-ids.js';
 import { parseRetryAfter } from './zulip-api.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -266,9 +266,24 @@ export async function buildAttachmentBlocks(
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
     } catch (err) {
-      const remedy = attachmentWasRefused(err) ? `check access and the attachment path ${ref.path} before retrying` : `fetch_attachment ${ref.path}`;
-      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${messageIdError(err, messageIds).message}); ${remedy}]`));
+      blocks.push(text(`[attachment: ${ref.name} — could not fetch ${inlineFailure(err, ref.path, messageIds)}]`));
     }
   }
   return blocks;
+}
+
+/**
+ * The parenthesized facts and one remedy for an inline marker. A download
+ * failure gives its status and path; anything else keeps its safe message.
+ */
+function inlineFailure(err: unknown, path: string, messageIds: MessageIds): string {
+  const failure = attachmentDownloadFailure(err);
+  if (!failure) return `(${messageIdError(err, messageIds).message}); fetch_attachment ${path}`;
+  logDiagnostic(err);
+  const facts = [failure.refused ? 'refused' : 'incomplete'];
+  if (failure.status !== undefined) facts.push(`HTTP ${failure.status}`);
+  if (failure.timeoutSeconds !== undefined) facts.push(`no data for ${failure.timeoutSeconds} s`);
+  if (failure.retryAfterSeconds !== undefined) facts.push(`Retry-After ${failure.retryAfterSeconds} s`);
+  facts.push(path);
+  return `(${facts.join(', ')}); ${failure.refused ? 'check access and the path before retrying' : 'retry with fetch_attachment'}`;
 }

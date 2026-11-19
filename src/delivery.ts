@@ -20,8 +20,6 @@ interface DeliveryFile {
   lastOpen?: string[];
   streams?: Record<string, string>;
   formerNames?: Record<string, number>;
-  /** Per channel, each held message id and how many reads of it by id have failed. */
-  held?: Record<string, Record<string, number>>;
 }
 
 interface Unresolved {
@@ -36,31 +34,20 @@ interface Held {
   status: HeldStatus;
   replayed: boolean;
   replyVerified: boolean;
-  saveDropped?: boolean;
 }
 
 const HELD_CAP_PER_CHANNEL = 50_000;
-// The holds a restart would forget are saved by id. A later run offers by id
-// each one its watermark has passed, which no catch-up from the watermark can
-// reach. Each costs that run one request, so few are kept.
-export const HELD_SAVED_PER_CHANNEL = 50;
-export const CARRIED_READ_TRIES = 3;
 
 export class DeliveryState {
   writes = true;
   private unreadableFile = false;
-  private lastSaved: string | undefined;
   private copy: DirectorySnapshot | null = null;
   private watermarks = new Map<ChannelKey, number>();
   private missed = new Map<ChannelKey, MissedTally>();
   private lastOpen = new Set<ChannelKey>();
   private unresolved = new Map<string, Unresolved>();
   private held = new Map<ChannelKey, Map<number, Held>>();
-  // Bounded save-eligible current-run IDs; saving never traverses queued holds.
-  private savedCurrent = new Map<ChannelKey, Set<number>>();
   private reached = new Map<ChannelKey, number>();
-  // The holds the last run saved, with the failed reads of each.
-  private carried = new Map<ChannelKey, Map<number, number>>();
 
   constructor(
     private readonly stateDir: string | null,
@@ -80,7 +67,6 @@ export class DeliveryState {
     if (!path || !existsSync(path)) return;
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf-8')) as DeliveryFile;
-      this.lastSaved = JSON.stringify(parsed, null, 2) + '\n';
       const saved = parsed.streams && typeof parsed.streams === 'object' ? parsed.streams : null;
       if (saved) {
         this.directory.load({ streams: saved, formerNames: parsed.formerNames ?? {} });
@@ -89,12 +75,6 @@ export class DeliveryState {
       const idBySavedName = new Map<string, number>();
       for (const [id, name] of Object.entries(saved ?? {})) if (typeof name === 'string') idBySavedName.set(name, Number(id));
       const keyOf = (chan: string): ChannelKey | null => {
-        // Absent streams retain stable numeric keys; names may be reused while
-        // the stream is archived/deleted, so do not fall back to stale names.
-        if (/^stream-id:[1-9][0-9]*$/.test(chan)) {
-          const id = Number(chan.slice(10));
-          return Number.isSafeInteger(id) ? streamKey(id) : null;
-        }
         const dm = parseDmChannelId(chan);
         if (dm) return dmKey(dm);
         if (!chan.startsWith('zulip:')) return null;
@@ -130,19 +110,6 @@ export class DeliveryState {
         if (typeof chan !== 'string') continue;
         place(chan, (key) => this.lastOpen.add(key), (u) => { u.lastOpen = true; });
       }
-      for (const [chan, ids] of Object.entries(parsed.held ?? {})) {
-        const tries = new Map<number, number>();
-        for (const [id, failed] of Object.entries(ids ?? {})) {
-          if (Number.isSafeInteger(Number(id)) && Number(id) > 0) tries.set(Number(id), Number.isInteger(failed) && failed >= 0 && failed < CARRIED_READ_TRIES ? failed : 0);
-          else console.error(`[zulip-mcp] ${chan}: dropping saved held ID ${JSON.stringify(id)}: not a positive safe integer`);
-        }
-        if (tries.size === 0) continue;
-        const key = keyOf(chan);
-        if (key !== null) {
-          this.carried.set(key, tries);
-          this.savedHolds(key);
-        } else for (const id of tries.keys()) console.error(`[zulip-mcp] ${chan}: dropping saved held ID ${id}: the file has no stream list to place it by`);
-      }
     } catch (err) {
       this.unreadableFile = true;
       console.error('[zulip-mcp] Failed to load delivery state:', (err as Error).message);
@@ -173,7 +140,7 @@ export class DeliveryState {
     const parsed = parseKey(key);
     if (parsed.kind === 'dm') return dmChannelIdFor(parsed.userIds);
     const name = this.directory.nameOf(parsed.streamId);
-    return name === undefined ? `stream-id:${parsed.streamId}` : `zulip:${name}`;
+    return name === undefined ? null : `zulip:${name}`;
   }
 
   save(): void {
@@ -195,25 +162,15 @@ export class DeliveryState {
       };
       const lastOpen = [...this.lastOpen].map((key) => this.fileKey(key)).filter((c): c is string => c !== null);
       for (const [name, u] of this.unresolved) if (u.lastOpen) lastOpen.push(`zulip:${name}`);
-      const snapshot = this.directory.snapshot();
-      const copy = this.copy !== null || this.directory.isFilled || Object.keys(snapshot.streams).length > 0 ? snapshot : null;
-      const held: [string, Record<string, number>][] = [];
-      for (const key of new Set([...this.carried.keys(), ...this.savedCurrent.keys()])) {
-        const chan = this.fileKey(key);
-        const ids = this.savedHolds(key);
-        if (chan !== null && ids.length > 0) held.push([chan, Object.fromEntries(ids)]);
-      }
+      const copy = this.copy !== null || this.directory.isFilled ? this.directory.snapshot() : null;
       const out: DeliveryFile = {
         watermarks: Object.fromEntries(entries(this.watermarks)),
         missed: Object.fromEntries(entries(this.missed)),
         lastOpen: lastOpen.sort(),
-        ...(held.length > 0 ? { held: Object.fromEntries(held.sort((a, b) => a[0].localeCompare(b[0]))) } : {}),
         ...(copy ?? {}),
       };
-      const serialized = JSON.stringify(out, null, 2) + '\n';
-      if (serialized === this.lastSaved && !this.unreadableFile) return;
       const tmp = `${path}.${process.pid}.tmp`;
-      writeFileSync(tmp, serialized);
+      writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
       if (this.unreadableFile) {
         const aside = `${path}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
         try {
@@ -229,77 +186,10 @@ export class DeliveryState {
         this.unreadableFile = false;
       }
       renameSync(tmp, path);
-      this.lastSaved = serialized;
       if (copy) this.copy = copy;
     } catch (err) {
       console.error('[zulip-mcp] Failed to save delivery state:', (err as Error).message);
     }
-  }
-
-  /**
-   * The held ids to save: the last run's that are still owed and this run's
-   * own that the host refused or that failed, as one list with each id once,
-   * HELD_SAVED_PER_CHANNEL in all. Past that the oldest ids of the whole list
-   * give way, whichever run held them.
-   */
-  private savedHolds(key: ChannelKey): [number, number][] {
-    const all = new Map<number, number>();
-    for (const id of this.savedCurrent.get(key) ?? []) all.set(id, 0);
-    for (const [id, failed] of this.carried.get(key) ?? []) all.set(id, failed);
-    const kept = [...all].sort((a, b) => a[0] - b[0]);
-    const dropped = kept.splice(0, Math.max(0, kept.length - HELD_SAVED_PER_CHANNEL)).map(([id]) => id);
-    this.uncarry(key, dropped);
-    for (const id of dropped) {
-      const h = this.held.get(key)?.get(id);
-      if (h) h.saveDropped = true;
-      this.savedCurrent.get(key)?.delete(id);
-    }
-    if (dropped.length > 0) {
-      console.error(
-        `[zulip-mcp] ${this.fileKey(key) ?? key}: more than ${HELD_SAVED_PER_CHANNEL} undelivered message ids to save for a restart; ` +
-          `the oldest ${dropped.length} (${dropped[0]}–${dropped[dropped.length - 1]}) are dropped from that list and will not be offered by id`,
-      );
-    }
-    if (this.savedCurrent.get(key)?.size === 0) this.savedCurrent.delete(key);
-    return kept;
-  }
-
-  private rememberHold(key: ChannelKey, id: number): void {
-    if (this.held.get(key)?.get(id)?.saveDropped) return;
-    const saved = this.savedCurrent.get(key) ?? new Set<number>();
-    saved.add(id);
-    this.savedCurrent.set(key, saved);
-    if (saved.size + (this.carried.get(key)?.size ?? 0) > HELD_SAVED_PER_CHANNEL) this.savedHolds(key);
-  }
-
-  carriedChannels(): ChannelKey[] {
-    return [...this.carried.keys()];
-  }
-
-  carriedIds(key: ChannelKey): number[] {
-    return [...(this.carried.get(key)?.keys() ?? [])].sort((a, b) => a - b);
-  }
-
-  /** Offered, accepted within a scan, or withdrawn: a later restart doesn't offer it by id. */
-  uncarry(key: ChannelKey, ids: number[], reason?: string): void {
-    const carried = this.carried.get(key);
-    if (!carried) return;
-    for (const id of ids) {
-      if (carried.delete(id) && reason) console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: dropping saved held ID ${id}: ${reason}`);
-    }
-    if (carried.size === 0) this.carried.delete(key);
-  }
-
-  carriedReadFailed(key: ChannelKey, id: number): void {
-    const carried = this.carried.get(key);
-    const failed = carried?.get(id);
-    if (failed === undefined) return;
-    if (failed + 1 < CARRIED_READ_TRIES) {
-      carried!.set(id, failed + 1);
-      return;
-    }
-    this.uncarry(key, [id]);
-    console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered message ${id} could not be read by id in ${CARRIED_READ_TRIES} starts and is dropped; it will not be offered`);
   }
 
   watermark(key: ChannelKey): number | undefined {
@@ -313,10 +203,9 @@ export class DeliveryState {
   }
 
   advanceThrough(key: ChannelKey, messageId: number, afterId = 0): boolean {
-    this.uncarry(key, this.carriedIds(key).filter((id) => id > afterId && id <= messageId));
     const held = this.held.get(key);
     if (held) {
-      for (const id of held.keys()) if (id > afterId && id <= messageId) { held.delete(id); this.savedCurrent.get(key)?.delete(id); }
+      for (const id of held.keys()) if (id > afterId && id <= messageId) held.delete(id);
       if (held.size === 0) this.held.delete(key);
     }
     return this.advance(key, messageId);
@@ -345,8 +234,7 @@ export class DeliveryState {
     return [...this.watermarks.keys()];
   }
 
-  /** Bulk callers defer saves until all statuses in their batch are updated. */
-  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued', save = true): void {
+  hold(key: ChannelKey, messageId: number, status: HeldStatus = 'queued'): void {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     if (messageId <= (this.watermarks.get(key) ?? 0)) return;
     let held = this.held.get(key);
@@ -361,18 +249,10 @@ export class DeliveryState {
       console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
       return;
     } else {
-      if (held.size >= HELD_CAP_PER_CHANNEL) {
-        const evicted = Math.max(...held.keys());
-        held.delete(evicted);
-        if (this.savedCurrent.get(key)?.delete(evicted)) console.error(`[zulip-mcp] ${this.fileKey(key) ?? key}: dropping saved held ID ${evicted}: in-memory hold cap eviction`);
-      }
+      if (held.size >= HELD_CAP_PER_CHANNEL) held.delete(Math.max(...held.keys()));
       held.set(messageId, { status, replayed: false, replyVerified: false });
     }
-    if (status !== 'queued') {
-      this.rememberHold(key, messageId);
-      this.watermarkBelowHolds(key);
-      if (save) this.save();
-    }
+    if (status !== 'queued' && this.watermarkBelowHolds(key)) this.save();
   }
 
   watermarkBelowHolds(key: ChannelKey): boolean {
@@ -383,31 +263,26 @@ export class DeliveryState {
     return true;
   }
 
-  release(key: ChannelKey, messageId: number, reason?: string): boolean {
-    const carried = this.carried.get(key)?.has(messageId) ?? false;
-    this.uncarry(key, [messageId], reason);
-    const saved = this.savedCurrent.get(key)?.delete(messageId) ?? false;
+  release(key: ChannelKey, messageId: number): boolean {
     const held = this.held.get(key);
-    if (!held?.delete(messageId)) return carried || saved;
+    if (!held?.delete(messageId)) return false;
     if (held.size === 0) this.held.delete(key);
-    return this.settle(key) || carried || saved;
+    return this.settle(key);
   }
 
   refuse(key: ChannelKey, afterId: number, messageId: number): void {
     const held = this.held.get(key);
     if (!held) return;
-    for (const [id, h] of held) if (id > afterId && id <= messageId) { h.status = 'rejected'; this.rememberHold(key, id); }
-    this.watermarkBelowHolds(key);
-    this.save();
+    for (const [id, h] of held) if (id > afterId && id <= messageId) h.status = 'rejected';
+    if (this.watermarkBelowHolds(key)) this.save();
   }
 
   failQueued(): void {
     for (const [key, held] of this.held) {
       let failed = false;
-      for (const [id, h] of held) {
+      for (const h of held.values()) {
         if (h.status !== 'queued') continue;
         h.status = 'failed';
-        this.rememberHold(key, id);
         failed = true;
       }
       if (failed) this.watermarkBelowHolds(key);
@@ -415,9 +290,8 @@ export class DeliveryState {
   }
 
   releaseAll(key: ChannelKey): boolean {
-    const saved = this.savedCurrent.delete(key);
-    if (!this.held.delete(key)) return saved;
-    return this.settle(key) || saved;
+    if (!this.held.delete(key)) return false;
+    return this.settle(key);
   }
 
   floor(key: ChannelKey): number | undefined {
@@ -524,8 +398,6 @@ export type DeliveryReader = Pick<
   | 'floor'
   | 'heldChannels'
   | 'heldIds'
-  | 'carriedChannels'
-  | 'carriedIds'
   | 'verifiedReply'
   | 'wasOpen'
   | 'lastOpenChannels'
@@ -627,8 +499,6 @@ export interface MissedBlockOptions {
   maxChars?: number;
   moreBeyond?: boolean;
   newestScannedId?: number;
-  firstScannedId?: number;
-  byId?: boolean;
 }
 
 function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined, ids: MessageIds): string {
@@ -695,7 +565,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) for budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); page with fetch_history(channel=channelId). ${opts.byId ? 'This is a by-ID offer of the listed messages only, not a scan of the intervening interval; it does not move the watermark.' : `Accepting this notice acknowledges the entire scanned interval ${ids.format(opts.firstScannedId ?? msgs[0].id)}–${ids.format(newestScanned ?? msgs[msgs.length - 1].id)}, including unselected rows and earlier holds in this scan. An older hold outside this scan can cause it to recur after restart.`}` +
+      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) for budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); page with fetch_history(channel=channelId).` +
       `${opts.moreBeyond ? ` Newer messages also exist; fetch_history(channel=channelId, after=${JSON.stringify(newestScanned === undefined ? newestScanned : ids.format(newestScanned))}) continues.` : ''}]\n</missed>`;
   }
   return { text: block, elided };

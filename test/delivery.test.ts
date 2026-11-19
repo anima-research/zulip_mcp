@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
-import { CARRIED_READ_TRIES, DeliveryState, HELD_SAVED_PER_CHANNEL, attributeMessage, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
+import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type KeyedMessage } from '../src/channel-key.ts';
 
@@ -471,7 +471,7 @@ test('enabled catch-up bounds long channel identifiers and realm tags', () => {
   }
 });
 
-test('what the host accepted above a hold is not durable: an accepted later scan can recur after restart', () => {
+test('only the watermark is durable: an older hold permits an accepted later scan to recur after restart', () => {
   const dir = tmp();
   try {
     const state = new DeliveryState(dir, 'pinned', directoryOf({ 1: 'general' }));
@@ -486,196 +486,5 @@ test('what the host accepted above a hold is not durable: an accepted later scan
     const restarted = new DeliveryState(dir, 'pinned', new StreamDirectory());
     assert.equal(restarted.watermark(GENERAL), 9);
     assert.equal(restarted.acceptedThrough(GENERAL), 9, 'a restarted scan begins at 9, not at the accepted 30');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('held ids are saved beside the watermark and carried into the next run; a file with nothing held has no list', () => {
-  const dir = tmp();
-  const saved = () => JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf-8'));
-  try {
-    const a = new DeliveryState(dir, 's', directoryOf({ 1: 'general', 2: 'dev' }));
-    a.advance(GENERAL, 9);
-    a.advance(DEV, 5);
-    a.save();
-    assert.deepEqual(Object.keys(saved()), ['watermarks', 'missed', 'lastOpen', 'streams', 'formerNames'], 'the keys main writes, no more');
-
-    a.hold(GENERAL, 12, 'rejected');
-    a.hold(GENERAL, 10, 'failed');
-    a.hold(GENERAL, 14);
-    a.advance(GENERAL, 15);
-    a.save();
-    assert.equal(saved().watermarks['zulip:general'], 9, 'a hold keeps the watermark below it, as before');
-    assert.deepEqual(saved().held, { 'zulip:general': { 10: 0, 12: 0 } }, 'not 14, which is on its way to the host');
-    a.failQueued();
-    a.save();
-    assert.deepEqual(saved().held, { 'zulip:general': { 10: 0, 12: 0, 14: 0 } }, 'as the connection ends, what was on its way is held too');
-    assert.deepEqual(a.carriedIds(GENERAL), [], 'what this run holds is not carried by it');
-
-    const b = new DeliveryState(dir, 's', new StreamDirectory());
-    assert.deepEqual(b.carriedChannels(), [GENERAL]);
-    assert.deepEqual(b.carriedIds(GENERAL), [10, 12, 14]);
-    assert.equal(b.floor(GENERAL), undefined, 'a carried id holds no watermark back');
-    b.save();
-    assert.deepEqual(saved().held, { 'zulip:general': { 10: 0, 12: 0, 14: 0 } }, 'kept until offered');
-
-    b.uncarry(GENERAL, [10]);
-    b.hold(GENERAL, 14, 'failed');
-    b.release(GENERAL, 14);
-    b.hold(GENERAL, 16, 'failed');
-    b.save();
-    assert.deepEqual(saved().held, { 'zulip:general': { 12: 0, 16: 0 } }, "the last run's and this run's together, less what the host accepted or was let go");
-    b.advanceThrough(GENERAL, 16, 9);
-    b.save();
-    assert.equal(saved().held, undefined, 'a scan the host accepted takes the ids it covers off the list');
-    assert.equal(saved().watermarks['zulip:general'], 16);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("past the cap the oldest held ids leave the saved list with a warning, on save and on load, the last run's before this run's newer ones", (t) => {
-  const logs: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-  const dir = tmp();
-  const saved = () => JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf-8'));
-  try {
-    const a = new DeliveryState(dir, 's', directoryOf({ 1: 'general' }));
-    a.advance(GENERAL, 100);
-    for (let id = 101; id <= 100 + HELD_SAVED_PER_CHANNEL + 3; id++) a.hold(GENERAL, id, 'failed');
-    for (let id = 300; id < 400; id++) a.hold(GENERAL, id);
-    a.save();
-    const kept = Object.keys(saved().held['zulip:general']).map(Number);
-    assert.equal(kept.length, HELD_SAVED_PER_CHANNEL);
-    assert.deepEqual([kept[0], kept[kept.length - 1]], [104, 153], 'the newest are kept; what is on its way to the host takes no place');
-    assert.equal(saved().watermarks['zulip:general'], 100, 'the watermark stays below every hold, so the next catch-up starts at the dropped ones');
-    assert.equal(logs.length, 3, 'each non-queued hold is saved immediately');
-    for (let i = 0; i < 3; i++) assert.ok(logs[i].includes(`the oldest 1 (${101 + i}–${101 + i})`));
-    a.save();
-    assert.equal(logs.length, 3, 'the same ids are not reported at every save');
-    a.releaseAll(GENERAL);
-    for (let id = 105; id <= 155; id++) a.hold(GENERAL, id, 'failed');
-    a.save();
-    assert.match(logs[3], /the oldest 1 \(105–105\)/, 'a further id is');
-
-    const many = Object.fromEntries(Array.from({ length: HELD_SAVED_PER_CHANNEL + 2 }, (_, i) => [String(i + 1), 0]));
-    writeFileSync(join(dir, 's.delivery.json'), JSON.stringify({ watermarks: { 'zulip:general': 100 }, streams: { 1: 'general' }, held: { 'zulip:general': { ...many, nonsense: 1, '-4': 0, '7.5': 0 }, 'zulip:gone': { 3: 0 } } }));
-    logs.length = 0;
-    const b = new DeliveryState(dir, 's', new StreamDirectory());
-    assert.equal(b.carriedIds(GENERAL).length, HELD_SAVED_PER_CHANNEL, 'a longer list in the file is cut on load, so a start reads at most that many by id');
-    assert.equal(b.carriedIds(GENERAL)[0], 3);
-    assert.ok(logs.some((line) => /the oldest 2 \(1–2\) are dropped/.test(line)));
-    assert.ok(logs.some((line) => line.includes('zulip:gone: dropping saved held ID 3:')), "a channel the file's stream list doesn't hold is dropped aloud, as its watermark is");
-
-    logs.length = 0;
-    for (let id = 201; id <= 260; id++) b.hold(GENERAL, id, 'rejected');
-    b.save();
-    assert.deepEqual(Object.keys(saved().held['zulip:general']).map(Number), Array.from({ length: HELD_SAVED_PER_CHANNEL }, (_, i) => 211 + i), "the newest of the two runs' ids together are kept");
-    assert.deepEqual(b.carriedIds(GENERAL), [], "the last run's ids, the oldest of all, gave way to this run's");
-    assert.equal(logs.filter((line) => line.includes('are dropped')).length, 60);
-    assert.match(logs[0], /the oldest 1 \(3–3\)/);
-    assert.match(logs.at(-1)!, /the oldest 1 \(210–210\)/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a full saved list and one newer hold after a restart: the oldest saved id gives way, not the new one", (t) => {
-  const logs: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-  const dir = tmp();
-  const saved = () => JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf-8'));
-  const savedIds = () => Object.keys(saved().held['zulip:general']).map(Number);
-  const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
-  try {
-    const a = new DeliveryState(dir, 's', directoryOf({ 1: 'general' }));
-    a.advance(GENERAL, 100);
-    for (let id = 101; id <= 100 + HELD_SAVED_PER_CHANNEL; id++) a.hold(GENERAL, id, 'failed');
-    a.save();
-    assert.deepEqual(savedIds(), range(101, 150));
-    assert.deepEqual(logs, [], 'exactly the cap fits');
-
-    const b = new DeliveryState(dir, 's', new StreamDirectory());
-    assert.deepEqual(b.carriedIds(GENERAL), range(101, 150));
-    b.carriedReadFailed(GENERAL, 102);
-    b.hold(GENERAL, 150, 'rejected');
-    b.save();
-    assert.deepEqual(savedIds(), range(101, 150), 'an id both runs held takes one place');
-    assert.deepEqual(logs, []);
-
-    b.hold(GENERAL, 151, 'failed');
-    b.save();
-    assert.deepEqual(savedIds(), range(102, 151), 'the new hold is saved and the oldest id of the whole list is the one dropped');
-    assert.deepEqual(logs, ['[zulip-mcp] zulip:general: more than 50 undelivered message ids to save for a restart; the oldest 1 (101–101) are dropped from that list and will not be offered by id']);
-    assert.equal(saved().held['zulip:general'][102], 1, 'a kept id keeps its count of failed reads');
-    assert.deepEqual(b.carriedIds(GENERAL), range(102, 150), 'the dropped id is not read by id in this run either');
-    assert.equal(saved().watermarks['zulip:general'], 100, 'the watermark is where it was');
-    b.save();
-    assert.equal(logs.length, 1, 'said once');
-
-    b.hold(GENERAL, 153, 'rejected');
-    b.hold(GENERAL, 152);
-    b.save();
-    assert.deepEqual(savedIds(), [...range(103, 151), 153], 'each further hold pushes out the next oldest; one still on its way to the host pushes out none');
-    assert.match(logs[1], /the oldest 1 \(102–102\) are dropped/);
-
-    logs.length = 0;
-    const c = new DeliveryState(dir, 's', new StreamDirectory());
-    assert.deepEqual(c.carriedIds(GENERAL), [...range(103, 151), 153], 'the next run carries the list as saved');
-    assert.deepEqual(logs, []);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('a carried id whose read fails is kept for a bounded number of starts, then dropped with a warning', (t) => {
-  const logs: string[] = [];
-  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-  const dir = tmp();
-  try {
-    writeFileSync(join(dir, 's.delivery.json'), JSON.stringify({ watermarks: { 'zulip:general': 100 }, streams: { 1: 'general' }, held: { 'zulip:general': { 40: 0, 41: CARRIED_READ_TRIES - 1 } } }));
-    const state = new DeliveryState(dir, 's', new StreamDirectory());
-    for (const id of [40, 41, 99]) state.carriedReadFailed(GENERAL, id);
-    assert.deepEqual(state.carriedIds(GENERAL), [40]);
-    assert.deepEqual(logs, ['[zulip-mcp] zulip:general: undelivered message 41 could not be read by id in 3 starts and is dropped; it will not be offered']);
-    state.save();
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf-8')).held, { 'zulip:general': { 40: 1 } });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('refusing a queued scan saves held IDs even when its watermark cannot move', () => {
-  const dir = tmp();
-  try {
-    const state = new DeliveryState(dir, 's', directoryOf({ 1: 'general' }));
-    state.advance(GENERAL, 20);
-    state.save();
-    state.hold(GENERAL, 21);
-    state.hold(GENERAL, 22);
-    state.refuse(GENERAL, 20, 22);
-    const saved = JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf8'));
-    assert.deepEqual(saved.held['zulip:general'], { 21: 0, 22: 0 });
-    assert.equal(saved.watermarks['zulip:general'], 20);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('overflow drops never resurrect and newly dropped lower IDs are reported', t => {
-  t.mock.method(console, 'error', () => {});
-  const dir = tmp();
-  const state = new DeliveryState(dir, 's', directoryOf({ 1: 'general' }));
-  const savedIds = () => Object.keys(JSON.parse(readFileSync(join(dir, 's.delivery.json'), 'utf8')).held?.['zulip:general'] ?? {});
-  try {
-    state.advance(GENERAL, 100);
-    for (let id = 1001; id <= 1051; id++) state.hold(GENERAL, id, 'failed');
-    assert.ok(!savedIds().includes('1001'));
-    for (let id = 1002; id <= 1051; id++) state.release(GENERAL, id);
-    state.save();
-    assert.deepEqual(savedIds(), [], 'the still-held overflow ID cannot return to disk');
-    assert.deepEqual(state.heldIds(GENERAL), [1001], 'its watermark hold is unchanged');
-    state.releaseAll(GENERAL);
-    const logs: string[] = [];
-    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args.join(' ')); });
-    for (let id = 101; id <= 151; id++) state.hold(GENERAL, id, 'failed');
-    assert.match(logs.join('\n'), /the oldest 1 \(101–101\)/, 'a lower range is not silenced by an earlier high-range warning');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

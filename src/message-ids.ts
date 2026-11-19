@@ -109,8 +109,11 @@ export function markTransportError(error: unknown, facts: TransportFacts = {}): 
   return error;
 }
 
-export function attachmentWasRefused(error: unknown): boolean {
-  return error instanceof Error && nativeTransportErrors.get(error)?.operation === 'Attachment download' && nativeTransportErrors.get(error)?.completed === true;
+/** The safe facts of a download failure marked at the native fetch boundary, if any. */
+export function attachmentDownloadFailure(error: unknown): { refused: boolean; status?: number; timeoutSeconds?: number; retryAfterSeconds?: number } | undefined {
+  const facts = error instanceof Error ? nativeTransportErrors.get(error) : undefined;
+  if (facts?.operation !== 'Attachment download') return undefined;
+  return { refused: facts.completed === true, status: facts.status, timeoutSeconds: facts.timeoutSeconds, retryAfterSeconds: facts.retryAfterSeconds };
 }
 
 const loggedDiagnostics = new WeakSet<Error>();

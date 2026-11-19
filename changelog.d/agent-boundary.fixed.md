@@ -1,28 +1,46 @@
-- In every ID mode, listen/unlisten validation, explicit Zulip error responses and transport failures now set the tool error flag instead of returning successful error objects.
-- Unread totals are null if any channel check fails; the unread summary reports unknown state and labels partial counts “At least”, rather than claiming no unread messages. Per-channel resource errors use the same safe diagnostics.
-- Attachment downloads distinguish invalid input paths from invalid configured realm origins (including queries, fragments and credentials; HTTP(S) path suffixes are accepted), before any fetch.
-- Transport diagnostics are sanitized on every agent-facing path in every ID mode, preserving HTTP status, timeout duration, retry facts and write uncertainty. Read failures recommend retrying the read except that HTTP 401/403 require correcting access first; uncertain upload outcomes explain that no path was confirmed and require an operator check before retrying. Response-body failures retain known HTTP status, and self-ID gates retain transport facts and refusal status in every mode.
-- Request/event and native transport boundaries retain original errors and stacks on stderr in every ID mode, including best-effort message-link lookup failures. This is not a promise for every internal fallback or state-file catch. Timeout duration metadata is non-enumerable and absent when unknown, avoiding extra error-inspection fields.
-- Move read-back failures retain successful move outcomes with operation/ID context and safe transport facts in every mode.
-- Server version comes from package.json in every mode.
-- Oversized catch-up headers use a bounded notice naming the omitted count/range and a fetch_around recovery anchor with fetch_history paging guidance; DM anchors now return a usable channelId in every mode. Acceptance acknowledges the scan like ordinary elision, with ordinary restart catch-up starting after the saved watermark (a separate bounded saved-ID list recovers eligible held messages it has passed); an older hold can pin it, and accepted later ranges are not separately persisted and may recur. Both ordinary and compact catch-up scans mark the holds inside their pending interval (ambient ones included) as on offer, so no read is started for them meanwhile; a read that another hold starts can still offer rows of that interval again, as on main. Failed or rejected delivery still holds the range back. Recovery is limited to fetched rows and existing caps; at the 50,000 held-ID cap untracked refusals can be passed after older holds release.
-- Invalid acknowledgement IDs are described safely even when their JSON value cannot be string-converted.
-- Attachment URL authorization is guarded after resolving against the realm: protocol-relative URLs, backslashes and percent-encoded foreign hosts cannot bypass the initial same-origin check in any ID mode. Redirect destinations retain native fetch behavior and are not checked again; credential-bearing URLs and encoded separators are rejected. Attachment body-read failures and stalls preserve an already-received HTTP status (including 206).
-
-- Completed HTTP attachment refusals retain status and suggest corrective checks rather than claiming an incomplete transport failure or recommending an identical retry. Inline body-read errors retain status too.
-- Transport and self-ID replacement errors retain their original exceptions as operator-only causes. Safe boundary copies remove raw causes and stack text; contextual callers avoid duplicate transport logs. Ordinary local boundary exceptions are logged too.
-- Only complete upload responses with rejection statuses 400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals. All other responses, including complete 5xx/proxy failures, retain duplicate-upload uncertainty; complete uncertain responses no longer claim that the body was incomplete. Marked failures retain status and Retry-After; ordinary Zulip JSON refusals at those rejection statuses retain their error text and now append received Retry-After advice.
-- Non-JSON and body-read transport failures retain Retry-After headers. Event-poll degraded notices explain server retries, not an agent read command.
-- Compat warning decoration leaves non-record results intact; the warning remains on stderr. Enabled host-result mapping requires boolean acceptance, drops duplicate normalized IDs, and never logs raw malformed payloads.
-- Legacy audit corrections: catch-up channel arguments are JSON-escaped in every mode, fixing quotes and backslashes even in legacy; ordinary acknowledgement refusals retain their unprefixed reason. DM fetch_around channel fields change only as the documented compact-notice recovery error fix. The added message-ID startup diagnostic is emitted only in compat/strict modes; legacy startup also gains operator-only self-ID cause diagnostics on initial lookup failure.
-
-- Batch upload failures report paths confirmed earlier in the batch and warn that retrying the original send reuploads them. Enabled host-result diagnostics distinguish invalid/unmatched IDs, non-boolean acceptance and duplicate normalized IDs without dumping payloads.
-
-- Successful listen responses containing only unauthorized streams still return a successful result with unauthorized entries; callers must inspect it. Attachment inputs retain main's spelling restrictions: same-origin protocol-relative and uppercase-scheme URLs are rejected, while resolved-origin authorization remains enforced.
-
-- Malformed upload successes without a usable path retain received Retry-After advice. MCPL publish batch failures retain earlier confirmed upload paths and warn that retrying the original publish uploads those attachments again.
-
-- Catch-up delivery rechecks mute/allowlist policy after fetching. Answers from replaced lane generations cannot mutate current holds; accepted answers still drain during shutdown. Overlapping pending scans may repeat already offered rows rather than drop an unoffered tail.
-- Inline completed refusals advise checking access/path rather than repeating fetch_attachment. Native downloads retain Retry-After on refusals, body errors and idle timeouts; the overall inline deadline still may win before a status-bearing rejection settles.
-- Failed first attachment uploads explicitly say posting was never reached; message-post failures after successful uploads retain all confirmed paths alongside any post uncertainty/posted-part receipt. Native event-loop sleep timers are cleared on stop; injected sleep implementations retain caller-owned lifecycle semantics.
-- Compat MCPL acknowledgement, history cursors and itemized-result bare IDs warn on stderr. Unconfirmed incoming delivery has mode-independent wording, counts host response duplicates correctly, and distinguishes synthetic events that cannot be recovered from message history.
+- Tool errors: `listen`/`unlisten` validation, explicit Zulip refusals and
+  transport failures set the tool error flag instead of returning a
+  successful result that holds an error. An explicit Zulip refusal uses
+  Zulip's message if present, otherwise a generic error, not the refusal
+  code. A `listen` whose streams are all unauthorized still succeeds and
+  lists them as unauthorized.
+- Unread totals are null when any channel check fails, and the unread
+  summary labels partial counts “At least” instead of reporting no unread
+  messages.
+- Agent-facing transport errors keep the HTTP status, timeout, Retry-After
+  and whether a write may have been applied, but no longer show raw request
+  paths, response bodies, causes or stacks; the original error goes to stderr
+  once. Reads that fail are offered for retry, except that HTTP 401/403 ask
+  for an access repair first. A move whose read-back fails still reports the
+  move and points to `fetch_around` rather than another move.
+- Uploads: only complete responses with status 400, 401, 403, 404, 405, 413,
+  415, 422 or 429 count as refusals. Any other failure, 5xx and proxy errors
+  and malformed successes included, is reported as possibly stored, so a
+  retry may duplicate the file. HTTP 413 refusals reported as transport errors
+  suggest reducing or omitting the attachment; a complete Zulip JSON refusal
+  does not add this advice. A failed send or publish lists the attachment
+  paths already uploaded and warns that retrying it uploads them again.
+- Attachments: before fetching, `fetch_attachment` and inline attachments
+  require the resolved URL to match the configured realm's origin and be
+  under `/user_uploads/`. The resolved URL cannot contain credentials or
+  encoded path separators. Redirects follow native fetch behavior and are
+  not checked again. An inline failure marker gives the path and one remedy,
+  plus the HTTP status when available. Refusals ask for an access or path
+  check rather than the same fetch again. Invalid input paths and an invalid
+  configured realm are reported separately.
+- Catch-up: when even a `<missed>` block's header cannot fit its size cap,
+  a notice names the omitted count and ID range with a `fetch_around` anchor,
+  and `fetch_around` now returns a usable `channelId` for DMs. Channel
+  arguments in catch-up pointers are JSON-escaped, so quotes and backslashes
+  in stream names work. Catch-up rechecks mute and allowlist rules after
+  history returns, and overlapping catch-up scans may repeat a row rather
+  than drop one.
+- Event polling: refusals keep their HTTP status and Retry-After, and the
+  degraded notice says polling retries automatically and when authorization
+  needs the host operator.
+- `channels/incoming` results must give a boolean acceptance and name each
+  offered message once; other entries are ignored without logging the
+  payload, and the stderr line says whether delivery is unconfirmed or the
+  event cannot be replayed from history.
+- Invalid acknowledgement IDs are described safely, and the reported server
+  version comes from package.json.
