@@ -285,5 +285,8 @@ function inlineFailure(err: unknown, path: string, messageIds: MessageIds): stri
   if (failure.timeoutSeconds !== undefined) facts.push(`no data for ${failure.timeoutSeconds} s`);
   if (failure.retryAfterSeconds !== undefined) facts.push(`Retry-After ${failure.retryAfterSeconds} s`);
   facts.push(path);
-  return `(${facts.join(', ')}); ${failure.refused ? 'check access and the path before retrying' : 'retry with fetch_attachment'}`;
+  const remedy = failure.status === 401 || failure.status === 403
+    ? "the host operator must fix authorization; retrying alone won't help"
+    : failure.status === 404 ? 'check the path before retrying' : 'retry with fetch_attachment';
+  return `(${facts.join(', ')}); ${remedy}`;
 }

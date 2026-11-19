@@ -37,16 +37,23 @@ for (const mode of ['legacy', 'compat', 'strict'] as const) {
     }
   });
 
-  test(`${mode} inline refusals do not direct a repeat of the same fetch`, async t => {
-    t.mock.method(console, 'error', () => {});
-    t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 403 }));
-    const blocks = await buildAttachmentBlocks([{ path: '/user_uploads/a', name: 'a.txt', mimeType: 'text/plain', isImage: false }], {
-      fetch: (path, max, signal) => fetchCapped('https://example.invalid' + path, {}, max, signal),
-    }, { inlineImages: false, maxImages: 0, inlineTextMaxBytes: 100 }, new AbortController().signal, ids);
-    const text = (blocks[0] as { text: string }).text;
-    assert.equal(text, '[attachment: a.txt — could not fetch (refused, HTTP 403, /user_uploads/a); check access and the path before retrying]');
-    assert.doesNotMatch(text, /fetch_attachment/);
-  });
+  for (const [status, remedy] of [
+    [401, "the host operator must fix authorization; retrying alone won't help"],
+    [403, "the host operator must fix authorization; retrying alone won't help"],
+    [429, 'retry with fetch_attachment'],
+  ] as const) {
+    test(`${mode} inline HTTP ${status} marker gives the matching remedy`, async t => {
+      t.mock.method(console, 'error', () => {});
+      t.mock.method(globalThis, 'fetch', async () => new Response('', { status }));
+      const blocks = await buildAttachmentBlocks([{ path: '/user_uploads/a', name: 'a.txt', mimeType: 'text/plain', isImage: false }], {
+        fetch: (path, max, signal) => fetchCapped('https://example.invalid' + path, {}, max, signal),
+      }, { inlineImages: false, maxImages: 0, inlineTextMaxBytes: 100 }, new AbortController().signal, ids);
+      assert.deepEqual(blocks, [{
+        type: 'text',
+        text: `[attachment: a.txt — could not fetch (refused, HTTP ${status}, /user_uploads/a); ${remedy}]`,
+      }]);
+    });
+  }
 
   test(`${mode} ordinary JSON upload refusals preserve Retry-After`, async () => {
     const uploader = createZulipUploader({ realm: 'https://example.invalid', authHeader: 'test' }, async () => new Response(JSON.stringify({ result: 'error', msg: 'Rate limited' }), { status: 429, headers: { 'Retry-After': '60' } }));

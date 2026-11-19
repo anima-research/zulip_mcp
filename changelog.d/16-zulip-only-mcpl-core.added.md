@@ -2,10 +2,12 @@
   not opened arrive as `push/event` with the missed-ambient tally in the
   origin; ambient on closed channels is counted (`channel_missed`).
 - Catch-up: persisted per-channel watermarks that advance on the host's
-  acceptance. A refused message, or one whose offer was lost, holds the
-  watermark back until it is replayed from history or the host accepts a
-  later catch-up that covers it, including what that block declares omitted;
+  acceptance. While tracked, a refused message or lost offer holds the
+  watermark back until replay or acceptance of a covering scan, including
+  rows it declares omitted. Holds are in memory and are lost on restart;
   past 50,000 held messages in one channel, newer refusals are not tracked.
+  Bounded or failed catch-up may not recover a refusal whose hold was lost,
+  and a later accepted message can move the watermark past it.
   One or more `<missed>` blocks per channel on reconnect (full backscroll for
   channels the host had open, addressed messages ±7 otherwise; mentions,
   replies and DMs are addressed), paged up to `ZULIP_CATCHUP_LIMIT` and

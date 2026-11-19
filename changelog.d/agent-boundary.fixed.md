@@ -25,9 +25,11 @@
   under `/user_uploads/`. The resolved URL cannot contain credentials or
   encoded path separators. Redirects follow native fetch behavior and are
   not checked again. An inline failure marker gives the path and one remedy,
-  plus the HTTP status when available. Refusals ask for an access or path
-  check rather than the same fetch again. Invalid input paths and an invalid
-  configured realm are reported separately.
+  plus the HTTP status when available. For 401/403 it asks the host operator
+  to fix authorization because retrying alone will not help; for 404 it
+  asks to check the path, and for other HTTP statuses it suggests retrying
+  with `fetch_attachment`. Invalid input paths and an invalid configured
+  realm are reported separately.
 - Catch-up: when even a `<missed>` block's header cannot fit its size cap,
   a notice names the omitted count and ID range with a `fetch_around` anchor,
   and `fetch_around` now returns a usable `channelId` for DMs. Channel

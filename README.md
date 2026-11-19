@@ -49,10 +49,9 @@ Discord and Slack adapters that once lived here moved to those servers.
   reaction to a message the server hasn't seen, and the reactions after it,
   and the changes and stream messages after it that carry no stream id, wait
   behind it. A direct message doesn't wait. When delivery
-  stops, a message the server already holds is offered by the next
-  connection's catch-up, as any message above the watermark is, if Zulip's
-  history still has it there; one still waiting for the lookup that places
-  it is dropped, and the next catch-up recovers what it can. Recovery covers
+  stops, the next connection's catch-up can recover a held message if it
+  reaches that message in Zulip's history above the watermark. A message
+  still waiting for the lookup that places it is dropped. Recovery covers
   fetched rows only, within the catch-up ceiling and held-ID cap, not an
   unfetched interval. Accepted elision notices acknowledge omitted rows; use
   their recovery pointers to read them explicitly.
@@ -122,11 +121,11 @@ Discord and Slack adapters that once lived here moved to those servers.
   ambient-only history). It is not proof that every passed row was offered.
   A channel the host has accepted nothing on gets one just
   below its first message that isn't accepted, and while `zulip.messaging`
-  is disabled, as that message comes in. A refused or transport-lost offer holds
-  the watermark back until replay or acceptance of a later catch-up scan that
-  includes it (including compact notices acknowledging omitted rows), subject to
-  the 50,000 held-ID cap: untracked refusals can be passed after older holds
-  release, so automatic restart recovery is not guaranteed at that cap.
+  is disabled, as that message comes in. While tracked, a refused or
+  transport-lost offer holds the watermark back until replay or acceptance
+  of a later catch-up scan that includes it (including compact notices
+  acknowledging omitted rows). Holds are in memory only and are lost on
+  restart. The 50,000 held-ID cap also leaves some refusals untracked.
   Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.
@@ -145,12 +144,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   event-queue expiry is healed the same way — open channels replayed, closed
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
-  follows it, as a message. If catch-up fails or stops at its ceiling, later
-  accepted live delivery can move the watermark past unfetched offline rows,
-  including a message held before a restart (a restart forgets its holds);
-  those then need an explicit `fetch_history`, or `fetch_around` with a known
-  ID. Past 5,000 waiting messages, the channel with the
-  most gives its waiting messages up to a read from history in their place.
+  follows it, as a message. If catch-up fails or stops at its ceiling,
+  a refused message whose hold was lost may not be recovered. A later
+  accepted live delivery can move the watermark past that message or other
+  unfetched offline rows; those then need an explicit `fetch_history`, or
+  `fetch_around` with a known ID. Past 5,000 waiting messages, the channel
+  with the most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
   policy. Images are inlined on live delivery, downsampled to model-max.
@@ -671,7 +670,9 @@ environment). Under connectome-host, point it into the data volume, e.g.
   and inline attachments check that the resolved URL is on the configured
   realm's origin and under `/user_uploads/`. Redirects follow native fetch
   behavior and are not checked again. An inline failure marker gives the
-  path and one remedy, plus the HTTP status when available.
+  path and one remedy, plus the HTTP status when available: for 401/403 the
+  host operator must fix authorization, and retrying alone will not help;
+  for 404 check the path; for other HTTP statuses retry with `fetch_attachment`.
 - **Agent-facing errors** keep the HTTP status, timeout, Retry-After and
   whether a write may have been applied, but not raw request paths, bodies or
   stacks; the original error goes to stderr. For explicit Zulip refusals,
