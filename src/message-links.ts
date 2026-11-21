@@ -56,11 +56,13 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+import { LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { agentSafeError } from './agent-errors.js';
 import { CODE, HEADING, RULE, expandTabs, markdownBlocks, nextMatching } from './markdown-blocks.js';
 import { tableTest } from './tables.js';
 import { ZulipNoAnswer, isRefusal, type ZulipApi } from './zulip-api.js';
 
-const TOKEN = /\[\[msg:([0-9]+)\]\]/g;
+const TOKEN = /\[\[msg:((?:(?!\[\[msg:)[^\r\n])*?)\]\]/g;
 const BACKTICK = /(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\2(?!`))/gs;
 /** Zulip's MarkdownListPreprocessor.LI_RE (zerver/lib/markdown/__init__.py at tag 12.4). */
 const LIST_ITEM = /^[ ]*(?:[*+-]|\d\.)[ ]+/;
@@ -120,10 +122,10 @@ function inlineRuns(
 /**
  * Each `[[msg:ID]]` that Zulip would read as Markdown: outside every code and
  * math fence (a quote, quoted or spoiler fence's inside counts as Markdown)
- * and outside inline code. Zulip has no backslash escape for a bracket, so a
- * backslash before a token changes nothing.
+ * and outside inline code. Legacy numeric tokens ignore backslashes; enabled
+ * modes preserve all escaped tokens as literals.
  */
-function messageTokens(text: string): MessageToken[] {
+function messageTokens(text: string, scoped = false): MessageToken[] {
   if (!text.includes('[[msg:')) return [];
   const raw = text.split('\n');
   const starts: number[] = [];
@@ -152,7 +154,7 @@ function messageTokens(text: string): MessageToken[] {
   const tokens: MessageToken[] = [];
   let line = 0;
   let span = 0;
-  for (const m of text.matchAll(TOKEN)) {
+  for (const m of text.matchAll(scoped ? TOKEN : /\[\[msg:([0-9]+)\]\]/g)) {
     const start = m.index;
     const end = start + m[0].length;
     while (line + 1 < starts.length && starts[line + 1]! <= start) line += 1;
@@ -162,6 +164,18 @@ function messageTokens(text: string): MessageToken[] {
     tokens.push({ start, end, digits: m[1]! });
   }
   return tokens;
+}
+
+/** Validate all active tokens before any destination lookup or upload. */
+export function validateMessageLinks(text: string, ids: MessageIds = LEGACY_IDS, bare?: () => void): void {
+  if (ids.mode === 'legacy') return;
+  for (const token of messageTokens(text, true)) {
+    // An odd backslash escapes a literal token; code spans were excluded by the scanner.
+    let slashes = 0;
+    for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
+    if (slashes % 2) continue;
+    ids.parse(token.digits, bare, `[[msg:${token.digits}]]`);
+  }
 }
 
 const HASH_REPLACEMENTS = new Map([
@@ -255,8 +269,25 @@ export async function linkMessages(
   text: string,
   audience: () => Promise<Audience>,
   unlinkable: Unlinkable,
+  ids: MessageIds = LEGACY_IDS,
 ): Promise<string> {
-  const tokens = messageTokens(text);
+  if (unlinkable === 'refuse') validateMessageLinks(text, ids);
+  // Tool calls warn while validating; as-typed publish warns here, once per text.
+  let warned = false;
+  const bare = () => {
+    if (warned) return;
+    warned = true;
+    console.error(`[zulip-mcp] Warning: bare message-link token accepted in a publish; use [[msg:${ids.tag}:<n>]].`);
+  };
+  const tokens = messageTokens(text, ids.mode !== 'legacy').filter(token => {
+    let slashes = 0;
+    for (let i = token.start - 1; i >= 0 && text[i] === '\\'; i--) slashes++;
+    if (ids.mode !== 'legacy' && slashes % 2) return false;
+    if (ids.mode !== 'legacy' && unlinkable === 'as-typed') {
+      try { ids.parse(token.digits, bare); } catch { return false; }
+    }
+    return true;
+  });
   if (tokens.length === 0) return text;
 
   let destination: Promise<Audience> | undefined;
@@ -283,32 +314,32 @@ export async function linkMessages(
   };
 
   const decide = async (digits: string): Promise<Outcome> => {
-    const id = Number(digits);
+    const id = ids.mode === 'legacy' ? Number(digits) : ids.parse(digits);
     if (!Number.isSafeInteger(id) || id <= 0) return { reason: `there is no message ${digits}` };
     const answer = await api.requestAnswer<{ message?: Record<string, unknown> }>('GET', `/messages/${id}`, {
       apply_markdown: false,
       allow_empty_topic_name: true,
     });
-    if (isRefusal(answer)) return { reason: `Zulip refused to show message ${id} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
+    if (isRefusal(answer)) return { reason: `Zulip refused to show message ${ids.format(id)} to this bot (${answer.msg ?? answer.code ?? 'unknown error'})` };
     const m = answer.message ?? {};
-    if (m.type !== 'stream') return { reason: `message ${id} is a direct message, and only a stream message can be linked` };
+    if (m.type !== 'stream') return { reason: `message ${ids.format(id)} is a direct message, and only a stream message can be linked` };
     const { stream_id: streamId, display_recipient: stream, subject: topic } = m;
     if (typeof streamId !== 'number' || typeof stream !== 'string' || typeof topic !== 'string') {
-      return { reason: `Zulip's answer for message ${id} names no stream and topic` };
+      return { reason: `Zulip's answer for message ${ids.format(id)} names no stream and topic` };
     }
     const link = { link: messageLink({ id, streamId, stream, topic }) };
     const to = await destinationOnce();
     if (to.kind === 'stream' && to.id === streamId) return link;
     const read = await privacyOnce(streamId);
-    if ('refused' in read) return { reason: `Zulip didn't say whether message ${id}'s stream is private (${read.refused})` };
+    if ('refused' in read) return { reason: `Zulip didn't say whether message ${ids.format(id)}'s stream is private (${read.refused})` };
     if (!read.inviteOnly) return link;
     const destinationId = await destinationIdOnce();
     if ('refused' in destinationId) return { reason: destinationId.refused };
     if (destinationId.id === streamId) return link;
-    return { reason: `message ${id} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
+    return { reason: `message ${ids.format(id)} is in a private stream, and a link would show that stream's and topic's names to this conversation's readers` };
   };
 
-  const keyOf = (digits: string) => (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits);
+  const keyOf = (digits: string) => ids.mode === 'legacy' ? (Number.isSafeInteger(Number(digits)) ? Number(digits) : digits) : ids.parse(digits);
   const outcomes = new Map<number | string, { digits: string; outcome: Outcome | null }>();
   let answered = true;
   for (const token of tokens) {
@@ -321,8 +352,9 @@ export async function linkMessages(
     try {
       outcomes.set(key, { digits: token.digits, outcome: await decide(token.digits) });
     } catch (err) {
-      if (unlinkable === 'refuse') throw new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? err.message : err).replace(/\.$/, '')}.`]);
+      if (unlinkable === 'refuse') throw agentSafeError(new MessageLinkRefused([`[[msg:${token.digits}]] can't become a link: ${String(err instanceof Error ? agentSafeError(err).message : err).replace(/\.$/, '')}.`]), false);
       if (!(err instanceof ZulipNoAnswer)) throw err;
+      agentSafeError(err); // Best-effort as-typed fallback still retains the original diagnostic.
       outcomes.set(key, { digits: token.digits, outcome: null });
       answered = false;
     }

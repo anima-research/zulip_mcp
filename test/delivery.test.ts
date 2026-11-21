@@ -1,3 +1,4 @@
+import { MessageIds } from '../src/message-ids.ts';
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs, { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, type PathLike } from 'node:fs';
@@ -8,6 +9,8 @@ import type { IncomingChannelMessage } from '@animalabs/mcpl-core';
 import { DeliveryState, attributeMessage, renderMissedBlock, selectMissed, viewOf, type MissedView } from '../src/delivery.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey, type KeyedMessage } from '../src/channel-key.ts';
+import { ZulipToolRuntime } from '../src/tool-runtime.ts';
+import { standInApi } from './zulip-stand-in.ts';
 
 function directoryOf(streams: Record<number, string> = {}): StreamDirectory {
   const directory = new StreamDirectory();
@@ -256,6 +259,12 @@ test('renderMissedBlock: the budget is a hard cap on the whole block, one long l
   const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
     streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
   }).text;
+  const tagged = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
+    streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
+    messageIds: new MessageIds('alpha', 'strict'),
+  }).text;
+  assert.ok(tagged.length <= 1000, `block is ${tagged.length} chars`);
+  assert.match(tagged, /fetch_around\(message_id="alpha:7"\)/);
   assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
   assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[#general > topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });
@@ -437,3 +446,107 @@ test('a save after a failed load whose file is gone by then writes the state, wi
     assert.equal(JSON.parse(readFileSync(path, 'utf-8')).watermarks['zulip:general'], 7);
   });
 });
+
+test('recovery advice JSON-escapes channel IDs in every mode', () => {
+  const channelId = 'zulip:team \\ "alpha"';
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const text = renderMissedBlock([viewOf(msg(7, true, 'hello'))], {
+      streamName: 'team "alpha"', channelId, reason: 'backscroll', count: 1,
+      formatTime: () => '', moreBeyond: true, messageIds: new MessageIds('alpha', mode),
+    }).text;
+    const channel = JSON.stringify(channelId);
+    assert.ok(text.includes(`fetch_history(channel=${channel}, after=${mode === 'legacy' ? '7' : '"alpha:7"'})`));
+  }
+});
+
+
+test('enabled catch-up bounds long channel identifiers and realm tags', () => {
+  for (const mode of ['compat', 'strict'] as const) {
+    const ids = new MessageIds('a'.repeat(64), mode);
+    const block = renderMissedBlock([viewOf(msg(7, false, 'x'.repeat(2000))), viewOf(msg(8, false, 'y'.repeat(2000)))], {
+      streamName: 'group', channelId: 'zulip:dm:' + Array.from({ length: 400 }, (_, i) => 10000 + i).join('+'), reason: 'backscroll', count: 2,
+      formatTime: () => '', maxChars: 1000, moreBeyond: true, newestScannedId: 8, messageIds: ids,
+    }).text;
+    assert.ok(block.length <= 1000);
+    assert.ok(block.includes(`fetch_around(message_id="${'a'.repeat(64)}:7")`));
+    assert.match(block, /Newer messages also exist/);
+  }
+});
+
+test('only the watermark is durable: an older hold permits an accepted later scan to recur after restart', () => {
+  const dir = tmp();
+  try {
+    const state = new DeliveryState(dir, 'pinned', directoryOf({ 1: 'general' }));
+    state.advance(GENERAL, 9);
+    state.hold(GENERAL, 10, 'rejected');
+    state.hold(GENERAL, 21);
+    state.hold(GENERAL, 30);
+    state.advanceThrough(GENERAL, 30, 20);
+    state.save();
+    assert.equal(state.watermark(GENERAL), 9);
+    assert.equal(state.acceptedThrough(GENERAL), 30);
+    const restarted = new DeliveryState(dir, 'pinned', new StreamDirectory());
+    assert.equal(restarted.watermark(GENERAL), 9);
+    assert.equal(restarted.acceptedThrough(GENERAL), 9, 'a restarted scan begins at 9, not at the accepted 30');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} compact DM recovery gets a pageable channel from its anchor`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const dir = mkdtempSync(join(tmpdir(), 'r13-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const users = [1, ...Array.from({ length: 399 }, (_, i) => i + 10000)];
+    const channel = 'zulip:dm:' + users.slice(1).join('+');
+    let paged = false;
+    const raw = { id: 101, type: 'private',
+      display_recipient: users.map(id => ({ id, full_name: `user${id}`, email: `${id}@example.com` })),
+      sender_id: 10000, sender_full_name: 'sender', sender_email: 'sender@example.com',
+      subject: '', timestamp: 1000, content: 'hello', flags: [] };
+    const { api } = standInApi({
+      'GET /messages/101': { result: 'success', message: raw },
+      'GET /messages': params => {
+        if (params.include_anchor === true) return { result: 'success', messages: [raw] };
+        assert.deepEqual(params.narrow, [{ operator: 'dm', operand: users.slice(1) }]);
+        paged = true;
+        return { result: 'success', messages: [], found_oldest: true, found_newest: true };
+      },
+    });
+    const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'r13' }, dir, { messageIds: ids });
+    const notice = renderMissedBlock([{ id: 101, authorName: 'sender', timestamp: new Date(),
+      topic: '', text: 'hello', attachmentNames: [], mentioned: false } as any], {
+      streamName: channel, channelId: channel, reason: 'backscroll', count: 1,
+      formatTime: () => '', maxChars: 1000, messageIds: ids,
+    }).text;
+    assert.ok(notice.length <= 1000);
+    assert.match(notice, /returns channelId \(including for DMs\)/);
+    const reference = JSON.parse(/fetch_around\(message_id=([^)]*)\)/.exec(notice)![1]);
+    const anchor = await tools.handleToolCall('fetch_around', { message_id: reference }) as any;
+    assert.equal(anchor.channelId, channel);
+    await tools.handleToolCall('fetch_history', { channel: anchor.channelId, after: ids.format(101) });
+    assert.ok(paged);
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} compact recovery keeps the count, range, anchor and ceiling continuation without delivery mechanics`, () => {
+    const rows = [10, 100].map(id => ({ id, authorName: 'a', timestamp: new Date(), topic: '', text: 'hello', attachmentNames: [], mentioned: true }));
+    const opts = { streamName: 'x'.repeat(2000), channelId: 'zulip:' + 'x'.repeat(2000), reason: 'backscroll' as const, count: 2, formatTime: () => '', maxChars: 1000, messageIds: ids, newestScannedId: 100 };
+    const plain = renderMissedBlock(rows, opts).text;
+    assert.ok(plain.includes(`[2 messages omitted (ids ${ids.format(10)}–${ids.format(100)})`));
+    assert.ok(plain.includes(`fetch_around(message_id=${JSON.stringify(ids.format(10))})`));
+    assert.ok(plain.includes(`continue with fetch_history(channel=channelId, after=${JSON.stringify(ids.format(10))})`));
+    assert.doesNotMatch(plain, /accept|watermark|hold|restart/i);
+    assert.ok(plain.length <= 1000);
+    const scanned = renderMissedBlock(rows, { ...opts, moreBeyond: true }).text;
+    assert.ok(scanned.length <= 1000);
+    assert.ok(scanned.includes(`fetch_history(channel=channelId, after=${JSON.stringify(ids.format(100))})`));
+    const maximum = new MessageIds('x'.repeat(64), mode);
+    const largeIds = rows.map((row, i) => ({ ...row, id: Number.MAX_SAFE_INTEGER - 1 + i }));
+    const bounded = renderMissedBlock(largeIds, { ...opts, messageIds: maximum, moreBeyond: true, newestScannedId: Number.MAX_SAFE_INTEGER }).text;
+    assert.ok(bounded.length <= 1000, 'continuation fits even with maximum-width tagged IDs');
+    assert.ok(bounded.includes(`after=${JSON.stringify(maximum.format(Number.MAX_SAFE_INTEGER))}`));
+  });
+}

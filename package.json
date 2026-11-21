@@ -36,6 +36,7 @@
   "files": [
     "build",
     "README.md",
+    "docs/realm-ids.md",
     "LICENSE",
     "zuliprc.example"
   ],

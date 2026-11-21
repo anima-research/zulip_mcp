@@ -1,3 +1,4 @@
+import { agentSafeError } from './agent-errors.js';
 import { ERR_UNKNOWN_CHANNEL } from '@animalabs/mcpl-core';
 import type {
   ChannelDescriptor,
@@ -220,7 +221,7 @@ export class ChannelManager {
       if (refusedNow.length > 0) console.error(`host refused ${refusedNow.length} channel(s): ${refusedNow.join(', ')}`);
       return { announced, local, refused: refusedNow };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error ? agentSafeError(error).message : String(error);
       console.error(`Failed to announce ${added.length} channel(s) (${reason}); they stay usable here and are re-announced on the next refresh`);
       const local: string[] = [];
       for (const d of added) {
@@ -699,10 +700,12 @@ export class ChannelManager {
       console.error(
         `Failed to send ${allMessages.length} incoming message(s) to host` +
           (retry.length > 0 ? `; retrying ${retry.length}` : '') +
-          (givenUp.length > 0 ? `; giving up on ${givenUp.length} (held below the watermark for a later replay)` : '') +
+          (givenUp.length > 0 ? `; giving up on ${givenUp.length} (delivery unconfirmed; replayable messages remain held where applicable)` : '') +
           ':',
         (error as Error).message ?? error,
       );
+      const synthetic = givenUp.filter(m => !/^[0-9]+$/.test(m.messageId)).length;
+      if (synthetic > 0) console.error(`${synthetic} unconfirmed synthetic event(s) cannot be replayed from message history`);
       for (const [key, messages] of groupByKey(givenUp)) this.report(this.hooks.onGivenUp, key, messages);
       const requeued = new Map<ChannelKey, Queued[]>();
       for (const q of retry) {
@@ -733,7 +736,9 @@ export class ChannelManager {
       byKey.set(m.key, entry);
     }
     if (rejected > 0) {
-      console.error(`Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
+      console.error(`Host did not confirm acceptance of ${rejected} of ${allMessages.length} incoming message(s); delivery is unconfirmed`);
+      const synthetic = [...byKey.values()].flatMap(entry => entry.rejected).filter(m => !/^[0-9]+$/.test(m.messageId)).length;
+      if (synthetic > 0) console.error(`${synthetic} unconfirmed synthetic event(s) cannot be replayed from message history`);
     }
     for (const [key, entry] of byKey) {
       try {
@@ -764,7 +769,9 @@ export class ChannelManager {
     sent: KeyedMessage[],
   ): Set<string> {
     if (result && Array.isArray(result.results)) {
-      return new Set(result.results.filter((r) => r?.accepted).map((r) => r.messageId));
+      const counts = new Map<string, number>();
+      for (const r of result.results) if (typeof r?.messageId === 'string') counts.set(r.messageId, (counts.get(r.messageId) ?? 0) + 1);
+      return new Set(result.results.filter((r) => r?.accepted === true && counts.get(r.messageId) === 1).map((r) => r.messageId));
     }
     return new Set(sent.map((m) => m.messageId));
   }

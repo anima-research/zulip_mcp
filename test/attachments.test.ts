@@ -266,7 +266,7 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     ];
     const open = new AbortController().signal;
     const blocks = await buildAttachmentBlocks(refs, source, { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 1 }, open);
-    assert.match((blocks[0] as { text: string }).text, /missing\.png — could not fetch \(HTTP 404\)/);
+    assert.equal((blocks[0] as { text: string }).text, '[attachment: missing.png — could not fetch (refused, HTTP 404, /user_uploads/1/a/missing.png); check the path before retrying]');
     assert.equal(blocks[1].type, 'image');
     assert.equal((blocks[1] as { mimeType: string }).mimeType, 'image/jpeg');
     assert.equal((blocks[2] as { text: string }).text, '[image attachment: shot.png]');
@@ -279,5 +279,37 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
     assert.match((off[0] as { text: string }).text, /image inlining is off/);
   } finally {
     server.close();
+  }
+});
+
+test('inline attachment transport diagnostics use the shared mode-aware wrapper', async () => {
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const failure = new ZulipNoAnswer('network', 'GET', '/messages/7', false, 'raw GET /messages/7');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const blocks = await buildAttachmentBlocks(
+      [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
+      { fetch: async () => { throw failure; } }, resolveInlineOptions(), new AbortController().signal);
+    const result = JSON.stringify(blocks);
+    {
+      assert.match(result, /Zulip transport failure/);
+      assert.doesNotMatch(result, /raw GET|\/messages\/7/);
+    }
+  }
+});
+
+
+test('inline native fetch failures hide raw URLs in enabled modes', async t => {
+  for (const failure of [new TypeError('fetch failed: https://private.invalid/secret'), new DOMException('private response body', 'AbortError')]) {
+    t.mock.method(globalThis, 'fetch', async () => { throw failure; });
+    for (const mode of ['legacy', 'compat', 'strict'] as const) {
+      const blocks = await buildAttachmentBlocks(
+        [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
+        { fetch: (path, maxBytes, signal) => fetchCapped('https://private.invalid' + path, {}, maxBytes, signal) }, resolveInlineOptions(), new AbortController().signal);
+      const text = JSON.stringify(blocks);
+      {
+        assert.match(text, /could not fetch \(incomplete, \/user_uploads\/note\.txt\); retry with fetch_attachment\]/);
+        assert.doesNotMatch(text, /private|secret/);
+      }
+    }
   }
 });

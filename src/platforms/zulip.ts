@@ -25,6 +25,7 @@ import { ZulipEventLoop, type ZulipMessageChange } from './zulip-events.js';
 import { cleanMarkdown } from '../content.js';
 import { DEFAULT_CONTEXT_POSITION, type ContextPosition } from '../feature-sets.js';
 import { namePosted, NothingToSend, SendRefused, sendMessage, ZULIP_MAX_MESSAGE_LENGTH, type Destination } from '../outgoing.js';
+import { LEGACY_IDS, type MessageIds } from '../message-ids.js';
 import { messageLineHead } from '../message-line.js';
 import { agentLineTimeFormatter } from '../timezone.js';
 import { uploadBlocks, type UploadPolicy, type Uploader } from '../uploads.js';
@@ -129,6 +130,7 @@ export interface FilterView {
 const ALLOW_ALL: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
 
 export interface ZulipAdapterOptions {
+  messageIds?: MessageIds;
   backscrollDefault?: number;
   backscrollLimits?: ReadonlyMap<string, number>;
   filters?: FilterView;
@@ -182,6 +184,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private selfDeleted = new Map<number, number>();
   private readonly listReadFor = new Map<string, number>();
   private listRead: Promise<boolean> | null = null;
+  private readonly messageIds: MessageIds;
   /** Zulip reports a move to a stream the bot cannot see as a delete event. */
   private movedAway = new Map<number, number>();
   private readonly changeOf = new WeakMap<ChangeEntry, ZulipMessageChange>();
@@ -193,6 +196,7 @@ export class ZulipAdapter implements PlatformAdapter {
     identity: ZulipIdentity,
     options: ZulipAdapterOptions = {},
   ) {
+    this.messageIds = options.messageIds ?? LEGACY_IDS;
     this.identity = identity;
     this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
     this.backscrollLimits = options.backscrollLimits ?? new Map();
@@ -364,7 +368,7 @@ export class ZulipAdapter implements PlatformAdapter {
       // Older (pre-5.0) servers omit code; only then use the legacy text.
       if (quoteLookup && result.result === 'error' &&
           (result.code === 'BAD_REQUEST' || (result.code === undefined && result.msg === 'Invalid message(s)'))) return null;
-      if (isRefusal(result)) throw new ZulipRefused(`message ${messageId}`, result);
+      if (isRefusal(result)) throw new ZulipRefused(`message ${this.messageIds.format(messageId)}`, result);
       const raw = result.message;
       if (!raw) throw new Error('response contained no message');
       if (raw.id !== messageId) throw new Error('response contained a different message id');
@@ -687,6 +691,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const posted: number[] = [];
     try {
       const { chunks } = await sendMessage(this.api, destination, textContent, {
+        messageIds: this.messageIds,
         limit: this.maxMessageLength,
         unlinkable: 'as-typed',
         ...(upload ? { upload } : {}),
@@ -699,14 +704,14 @@ export class ZulipAdapter implements PlatformAdapter {
       return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
     } catch (err) {
       if (err instanceof NothingToSend) return { delivered: false };
-      if (err instanceof SendRefused) throw namePosted(new ZulipRefused(what, err.answer), posted);
-      throw err instanceof Error ? namePosted(err, posted) : err;
+      if (err instanceof SendRefused) throw namePosted(new ZulipRefused(what, err.answer), posted, this.messageIds);
+      throw err instanceof Error ? namePosted(err, posted, this.messageIds) : err;
     }
   }
 
   async acknowledge(_key: ChannelKey | null, messageId: string, value?: string): Promise<string> {
     const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
-    await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${messageId}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
+    await this.api.request('POST', `/messages/${Number(messageId)}/reactions`, `acknowledging message ${this.messageIds.format(messageId)}`, { emoji_name: name, reaction_type: 'unicode_emoji' });
     return `:${name}:`;
   }
 
@@ -714,7 +719,7 @@ export class ZulipAdapter implements PlatformAdapter {
     const id = Number(messageId);
     this.noteSelfDeleted(id);
     try {
-      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${messageId}`);
+      await this.api.request('DELETE', `/messages/${id}`, `deleting message ${this.messageIds.format(messageId)}`);
     } catch (err) {
       if (!mayHaveBeenApplied(err)) this.selfDeleted.delete(id);
       throw err;
@@ -832,7 +837,7 @@ export class ZulipAdapter implements PlatformAdapter {
     if (messages.length === 0) return null;
 
     const formatted = messages.map((m) => messageLineHead({
-      id: m.id,
+      id: this.messageIds.format(m.id),
       time: Number.isNaN(m.timestamp.getTime()) ? '' : this.formatTime(m.timestamp),
       stream: parsed.kind === 'dm' ? null : m.streamNameShown ?? streamName,
       topic: m.topic,
@@ -928,7 +933,7 @@ export class ZulipAdapter implements PlatformAdapter {
     onReaction?: OnReaction,
     onMessageChange?: OnMessageChange,
   ): void {
-    const loop = this.eventLoop = new ZulipEventLoop({ directory: this.directory });
+    const loop = this.eventLoop = new ZulipEventLoop({ directory: this.directory, messageIds: this.messageIds });
     const current = () => this.eventLoop === loop;
     const changeHandler = onMessageChange
       ? (change: ZulipMessageChange) => {

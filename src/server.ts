@@ -46,6 +46,8 @@ import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, P
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
+import { describe, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { logDiagnostic, hasLoggedDiagnostic, agentSafeError } from './agent-errors.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
@@ -74,6 +76,7 @@ const READ_RETRY_MAX_MS = 60_000;
 const READ_WAIT_LINE_MS = 90_000;
 
 export interface ZulipMcplServerOptions {
+  messageIds?: MessageIds;
   serverInfo: { name: string; version: string };
   mcplEnabled?: boolean;
   batchWindowMs?: number;
@@ -139,6 +142,7 @@ interface CatchUpRead {
 }
 
 export class ZulipMcplServer {
+  private readonly messageIds: MessageIds;
   private conn: McplConnection | null = null;
   private mcplActive = false;
 
@@ -184,6 +188,7 @@ export class ZulipMcplServer {
     private readonly tools: ZulipToolRuntime,
     private readonly options: ZulipMcplServerOptions,
   ) {
+    this.messageIds = options.messageIds ?? LEGACY_IDS;
     this.adapters = new Map([[adapter.type, adapter]]);
     this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
     this.missedBlockMaxChars = Math.max(1000, options.missedBlockMaxChars ?? DEFAULT_MISSED_BLOCK_MAX_CHARS);
@@ -516,7 +521,7 @@ export class ZulipMcplServer {
     const result: McplInitializeResult = {
       protocolVersion,
       capabilities,
-      serverInfo: this.options.serverInfo,
+      serverInfo: messageIdServerInfo(this.options.serverInfo, this.messageIds),
     };
     conn.sendResponse(msg.request.id, result);
 
@@ -549,7 +554,7 @@ export class ZulipMcplServer {
 
         case 'tools/list':
           // MCPL RFC-008: each tool carries its class in _meta['mcpl/class'].
-          conn.sendResponse(req.id, { tools: withToolClasses(toolDefinitions) });
+          conn.sendResponse(req.id, { tools: withToolClasses(idToolDefinitions(toolDefinitions, this.messageIds)) });
           break;
 
         case 'tools/call': {
@@ -568,7 +573,7 @@ export class ZulipMcplServer {
           try {
             conn.sendResponse(req.id, await this.tools.readResource(uri));
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error ? agentSafeError(error).message : String(error);
             throw new McplRpcError(-32602, `Failed to read resource: ${message}`);
           }
           break;
@@ -637,7 +642,7 @@ export class ZulipMcplServer {
           // carry one (§14.3), so a host can only learn checkpoints from tool
           // results.
           const result = await this.channelManager.publish(publish);
-          conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) });
+          conn.sendResponse(req.id, this.messageIds.project({ delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) }));
           break;
         }
 
@@ -651,10 +656,15 @@ export class ZulipMcplServer {
             break;
           }
           try {
-            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), ack.messageId, ack.value);
+            const representation = await this.adapter.acknowledge(this.channelManager.keyOfHeld(ack.channelId), this.messageIds.mode === 'legacy' ? ack.messageId : String(this.messageIds.parse(ack.messageId, () => this.warnBareId('messageId'), 'messageId')), ack.value);
             conn.sendResponse(req.id, { acknowledged: true, representation });
           } catch (error) {
-            conn.sendResponse(req.id, { acknowledged: false, reason: (error as Error).message });
+            const parserPrefix = `messageId=${describe(ack.messageId)}:`;
+            const context = error instanceof Error && error.message.startsWith(parserPrefix)
+              ? 'channels/acknowledge' : `channels/acknowledge (messageId=${describe(ack.messageId)})`;
+            conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' && !(error instanceof ZulipNoAnswer)
+              ? agentSafeError(error).message
+              : `${context}: ${agentSafeError(error).message}` });
           }
           break;
         }
@@ -685,9 +695,9 @@ export class ZulipMcplServer {
       conn.sendError(req.id, err.code, err.message, err.data);
       return;
     }
-    const e = err as Error;
-    console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, e.stack ?? e.message);
-    conn.sendError(req.id, -32603, e.message ?? String(err));
+    const e = agentSafeError(err, false);
+    if (!hasLoggedDiagnostic(err)) console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
+    conn.sendError(req.id, -32603, e.message);
   }
 
   private async handleNotification(conn: McplConnection, notif: JsonRpcNotification): Promise<void> {
@@ -731,8 +741,22 @@ export class ZulipMcplServer {
     void conn;
   }
 
+  private warnBareId(field: string): void {
+    console.error(`[zulip-mcp] Warning: bare ${field} accepted; use ${this.messageIds.tag}:<n>.`);
+  }
+
+  private parseOpenCursor(params: ChannelsOpenParams): ChannelsOpenParams {
+    if (this.messageIds.mode === 'legacy' || params.history?.beforeMessageId === undefined) return params;
+    try {
+      return { ...params, history: { ...params.history, beforeMessageId: String(this.messageIds.parse(params.history.beforeMessageId, () => this.warnBareId('beforeMessageId'), 'beforeMessageId')) } };
+    } catch (err) {
+      throw new McplRpcError(-32602, (err as Error).message);
+    }
+  }
+
   private async openTarget(params: ChannelsOpenParams): Promise<{ descriptor: ChannelDescriptor; key: ChannelKey }> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    this.parseOpenCursor(params); // Refuse before rediscovery can register channels.
     if (params.channelId) {
       const answer = await this.ids.keyOf(params.channelId);
       if ('refusal' in answer) throw new McplRpcError(ERR_UNKNOWN_CHANNEL, answer.refusal, { channelId: params.channelId });
@@ -745,6 +769,7 @@ export class ZulipMcplServer {
 
   private async openChannel(ctx: Ctx, params: ChannelsOpenParams, descriptor: ChannelDescriptor, key: ChannelKey, conn: McplConnection): Promise<ChannelsOpenResult> {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    params = this.parseOpenCursor(params);
     // Opening a channel is proof the host knows it — the only proof available
     // when the answer to its announcement cannot reach us (#20 review).
     this.channelManager.confirmAnnounced(descriptor.id);
@@ -756,7 +781,7 @@ export class ZulipMcplServer {
       } catch (err) {
         throw new McplRpcError(
           ERR_CHANNEL_OPEN_FAILED,
-          `Cannot open ${descriptor.id}: ${(err as Error).message}`,
+          `Cannot open ${descriptor.id}: ${agentSafeError(err).message}`,
           { channelId: descriptor.id },
         );
       }
@@ -783,7 +808,7 @@ export class ZulipMcplServer {
       const messages = read.messages.filter((m) => !(Number(m.messageId) >= below));
       // Not attributed: the host hands this back as the channel_open tool
       // result, JSON that already shows author, threadId and metadata.
-      result.history = this.projectHistoryReactions(messages).map((m) => toWire(m, descriptor.id));
+      result.history = this.messageIds.project(this.projectHistoryReactions(messages).map((m) => toWire(m, descriptor.id)));
       result.historyTruncated = requested > limit;
       page = { messages, older: beforeMessageId !== undefined, sinceLastSeen: afterMessageId !== undefined };
     }
@@ -824,7 +849,7 @@ export class ZulipMcplServer {
   }
 
   private attributed(message: KeyedMessage): KeyedMessage {
-    return this.attributeDelivery ? attributeMessage(message, message.streamNameShown ?? this.streamNameOf(message.key), this.formatTime) : message;
+    return this.attributeDelivery ? attributeMessage(message, message.streamNameShown ?? this.streamNameOf(message.key), this.formatTime, this.messageIds) : message;
   }
 
   private label(key: ChannelKey): string {
@@ -1026,7 +1051,7 @@ export class ZulipMcplServer {
       const authorId = message.author.id;
       const note = `<system>Direct message from ${message.author.name} (user id ${authorId}). ` +
         `To reply, use send_dm(["${authorId}"]) or publish to channel ${this.ids.channelIdOf(key)}. ` +
-        `DMs always reach you; there is nothing to subscribe to.</system>`;
+        `DMs are delivered to you directly; there is nothing to subscribe to.</system>`;
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
 
@@ -1119,7 +1144,7 @@ export class ZulipMcplServer {
         });
       }
     } catch (err) {
-      console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
+      logDiagnostic(err, `[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`);
     }
     return async (ctx) => {
       if (ctx.ended) return;
@@ -1127,7 +1152,7 @@ export class ZulipMcplServer {
       try {
         await hand?.(ctx);
       } catch (err) {
-        console.error(`[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`, (err as Error).message);
+        logDiagnostic(err, `[zulip-mcp] replay of undelivered messages on ${this.label(key)} failed:`);
       }
       this.delivery.save();
     };
@@ -1179,7 +1204,7 @@ export class ZulipMcplServer {
     const channelId = this.ids.channelIdOf(message.key);
     if (channelId === null) return false;
     if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
-      console.error(`[zulip-mcp] pushEvents not granted; dropping addressed message ${message.messageId} on closed ${channelId}`);
+      console.error(`[zulip-mcp] pushEvents not granted; dropping addressed message ${this.messageIds.format(message.messageId)} on closed ${channelId}`);
       return false;
     }
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
@@ -1213,14 +1238,14 @@ export class ZulipMcplServer {
     };
     try {
       beforeOffer?.();
-      const result = (await this.outToHost(conn.sendRequest(method.PUSH_EVENT, params))) as { accepted?: boolean; reason?: string } | undefined;
+      const result = (await this.outToHost(conn.sendRequest(method.PUSH_EVENT, this.messageIds.project(params)))) as { accepted?: boolean; reason?: string } | undefined;
       if (result && result.accepted === false) {
         console.error(`[zulip-mcp] push/event ${eventId} not accepted by host${result.reason ? `: ${result.reason}` : ''}`);
         return false;
       }
       return true;
     } catch (err) {
-      console.error('[zulip-mcp] push/event failed:', (err as Error).message);
+      logDiagnostic(err, '[zulip-mcp] push/event failed:');
       return false;
     }
   }
@@ -1333,7 +1358,7 @@ export class ZulipMcplServer {
       return { ...pass, fetched: await this.fetchAfter(r, key, pass.after, bound, passBudget) };
     } catch (err) {
       if (read.fill && triesAgain(err)) throw err;
-      console.error(`[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`, (err as Error).message);
+      logDiagnostic(err, `[zulip-mcp] catch-up: history fetch failed for ${this.label(key)}:`);
       return pass;
     } finally {
       budget.remainingMs -= passMs - passBudget.remainingMs;
@@ -1342,11 +1367,11 @@ export class ZulipMcplServer {
 
   private handCatchUp(ctx: Ctx, key: ChannelKey, read: CatchUpRead, pass: CatchUpPass, window?: { through: number; truncated: boolean }, second?: CatchUpPass): void {
     const { after, fetched } = pass;
+    if (ctx.ended || this.isMuted(key) || !this.isAllowed(key)) return;
     if (!fetched) {
       read.onAttempt?.(ctx.w, Infinity);
       return;
     }
-    if (ctx.ended) return;
     if (fetched.scannedThrough === null || !window) {
       this.letGoUnfound(ctx.w, key, this.heldBetween(key, after, Math.min(pass.bound ?? Infinity, read.through?.() ?? Infinity)), fetched);
       read.onAttempt?.(ctx.w, Infinity);
@@ -1390,6 +1415,7 @@ export class ZulipMcplServer {
       count: keepAll ? kept.length : addressedCount,
       formatTime: this.formatTime,
       maxChars: this.missedBlockMaxChars,
+      messageIds: this.messageIds,
       moreBeyond: (truncated && !read.ceiling) || blocked !== undefined,
       newestScannedId: newestId,
     });
@@ -1411,7 +1437,11 @@ export class ZulipMcplServer {
     };
     let offered = false;
     const firstId = kept[0].id;
-    const shownIds = [firstId, ...kept.slice(Math.max(1, elided)).map((v) => v.id)];
+    // Reserve existing holds across the whole scan, including unselected ambient
+    // rows, so no held read starts for them while this offer is pending. A read
+    // that another hold starts may still offer rows of this interval again.
+    const shownIds = [...new Set([...this.heldBetween(key, after, newestId), firstId,
+      ...kept.slice(Math.max(1, elided)).map(v => v.id)])];
     for (const id of shownIds) ctx.w.delivery.hold(key, id, 'queued');
     const sent = this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
       missed: true,
@@ -1425,6 +1455,7 @@ export class ZulipMcplServer {
     });
     const answered = (w: DeliveryWriter, ok: boolean) => {
       if (ok) {
+        w.delivery.markReplayed(key, shownIds);
         w.delivery.advanceThrough(key, newestId, after);
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (!keepAll && !isAddressed(views[i])) continue;
@@ -1440,9 +1471,13 @@ export class ZulipMcplServer {
       }
       this.delivery.save();
     };
+    const owner = this.lanes;
     const answer = sent.then((ok) => new Promise<boolean>((resolve) => ctx.lane.answer((c) => {
-      answered(c.w, ok);
-      resolve(ok);
+      // Drain an acceptance during shutdown, but never let an old connection's
+      // answer alter a replacement lane's holds. Ended refusals cannot re-hold.
+      const current = this.lanes === owner && (ok || !c.ended);
+      if (current) answered(c.w, ok);
+      resolve(current && ok);
     })));
     read.answers?.push(answer);
     if (blocked !== undefined) handSecond();
@@ -1580,7 +1615,7 @@ export class ZulipMcplServer {
       if (r.ended) return;
       const step = Math.min(READ_RETRY_FIRST_MS * 2 ** Math.min(tries, 30), READ_RETRY_MAX_MS);
       const ms = Math.max(step, (err.retryAfterSeconds ?? 0) * 1000);
-      console.error(`[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed: ${err.message}; trying again in ${ms / 1000} s`);
+      logDiagnostic(err, `[zulip-mcp] reading ${this.label(lane.key)}'s history to fill a hole failed; trying again in ${ms / 1000} s:`);
       this.readWaits.add(lane.key);
       const ranOut = err instanceof ZulipNoAnswer && err.kind === 'timeout';
       const untold = this.toldReadWait === null || (this.toldReadWait === 'log' && this.openKeys().length > 0);
@@ -1937,7 +1972,7 @@ export class ZulipMcplServer {
     }
     try {
       const own = await this.serverTool(name, args);
-      const result = toToolCallResult(own !== undefined ? own : await this.tools.handleToolCall(name, args));
+      const result = toToolCallResult(own !== undefined ? this.messageIds.project(own) : await this.tools.handleToolCall(name, args));
       // §8: a tool of the rollback-capable feature set mints a checkpoint and
       // hands it back in `state`, the only way a host ever learns one.
       if (this.mcplActive && featureSetForTool(name) === MESSAGING_FEATURE_SET) {
@@ -1947,7 +1982,7 @@ export class ZulipMcplServer {
       }
       return result;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? agentSafeError(error).message : String(error);
       return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
     }
   }
@@ -1995,7 +2030,7 @@ export class ZulipMcplServer {
       void this.reconcileHostIds();
       return result;
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error ? agentSafeError(error, false).message : String(error);
       console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
       return { ...empty, reason };
     }
@@ -2225,7 +2260,7 @@ export class ZulipMcplServer {
   private async onReaction(w: DeliveryWriter, ev: ReactionEvent): Promise<void> {
     if (!this.reactionShown(ev)) return;
     const verb = ev.action === 'add' ? 'reacted' : 'removed a reaction';
-    const target = ev.onOwnMessage ? 'your message' : `message ${ev.messageId}`;
+    const target = ev.onOwnMessage ? 'your message' : `message ${this.messageIds.format(ev.messageId)}`;
     const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
     const line = `[reaction] ${ev.reactorName} ${verb} :${ev.emoji}: on ${target}${quoted}`;
     const message: KeyedMessage = {
@@ -2301,7 +2336,7 @@ export class ZulipMcplServer {
     }
 
     const head = messageLineHead({
-      id: ev.messageId,
+      id: this.messageIds.format(ev.messageId),
       time: Number.isNaN(ev.timestamp.getTime()) ? '' : this.formatTime(ev.timestamp),
       stream: ev.isDM ? null : this.streamNameOf(ev.key) ?? '',
       topic: ev.topic,
@@ -2416,7 +2451,35 @@ export class ZulipMcplServer {
   private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
-    return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
+    const result = (await conn.sendRequest(method.CHANNELS_INCOMING, this.messageIds.project({ messages }))) as ChannelsIncomingResult | undefined;
+    if (Array.isArray(result?.results)) {
+      // Only reverse IDs actually sent in this batch. Synthetic events and bad
+      // host entries must not throw or prevent independent results settling.
+      const originals = new Map(messages.map(m => [String(this.messageIds.format(m.messageId)), m.messageId]));
+      const numericOriginals = this.messageIds.mode === 'legacy' ? undefined : new Map(messages.filter(m => /^[0-9]+$/.test(m.messageId))
+        .map(m => [Number(m.messageId), m.messageId]));
+      const counts = new Map<string, number>();
+      const results = result.results.flatMap(r => {
+        let original = r && typeof r.messageId === 'string' ? originals.get(r.messageId) : undefined;
+        if (original === undefined && numericOriginals && r && typeof r.messageId === 'string') {
+          try { original = numericOriginals.get(this.messageIds.parse(r.messageId, () => this.warnBareId('incoming result messageId'))); } catch { /* diagnosed below */ }
+        }
+        if (original !== undefined) counts.set(original, (counts.get(original) ?? 0) + 1);
+        if (original === undefined || typeof r.accepted !== 'boolean') {
+          const reason = original === undefined ? 'malformed ID or not in offered batch' : 'acceptance is not boolean';
+          console.error(`[zulip-mcp] Ignoring incoming result: ${reason} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}).`);
+          return [];
+        }
+        return [{ ...r, messageId: original }];
+      });
+      // Refuse ambiguous duplicates after normalization, regardless of spelling.
+      // Count recognized IDs even when their acceptance value is malformed.
+      for (const [id, count] of counts) if (count > 1) {
+        console.error(`[zulip-mcp] Ignoring incoming result: duplicate normalized ID ${JSON.stringify(id)} under ${this.messageIds.mode} mode (realm ${this.messageIds.tag}); ${count} entries in host response.`);
+      }
+      return { ...result, results: results.filter(r => counts.get(r.messageId) === 1) };
+    }
+    return result;
   }
 }
 

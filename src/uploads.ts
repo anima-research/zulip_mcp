@@ -3,6 +3,8 @@
  * `/user_uploads/...` path and the message body links to it.
  */
 
+import { parseRetryAfter } from './zulip-api.js';
+import { agentSafeError, markTransportError } from './agent-errors.js';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, type FileHandle, open, readlink, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -81,7 +83,7 @@ export interface UploadTarget {
   authHeader: string;
 }
 
-type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: Buffer }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: Buffer }) => Promise<{ ok: boolean; status: number; headers?: { get(name: string): string | null }; text?(): Promise<string>; json(): Promise<unknown> }>;
 
 /** RFC 2045 `type/subtype`, no parameters. Anything else cannot go into a part header. */
 const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
@@ -114,20 +116,46 @@ export function createZulipUploader(target: UploadTarget, fetchImpl: FetchLike =
         method: 'POST',
         headers: { Authorization: target.authHeader, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: multipartBody(input, boundary),
-      });
-      let body: { result?: string; msg?: string; uri?: string; url?: string } = {};
+      }).catch(error => { throw markTransportError(error, { operation: 'Upload', attachmentName: input.name }); });
+      const retryAfterSeconds = parseRetryAfter(res.headers?.get('retry-after'));
+      let completed = false;
+      let unreadable = false;
+      let original: unknown;
+      let body: { result?: string; msg?: string; code?: string; uri?: string; url?: string } = {};
       try {
-        body = (await res.json()) as typeof body;
-      } catch {
+        let parsed: unknown;
+        if (res.text) {
+          const text = await res.text();
+          completed = true; // Receiving the body and parsing it are different failures.
+          parsed = JSON.parse(text);
+        } else {
+          parsed = await res.json();
+          completed = true;
+        }
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as typeof body;
+        else unreadable = true;
+      } catch (error) {
+        original = error;
+        unreadable = true;
       }
+      // These statuses reject the request before storage. Timeouts, conflicts,
+      // redirects and server/proxy failures do not establish that nothing was stored.
+      const refused = completed && [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(res.status);
       if (!res.ok || body.result !== 'success') {
-        throw new Error(`upload of "${input.name}" failed: ${body.msg ?? `HTTP ${res.status}`}`);
+        const authorization = [401, 403].includes(res.status);
+        const advice = (authorization ? '. The host operator must repair authorization; retries alone cannot fix access.' : '')
+          + (retryAfterSeconds === undefined ? '' : authorization
+            ? `. Server Retry-After: ${retryAfterSeconds} seconds; access must be corrected first.`
+            : `. Retry after ${retryAfterSeconds} seconds.`);
+        const error = new Error(`upload of "${input.name}" failed: ${body.msg ?? body.code ?? `HTTP ${res.status}`}${advice}`);
+        throw unreadable || !refused || body.result !== 'error'
+          ? markTransportError(error, { operation: 'Upload', attachmentName: input.name, status: res.status, original, completed, refused, retryAfterSeconds }) : error;
       }
       // Zulip 9.0 (feature level 272) renamed `uri` to `url`; older servers
       // send only `uri`. Either is the `/user_uploads/...` path.
       const path = body.url ?? body.uri;
       if (typeof path !== 'string' || !path.startsWith('/user_uploads/')) {
-        throw new Error(`upload of "${input.name}" returned no usable path`);
+        throw markTransportError(new Error(`upload of "${input.name}" returned no usable path`), { operation: 'Upload', attachmentName: input.name, status: res.status, completed, retryAfterSeconds });
       }
       return { name: input.name, path, url: `${realm}${path}` };
     },
@@ -419,6 +447,8 @@ export async function uploadPrepared(uploader: Uploader, prepared: PreparedUploa
       if (total > policy.maxTotalBytes) throw new Error(`attachments total over the ${fmt(policy.maxTotalBytes)} per-message budget`);
       out.push(await uploader.upload({ name: p.name, mimeType: p.mimeType, data }));
     }
+  } catch (error) {
+    throw partialUploadError(error, out, 'send');
   } finally {
     await closeAll(prepared);
   }
@@ -472,17 +502,35 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
   return prepared;
 }
 
+/** Retain confirmed receipts independently of the failing attempt's uncertainty. */
+function partialUploadError(error: unknown, confirmed: UploadedFile[], operation: 'send' | 'publish'): unknown {
+  const safe = agentSafeError(error);
+  if (confirmed.length === 0) {
+    safe.message += ' No message was sent: attachment upload failed before message posting began.';
+    return safe;
+  }
+  safe.message += ` Earlier attachment uploads confirmed: ${JSON.stringify(confirmed.map(file => file.path))}. No message was sent. Retrying the original ${operation} uploads those attachments again; reuse the confirmed paths instead.`;
+  return safe;
+}
+
 export async function uploadBlocks(uploader: Uploader, blocks: ContentBlock[], policy: UploadPolicy): Promise<UploadedFile[]> {
+  const prepared = await prepareBlocks(blocks, policy);
   const out: UploadedFile[] = [];
-  for (const p of await prepareBlocks(blocks, policy)) {
-    const data = await p.read();
-    let mimeType = p.mimeType;
-    let name = p.name;
-    if (!mimeType && name.startsWith('image-')) {
-      mimeType = sniffImageType(data);
-      if (mimeType) name = name.replace(/\.bin$/, `.${extensionFor(mimeType)}`);
+  try {
+    for (const p of prepared) {
+      const data = await p.read();
+      let mimeType = p.mimeType;
+      let name = p.name;
+      if (!mimeType && name.startsWith('image-')) {
+        mimeType = sniffImageType(data);
+        if (mimeType) name = name.replace(/\.bin$/, `.${extensionFor(mimeType)}`);
+      }
+      out.push(await uploader.upload({ name, mimeType, data }));
     }
-    out.push(await uploader.upload({ name, mimeType, data }));
+  } catch (error) {
+    throw partialUploadError(error, out, 'publish');
+  } finally {
+    await closeAll(prepared);
   }
   return out;
 }

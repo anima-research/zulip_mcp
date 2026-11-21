@@ -24,6 +24,7 @@ export interface ZulipApi {
 }
 
 export interface TransportAnswer {
+  retryAfterSeconds?: number;
   status: number;
   body: unknown;
 }
@@ -35,6 +36,7 @@ export type Transport = (
 export type NoAnswerKind = 'timeout' | 'network' | 'not-json' | 'no-self-id';
 
 export class ZulipNoAnswer extends Error {
+  declare readonly timeoutSeconds?: number;
   constructor(
     readonly kind: NoAnswerKind,
     readonly method: Method,
@@ -43,11 +45,15 @@ export class ZulipNoAnswer extends Error {
     detail: string,
     readonly status?: number,
     readonly retryAfterSeconds?: number,
+    timeoutSeconds?: number,
+    cause?: unknown,
   ) {
     super(`${detail} ${mayHaveBeenApplied
       ? 'The request may have been applied: check before sending it again.'
       : method === 'GET' && kind !== 'no-self-id' ? '' : 'The request was not sent.'}`.trim());
+    if (cause !== undefined) Object.defineProperty(this, 'cause', { value: cause, configurable: true });
     this.name = 'ZulipNoAnswer';
+    if (timeoutSeconds !== undefined) Object.defineProperty(this, 'timeoutSeconds', { value: timeoutSeconds, enumerable: false });
   }
 }
 
@@ -55,6 +61,16 @@ const WRITE_MAY_HAVE_BEEN_APPLIED = 'Zulip answered with a server error, so the 
 
 export function isRefusal(answer: unknown): answer is ZulipRefusal {
   return typeof answer === 'object' && answer !== null && (answer as { result?: unknown }).result === 'error';
+}
+
+const refusalMetadata = new WeakMap<ZulipRefusal, { status?: number; retryAfterSeconds?: number }>();
+
+/** HTTP facts stay out of the JSON answer's public fields. */
+export function refusalFacts(answer: ZulipRefusal): { status?: number; retryAfterSeconds?: number } {
+  const facts = refusalMetadata.get(answer);
+  const header = facts?.retryAfterSeconds;
+  const body = retryAfterOf(answer);
+  return { status: facts?.status, retryAfterSeconds: header === undefined ? body : body === undefined ? header : Math.max(header, body) };
 }
 
 export function refusalText(answer: ZulipRefusal): string {
@@ -83,7 +99,8 @@ export function mayHaveBeenApplied(err: unknown): boolean {
 
 export function zulipApi(transport: Transport): ZulipApi {
   const answer = async (method: Method, path: string, params?: Record<string, unknown>, opts?: RequestOptions) => {
-    const { status, body } = await transport(method, path, params, opts);
+    const { status, body, retryAfterSeconds } = await transport(method, path, params, opts);
+    if (isRefusal(body)) refusalMetadata.set(body, { status, retryAfterSeconds });
     if (method !== 'GET' && status >= 500 && isRefusal(body)) {
       const text = body.msg || body.code || 'unknown error';
       return { body: { ...body, msg: `${text}${/[.!?]$/.test(text) ? '' : '.'} ${WRITE_MAY_HAVE_BEEN_APPLIED}` }, serverError: true };
@@ -105,7 +122,7 @@ export function zulipApi(transport: Transport): ZulipApi {
 export interface SelfIdGate {
   readonly selfUserId: number | null;
   readonly transport: Transport;
-  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number } | null>;
+  read(opts?: RequestOptions): Promise<{ reason: string; retryAfterSeconds?: number; status?: number; timeoutSeconds?: number; cause?: unknown } | null>;
 }
 
 export function selfIdGate(inner: Transport): SelfIdGate {
@@ -118,7 +135,8 @@ export function selfIdGate(inner: Transport): SelfIdGate {
     try {
       answer = await inner('GET', '/users/me', undefined, opts);
     } catch (err) {
-      return { reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, '') };
+      return { cause: err, reason: (err instanceof Error ? err.message : String(err)).replace(/\.+$/, ''),
+        ...(err instanceof ZulipNoAnswer ? { status: err.status, retryAfterSeconds: err.retryAfterSeconds, timeoutSeconds: err.timeoutSeconds } : {}) };
     }
     const { status, body } = answer;
     const id = (body as { user_id?: unknown } | null)?.user_id;
@@ -135,7 +153,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
       console.error(`Zulip refused the read of the bot's own user id: ${reason}. The server goes on without it for this run.`);
       return null;
     }
-    return { reason, retryAfterSeconds: isRefusal(body) ? retryAfterOf(body) : undefined };
+    return { reason, status, retryAfterSeconds: isRefusal(body) ? retryAfterOf(body) : undefined };
   };
   const read = (opts?: RequestOptions) => (pending ??= readOnce(opts).finally(() => { pending = null; }));
 
@@ -148,7 +166,7 @@ export function selfIdGate(inner: Transport): SelfIdGate {
         if (failure) {
           throw new ZulipNoAnswer('no-self-id', method, path, false,
             `The server doesn't have the bot's own user id yet, and reading it failed: ${failure.reason}. A later call reads it again.`,
-            undefined, failure.retryAfterSeconds);
+            failure.status, failure.retryAfterSeconds, failure.timeoutSeconds, failure.cause);
         }
       }
       return inner(method, path, params, opts);
@@ -191,6 +209,15 @@ function duration(ms: number): string {
   return ms < 1000 ? `${ms} ms` : `${ms / 1000} s`;
 }
 
+/** Retry-After permits delta seconds or an HTTP date; retain fractional delays. */
+export function parseRetryAfter(after: string | null | undefined): number | undefined {
+  if (!after) return undefined;
+  after = after.trim();
+  if (!/^\d+(?:\.\d+)?$/.test(after) && !/^[A-Za-z]{3,9},? /.test(after)) return undefined;
+  const seconds = /^\d+(?:\.\d+)?$/.test(after) ? Number(after) : (Date.parse(after) - Date.now()) / 1000;
+  return Number.isFinite(seconds) ? Math.max(0, seconds) : undefined;
+}
+
 export function httpTransport(config: HttpTransportConfig): Transport {
   return async (method, path, params, opts) => {
     const timeoutMs = opts?.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -207,30 +234,32 @@ export function httpTransport(config: HttpTransportConfig): Transport {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     init.signal = controller.signal;
     const write = method !== 'GET';
-    let status: number;
+    let status: number | undefined;
     let text: string;
+    let retryAfterSeconds: number | undefined;
     try {
       const response = await fetch(url, init);
       status = response.status;
+      retryAfterSeconds = parseRetryAfter(response.headers?.get('retry-after'));
       text = await response.text();
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`);
+        throw new ZulipNoAnswer('timeout', method, path, write, `Zulip gave no answer to ${method} ${path} within ${duration(timeoutMs)}.`, status, retryAfterSeconds, timeoutMs / 1000, err);
       }
       const code = causeCode(err);
       const unsent = code !== undefined && notSent(code);
       throw new ZulipNoAnswer('network', method, path, write && !unsent,
         unsent
           ? `Couldn't reach Zulip for ${method} ${path} (${code}).`
-          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`);
+          : `The connection to Zulip failed during ${method} ${path}${code ? ` (${code})` : ''}.`, status, retryAfterSeconds, undefined, err);
     } finally {
       clearTimeout(timer);
     }
     try {
-      return { status, body: JSON.parse(text) };
-    } catch {
+      return { status, body: JSON.parse(text), ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) };
+    } catch (err) {
       throw new ZulipNoAnswer('not-json', method, path, write,
-        `Zulip's answer to ${method} ${path} wasn't JSON (HTTP ${status}).`, status);
+        `Zulip's answer to ${method} ${path} wasn't JSON (HTTP ${status}).`, status, retryAfterSeconds, undefined, err);
     }
   };
 }

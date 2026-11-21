@@ -47,6 +47,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Built MCP/MCPL handshake
+        run: node scripts/check-built-handshake.mjs
+
       # Tests run on both platforms: process/stdio behaviour differs (pipes
       # are asynchronous on macOS), and ubuntu-only runs have missed that.
       - name: Test

@@ -7,11 +7,15 @@ import { ZulipToolRuntime } from '../src/tool-runtime.ts';
 import { initializeZulipClient, subscribeConfigured } from '../src/zulip-client.ts';
 import type { StreamDirectory } from '../src/stream-directory.ts';
 import { standInApi } from './zulip-stand-in.ts';
-import { httpTransport, zulipApi, ZulipRefused } from '../src/zulip-api.ts';
+import { httpTransport, parseRetryAfter, selfIdGate, zulipApi, ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { realm } from './http-realm.ts';
 import { ZulipAdapter } from '../src/platforms/zulip.ts';
 import { dmKey } from '../src/channel-key.ts';
 import { ZulipEventLoop } from '../src/platforms/zulip-events.ts';
+import { fetchAttachmentBytes, parseZulipAttachmentUrl } from '../src/content.ts';
+import { fetchCapped, buildAttachmentBlocks } from '../src/attachments.ts';
+import { MessageIds } from '../src/message-ids.ts';
+import { agentSafeError, markTransportError } from '../src/agent-errors.ts';
 
 async function serverOn(realmUrl: string, env: Record<string, string> = {}, options: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'zulip-api-'));
@@ -76,8 +80,8 @@ test('a call that gets no answer ends with an error at its bound, and its connec
   try {
     const started = Date.now();
     await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
-      assert.match(err.message, /no answer/i);
-      assert.match(err.message, /within 2 s/);
+      assert.match(err.message, /transport failure \(timeout\)/i);
+      assert.match(err.message, /Timeout: 2 seconds/);
       assert.equal(err.kind, 'timeout');
       return true;
     });
@@ -248,6 +252,30 @@ async function startLogging(env: Record<string, string>) {
   }
 }
 
+test('successful startup retains legacy output and announces only enabled realm tags', async () => {
+  const z = await realm({});
+  try {
+    for (const mode of [undefined, 'legacy', 'compat', 'strict']) {
+      const env: Record<string, string> = {
+        ZULIP_REALM: z.url, ZULIP_EMAIL: 'bot@example.com', ZULIP_API_KEY: 'key-for-tests',
+        // Even a configured tag must be silent while tagging is disabled.
+        ZULIP_REALM_TAG: 'test-realm',
+      };
+      if (mode !== undefined) env.ZULIP_ID_MODE = mode;
+      const { session, lines } = await startLogging(env);
+      assert.deepEqual(lines, [
+        ...(mode === 'compat' || mode === 'strict' ? [`message IDs: ${mode}, tag "test-realm"`] : []),
+        'Zulip MCP bot user_id: 790',
+        'Zulip MCP initialized with session: bot@example.com',
+      ], `startup stderr for ${mode ?? 'default'}`);
+      assert.equal(session.selfUserId, 790);
+      assert.equal(session.maxUploadBytes, 25 * 1024 * 1024);
+    }
+    assert.deepEqual(z.requests.map(r => `${r.method} ${r.path}`),
+      Array.from({ length: 4 }, () => ['GET /users/me', 'GET /server_settings']).flat());
+  } finally { z.close(); }
+});
+
 test('a password exchange that Zulip refuses is logged with Zulip\'s words and the missing key, the start goes on, and no line shows the password', async () => {
   const password = 'pw-that-must-not-show';
   const z = await realm({
@@ -324,6 +352,7 @@ test('a call\'s own bound ends a real HTTP call at it, below the default', { tim
     const started = Date.now();
     await assert.rejects(api.request('GET', '/streams', 'listing streams', {}, { timeoutMs: 300 }), (err: Error & { kind?: string }) => {
       assert.equal(err.kind, 'timeout');
+      assert.equal((err as Error & { timeoutSeconds: number }).timeoutSeconds, 0.3);
       assert.match(err.message, /within 300 ms\./);
       return true;
     });
@@ -356,7 +385,8 @@ test('fetch_attachment ends a download that gets no data for 15 s, and a slow on
   try {
     for (const name of ['never.png', 'stalls.png']) {
       await assert.rejects(s.tools.handleToolCall('fetch_attachment', { path: `/user_uploads/2/ab/${name}` }), (err: Error) => {
-        assert.equal(err.message, `The download of ${name} got no data for 15 s.`);
+        assert.equal(err.message, 'Attachment download failed before a complete answer was received. Retry fetch_attachment with the same path.'
+          + (name === 'stalls.png' ? ' HTTP 200.' : '') + ' Timeout: 15 seconds.');
         return true;
       }, name);
     }
@@ -374,7 +404,7 @@ test('a call with no bound of its own ends at 15 s', async () => {
   globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => original(fn, ms === 15_000 ? 50 : ms, ...rest)) as typeof setTimeout;
   try {
     await assert.rejects(s.tools.handleToolCall('list_streams', {}), (err: Error & { kind?: string }) => {
-      assert.match(err.message, /within 15 s\./);
+      assert.match(err.message, /Timeout: 15 seconds\./);
       assert.equal(err.kind, 'timeout');
       return true;
     });
@@ -533,7 +563,7 @@ test('a realm that ends with /api is addressed at /api/v1', async () => {
   } finally { s.done(); z.close(); }
 });
 
-test('listen and unlisten return Zulip\'s refusal as data, as they do today', async () => {
+test('listen and unlisten throw Zulip refusals for tool error reporting', async () => {
   const refusal = { result: 'error', code: 'BAD_REQUEST', msg: 'Invalid stream name' };
   const z = await realm({
     'POST /users/me/subscriptions': { status: 400, json: refusal },
@@ -541,12 +571,8 @@ test('listen and unlisten return Zulip\'s refusal as data, as they do today', as
   });
   const s = await serverOn(z.url);
   try {
-    const joined = await s.tools.handleToolCall('listen', { channels: ['general'] });
-    assert.equal(joined.result, 'error');
-    assert.equal(joined.msg, 'Invalid stream name');
-    const left = await s.tools.handleToolCall('unlisten', { channels: ['general'] });
-    assert.equal(left.result, 'error');
-    assert.equal(left.msg, 'Invalid stream name');
+    await assert.rejects(s.tools.handleToolCall('listen', { channels: ['general'] }), /Invalid stream name/);
+    await assert.rejects(s.tools.handleToolCall('unlisten', { channels: ['general'] }), /Invalid stream name/);
   } finally { s.done(); z.close(); }
 });
 
@@ -703,7 +729,7 @@ test("while the bot's own user id is unknown and reading it fails, a tool call f
     await assert.rejects(
       s.tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 'deploys', content: 'hi' }),
       (err: Error & { mayHaveBeenApplied?: boolean }) => {
-        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.match(err.message, /HTTP 503/);
         assert.ok(err.message.endsWith('The request was not sent.'), err.message);
         assert.equal(err.mayHaveBeenApplied, false);
         return true;
@@ -711,7 +737,7 @@ test("while the bot's own user id is unknown and reading it fails, a tool call f
     );
     for (const [name, args] of [['list_streams', {}], ['send_message', { reply_to: 55, content: 'hi' }]] as const) {
       await assert.rejects(s.tools.handleToolCall(name, args), (err: Error) => {
-        assert.match(err.message, /GET \/users\/me with HTTP 503: Service unavailable/);
+        assert.match(err.message, /HTTP 503/);
         assert.ok(err.message.endsWith('The request was not sent.'), err.message);
         return true;
       }, name);
@@ -831,7 +857,9 @@ test("while the bot's own user id can't be read, the event loop's degraded notic
     await running;
     const degraded = notices.find((n) => n.kind === 'degraded');
     assert.ok(degraded, 'a degraded notice within 3 s');
-    assert.match(degraded.text, /GET \/users\/me with HTTP 503: Service unavailable/);
+    assert.match(degraded.text, /HTTP 503/);
+    assert.match(degraded.text, /polling retries automatically/);
+    assert.doesNotMatch(degraded.text, /later call|no-self-id|transport failure/);
   } finally { console.error = original; s.done(); z.close(); }
 });
 
@@ -850,4 +878,226 @@ test("ZULIP_SUBSCRIBE's subscribe goes out while the bot's own user id can't be 
     assert.deepEqual(z.requests.slice(afterStart).map((r) => `${r.method} ${r.path}`), ['POST /users/me/subscriptions']);
     assert.equal(s.session.selfUserId, null);
   } finally { console.error = original; s.done(); z.close(); }
+});
+
+test('response-body failures retain received HTTP status and unobtrusive timeout facts', async t => {
+  const { agentSafeError } = await import('../src/agent-errors.ts');
+  const { inspect } = await import('node:util');
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  for (const timedOut of [false, true]) {
+    t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => ({
+      status: 503,
+      headers: new Headers({ 'Retry-After': '120' }),
+      text: async () => timedOut ? await new Promise((_resolve, reject) => {
+        init.signal!.addEventListener('abort', () => reject(new Error('private body timeout')), { once: true });
+      }) : await Promise.reject(new Error('private body failure')),
+    }));
+    const transport = httpTransport({ apiUrl: 'https://example.invalid/api/v1', authHeader: '', timeoutMs: 10 });
+    await assert.rejects(transport('GET', '/streams', undefined, undefined), error => {
+      assert.ok(error instanceof ZulipNoAnswer);
+      assert.equal(error.status, 503);
+      assert.equal(error.retryAfterSeconds, 120);
+      assert.equal(error.kind, timedOut ? 'timeout' : 'network');
+      assert.equal(error.timeoutSeconds, timedOut ? 0.01 : undefined);
+      assert.equal(Object.hasOwn(error, 'timeoutSeconds'), timedOut);
+      assert.doesNotMatch(inspect(error), /timeoutSeconds/);
+      for (const mode of ['legacy', 'compat', 'strict'] as const) {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, /HTTP 503/);
+        assert.match(safe.message, /Retry after 120 seconds, then retry the read/);
+        assert.doesNotMatch(safe.message, /private/);
+      }
+      return true;
+    });
+  }
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} API-suffixed realms resolve attachment paths at the origin`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const requested: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (url: string) => {
+      requested.push(url);
+      return new Response('hello', { headers: { 'content-type': 'text/plain' } });
+    });
+    for (const realm of ['https://alpha.example', 'https://alpha.example/', 'https://alpha.example/api', 'https://alpha.example/api/', 'https://alpha.example/zulip']) {
+      for (const path of ['https://alpha.example/user_uploads/a.txt', '/user_uploads/a.txt', 'user_uploads/a.txt']) {
+        const url = parseZulipAttachmentUrl(path, realm);
+        assert.equal(url.href, 'https://alpha.example/user_uploads/a.txt');
+        assert.equal((await fetchAttachmentBytes(url.href, 'a.txt')).buf.toString(), 'hello');
+        assert.equal((await fetchCapped(url.href, {}, 10, new AbortController().signal)).buf.toString(), 'hello');
+      }
+    }
+    assert.equal(requested.length, 30);
+    for (const path of ['https://u:p@alpha.example/user_uploads/a', '/user_uploads/%2e%2e%2fapi/v1/users/me', '/user_uploads/..%5capi/v1/users/me']) {
+      assert.throws(() => parseZulipAttachmentUrl(path, 'https://alpha.example/api'), /credentials|only serves/);
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} original native errors survive transport and self-ID replacements`, async t => {
+    const failure = new TypeError('private socket diagnostic', { cause: new Error('private native cause') });
+    const stack = failure.stack;
+    const logs: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+    t.mock.method(globalThis, 'fetch', async () => { throw failure; });
+    const transport = httpTransport({ apiUrl: 'https://alpha.example/api/v1', authHeader: '' });
+    for (const inner of [transport, selfIdGate(transport).transport]) {
+      await assert.rejects(inner('GET', '/messages', {}, {}), error => {
+        assert.ok(error instanceof ZulipNoAnswer);
+        const native = error.kind === 'no-self-id' ? (error.cause as Error).cause : error.cause;
+        assert.equal(native, failure);
+        const safe = agentSafeError(error);
+        assert.doesNotMatch(safe.message + safe.stack, /private/);
+        assert.equal(safe.cause, undefined);
+        assert.equal(failure.stack, stack);
+        assert.equal(logs.at(-1)?.[1], error);
+        return true;
+      });
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`${mode} inline body failures retain HTTP 206 and completed refusals do not advise blind retry`, async t => {
+    t.mock.method(console, 'error', () => {});
+    let status = 206;
+    t.mock.method(globalThis, 'fetch', async () => status === 206 ? new Response(new ReadableStream({
+      start(controller) { controller.error(new Error('private broken body')); },
+    }), { status }) : new Response('', { status }));
+    const blocks = await buildAttachmentBlocks([{ path: '/user_uploads/a.txt', name: 'a.txt', mimeType: 'text/plain', isImage: false }], {
+      fetch: (path, max, signal) => fetchCapped(path, {}, max, signal),
+    }, { inlineImages: false, maxImages: 0, inlineTextMaxBytes: 100 }, new AbortController().signal);
+    assert.match(JSON.stringify(blocks), /HTTP 206/);
+    assert.doesNotMatch(JSON.stringify(blocks), /private broken body/);
+    for (const refusalStatus of [403, 404]) {
+      status = refusalStatus;
+      await assert.rejects(fetchAttachmentBytes('https://alpha.example/user_uploads/a', 'a'), error => {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, new RegExp(`refused.*HTTP ${status}`));
+        assert.doesNotMatch(safe.message, /before a complete answer|Retry fetch_attachment/);
+        return true;
+      });
+    }
+  });
+}
+
+test('non-JSON transport failures retain numeric and date Retry-After headers', async t => {
+  t.mock.method(console, 'error', () => {});
+  let header = '';
+  t.mock.method(globalThis, 'fetch', async () => new Response('not JSON', { status: 503, headers: { 'Retry-After': header } }));
+  t.mock.method(Date, 'now', () => Date.parse('2026-11-18T00:00:00Z'));
+  for (const [after, seconds] of [['60', 60], ['0.5', 0.5], ['Wed, 18 Nov 2026 00:02:00 GMT', 120]] as const) {
+    header = after;
+    await assert.rejects(httpTransport({ apiUrl: 'https://alpha.example/api/v1', authHeader: '' })('GET', '/messages', {}, {}), error => {
+      assert.ok(error instanceof ZulipNoAnswer);
+      assert.equal(error.retryAfterSeconds, seconds);
+      assert.match(agentSafeError(error).message, new RegExp(`HTTP 503.*Retry after ${seconds} seconds`));
+      return true;
+    });
+  }
+});
+
+test('rate-limited reads wait before recommending a retry', () => {
+  const safe = agentSafeError(new ZulipNoAnswer('not-json', 'GET', '/messages', false, 'private', 429, 60), false);
+  assert.match(safe.message, /Retry after 60 seconds, then retry the read/);
+  assert.doesNotMatch(safe.message, /Retry the read\./);
+});
+
+test('Retry-After rejects numeric date lookalikes and accepts padded delta seconds', () => {
+  for (const text of ['-1', '+1', '1e3', '1/2']) assert.equal(parseRetryAfter(text), undefined);
+  assert.equal(parseRetryAfter(' 60 '), 60);
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} authorization read failures require correcting access rather than blind retry`, () => {
+    for (const status of [401, 403]) {
+      const safe = agentSafeError(new ZulipNoAnswer('not-json', 'GET', '/private', false, 'secret', status), false);
+      assert.match(safe.message, /The host operator must repair authorization before retrying\./);
+      assert.doesNotMatch(safe.message, /Retry the read/);
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} native downloads retain Retry-After on refusal and body failure`, async t => {
+    t.mock.method(console, 'error', () => {});
+    for (const refused of [true, false]) {
+      t.mock.method(globalThis, 'fetch', async () => refused
+        ? new Response('', { status: 429, headers: { 'Retry-After': '120' } })
+        : new Response(new ReadableStream({ start(controller) { controller.error(new Error('private body error')); } }), { status: 200, headers: { 'Retry-After': '120' } }));
+      for (const download of [
+        () => fetchCapped('https://example.invalid/user_uploads/a', {}, 100, new AbortController().signal),
+        () => fetchAttachmentBytes('https://example.invalid/user_uploads/a', 'a'),
+      ]) await assert.rejects(download(), error => {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, /Retry after 120 seconds/);
+        assert.match(safe.message, new RegExp(`HTTP ${refused ? 429 : 200}`));
+        assert.doesNotMatch(safe.message, /private body error/);
+        return true;
+      });
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  for (const [status, remedy] of [
+    [401, "the host operator must fix authorization; retrying alone won't help"],
+    [403, "the host operator must fix authorization; retrying alone won't help"],
+    [429, 'retry with fetch_attachment'],
+  ] as const) {
+    test(`${mode} inline HTTP ${status} marker gives the matching remedy`, async t => {
+      t.mock.method(console, 'error', () => {});
+      t.mock.method(globalThis, 'fetch', async () => new Response('', { status }));
+      const blocks = await buildAttachmentBlocks([{ path: '/user_uploads/a', name: 'a.txt', mimeType: 'text/plain', isImage: false }], {
+        fetch: (path, max, signal) => fetchCapped('https://example.invalid' + path, {}, max, signal),
+      }, { inlineImages: false, maxImages: 0, inlineTextMaxBytes: 100 }, new AbortController().signal);
+      assert.deepEqual(blocks, [{
+        type: 'text',
+        text: `[attachment: a.txt — could not fetch (refused, HTTP ${status}, /user_uploads/a); ${remedy}]`,
+      }]);
+    });
+  }
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`authorization Retry-After and upload uncertainty give consistent recovery advice in ${mode}`, t => {
+    t.mock.method(console, 'error', () => {});
+    const ids = new MessageIds('alpha', mode);
+    const auth = agentSafeError(new ZulipNoAnswer('not-json', 'GET', '/messages', false, 'private', 401, 30)).message;
+    assert.match(auth, /HTTP 401.*Server Retry-After: 30 seconds\.$/);
+    assert.doesNotMatch(auth, /then retry the read/);
+    const upload = agentSafeError(markTransportError(new Error('private'), { operation: 'Upload' })).message;
+    assert.match(upload, /attachment upload in the original operation/);
+    assert.doesNotMatch(upload, /retrying upload_file/);
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} self-ID and native authorization advice requires operator repair before retry`, t => {
+    t.mock.method(console, 'error', () => {});
+    for (const method of ['GET', 'POST'] as const) {
+      const safe = agentSafeError(new ZulipNoAnswer('no-self-id', method, '/messages', false, 'private', 401));
+      assert.match(safe.message, /host operator must repair authorization/);
+      assert.match(safe.message, /not sent/);
+    }
+  });
+}
+
+test('unreadable write authorization failures require repair, not waiting out Retry-After', async t => {
+  t.mock.method(console, 'error', () => {});
+  const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
+  const { agentSafeError } = await import('../src/agent-errors.ts');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) for (const status of [401, 403]) {
+    const safe = agentSafeError(new ZulipNoAnswer('not-json', 'POST', '/messages', true, 'private', status, 10));
+    assert.match(safe.message, /host operator must repair authorization/);
+    assert.match(safe.message, /Server Retry-After: 10 seconds\./);
+    assert.doesNotMatch(safe.message, / Retry after/);
+  }
 });

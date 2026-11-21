@@ -1,15 +1,18 @@
 - Closed-channel delivery (#16): mentions and DMs on channels the host has
   not opened arrive as `push/event` with the missed-ambient tally in the
   origin; ambient on closed channels is counted (`channel_missed`).
-- Catch-up: persisted per-channel watermarks that advance only on the host's
-  acceptance and never past a message the host was offered but did not
-  accept (a refusal, a batch lost to a transport failure) — such a message
-  is replayed from history once the host answers again, or by the next
-  connection's sweep; a `<missed>` block per channel on reconnect (full
-  backscroll for channels the host had open, mention ±7 otherwise), paged
-  up to `ZULIP_CATCHUP_LIMIT` and hard-capped by
-  `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry is healed from
-  history for open and closed channels alike.
+- Catch-up: persisted per-channel watermarks that advance on the host's
+  acceptance. While tracked, a refused message or lost offer holds the
+  watermark back until replay or acceptance of a covering scan, including
+  rows it declares omitted. Holds are in memory and are lost on restart;
+  past 50,000 held messages in one channel, newer refusals are not tracked.
+  Bounded or failed catch-up may not recover a refusal whose hold was lost,
+  and a later accepted message can move the watermark past it.
+  One or more `<missed>` blocks per channel on reconnect (full backscroll for
+  channels the host had open, addressed messages ±7 otherwise; mentions,
+  replies and DMs are addressed), paged up to `ZULIP_CATCHUP_LIMIT` and
+  hard-capped by `ZULIP_MISSED_BLOCK_MAX_CHARS`; a Zulip event-queue expiry
+  is healed from history for open and closed channels alike.
 - DM conversations are channels (`zulip:dm:<ids>`), discovered from history
   and announced on the fly; `send_dm` by name, email or id (closes #5).
 - History on `channels/open` (`limit`, `beforeMessageId`, `sinceLastSeen`),

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipEventLoop, type ZulipMessageChange } from '../src/platforms/zulip-events.ts';
 import type { PlatformSystemEvent } from '../src/platforms/adapter.ts';
-import { ZulipNoAnswer } from '../src/zulip-api.ts';
+import { ZulipNoAnswer, zulipApi } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
 
 function html502Error(): Error {
@@ -43,7 +43,7 @@ test('an HTML/proxy 502 backs off exponentially', async () => {
 
   const degraded = systemEvents.filter(e => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /non-JSON/);
+  assert.match(degraded[0].text, /received an unreadable response/);
 
   assert.equal(systemEvents.filter(e => e.kind === 'gap').length, 0);
 });
@@ -88,7 +88,7 @@ test('a poll unanswered past its bound fails that poll: the loop backs off, asks
   assert.deepEqual(delays, [2000, 4000, 8000]);
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.match(degraded[0].text, /no answer/i);
+  assert.match(degraded[0].text, /poll timed out/i);
   assert.doesNotMatch(degraded[0].text, /\.\)/, 'no period inside the parentheses');
 });
 
@@ -225,7 +225,7 @@ test('a refused poll, other than an expired queue, is logged and marked degraded
     `Zulip refused events.retrieve: Invalid API key (INVALID_API_KEY) (attempt ${n}); retrying in ${[2000, 4000, 8000][n - 1]}ms`));
   const degraded = systemEvents.filter((e) => e.kind === 'degraded');
   assert.equal(degraded.length, 1);
-  assert.equal((degraded[0].metadata as { reason?: string }).reason, 'events.retrieve was refused: Invalid API key (INVALID_API_KEY)');
+  assert.equal((degraded[0].metadata as { reason?: string }).reason, 'events.retrieve was refused: Invalid API key (INVALID_API_KEY) (HTTP 400); polling retries automatically');
 });
 
 test('well-formed response resets the backoff counter', async () => {
@@ -507,3 +507,140 @@ test('stopping in a message handler drops all subsequent events in its batch', a
   }, undefined, () => { seen.push('reaction'); }, () => { seen.push('change'); });
   assert.deepEqual(seen, ['message']);
 });
+
+test('degraded event text and metadata describe polling without tool diagnostics', async () => {
+  const { MessageIds } = await import('../src/message-ids.ts');
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    let loop: ZulipEventLoop;
+    const { sleep } = makeSleepRecorder(() => loop, 3);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, messageIds: new MessageIds('alpha', mode) });
+    const failure = econnresetError();
+    await loop.start(standInApi({
+      'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+      'GET /events': async () => { throw failure; },
+    }).api, () => {}, e => events.push(e));
+    const result = JSON.stringify(events.filter(e => e.kind === 'degraded'));
+    {
+      assert.match(result, /poll failed before a complete answer; polling retries automatically/);
+      assert.doesNotMatch(result, /ECONNRESET|GET \/events/);
+    }
+  }
+});
+
+for (const mode of ['compat', 'strict'] as const) {
+  test(`non-JSON degraded events retain safe HTTP status in ${mode}`, async () => {
+    const { MessageIds } = await import('../src/message-ids.ts');
+    let loop: ZulipEventLoop;
+    const { sleep } = makeSleepRecorder(() => loop, 3);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, messageIds: new MessageIds('alpha', mode) });
+    const failure = new ZulipNoAnswer('not-json', 'GET', '/events', false,
+      'private upstream response body', 502);
+    await loop.start(standInApi({
+      'POST /register': async () => ({ queue_id: 'q1', last_event_id: -1 }),
+      'GET /events': async () => { throw failure; },
+    }).api, () => {}, e => events.push(e));
+    const degraded = events.filter(e => e.kind === 'degraded');
+    assert.equal(degraded.length, 1);
+    assert.match(degraded[0].text, /HTTP 502/);
+    assert.equal(degraded[0].metadata?.reason, 'the poll received an unreadable response (HTTP 502); polling retries automatically');
+    assert.doesNotMatch(JSON.stringify(degraded), /private upstream response body|GET|\/events/);
+    assert.equal(failure.message, 'private upstream response body');
+  });
+}
+
+test('event polling honors Retry-After even beyond the exponential-backoff cap', async t => {
+  t.mock.method(console, 'error', () => {});
+  for (const seconds of [60, 0.5]) {
+    let loop: ZulipEventLoop;
+    const { delays, sleep } = makeSleepRecorder(() => loop, 1);
+    const events: PlatformSystemEvent[] = [];
+    loop = new ZulipEventLoop({ sleep, degradedThreshold: 1 });
+    const { api } = standInApi({
+      'POST /register': { queue_id: 'q1', last_event_id: -1 },
+      'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, seconds); },
+    });
+    await loop.start(api, () => {}, event => events.push(event));
+    assert.deepEqual(delays, [Math.max(2000, seconds * 1000)]);
+    assert.match(events[0].text, new RegExp(`retry after ${seconds} seconds`));
+    assert.doesNotMatch(events[0].text, /retry the read/i);
+  }
+});
+
+
+test('stop cancels the native Retry-After timer and lets the loop finish', async t => {
+  t.mock.method(console, 'error', () => {});
+  const loop = new ZulipEventLoop({ degradedThreshold: 1 });
+  let degraded!: () => void;
+  const sleeping = new Promise<void>(resolve => { degraded = resolve; });
+  const running = loop.start(standInApi({
+    'POST /register': { queue_id: 'q1', last_event_id: -1 },
+    'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, 2147484); },
+  }).api, () => {}, () => degraded());
+  await sleeping;
+  assert.equal(typeof (loop as any).cancelSleep, 'function');
+  loop.stop();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([running, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('stop did not cancel the native sleep within 1 second')), 1000);
+    })]);
+  } finally {
+    clearTimeout(timer);
+    (loop as any).cancelSleep?.();
+  }
+  assert.equal((loop as any).cancelSleep, undefined);
+});
+
+test('polling awaits bounded Retry-After sleep before another request', async t => {
+  t.mock.method(console, 'error', () => {});
+  let release!: () => void;
+  let sleeping!: () => void;
+  const entered = new Promise<void>(resolve => { sleeping = resolve; });
+  let calls = 0;
+  const loop = new ZulipEventLoop({ sleep: ms => {
+    assert.equal(ms, 2 ** 31 - 1);
+    sleeping();
+    return new Promise<void>(resolve => { release = resolve; });
+  } });
+  const { api } = standInApi({
+    'POST /register': { queue_id: 'q1', last_event_id: -1 },
+    'GET /events': () => { calls++; throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, 3000000); },
+  });
+  const running = loop.start(api, () => {});
+  await entered;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  loop.stop();
+  release();
+  await running;
+});
+
+test('degraded polling authorization errors require operator repair', async t => {
+  t.mock.method(console, 'error', () => {});
+  const events: string[] = [];
+  const loop = new ZulipEventLoop({ degradedThreshold: 1, sleep: async () => loop.stop() });
+  await loop.start(standInApi({
+    'POST /register': { queue_id: 'q', last_event_id: -1 },
+    'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 401, 30); },
+  }).api, () => {}, event => events.push(event.text));
+  assert.match(events[0], /host operator must repair authorization; retries alone cannot fix access/);
+});
+
+for (const status of [401, 403, 429]) {
+  test(`JSON poll refusal preserves HTTP ${status}, repair advice and numeric backoff`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const events: PlatformSystemEvent[] = [];
+    const delays: number[] = [];
+    const loop = new ZulipEventLoop({ degradedThreshold: 1, sleep: async ms => { delays.push(ms); loop.stop(); } });
+    const api = zulipApi(async (_method, path) => path === '/register'
+      ? { status: 200, body: { result: 'success', queue_id: 'q', last_event_id: -1 } }
+      : { status, body: { result: 'error', code: status === 429 ? 'RATE_LIMIT_HIT' : 'UNAUTHORIZED', 'retry-after': 120 } });
+    await loop.start(api, () => {}, event => events.push(event));
+    assert.deepEqual(delays, [120_000]);
+    assert.match(events[0].text, new RegExp(`HTTP ${status}`));
+    assert.match(events[0].text, /polling retries automatically/);
+    if (status !== 429) assert.match(events[0].text, /host operator must repair authorization; retries alone cannot fix access/);
+  });
+}

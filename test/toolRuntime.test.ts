@@ -274,7 +274,7 @@ test('listen does not register anything when Zulip refused the subscription (#20
       'POST /users/me/subscriptions': async () => { throw new Error('nope'); },
     }).api);
     failing.tools.onSubscribed = () => { called++; };
-    assert.match((await failing.tools.handleToolCall('listen', { channels: ['ops'] })).error, /nope/);
+    await assert.rejects(failing.tools.handleToolCall('listen', { channels: ['ops'] }), /nope/);
     assert.equal(called, 0);
     rmSync(failing.dir, { recursive: true, force: true });
   } finally {
@@ -1016,7 +1016,7 @@ test('move_messages says the move was made when Zulip accepted it but the read b
       assert.deepEqual(result, {
         moved: true,
         asked: { topic: 'renamed', scope: 'one' },
-        readBackError: "Zulip's answer gave no stream and topic for message 77.",
+        readBackError: "move_messages: Zulip's answer gave no stream and topic for message 77. Inspect it with fetch_around(message_id=77); do not repeat the move to retry its read-back.",
         note: 'To answer this message where it is now, use send_message with reply_to.',
       }, `an answer with no usable stream claims no place, and has the note: ${JSON.stringify(answer)}`);
     } finally { rmSync(placeless.dir, { recursive: true, force: true }); }
@@ -1052,12 +1052,12 @@ for (const known of [false, true]) {
   });
 }
 
-test('move_messages keeps a stream lookup that got no answer as it is, with no pointer to list_streams, and moves nothing', async () => {
+test('move_messages sanitizes an unanswered stream lookup, with no pointer to list_streams, and moves nothing', async () => {
   const { tools, dir, calls } = moveRuntime({ known: false, lookup: () => { throw new ZulipNoAnswer('timeout', 'GET', '/get_stream_id', false, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.'); } });
   try {
     await assert.rejects(tools.handleToolCall('move_messages', { message_id: 77, stream: 'ops', scope: 'one' }), (err: Error) => {
       assert.ok(err instanceof ZulipNoAnswer, `${err.constructor.name}: ${err.message}`);
-      assert.equal(err.message, 'Zulip gave no answer to GET /get_stream_id within 15000 ms.');
+      assert.equal(err.message, 'move_messages (message_id=77): Zulip transport failure (timeout). Retry the read.');
       return true;
     });
     assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['GET /get_stream_id']);

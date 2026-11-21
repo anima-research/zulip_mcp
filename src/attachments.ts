@@ -1,3 +1,5 @@
+import { agentSafeError, markTransportError, attachmentDownloadFailure, logDiagnostic } from './agent-errors.js';
+import { parseRetryAfter } from './zulip-api.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -143,8 +145,9 @@ export async function fetchCapped(
   maxBytes: number,
   signal: AbortSignal,
 ): Promise<FetchedBytes> {
-  const res = await fetch(url, { headers, redirect: 'follow', signal });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetch(url, { headers, redirect: 'follow', signal }).catch(error => { throw markTransportError(error, { operation: 'Attachment download' }); });
+  const retryAfterSeconds = parseRetryAfter(res.headers.get('retry-after'));
+  if (!res.ok) throw markTransportError(new Error(`HTTP ${res.status}`), { operation: 'Attachment download', status: res.status, completed: true, retryAfterSeconds });
   const mimeType = res.headers.get('content-type')?.split(';')[0].trim() ?? null;
   const declared = Number(res.headers.get('content-length') ?? '');
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -155,7 +158,7 @@ export async function fetchCapped(
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await reader.read().catch(error => { throw markTransportError(error, { operation: 'Attachment download', status: res.status, retryAfterSeconds }); });
     if (done) break;
     total += value.length;
     if (total > maxBytes) {
@@ -262,8 +265,27 @@ export async function buildAttachmentBlocks(
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
     } catch (err) {
-      blocks.push(text(`[attachment: ${ref.name} — could not fetch (${(err as Error).message}); fetch_attachment ${ref.path}]`));
+      blocks.push(text(`[attachment: ${ref.name} — could not fetch ${inlineFailure(err, ref.path)}]`));
     }
   }
   return blocks;
+}
+
+/**
+ * The parenthesized facts and one remedy for an inline marker. A download
+ * failure gives its status and path; anything else keeps its safe message.
+ */
+function inlineFailure(err: unknown, path: string): string {
+  const failure = attachmentDownloadFailure(err);
+  if (!failure) return `(${agentSafeError(err).message}); fetch_attachment ${path}`;
+  logDiagnostic(err);
+  const facts = [failure.refused ? 'refused' : 'incomplete'];
+  if (failure.status !== undefined) facts.push(`HTTP ${failure.status}`);
+  if (failure.timeoutSeconds !== undefined) facts.push(`no data for ${failure.timeoutSeconds} s`);
+  if (failure.retryAfterSeconds !== undefined) facts.push(`Retry-After ${failure.retryAfterSeconds} s`);
+  facts.push(path);
+  const remedy = failure.status === 401 || failure.status === 403
+    ? "the host operator must fix authorization; retrying alone won't help"
+    : failure.status === 404 ? 'check the path before retrying' : 'retry with fetch_attachment';
+  return `(${facts.join(', ')}); ${remedy}`;
 }

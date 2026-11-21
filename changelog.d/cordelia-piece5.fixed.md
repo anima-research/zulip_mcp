@@ -32,9 +32,10 @@
   when the host had accepted nothing on its channel before it, such as one
   the host refused, or one that was waiting or on its way when the
   connection ended. Such a channel had no watermark on disk. It now gets one
-  just below that message, so the next start's catch-up offers it, as it
-  offers any message above the watermark, if Zulip's history still has it
-  there.
+  just below that message. Holds themselves are in memory and lost on
+  restart. The next catch-up can recover the message only if it reaches it
+  in Zulip's history; if catch-up is bounded or fails, the watermark can
+  later pass the unrecovered message.
 - A message that arrived while the host had `zulip.messaging` disabled was
   dropped, unless it was already waiting in the batch. It now waits in its
   channel until the host enables `zulip.messaging` again. An edit of it that
@@ -69,9 +70,9 @@
 - A catch-up block the host refused was lost once the host accepted a later
   message of its channel: the watermark moved past the block. The block's
   first message, and each message its text showed, are now held, so the
-  watermark stays below the block, and the block is offered again when the
-  host next accepts something. Where the channel is open by then, each of
-  those messages is offered again as a message, unless the open's history
+  watermark stays below the block while those in-memory holds remain. A
+  later history read can offer it again. Where the channel is open by then,
+  each of those messages is offered again as a message, unless the open's history
   brought it. The other messages that the block's text left out to fit its
   size aren't.
 - An offer that the host refused, or that was lost, after its stream was
@@ -130,8 +131,9 @@
   of them either, and the log gives the refusal. They stay held, up to the
   50,000 holds a channel keeps, so on an open channel a later read of held
   messages offers them, after messages that arrived after them. If
-  that read is refused too, the next connection's catch-up brings them. A
-  reaction, or a change about another message, that was waiting stays, and
+  that read is refused too, the next connection's catch-up can recover
+  them if it reaches them in history. A reaction, or a change about another
+  message, that was waiting stays, and
   its turn comes after the read. On a closed channel, the given-up messages
   that don't address the agent aren't counted as missed. A later such
   message of that connection moves the count past them, and then nothing

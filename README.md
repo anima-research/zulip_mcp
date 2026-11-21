@@ -33,7 +33,7 @@ Discord and Slack adapters that once lived here moved to those servers.
   as `dm:42`, isn't served.
 - Delivery model: messages on **open** channels arrive as `channels/incoming`;
   **mentions, quote replies and DMs on closed channels** arrive as
-  `push/event` so they always reach the agent; ambient traffic on closed channels is dropped and counted
+  `push/event` when delivery is available (bounded recovery is described below); ambient traffic on closed channels is dropped and counted
   (`channel_missed`). On live delivery, each channel's messages, reactions and
   changes are offered to the host in the order the server received them. An
   edit that doesn't move its message, or a deletion, that arrives while the
@@ -49,10 +49,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   reaction to a message the server hasn't seen, and the reactions after it,
   and the changes and stream messages after it that carry no stream id, wait
   behind it. A direct message doesn't wait. When delivery
-  stops, a message the server already holds is offered by the next
-  connection's catch-up, as any message above the watermark is, if Zulip's
-  history still has it there; one still waiting for the lookup that places
-  it is dropped, and the next catch-up recovers what it can.
+  stops, the next connection's catch-up can recover a held message if it
+  reaches that message in Zulip's history above the watermark. A message
+  still waiting for the lookup that places it is dropped. Recovery covers
+  fetched rows only, within the catch-up ceiling and held-ID cap, not an
+  unfetched interval. Accepted elision notices acknowledge omitted rows; use
+  their recovery pointers to read them explicitly.
 
   A stream quote reply counts as addressed when a message link ending in
   `/near/N` immediately heads a `quote` fence and N resolves to a message
@@ -113,14 +115,18 @@ Discord and Slack adapters that once lived here moved to those servers.
   Locale/forward-heading limits and the bot-author exclusion are detailed
   below.
 
-- Catch-up: a persisted per-channel watermark advances only when the host
-  has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). A channel the host has accepted nothing on gets one just
+- Catch-up: a persisted per-channel watermark tracks host acceptance
+  (itemized `channels/incoming` results, acknowledged `push/event`) and
+  explicitly skipped scans with no selected rows (for example, closed-stream
+  ambient-only history). It is not proof that every passed row was offered.
+  A channel the host has accepted nothing on gets one just
   below its first message that isn't accepted, and while `zulip.messaging`
-  is disabled, as that message comes in. It never advances past a message
-  the host was offered but did not accept — a refusal, a batch lost to a
-  transport failure — which is replayed from history once the host answers
-  again. The exception is a channel that is muted or outside the allowlist
+  is disabled, as that message comes in. While tracked, a refused or
+  transport-lost offer holds the watermark back until replay or acceptance
+  of a later catch-up scan that includes it (including compact notices
+  acknowledging omitted rows). Holds are in memory only and are lost on
+  restart. The 50,000 held-ID cap also leaves some refusals untracked.
+  Another exception is a channel that is muted or outside the allowlist
   when the offer is refused or fails, or at a later read for held messages:
   there such a message is let go, as it may never reach the agent.
   On the next connection one or more `<missed>` blocks per channel
@@ -138,9 +144,12 @@ Discord and Slack adapters that once lived here moved to those servers.
   event-queue expiry is healed the same way — open channels replayed, closed
   channels' addressed messages pushed — not merely reported. A message
   that arrives before its channel's catch-up has run waits for it and
-  follows it, as a message, so a live delivery can never jump the watermark
-  over the offline gap. Past 5,000 waiting messages, the channel with the
-  most gives its waiting messages up to a read from history in their place.
+  follows it, as a message. If catch-up fails or stops at its ceiling,
+  a refused message whose hold was lost may not be recovered. A later
+  accepted live delivery can move the watermark past that message or other
+  unfetched offline rows; those then need an explicit `fetch_history`, or
+  `fetch_around` with a known ID. Past 5,000 waiting messages, the channel
+  with the most gives its waiting messages up to a read from history in their place.
 - RFC-001 tags on every message (`chat:mention`, `chat:reply`, `chat:dm`,
   `chat:ambient`, `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
   policy. Images are inlined on live delivery, downsampled to model-max.
@@ -181,6 +190,8 @@ are likely to touch:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `ZULIP_ID_MODE` | `legacy` | Message-ID format: `legacy`, `compat` (tagged output, bare inputs warn), or `strict` (tagged only) |
+| `ZULIP_REALM_TAG` | — | Required in compat/strict; choose a distinct, stable tag per realm |
 | `ZULIP_SESSION_ID` | bot email (from env or zuliprc) | Keys the persistent state files (monitoring, delivery, filters); set it when two sessions of one bot share a state dir |
 | `ZULIP_STATE_DIR` | `~/.zulip_mcp_state` | Where those files live |
 | `ZULIP_SUBSCRIBE` | — | Streams to subscribe the bot to, once a client has connected and the stream list has been read, or, for a client without MCPL, once its read of the list got no answer |
@@ -188,7 +199,7 @@ are likely to touch:
 | `ZULIP_STREAMS`, `ZULIP_DM_USERS`, `ZULIP_MUTED_STREAMS` | — | Seed for the filters file on first materialization |
 | `ZULIP_SUPPRESSED_REACTIONS_BASELINE` | `DISCORD_SUPPRESSED_REACTIONS_BASELINE` | Host-owned reaction markers withheld from the model; re-read every start, never persisted (connectome-host injects the `DISCORD_` name into every MCPL child) |
 | `ZULIP_CATCHUP_LIMIT` | 3000 | Per-channel ceiling for catch-up and gap recovery (max 10000). For an always-open desk channel a few hundred is plenty |
-| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer |
+| `ZULIP_MISSED_BLOCK_MAX_CHARS` | 40000 | Size cap on one `<missed>` block; the oldest lines are elided with a `fetch_history` pointer, or, when even the header cannot fit, replaced by a notice naming the omitted range and a `fetch_around` anchor |
 | `ZULIP_ATTRIBUTE_DELIVERY` | true | Prefix live, pushed and recovered bodies with `[time id=N] [#stream > topic] Author: `; `false` for a host that renders the structured fields itself (see *What the model reads*) |
 | `ZULIP_BACKSCROLL_DEFAULT`, `ZULIP_BACKSCROLL_CHANNELS` | 500 | History cap on `channels/open`, per stream as `general:50,dev:200` |
 | `ZULIP_INLINE_IMAGES`, `ZULIP_INLINE_IMAGES_MAX`, `ZULIP_ATTACHMENT_INLINE_MAX_BYTES` | true, 4, 5120 | Attachment inlining on live delivery |
@@ -197,6 +208,16 @@ are likely to touch:
 | `AGENT_TIMEZONE`, `AGENT_TIMESTAMP_STYLE` | system, `full` | Agent-visible time on every message line: delivery, `<missed>`, injected history, `fetch_history` |
 | `MCPL_CONTEXT_POSITION` | `beforeUser` | The position the `zulip.context` injection is declared at: `beforeUser` or `afterUser` (see *MCPL host*) |
 | `MCPL_ENABLED` | true | `false` forces plain-MCP mode even for MCPL hosts |
+
+### Realm-tagged message IDs (opt-in)
+
+For multi-realm deployments, `ZULIP_ID_MODE=compat` or `strict` and a distinct
+`ZULIP_REALM_TAG` enable scoped message IDs such as `research:123`. The default
+keeps numeric IDs. Enabled modes require an explicit tag. See
+[the ID contract and host handshake check](docs/realm-ids.md).
+
+In strict realm-ID mode, reply with `{"reply_to":"research:12345","content":"Thanks!"}`
+(using your configured realm tag) rather than a legacy integer reply reference.
 
 ### Plain MCP client (Claude Code, Cursor)
 
@@ -567,7 +588,8 @@ folded onto one line but not escaped, so a topic containing `]: ` reads
 ambiguously to a regex. The backscroll returned on `channels/open` is not
 prefixed: the host hands it to the agent as the `channel_open` tool result,
 JSON that already shows each message's author and topic. The legacy
-`get_channel_history` / `get_unread_messages` formats are unchanged.
+`get_channel_history` / `get_unread_messages` formats are unchanged in legacy
+ID mode; compat and strict tag their message IDs, including raw output.
 
 **Hosts that render provenance themselves.** A prefixed message is stamped
 `attributed: true` with `attributionHeader` (the exact prefix added) in its
@@ -634,6 +656,28 @@ environment). Under connectome-host, point it into the data volume, e.g.
 - **A message's attachments share one bound on live delivery:** 15 s for
   all its fetches together. An attachment not fetched by then gets a note
   with its path for `fetch_attachment`.
+- **Elided catch-up is acknowledged.** When the host accepts a `<missed>`
+  block, the watermark covers everything that block's scan read, including
+  elided lines and the rows a compact omitted-range notice stands for. Only
+  the explicit `fetch_history`/`fetch_around` pointers in the block reach them
+  afterwards. A hold older than the scan can still keep the watermark below
+  it, so the same range may be offered again after a restart. Overlapping
+  catch-up scans can repeat a row rather than drop one.
+- **Uploads and attachments.** Only complete upload responses with status
+  400, 401, 403, 404, 405, 413, 415, 422 or 429 count as refusals; anything
+  else, 5xx and proxy failures included, may have stored the file, and the
+  error says so before a retry duplicates it. Before fetching, `fetch_attachment`
+  and inline attachments check that the resolved URL is on the configured
+  realm's origin and under `/user_uploads/`. Redirects follow native fetch
+  behavior and are not checked again. An inline failure marker gives the
+  path and one remedy, plus the HTTP status when available: for 401/403 the
+  host operator must fix authorization, and retrying alone will not help;
+  for 404 check the path; for other HTTP statuses retry with `fetch_attachment`.
+- **Agent-facing transport errors** keep the HTTP status, timeout, Retry-After and
+  whether a write may have been applied, but not raw request paths, bodies or
+  stacks; the original error goes to stderr. For explicit Zulip refusals,
+  `listen` and `unlisten` show Zulip's message if present, or a generic
+  error if not, without showing the refusal code.
 - **Debugging delivery:** run the server standalone with the env of the recipe
   and watch stderr — hosts do not always capture MCPL child stderr.
 

@@ -40,10 +40,10 @@ interface Served {
   stop(): Promise<void>;
 }
 
-async function serve(): Promise<Served> {
+async function serve(extraEnv: NodeJS.ProcessEnv = {}): Promise<Served> {
   const stateDir = mkdtempSync(join(tmpdir(), 'zulip-contract-e2e-'));
   const child = spawn(process.execPath, [BIN, '--stdio'], {
-    env: { ...process.env, ZULIP_STATE_DIR: stateDir },
+    env: { ...process.env, ZULIP_STATE_DIR: stateDir, ...extraEnv },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
   const exited = new Promise<number | null>((resolve) => child.once('exit', (code) => resolve(code)));
@@ -192,3 +192,35 @@ test('end to end: on a closed channel, after the bot\'s own move_messages rename
     await stop();
   }
 });
+
+for (const mode of ['compat', 'strict']) {
+  test(`${mode} public tool contract: tagged receipt, reaction, edit link and foreign refusal`, async () => {
+    const stream = await newStream(env, 'realm-ids');
+    const { host, stop } = await serve({ ZULIP_ID_MODE: mode, ZULIP_REALM_TAG: 'contract' });
+    const call = async (name: string, args: Record<string, unknown>) =>
+      await host.sendRequest('tools/call', { name, arguments: args }) as { isError?: boolean; content: { text: string }[] };
+    try {
+      const sent = await call('send_message', { type: 'stream', to: stream, topic: 'tagged', content: 'tagged receipt' });
+      assert.notEqual(sent.isError, true);
+      const receipt = JSON.parse(sent.content[0].text);
+      assert.match(receipt.id, /^contract:[0-9]+$/);
+      const id = Number(receipt.id.split(':')[1]);
+      const reaction = await call('add_reaction', { message_id: receipt.id, emoji_name: 'eyes' });
+      assert.notEqual(reaction.isError, true, JSON.stringify(reaction));
+      const edited = await call('edit_message', { message_id: receipt.id, content: `see [[msg:${receipt.id}]]` });
+      assert.notEqual(edited.isError, true, JSON.stringify(edited));
+      const before = await bot.message(id);
+      assert.ok(before.content.includes(`/near/${id}`), before.content);
+      const read = await bot.ok('GET', `messages/${id}`);
+      assert.ok(read.message.reactions.some((r: any) => r.emoji_name === 'eyes'));
+      for (const name of ['add_reaction', 'edit_message']) {
+        const refused = await call(name, { message_id: `foreign:${id}`, emoji_name: 'warning', content: 'must not write' });
+        assert.equal(refused.isError, true);
+        assert.match(refused.content[0].text, /differs.*Nothing was written/);
+      }
+      const after = await bot.ok('GET', `messages/${id}`, { apply_markdown: false });
+      assert.equal(after.message.content, before.content, 'foreign edit never wrote');
+      assert.ok(!after.message.reactions.some((r: any) => r.emoji_name === 'warning'), 'foreign reaction never wrote');
+    } finally { await stop(); }
+  });
+}

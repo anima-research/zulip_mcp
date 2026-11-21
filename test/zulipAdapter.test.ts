@@ -7,6 +7,7 @@ import type { ChannelDescriptor } from '@animalabs/mcpl-core';
 import { inTurn, standInApi } from './zulip-stand-in.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import { dmKey, streamKey } from '../src/channel-key.ts';
+import { MessageIds } from '../src/message-ids.ts';
 import { ZulipNoAnswer } from '../src/zulip-api.ts';
 
 const SELF = 790;
@@ -104,19 +105,22 @@ test('fetchContext injects nothing for a stream outside the allowlist, and only 
   assert.doesNotMatch(injection!.content, /Ann: m4/);
 });
 
-test('fetchContext gives its injection at beforeUser, or at the position the adapter was built with', async () => {
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+test(`fetchContext preserves context position and text in ${mode} mode`, async () => {
   const { client } = fakeClient([raw(3)]);
   const identity = { selfUserId: SELF, sessionId: 's' };
-  const byDefault = new ZulipAdapter(client, identity, { directory: directoryOf() });
+  const byDefault = new ZulipAdapter(client, identity, { directory: directoryOf(), messageIds: new MessageIds('alpha', mode) });
   assert.equal(byDefault.contextPosition, 'beforeUser');
   assert.equal((await byDefault.fetchContext(GENERAL, undefined, 5))!.position, 'beforeUser');
 
-  const after = new ZulipAdapter(client, identity, { directory: directoryOf(), contextPosition: 'afterUser' });
+  const after = new ZulipAdapter(client, identity, { directory: directoryOf(), contextPosition: 'afterUser', messageIds: new MessageIds('alpha', mode) });
   assert.equal(after.contextPosition, 'afterUser');
   const injection = await after.fetchContext(GENERAL, undefined, 5);
   assert.equal(injection!.position, 'afterUser');
   assert.equal(injection!.content, (await byDefault.fetchContext(GENERAL, undefined, 5))!.content, 'the text is the same at either position');
 });
+
+}
 
 test('ensureSubscribed asks Zulip every time — a subscription dropped by unlisten is not remembered as live', async () => {
   const { client, calls } = fakeClient([]);

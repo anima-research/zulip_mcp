@@ -4,9 +4,10 @@
   (an `http` URL on an `https` realm), which would have sent the bot's
   credentials in clear.
 - A message that arrives before its channel's catch-up at a connection's
-  start waits for that catch-up and follows it, in order, so a live
-  delivery cannot advance the watermark over the offline gap, and a later
-  live message cannot overtake it. Past 5,000 waiting messages, the channel
+  start waits for that catch-up attempt and follows it in order. If catch-up
+  fails or hits its ceiling, a later accepted live message can advance the
+  watermark past unfetched rows, including a refusal whose in-memory hold
+  was lost on restart. Past 5,000 waiting messages, the channel
   with the most gives its waiting messages up to a read from history in
   their place. A `channel_open` with backscroll
   answered before the catch-up cannot hide the gap from it.

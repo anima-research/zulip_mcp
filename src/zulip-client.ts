@@ -1,3 +1,4 @@
+import { MessageIds } from './message-ids.js';
 import { readFileSync } from 'node:fs';
 import { parse as parseIni } from 'ini';
 import { httpTransport, isRefusal, LONG_TIMEOUT_MS, refusalText, selfIdGate, zulipApi, type ZulipApi } from './zulip-api.js';
@@ -60,6 +61,9 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     apiUrl = realm.endsWith("/api") ? `${realm}/v1` : `${realm}/api/v1`;
   }
 
+  const messageIds = MessageIds.fromEnv(realm, env); // validate before any request
+  if (messageIds.mode !== 'legacy') console.error(`message IDs: ${messageIds.mode}, tag "${messageIds.tag}"`);
+
   if (!apiKey && password) {
     const exchange = zulipApi(httpTransport({ apiUrl, authHeader: "", timeoutMs: options.timeoutMs }));
     const answer = await exchange.requestAnswer<{ api_key?: unknown }>("POST", "/fetch_api_key", { username: email, password });
@@ -81,6 +85,7 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
   const failure = await gate.read({ timeoutMs: LONG_TIMEOUT_MS });
   if (failure) {
     console.error(`Failed to read the bot's own user id: ${failure.reason}. A later request reads it again, and fails if that read does.`);
+    if (failure.cause !== undefined) console.error('[zulip self-id]', failure.cause);
   }
 
   let maxUploadBytes: number | null = null;

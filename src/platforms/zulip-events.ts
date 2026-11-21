@@ -9,7 +9,7 @@
  */
 
 import type { PlatformSystemEvent, OnSystemEvent } from './adapter.js';
-import { isRefusal, LONG_TIMEOUT_MS, refusalText, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
+import { isRefusal, LONG_TIMEOUT_MS, refusalFacts, refusalText, ZulipNoAnswer, type ZulipApi } from '../zulip-api.js';
 import type { StreamDirectory, ZulipStreamEvent } from '../stream-directory.js';
 
 export interface ZulipEventMessage {
@@ -115,6 +115,7 @@ export interface ZulipRetrieveResponse {
 }
 
 export interface ZulipEventLoopOptions {
+  messageIds?: import("../message-ids.js").MessageIds;
   baseBackoffMs?: number;
   maxBackoffMs?: number;
   degradedThreshold?: number;
@@ -145,16 +146,26 @@ export class ZulipEventLoop {
   private readonly baseBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly degradedThreshold: number;
+  private cancelSleep?: () => void;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly pollTimeoutMs: number;
   private readonly directory: StreamDirectory | null;
 
-  constructor(options: ZulipEventLoopOptions = {}) {
+  constructor(private readonly options: ZulipEventLoopOptions = {}) {
     this.directory = options.directory ?? null;
     this.baseBackoffMs = options.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
     this.maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
     this.degradedThreshold = options.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD;
-    this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    this.sleepFn = options.sleep ?? ((ms) => new Promise(resolve => {
+      const timer = setTimeout(done, ms);
+      const cancel = () => { clearTimeout(timer); done(); };
+      const self = this;
+      function done() {
+        if (self.cancelSleep === cancel) self.cancelSleep = undefined;
+        resolve();
+      }
+      this.cancelSleep = cancel;
+    }));
     this.pollTimeoutMs = options.pollTimeoutMs ?? LONG_TIMEOUT_MS;
   }
 
@@ -178,6 +189,7 @@ export class ZulipEventLoop {
 
   stop(): void {
     this.stopped = true;
+    this.cancelSleep?.();
   }
 
   private async pollLoop(
@@ -226,7 +238,7 @@ export class ZulipEventLoop {
       const gap = this.pendingGap;
       this.pendingGap = null;
       const since = gap.lastMessageId != null
-        ? `after message id ${gap.lastMessageId}` +
+        ? `after message id ${this.options.messageIds?.format(gap.lastMessageId) ?? gap.lastMessageId}` +
           (gap.lastMessageTimestamp != null
             ? ` (${new Date(gap.lastMessageTimestamp * 1000).toISOString()})`
             : '')
@@ -265,14 +277,20 @@ export class ZulipEventLoop {
 
         if (isRefusal(response) || !Array.isArray(response.events)) {
           this.consecutiveFailures++;
-          const delay = this.backoffDelay(this.consecutiveFailures);
+          const facts = isRefusal(response) ? refusalFacts(response) : {};
+          const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures), (facts.retryAfterSeconds ?? 0) * 1000));
           const refused = isRefusal(response) ? refusalText(response) : null;
           console.error(refused === null
             ? `Zulip events.retrieve returned no events array (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`
             : `Zulip refused events.retrieve: ${refused} (attempt ${this.consecutiveFailures}); retrying in ${delay}ms`);
-          this.maybeEmitDegraded(onSystemEvent, refused === null
+          let reason = refused === null
             ? 'events.retrieve returned a malformed response (no events array)'
-            : `events.retrieve was refused: ${refused}`);
+            : `events.retrieve was refused: ${refused}`;
+          if (facts.status !== undefined) reason += ` (HTTP ${facts.status})`;
+          reason += '; polling retries automatically';
+          if ([401, 403].includes(facts.status ?? 0)) reason += '; the host operator must repair authorization; retries alone cannot fix access';
+          if (facts.retryAfterSeconds !== undefined) reason += `; server Retry-After: ${facts.retryAfterSeconds} seconds`;
+          this.maybeEmitDegraded(onSystemEvent, reason);
           await this.sleep(delay);
           continue;
         }
@@ -387,21 +405,28 @@ export class ZulipEventLoop {
       } catch (error: unknown) {
         if (this.stopped) return;
 
-        const errMsg = error instanceof Error ? error.message : String(error);
+        let errMsg = error instanceof ZulipNoAnswer
+          ? error.kind === 'no-self-id' ? `the bot's user ID is not yet available${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
+            : `the poll ${error.kind === 'not-json' ? 'received an unreadable response' : error.kind === 'timeout' ? 'timed out' : 'failed before a complete answer'}${error.status === undefined ? '' : ` (HTTP ${error.status})`}; polling retries automatically`
+          : 'the poll failed; polling retries automatically';
+        if (error instanceof ZulipNoAnswer && [401, 403].includes(error.status ?? 0)) {
+          errMsg += '; the host operator must repair authorization; retries alone cannot fix access';
+        }
 
         this.consecutiveFailures++;
-        const delay = this.backoffDelay(this.consecutiveFailures);
+        const delay = Math.min(2 ** 31 - 1, Math.max(this.backoffDelay(this.consecutiveFailures),
+          error instanceof ZulipNoAnswer ? (error.retryAfterSeconds ?? 0) * 1000 : 0));
         const nonJson = error instanceof ZulipNoAnswer && error.kind === 'not-json';
         if (nonJson) {
           console.error(
-            `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms: ${errMsg}`,
+            `Zulip event poll got a non-JSON response (proxy/HTML error page?) (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, error,
           );
         } else {
           console.error(`Zulip event poll error (attempt ${this.consecutiveFailures}); retrying in ${delay}ms:`, error);
         }
         this.maybeEmitDegraded(
           onSystemEvent,
-          nonJson ? 'upstream is returning non-JSON responses (proxy/HTML error pages)' : errMsg.replace(/\.$/, ''),
+          errMsg + (error instanceof ZulipNoAnswer && error.retryAfterSeconds !== undefined ? `; retry after ${error.retryAfterSeconds} seconds` : ''),
         );
         await this.sleep(delay);
       }
@@ -449,6 +474,7 @@ export class ZulipEventLoop {
   }
 
   private sleep(ms: number): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     return this.sleepFn(ms);
   }
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import { MessageIds } from './message-ids.js';
 import * as net from 'node:net';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
@@ -21,7 +23,7 @@ import { initializeZulipClient, subscribeConfigured } from './zulip-client.js';
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, cleanMarkdown } from './content.js';
 export { formatMessages } from './tool-runtime.js';
 
-const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
+const SERVER_INFO = { name: 'zulip-mcp-server', version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version };
 
 function intEnv(name: string, fallback: number, min = 0): number {
   const raw = process.env[name];
@@ -83,6 +85,7 @@ async function main(): Promise<void> {
   }
 
   const session = await initializeZulipClient();
+  const messageIds = MessageIds.fromEnv(session.realm);
   const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
   const filters = new FiltersPlane(process.env.ZULIP_FILTERS_FILE || join(stateDir, `${session.sessionId}.filters.json`));
   filters.start();
@@ -97,6 +100,7 @@ async function main(): Promise<void> {
   const directory = new StreamDirectory();
   void subscribeConfigured(session.api, directory, process.env.ZULIP_SUBSCRIBE);
   const adapter = new ZulipAdapter(session.api, session, {
+    messageIds,
     directory,
     formatTime,
     uploader,
@@ -107,7 +111,7 @@ async function main(): Promise<void> {
     maxMessageLength,
     contextPosition: contextPositionFromEnv(),
   });
-  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength });
+  const tools = new ZulipToolRuntime(session, stateDir, { uploader, uploadPolicy, formatTime, maxMessageLength, messageIds });
   tools.setReactionPolicy({
     suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
@@ -124,6 +128,7 @@ async function main(): Promise<void> {
     formatTime,
     filters,
     directory,
+    messageIds,
     attachments: {
       source: {
         fetch: (path, maxBytes, signal) => {
