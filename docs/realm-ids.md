@@ -26,14 +26,14 @@ The contract covers message-ID tool inputs (`message_id`, `reply_to`, history
 publish receipts, acknowledgments, and history-open cursors. Active Markdown
 links use `[[msg:research:123]]`; code spans/fences stay literal. In compat/strict,
 an odd-length run of backslashes before any token (numeric, tagged, or malformed)
-keeps it literal; an even-length run leaves it active. Legacy retains upstream
-behavior: backslashes do not escape numeric tokens. Active foreign tags and
+keeps it literal; an even-length run leaves it active. In legacy, backslashes
+do not escape numeric tokens. Active foreign tags and
 malformed IDs are rejected before the tool's API calls or uploads. Message text, user/stream/channel
 IDs, event IDs and checkpoint tokens are not rewritten. Zero/negative sentinel
 values remain numeric, not usable message references. MCPL publish retains its
 as-typed policy: invalid, foreign and strict bare link tokens remain literal;
-tool calls reject them. In compat, a bare link token in a publish is still
-linked and warns once on stderr. Zulip API calls, routing
+tool calls reject them. In compat, a bare link token in a publish is treated
+like a tagged token and warns once on stderr. Zulip API calls, routing
 cursors and persisted state remain numeric. No server-state migration is needed.
 For existing agents, transition through compat until bare IDs in the host
 chronicle and agent context have been replaced or aged out, then switch to strict.

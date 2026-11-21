@@ -34,6 +34,9 @@ import {
   type UploadPolicy,
   type Uploader,
 } from '../src/uploads.ts';
+import { fetchCapped } from '../src/attachments.ts';
+import { MessageIds } from '../src/message-ids.ts';
+import { agentSafeError } from '../src/agent-errors.ts';
 
 function tmp(): string {
   return realpathSync(mkdtempSync(join(tmpdir(), 'zulip-uploads-')));
@@ -434,3 +437,144 @@ test('guessMimeType covers the image types Zulip thumbnails, and nothing it does
   assert.equal(guessMimeType('Makefile'), undefined);
   assert.equal(guessMimeType('a.xyz'), undefined);
 });
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} proxy JSON and malformed successful uploads retain uncertainty without leaking text`, async t => {
+    t.mock.method(console, 'error', () => {});
+    for (const [status, body] of [[502, { msg: 'private proxy text' }], [200, {}], [200, null], [200, { result: 'success' }]] as const) {
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({ ok: status === 200, status, text: async () => JSON.stringify(body), json: async () => body }));
+      await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, /No uploaded path was confirmed.*duplicate/);
+        assert.match(safe.message, new RegExp(`HTTP ${status}`));
+        assert.doesNotMatch(safe.message, /private/);
+        return true;
+      });
+    }
+  });
+}
+
+test('native socket resets retain response status and upload uncertainty', async t => {
+  t.mock.method(console, 'error', () => {});
+  let breakBody: (() => void) | undefined;
+  const server = createServer((req, res) => {
+    if (req.method === 'POST') { req.socket.destroy(); return; }
+    res.writeHead(206, { 'content-type': 'text/plain', 'content-length': '100' });
+    res.write('partial');
+    breakBody = () => res.destroy();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
+  const realm = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const nativeFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (...args: Parameters<typeof fetch>) => {
+    const response = await nativeFetch(...args);
+    assert.equal(response.status, 206, 'the client has received the headers before resetting the body');
+    breakBody!();
+    return response;
+  });
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    await assert.rejects(fetchCapped(`${realm}/user_uploads/a`, {}, 200, new AbortController().signal), error => {
+      assert.match(agentSafeError(error).message, /HTTP 206/);
+      assert.ok((error as Error).cause, 'native fetch attaches a socket cause');
+      return true;
+    });
+    const uploader = createZulipUploader({ realm, authHeader: 'test' });
+    await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+      assert.match(agentSafeError(error).message, /No uploaded path was confirmed.*duplicate/);
+      assert.ok((error as Error).cause);
+      return true;
+    });
+  }
+});
+
+test('completed upload refusals differ from truncated response bodies in every mode', async t => {
+  t.mock.method(console, 'error', () => {});
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const ids = new MessageIds('alpha', mode);
+    for (const [status, text] of [[500, '{"result":"error","msg":"private server detail"}'], [413, '<html>private proxy detail</html>'], [503, '<html>unavailable</html>']] as const) {
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => new Response(text, { status, headers: { 'Retry-After': '120' } }));
+      await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, status === 413 ? /Upload was refused by the server/ : /No uploaded path was confirmed.*duplicate/);
+        assert.match(safe.message, new RegExp(`HTTP ${status}.*Retry after 120 seconds`));
+        assert.doesNotMatch(safe.message, /before a complete|private|<html>/);
+        return true;
+      });
+    }
+    for (const status of [413, 503]) {
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({
+        ok: false, status, headers: { get: () => '120' }, text: async () => { throw new TypeError('socket lost'); }, json: async () => ({}),
+      }));
+      await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+        assert.match(agentSafeError(error).message, new RegExp(`before a complete.*No uploaded path was confirmed.*HTTP ${status}.*Retry after 120 seconds`));
+        return true;
+      });
+    }
+  }
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`only proven upload rejections omit duplicate uncertainty in ${mode}`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const ids = new MessageIds('alpha', mode);
+    for (const status of [400, 401, 403, 404, 405, 413, 415, 422, 429, 408, 409, 500, 502, 503, 504]) {
+      for (const text of ['<html>private proxy text</html>', '{"result":"error","msg":"private server text"}']) {
+        const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' },
+          async () => new Response(text, { status, headers: { 'Retry-After': '120' } }));
+        await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+          const safe = agentSafeError(error);
+          if ([408, 409, 500, 502, 503, 504].includes(status)) {
+            assert.match(safe.message, /No uploaded path was confirmed.*duplicate/);
+            assert.match(safe.message, new RegExp(`HTTP ${status}.*Retry after 120 seconds`));
+            assert.doesNotMatch(safe.message, /refused|before a complete|private/);
+          } else {
+            assert.doesNotMatch(safe.message, /duplicate/);
+            assert.match(safe.message, [401, 403].includes(status) ? /Server Retry-After: 120 seconds; access must be corrected first/ : /Retry after 120 seconds/);
+            if (text.startsWith('<')) {
+              assert.match(safe.message, new RegExp(`HTTP ${status}`));
+              assert.match(safe.message, /Upload was refused/);
+              if (status === 413) assert.match(safe.message, /Reduce the attachment size or omit it/);
+            }
+          }
+          return true;
+        });
+      }
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} ordinary JSON upload refusals preserve Retry-After`, async () => {
+    const uploader = createZulipUploader({ realm: 'https://example.invalid', authHeader: 'test' }, async () => new Response(JSON.stringify({ result: 'error', msg: 'Rate limited' }), { status: 429, headers: { 'Retry-After': '60' } }));
+    await assert.rejects(uploader.upload({ name: 'a', data: Buffer.from('a') }), error => {
+      assert.match(agentSafeError(error, false).message, /Rate limited.*Retry after 60 seconds/);
+      return true;
+    });
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} native upload failures retain the failing name and JSON refusals retain their code`, async t => {
+    t.mock.method(console, 'error', () => {});
+    for (const [status, body] of [[200, { result: 'success' }], [400, { result: 'error', code: 'BAD_REQUEST' }], [403, { result: 'error', code: 'DENIED' }]] as const) {
+      const uploader = createZulipUploader({ realm: 'https://alpha.example', authHeader: 'test' }, async () => ({ ok: status === 200, status, headers: new Headers({ 'Retry-After': '12' }), text: async () => JSON.stringify(body), json: async () => body }));
+      await assert.rejects(uploader.upload({ name: 'second.txt', data: Buffer.from('a') }), error => {
+        const safe = agentSafeError(error);
+        assert.match(safe.message, /second.txt/);
+        if (status === 400) assert.match(safe.message, /BAD_REQUEST/);
+        if (status === 403) {
+          assert.match(safe.message, /host operator must repair authorization/);
+          assert.match(safe.message, /access must be corrected first/);
+          assert.doesNotMatch(safe.message, /\. Retry after/);
+        }
+        return true;
+      });
+    }
+  });
+}

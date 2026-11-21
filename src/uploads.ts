@@ -4,7 +4,7 @@
  */
 
 import { parseRetryAfter } from './zulip-api.js';
-import { LEGACY_IDS, messageIdError, markTransportError } from './message-ids.js';
+import { agentSafeError, markTransportError } from './agent-errors.js';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, type FileHandle, open, readlink, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -504,7 +504,7 @@ export async function prepareBlocks(blocks: ContentBlock[], policy: UploadPolicy
 
 /** Retain confirmed receipts independently of the failing attempt's uncertainty. */
 function partialUploadError(error: unknown, confirmed: UploadedFile[], operation: 'send' | 'publish'): unknown {
-  const safe = messageIdError(error, LEGACY_IDS);
+  const safe = agentSafeError(error);
   if (confirmed.length === 0) {
     safe.message += ' No message was sent: attachment upload failed before message posting began.';
     return safe;

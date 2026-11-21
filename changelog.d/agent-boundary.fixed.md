@@ -31,8 +31,9 @@
   with `fetch_attachment`. Invalid input paths and an invalid configured
   realm are reported separately.
 - Catch-up: when even a `<missed>` block's header cannot fit its size cap,
-  a notice names the omitted count and ID range with a `fetch_around` anchor,
-  and `fetch_around` now returns a usable `channelId` for DMs. Channel
+  a notice names the omitted count and ID range with a `fetch_around` anchor.
+  For a DM anchor, `fetch_around` now returns a usable `channelId`, and its
+  `channel` is the `zulip:dm:…` ID instead of null. Channel
   arguments in catch-up pointers are JSON-escaped, so quotes and backslashes
   in stream names work. Catch-up rechecks mute and allowlist rules after
   history returns, and overlapping catch-up scans may repeat a row rather
@@ -44,5 +45,7 @@
   offered message once; other entries are ignored without logging the
   payload, and the stderr line says whether delivery is unconfirmed or the
   event cannot be replayed from history.
+- The `channel_missed` tool description and the note on a first DM now say
+  plainly that mentions, replies and DMs are delivered separately.
 - Invalid acknowledgement IDs are described safely, and the reported server
   version comes from package.json.

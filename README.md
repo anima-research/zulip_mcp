@@ -673,7 +673,7 @@ environment). Under connectome-host, point it into the data volume, e.g.
   path and one remedy, plus the HTTP status when available: for 401/403 the
   host operator must fix authorization, and retrying alone will not help;
   for 404 check the path; for other HTTP statuses retry with `fetch_attachment`.
-- **Agent-facing errors** keep the HTTP status, timeout, Retry-After and
+- **Agent-facing transport errors** keep the HTTP status, timeout, Retry-After and
   whether a write may have been applied, but not raw request paths, bodies or
   stacks; the original error goes to stderr. For explicit Zulip refusals,
   `listen` and `unlisten` show Zulip's message if present, or a generic

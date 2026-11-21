@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ZulipEventLoop, type ZulipMessageChange } from '../src/platforms/zulip-events.ts';
 import type { PlatformSystemEvent } from '../src/platforms/adapter.ts';
-import { ZulipNoAnswer } from '../src/zulip-api.ts';
+import { ZulipNoAnswer, zulipApi } from '../src/zulip-api.ts';
 import { standInApi } from './zulip-stand-in.ts';
 
 function html502Error(): Error {
@@ -592,3 +592,55 @@ test('stop cancels the native Retry-After timer and lets the loop finish', async
   }
   assert.equal((loop as any).cancelSleep, undefined);
 });
+
+test('polling awaits bounded Retry-After sleep before another request', async t => {
+  t.mock.method(console, 'error', () => {});
+  let release!: () => void;
+  let sleeping!: () => void;
+  const entered = new Promise<void>(resolve => { sleeping = resolve; });
+  let calls = 0;
+  const loop = new ZulipEventLoop({ sleep: ms => {
+    assert.equal(ms, 2 ** 31 - 1);
+    sleeping();
+    return new Promise<void>(resolve => { release = resolve; });
+  } });
+  const { api } = standInApi({
+    'POST /register': { queue_id: 'q1', last_event_id: -1 },
+    'GET /events': () => { calls++; throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 429, 3000000); },
+  });
+  const running = loop.start(api, () => {});
+  await entered;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  loop.stop();
+  release();
+  await running;
+});
+
+test('degraded polling authorization errors require operator repair', async t => {
+  t.mock.method(console, 'error', () => {});
+  const events: string[] = [];
+  const loop = new ZulipEventLoop({ degradedThreshold: 1, sleep: async () => loop.stop() });
+  await loop.start(standInApi({
+    'POST /register': { queue_id: 'q', last_event_id: -1 },
+    'GET /events': () => { throw new ZulipNoAnswer('not-json', 'GET', '/events', false, 'private', 401, 30); },
+  }).api, () => {}, event => events.push(event.text));
+  assert.match(events[0], /host operator must repair authorization; retries alone cannot fix access/);
+});
+
+for (const status of [401, 403, 429]) {
+  test(`JSON poll refusal preserves HTTP ${status}, repair advice and numeric backoff`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const events: PlatformSystemEvent[] = [];
+    const delays: number[] = [];
+    const loop = new ZulipEventLoop({ degradedThreshold: 1, sleep: async ms => { delays.push(ms); loop.stop(); } });
+    const api = zulipApi(async (_method, path) => path === '/register'
+      ? { status: 200, body: { result: 'success', queue_id: 'q', last_event_id: -1 } }
+      : { status, body: { result: 'error', code: status === 429 ? 'RATE_LIMIT_HIT' : 'UNAUTHORIZED', 'retry-after': 120 } });
+    await loop.start(api, () => {}, event => events.push(event));
+    assert.deepEqual(delays, [120_000]);
+    assert.match(events[0].text, new RegExp(`HTTP ${status}`));
+    assert.match(events[0].text, /polling retries automatically/);
+    if (status !== 429) assert.match(events[0].text, /host operator must repair authorization; retries alone cannot fix access/);
+  });
+}

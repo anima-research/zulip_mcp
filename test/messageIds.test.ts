@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MessageIds, messageIdError, idToolDefinitions, messageIdServerInfo } from '../src/message-ids.ts';
+import { MessageIds, idToolDefinitions, messageIdServerInfo } from '../src/message-ids.ts';
+import { agentSafeError, hasLoggedDiagnostic, logDiagnostic } from '../src/agent-errors.ts';
 import { ZulipToolRuntime, formatHistoryLines, formatMessages } from '../src/tool-runtime.ts';
 import { normalizeMessage } from '../src/history.ts';
 import { toolDefinitions } from '../src/tools.ts';
@@ -11,6 +12,8 @@ import { standInApi } from './zulip-stand-in.ts';
 import { validateMessageLinks, linkMessages } from '../src/message-links.ts';
 import { namePosted, prepareOutgoing } from '../src/outgoing.ts';
 import { initializeZulipClient } from '../src/zulip-client.ts';
+import { ZulipNoAnswer } from '../src/zulip-api.ts';
+import { ZulipMcplServer } from '../src/server.ts';
 
 const message = { id: 7, type: 'stream', stream_id: 12, display_recipient: 'general', subject: 'topic',
   content: 'hello', sender_id: 9, sender_full_name: 'Test User', sender_email: 'user@example.invalid', timestamp: 1700000000 };
@@ -464,9 +467,9 @@ test('partial sends never contaminate a reused transport error in enabled modes'
     const first = namePosted(original, [7], ids);
     assert.notEqual(first, original);
     assert.ok(first instanceof ZulipNoAnswer);
-    assert.match(messageIdError(first, ids).message, /Posted as message alpha:7/);
+    assert.match(agentSafeError(first).message, /Posted as message alpha:7/);
     assert.equal(original.message, text);
-    const second = messageIdError(namePosted(original, [], ids), ids);
+    const second = agentSafeError(namePosted(original, [], ids));
     assert.doesNotMatch(second.message, /Posted|alpha:7|raw diagnostic/);
     assert.ok(second instanceof ZulipNoAnswer);
     assert.equal(second.path, original.path);
@@ -565,7 +568,7 @@ test('caught tool transport errors are safe data in every mode', async t => {
 
 test('safe diagnostics retain facts, log originals once, and never mutate legacy errors', async t => {
   const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
-  const { markTransportError } = await import('../src/message-ids.ts');
+  const { markTransportError } = await import('../src/agent-errors.ts');
   const logs: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => logs.push(args));
   for (const mode of ['compat', 'strict'] as const) {
@@ -583,14 +586,14 @@ test('safe diagnostics retain facts, log originals once, and never mutate legacy
     for (const [error, expected] of cases) {
       const original = error.message;
       const before = logs.length;
-      const safe = messageIdError(error, ids);
+      const safe = agentSafeError(error);
       assert.equal(safe.message, expected);
-      assert.equal(messageIdError(safe, ids).message, expected);
-      assert.equal(messageIdError(error, ids).message, expected);
+      assert.equal(agentSafeError(safe).message, expected);
+      assert.equal(agentSafeError(error).message, expected);
       assert.equal(logs.length, before + 1);
       assert.equal(logs.at(-1)?.[1], error);
       assert.equal(error.message, original);
-      assert.equal(messageIdError(error, new MessageIds('alpha', 'legacy')).message, expected);
+      assert.equal(agentSafeError(error).message, expected);
     }
   }
 });
@@ -600,7 +603,7 @@ test('local TypeErrors are not transport failures and malformed attachment URLs 
   t.mock.method(globalThis, 'fetch', async () => { downloads++; throw new Error('unexpected download'); });
   for (const mode of ['compat', 'strict'] as const) {
     const ids = new MessageIds('alpha', mode);
-    assert.equal(messageIdError(new TypeError('local processing failed'), ids).message, 'local processing failed');
+    assert.equal(agentSafeError(new TypeError('local processing failed')).message, 'local processing failed');
     const { api, calls } = standInApi({});
     const dir = mkdtempSync(join(tmpdir(), 'bad-url-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -620,7 +623,7 @@ test('self-ID transport failures retain timeout and HTTP facts', async () => {
   const { selfIdGate, ZulipNoAnswer } = await import('../src/zulip-api.ts');
   const gate = selfIdGate(async () => { throw new ZulipNoAnswer('timeout', 'GET', '/users/me', false, 'private', 504, 3, 15); });
   await assert.rejects(gate.transport('POST', '/messages', {}, undefined), (error: Error) => {
-    const safe = messageIdError(error, new MessageIds('alpha', 'strict'));
+    const safe = agentSafeError(error);
     assert.match(safe.message, /Timeout: 15 seconds/);
     assert.match(safe.message, /HTTP 504/);
     assert.match(safe.message, /Retry after 3 seconds/);
@@ -706,3 +709,89 @@ test('multipart send_message and send_dm receipt ids arrays are projected in eve
     assert.deepEqual(receipt.ids, mode === 'legacy' ? [7, 8] : ['alpha:7', 'alpha:8']);
   }
 });
+
+test('compat warnings preserve primitive, array and null API results', async t => {
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const dir = mkdtempSync(join(tmpdir(), 'r13-warn-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const response of ['text', [1, 2], null]) {
+    const { api } = standInApi({ 'PATCH /messages/7': response });
+    const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'r13' }, dir,
+      { messageIds: new MessageIds('alpha', 'compat') });
+    assert.deepEqual(await tools.handleToolCall('edit_message', { message_id: 7, content: 'hello' }), response);
+  }
+  assert.equal(logs.filter(args => String(args[0]).includes('Warning: bare message_id')).length, 3);
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`publish error boundary logs the original once in ${mode}`, t => {
+    const logs: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+    const ids = new MessageIds('alpha', mode);
+    const raw = new ZulipNoAnswer('network', 'POST', '/messages', true, 'private socket detail');
+    const named = namePosted(raw, [7], ids);
+    let message = '';
+    (ZulipMcplServer.prototype as any).answerError.call({ messageIds: ids },
+      { sendError: (_id: unknown, _code: number, text: string) => { message = text; } },
+      { id: 1, method: 'channels/publish' }, named);
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0][1], raw);
+    assert.match(message, /Posted as message.*7.*twice/);
+    assert.doesNotMatch(message, /private/);
+    (ZulipMcplServer.prototype as any).answerError.call({ messageIds: ids },
+      { sendError: () => {} }, { id: 2, method: 'channels/publish' }, new Error('local failure'));
+    assert.equal(logs.length, 2, 'unlogged failures still get contextual diagnostics');
+  });
+}
+
+for (const mode of ['compat', 'strict'] as const) {
+  test(`non-boolean duplicate still invalidates normalized acceptance in ${mode}`, async t => {
+    const logs: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+    const context = {
+      messageIds: new MessageIds('alpha', mode),
+      conn: { sendRequest: async () => ({ results: [
+        { messageId: 'alpha:7', accepted: true },
+        { messageId: 'alpha:007', accepted: 'false' },
+        { messageId: 'secret-token-123', accepted: true },
+      ] }) },
+    };
+    const result = await (ZulipMcplServer.prototype as any).sendIncomingToHost.call(context, [{ messageId: '7' }]);
+    assert.deepEqual(result.results, []);
+    assert.doesNotMatch(JSON.stringify(logs), /secret-token-123/);
+  });
+}
+
+test('contextual delivery diagnostics retain the original error once and track ownership', t => {
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const native = new Error('private socket cause');
+  const failure = new ZulipNoAnswer('network', 'GET', '/messages', false, 'outer', undefined, undefined, undefined, native);
+  logDiagnostic(failure, 'catch-up history failed:');
+  assert.equal(logs[0][1], failure);
+  assert.equal(failure.cause, native);
+  assert.ok(failure.stack);
+  assert.equal(hasLoggedDiagnostic(failure), true);
+  agentSafeError(failure);
+  logDiagnostic(failure, 'outer boundary:');
+  assert.equal(logs.length, 1);
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`${mode} incoming results reject malformed acceptance and normalized duplicates independently`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const ids = new MessageIds('alpha', mode);
+    const format = (n: number) => String(ids.format(n));
+    const server = Object.assign(Object.create(ZulipMcplServer.prototype), {
+      messageIds: ids, conn: { sendRequest: async () => ({ results: [
+        { messageId: format(21), accepted: 'false' },
+        { messageId: format(22), accepted: true },
+        { messageId: format(22), accepted: false },
+        { messageId: format(23), accepted: true },
+      ] }) },
+    });
+    const result = await server.sendIncomingToHost([21, 22, 23].map(messageId => ({ messageId: String(messageId) })));
+    assert.deepEqual(result.results, [{ messageId: '23', accepted: true }]);
+  });
+}

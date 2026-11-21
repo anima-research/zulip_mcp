@@ -46,7 +46,8 @@ import type { ChangeEntry, IncomingEntry, MessageChangeEvent, PlatformAdapter, P
 import { messageLineHead } from './message-line.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
-import { logDiagnostic, hasLoggedDiagnostic, describe, messageIdError, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { describe, LEGACY_IDS, idToolDefinitions, messageIdServerInfo, type MessageIds } from './message-ids.js';
+import { logDiagnostic, hasLoggedDiagnostic, agentSafeError } from './agent-errors.js';
 import { toolDefinitions } from './tools.js';
 import { withToolClasses } from './tool-classes.js';
 import { toToolCallResult, type FollowSeen, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
@@ -235,7 +236,7 @@ export class ZulipMcplServer {
       deliverable: (message) => this.mayDeliver(message),
       onWithheld: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onWithheld(ctx.w, key, messages)),
       onGivenUp: (key, messages) => this.lanes?.lane(key).answer((ctx) => this.onGivenUp(ctx.w, key, messages)),
-    }, this.messageIds);
+    });
     this.channelManager = channels;
     const writer: DeliveryWriter = { delivery, channels };
     const moments: Moments<DeliveryWriter> = {
@@ -572,7 +573,7 @@ export class ZulipMcplServer {
           try {
             conn.sendResponse(req.id, await this.tools.readResource(uri));
           } catch (error) {
-            const message = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
+            const message = error instanceof Error ? agentSafeError(error).message : String(error);
             throw new McplRpcError(-32602, `Failed to read resource: ${message}`);
           }
           break;
@@ -662,8 +663,8 @@ export class ZulipMcplServer {
             const context = error instanceof Error && error.message.startsWith(parserPrefix)
               ? 'channels/acknowledge' : `channels/acknowledge (messageId=${describe(ack.messageId)})`;
             conn.sendResponse(req.id, { acknowledged: false, reason: this.messageIds.mode === 'legacy' && !(error instanceof ZulipNoAnswer)
-              ? messageIdError(error, this.messageIds).message
-              : `${context}: ${messageIdError(error, this.messageIds).message}` });
+              ? agentSafeError(error).message
+              : `${context}: ${agentSafeError(error).message}` });
           }
           break;
         }
@@ -694,7 +695,7 @@ export class ZulipMcplServer {
       conn.sendError(req.id, err.code, err.message, err.data);
       return;
     }
-    const e = messageIdError(err, this.messageIds, false);
+    const e = agentSafeError(err, false);
     if (!hasLoggedDiagnostic(err)) console.error(`[zulip-mcp] handleRequest error: method=${req.method}`, err);
     conn.sendError(req.id, -32603, e.message);
   }
@@ -780,7 +781,7 @@ export class ZulipMcplServer {
       } catch (err) {
         throw new McplRpcError(
           ERR_CHANNEL_OPEN_FAILED,
-          `Cannot open ${descriptor.id}: ${messageIdError(err, this.messageIds).message}`,
+          `Cannot open ${descriptor.id}: ${agentSafeError(err).message}`,
           { channelId: descriptor.id },
         );
       }
@@ -1036,7 +1037,7 @@ export class ZulipMcplServer {
     if (refs.length > 0 && this.options.attachments && meta.recovered !== true && (addressed || this.channelManager.isKeyOpen(key))) {
       const conn = this.conn;
       const { source, inline, deadline = () => AbortSignal.timeout(ATTACHMENT_DEADLINE_MS) } = this.options.attachments;
-      const blocks = await buildAttachmentBlocks(refs, source, inline, deadline(), this.messageIds);
+      const blocks = await buildAttachmentBlocks(refs, source, inline, deadline());
       if (conn === null || conn.isClosed || this.conn !== conn) return;
       if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
@@ -1050,7 +1051,7 @@ export class ZulipMcplServer {
       const authorId = message.author.id;
       const note = `<system>Direct message from ${message.author.name} (user id ${authorId}). ` +
         `To reply, use send_dm(["${authorId}"]) or publish to channel ${this.ids.channelIdOf(key)}. ` +
-        `DMs use live push and bounded recovery; there is nothing to subscribe to.</system>`;
+        `DMs are delivered to you directly; there is nothing to subscribe to.</system>`;
       message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
     }
 
@@ -1981,7 +1982,7 @@ export class ZulipMcplServer {
       }
       return result;
     } catch (error) {
-      const message = error instanceof Error ? messageIdError(error, this.messageIds).message : String(error);
+      const message = error instanceof Error ? agentSafeError(error).message : String(error);
       return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
     }
   }
@@ -2029,7 +2030,7 @@ export class ZulipMcplServer {
       void this.reconcileHostIds();
       return result;
     } catch (error) {
-      const reason = error instanceof Error ? messageIdError(error, this.messageIds, false).message : String(error);
+      const reason = error instanceof Error ? agentSafeError(error, false).message : String(error);
       console.error(`[zulip-mcp] registering ${streams.join(', ')} after listen failed:`, error);
       return { ...empty, reason };
     }

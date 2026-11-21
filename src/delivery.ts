@@ -565,7 +565,7 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     const anchor = ids.format(msgs[msgs.length - 1].id);
     elided = msgs.length;
     block = `<missed reason="${opts.reason}" elided="${elided}"${opts.moreBeyond ? ' truncated="true"' : ''}>\n` +
-      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) for budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); page with fetch_history(channel=channelId).` +
+      `[${msgs.length} messages omitted (ids ${ids.format(msgs[0].id)}–${anchor}) for budget; fetch_around(message_id=${JSON.stringify(ids.format(msgs[0].id))}) returns channelId (including for DMs); continue with fetch_history(channel=channelId, after=${JSON.stringify(ids.format(msgs[0].id))}).` +
       `${opts.moreBeyond ? ` Newer messages also exist; fetch_history(channel=channelId, after=${JSON.stringify(newestScanned === undefined ? newestScanned : ids.format(newestScanned))}) continues.` : ''}]\n</missed>`;
   }
   return { text: block, elided };

@@ -9,10 +9,12 @@ import { ZulipNoAnswer, ZulipRefused } from '../src/zulip-api.ts';
 import { dmKey, streamKey } from '../src/channel-key.ts';
 import { StreamDirectory } from '../src/stream-directory.ts';
 import type { ZulipSession } from '../src/zulip-client.ts';
-import type { UploadPolicy } from '../src/uploads.ts';
+import { uploadBlocks, type UploadPolicy } from '../src/uploads.ts';
 import { standInApi, type StandInCall } from './zulip-stand-in.ts';
 
 import { MessageIds, LEGACY_IDS } from '../src/message-ids.ts';
+import { markTransportError } from '../src/agent-errors.ts';
+import { sendMessage, SendRefused } from '../src/outgoing.ts';
 
 type Sent = { messageId: string; channelId: string; content: string };
 type Answer = (n: number) => unknown;
@@ -313,3 +315,98 @@ test('realm MCPL publish keeps invalid references as typed', async () => {
     assert.equal(calls[0].params.content, content);
   }
 });
+
+function state(t: any) {
+  const dir = mkdtempSync(join(tmpdir(), 'outgoing-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return { dir };
+}
+
+test('a failed send names earlier confirmed uploads without implying none of the batch succeeded', async t => {
+  const { markTransportError } = await import('../src/agent-errors.ts');
+  t.mock.method(console, 'error', () => {});
+  const dir = mkdtempSync(join(tmpdir(), 'batch-upload-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const mode of ['legacy', 'compat', 'strict'] as const) {
+    const { api, calls } = standInApi({});
+    let count = 0;
+    const tools = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'batch' }, dir, {
+      messageIds: new MessageIds('alpha', mode),
+      uploader: { upload: async () => {
+        if (++count === 2) throw markTransportError(new TypeError('private socket text'), { operation: 'Upload' });
+        return { name: 'first', path: '/user_uploads/1/confirmed', url: 'https://alpha.example/user_uploads/1/confirmed' };
+      } },
+    });
+    await assert.rejects(tools.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'files',
+      attachments: [{ name: 'first', data: 'YQ==' }, { name: 'second', data: 'Yg==' }],
+    }), error => {
+      assert.match((error as Error).message, /No uploaded path was confirmed for this attempt/);
+      assert.match((error as Error).message, /Earlier attachment uploads confirmed:.*\/user_uploads\/1\/confirmed/);
+      assert.match((error as Error).message, /No message was sent.*Retrying the original send uploads those attachments again/);
+      assert.doesNotMatch((error as Error).message, /private socket/);
+      return true;
+    });
+    assert.equal(count, 2);
+    assert.equal(calls.length, 0, 'no message was posted');
+  }
+});
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} failed first upload says message posting was not reached`, async t => {
+    t.mock.method(console, 'error', () => {});
+    await assert.rejects(uploadBlocks({ upload: async () => { throw markTransportError(new Error('secret'), { operation: 'Upload' }); } }, [{ type: 'image', mimeType: 'image/png', data: 'YQ==' }], {
+      roots: new Map(), maxBytes: 100, maxTotalBytes: 100, maxCount: 1,
+    }), /No message was sent: attachment upload failed before message posting began/);
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} post refusal and uncertainty retain every confirmed upload path`, async t => {
+    t.mock.method(console, 'error', () => {});
+    for (const refused of [true, false]) {
+      const { api } = standInApi({ 'POST /messages': () => {
+        if (refused) return { result: 'error', msg: 'No permission' };
+        throw new ZulipNoAnswer('timeout', 'POST', '/messages', true, 'private');
+      } });
+      const files = ['a', 'b'].map(name => ({ name, path: `/user_uploads/${name}`, url: `https://example.invalid/user_uploads/${name}` }));
+      await assert.rejects(sendMessage(api, { type: 'stream', to: 'general', topic: 't' }, 'hello', {
+        messageIds: ids, limit: 10000, unlinkable: 'refuse', upload: async () => files,
+      }), error => {
+        const text = error instanceof SendRefused ? error.answer.msg : (error as Error).message;
+        assert.match(text, /Attachment uploads confirmed:.*\/user_uploads\/a.*\/user_uploads\/b/);
+        assert.match(text, /reuse the confirmed paths after checking the message-post outcome/);
+        if (!refused) assert.match(text, /may have been applied/);
+        assert.doesNotMatch(text, /No message was sent|private/);
+        return true;
+      });
+    }
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  test(`post refusal without msg retains its code alongside upload receipts in ${mode}`, async () => {
+    const { api } = standInApi({ 'POST /messages': { result: 'error', code: 'BAD_REQUEST' } });
+    await assert.rejects(sendMessage(api, { type: 'stream', to: 7, topic: 'test' }, 'hello', {
+      messageIds: new MessageIds('alpha', mode),
+      upload: async () => [{ name: 'a.txt', path: '/user_uploads/a.txt', url: 'https://alpha.example/user_uploads/a.txt' }],
+    }), (error: Error) => {
+      assert.ok(error instanceof SendRefused);
+      assert.match(error.answer.msg, /^BAD_REQUEST Attachment uploads confirmed:/);
+      assert.doesNotMatch(error.answer.msg, /undefined/);
+      return true;
+    });
+  });
+}
+
+for (const mode of ['legacy', 'compat', 'strict'] as const) {
+  const ids = new MessageIds('alpha', mode);
+  test(`${mode} text-only sends keep refusal-code fallback`, async t => {
+    t.mock.method(console, 'error', () => {});
+    const { dir } = state(t);
+    const { api } = standInApi({ 'POST /messages': { result: 'error', code: 'SOME_REASON' } });
+    const runtime = new ZulipToolRuntime({ api, selfUserId: 1, realm: 'https://alpha.example', authHeader: '', sessionId: 'test' }, dir, { messageIds: ids });
+    await assert.rejects(runtime.handleToolCall('send_message', { type: 'stream', to: 'general', topic: 't', content: 'hello' }), /SOME_REASON/);
+  });
+}

@@ -283,14 +283,12 @@ test('buildAttachmentBlocks inlines images and small text, and degrades everythi
 });
 
 test('inline attachment transport diagnostics use the shared mode-aware wrapper', async () => {
-  const { MessageIds } = await import('../src/message-ids.ts');
   const { ZulipNoAnswer } = await import('../src/zulip-api.ts');
   const failure = new ZulipNoAnswer('network', 'GET', '/messages/7', false, 'raw GET /messages/7');
   for (const mode of ['legacy', 'compat', 'strict'] as const) {
     const blocks = await buildAttachmentBlocks(
       [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
-      { fetch: async () => { throw failure; } }, resolveInlineOptions(), new AbortController().signal,
-      new MessageIds('alpha', mode));
+      { fetch: async () => { throw failure; } }, resolveInlineOptions(), new AbortController().signal);
     const result = JSON.stringify(blocks);
     {
       assert.match(result, /Zulip transport failure/);
@@ -301,14 +299,12 @@ test('inline attachment transport diagnostics use the shared mode-aware wrapper'
 
 
 test('inline native fetch failures hide raw URLs in enabled modes', async t => {
-  const { MessageIds } = await import('../src/message-ids.ts');
   for (const failure of [new TypeError('fetch failed: https://private.invalid/secret'), new DOMException('private response body', 'AbortError')]) {
     t.mock.method(globalThis, 'fetch', async () => { throw failure; });
     for (const mode of ['legacy', 'compat', 'strict'] as const) {
       const blocks = await buildAttachmentBlocks(
         [{ name: 'note.txt', path: '/user_uploads/note.txt', mimeType: 'text/plain', isImage: false }],
-        { fetch: (path, maxBytes, signal) => fetchCapped('https://private.invalid' + path, {}, maxBytes, signal) }, resolveInlineOptions(), new AbortController().signal,
-        new MessageIds('alpha', mode));
+        { fetch: (path, maxBytes, signal) => fetchCapped('https://private.invalid' + path, {}, maxBytes, signal) }, resolveInlineOptions(), new AbortController().signal);
       const text = JSON.stringify(blocks);
       {
         assert.match(text, /could not fetch \(incomplete, \/user_uploads\/note\.txt\); retry with fetch_attachment\]/);

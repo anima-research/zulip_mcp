@@ -89,7 +89,7 @@ test('native HTML upload responses preserve status and log the original body fai
   const { createServer } = await import('node:http');
   const { once } = await import('node:events');
   const { createZulipUploader } = await import('../src/uploads.ts');
-  const { messageIdError } = await import('../src/message-ids.ts');
+  const { agentSafeError } = await import('../src/agent-errors.ts');
   const logs: unknown[][] = [];
   const originalLog = console.error;
   console.error = (...args) => { logs.push(args); };
@@ -103,7 +103,7 @@ test('native HTML upload responses preserve status and log the original body fai
       const uploader = createZulipUploader({ realm: `http://127.0.0.1:${address.port}`, authHeader: 'test' });
       for (const mode of ['legacy', 'compat', 'strict'] as const) {
         await assert.rejects(uploader.upload({ name: 'a.txt', data: Buffer.from('a') }), error => {
-          const safe = messageIdError(error, new MessageIds('alpha', mode));
+          const safe = agentSafeError(error);
           assert.match(safe.message, new RegExp(`HTTP ${status}`));
           {
             assert.match(safe.message, /Upload/);
@@ -119,7 +119,7 @@ test('native HTML upload responses preserve status and log the original body fai
 
 test('attachment timeout and HTTP reason phrases expose only safe facts', async t => {
   const { fetchAttachmentBytes } = await import('../src/content.ts');
-  const { messageIdError } = await import('../src/message-ids.ts');
+  const { agentSafeError } = await import('../src/agent-errors.ts');
   const originalFetch = globalThis.fetch;
   const originalLog = console.error;
   const logs: unknown[][] = [];
@@ -128,11 +128,11 @@ test('attachment timeout and HTTP reason phrases expose only safe facts', async 
   globalThis.fetch = async () => new Response('', { status: 502, statusText: 'private proxy path' });
   await assert.rejects(fetchAttachmentBytes('https://example.invalid/a', 'a'), error => {
     for (const mode of ['compat', 'strict'] as const) {
-      const safe = messageIdError(error, new MessageIds('alpha', mode));
+      const safe = agentSafeError(error);
       assert.match(safe.message, /Attachment download.*HTTP 502/);
       assert.doesNotMatch(safe.message, /private proxy/);
     }
-    assert.doesNotMatch(messageIdError(error, new MessageIds('alpha', 'legacy')).message, /private proxy/);
+    assert.doesNotMatch(agentSafeError(error).message, /private proxy/);
     return true;
   });
   try {
@@ -153,7 +153,7 @@ test('attachment timeout and HTTP reason phrases expose only safe facts', async 
   const pending = fetchAttachmentBytes('https://example.invalid/a', 'a');
   t.mock.timers.tick(15000);
   await assert.rejects(pending, error => {
-    const safe = messageIdError(error, new MessageIds('alpha', 'strict'));
+    const safe = agentSafeError(error);
     assert.match(safe.message, /Attachment download.*Timeout: 15 seconds/);
     assert.doesNotMatch(safe.message, /private/);
     assert.equal(logs.at(-1)?.[1], original);

@@ -1,4 +1,4 @@
-import { messageIdError, markTransportError, attachmentDownloadFailure, logDiagnostic, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { agentSafeError, markTransportError, attachmentDownloadFailure, logDiagnostic } from './agent-errors.js';
 import { parseRetryAfter } from './zulip-api.js';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -233,7 +233,6 @@ export async function buildAttachmentBlocks(
   source: AttachmentSource,
   options: InlineOptions,
   deadline: AbortSignal,
-  messageIds: MessageIds = LEGACY_IDS,
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   let imagesLeft = options.inlineImages ? options.maxImages : 0;
@@ -266,7 +265,7 @@ export async function buildAttachmentBlocks(
         blocks.push(text(`[attachment: ${ref.name} (${fmt(got.buf.length)})]\n${got.buf.toString('utf8')}`));
       }
     } catch (err) {
-      blocks.push(text(`[attachment: ${ref.name} — could not fetch ${inlineFailure(err, ref.path, messageIds)}]`));
+      blocks.push(text(`[attachment: ${ref.name} — could not fetch ${inlineFailure(err, ref.path)}]`));
     }
   }
   return blocks;
@@ -276,9 +275,9 @@ export async function buildAttachmentBlocks(
  * The parenthesized facts and one remedy for an inline marker. A download
  * failure gives its status and path; anything else keeps its safe message.
  */
-function inlineFailure(err: unknown, path: string, messageIds: MessageIds): string {
+function inlineFailure(err: unknown, path: string): string {
   const failure = attachmentDownloadFailure(err);
-  if (!failure) return `(${messageIdError(err, messageIds).message}); fetch_attachment ${path}`;
+  if (!failure) return `(${agentSafeError(err).message}); fetch_attachment ${path}`;
   logDiagnostic(err);
   const facts = [failure.refused ? 'refused' : 'incomplete'];
   if (failure.status !== undefined) facts.push(`HTTP ${failure.status}`);

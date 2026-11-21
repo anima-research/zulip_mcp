@@ -1,4 +1,5 @@
-import { messageIdError, LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { LEGACY_IDS, type MessageIds } from './message-ids.js';
+import { agentSafeError } from './agent-errors.js';
 import { isRefusal, type ZulipApi, type ZulipRefusal, type ZulipSuccess } from './zulip-api.js';
 import { withAttachmentLinks, type UploadedFile } from './uploads.js';
 import { blankLineAboveTables } from './tables.js';
@@ -56,7 +57,7 @@ function splitsPair(text: string, at: number): boolean {
 }
 
 export function namePosted<E extends Error>(err: E, posted: readonly number[], messageIds: MessageIds = LEGACY_IDS): E {
-  err = messageIdError(err, messageIds) as E;
+  err = agentSafeError(err) as E;
   if (posted.length === 0) return err;
   const n = posted.length;
   const formatted = posted.map(id => messageIds.format(id));
@@ -103,7 +104,7 @@ export async function sendMessage(
       answer = await api.requestAnswer<{ id: number }>('POST', '/messages', { ...destination, content: part });
     } catch (error) {
       if (!receipt) throw error;
-      const safe = messageIdError(error, opts.messageIds ?? LEGACY_IDS);
+      const safe = agentSafeError(error);
       safe.message += receipt;
       throw safe;
     }
